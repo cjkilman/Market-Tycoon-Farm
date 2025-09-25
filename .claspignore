@@ -1,0 +1,15 @@
+# Keep clasp from uploading unnecessary files/folders
+node_modules/
+.git/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
+
+# Ignore local config
+.clasp.json
+
+# Allow everything else
+!**/*.js
+!**/*.gs
+!**/*.json
