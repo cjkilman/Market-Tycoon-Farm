@@ -21,6 +21,31 @@ if (typeof getObjType !== "function") {
   }
 }
 
+/***** CONFIG *****/
+const CONTRACT_LOOKBACK_DAYS = 90;
+
+/* Sheet names (feel free to tweak) */
+const CONTRACTS_RAW_SHEET = "Contracts (RAW)";
+const CONTRACT_ITEMS_RAW_SHEET = "Contract Items (RAW)";
+const MATERIAL_LEDGER_SHEET = "Material_Ledger";
+
+/* Caching TTLs (seconds) */
+// ---- Cache TTLs for GESI (file-scoped)
+var GESI_TTL = (typeof GESI_TTL === 'object' && GESI_TTL) || {};
+GESI_TTL.chars     = (GESI_TTL.chars     != null) ? GESI_TTL.chars     : 21600; // 6h
+GESI_TTL.contracts = (GESI_TTL.contracts != null) ? GESI_TTL.contracts : 900;   // 15m
+GESI_TTL.items     = (GESI_TTL.items     != null) ? GESI_TTL.items     : 900;   // 15m
+
+function LOG_GESI(){ return LoggerEx.tag('GESI'); }
+
+/* Optional strict inbound detection:
+   When TRUE, we only ledger items if the contract's acceptor_id matches our char's ID.
+   Provide a map sheet named "CharIDMap" with headers: char | character_id
+   When FALSE, we treat included items on finished item_exchange as inbound. */
+const STRICT_ACCEPTOR_CHECK = false;
+
+
+
 // ==========================================================================================
 // Character contract items
 // ==========================================================================================
@@ -213,44 +238,54 @@ function array_corporations_corporation_contracts_contract_items(
   return out.length ? out : [["No data"]];
 }
 
-/***** CONFIG *****/
-const CONTRACT_LOOKBACK_DAYS = 90;
 
-/* Sheet names (feel free to tweak) */
-const CONTRACTS_RAW_SHEET = "Contracts (RAW)";
-const CONTRACT_ITEMS_RAW_SHEET = "Contract Items (RAW)";
-const MATERIAL_LEDGER_SHEET = "Material_Ledger";
-
-/* Caching TTLs (seconds) */
-const TTL = Object.assign(typeof TTL === 'object' ? TTL : {}, {
-  chars: 21600,  // 6h (per DOCUMENT)
-  items: 900,   // 15m (per USER, per contract)
-});
-
-/* Optional strict inbound detection:
-   When TRUE, we only ledger items if the contract's acceptor_id matches our char's ID.
-   Provide a map sheet named "CharIDMap" with headers: char | character_id
-   When FALSE, we treat included items on finished item_exchange as inbound. */
-const STRICT_ACCEPTOR_CHECK = false;
-
-/***** HELPERS *****/
-const LOG_GESI = LoggerEx.tag('GESI');
 
 function _sheet(name, header) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName(name);
-  if (!sh) {
-    sh = ss.insertSheet(name);
-    if (header && header.length) {
-      sh.getRange(1, 1, 1, header.length).setValues([header]);
+const ss = SpreadsheetApp.getActive();
+  const lock = LockService.getDocumentLock();
+  for (let a = 0; a < 5; a++) {
+    try {
+      lock.waitLock(5000);                       // short hold
+      let sh = ss.getSheetByName(name);
+      if (!sh) {
+        sh = ss.insertSheet(name);
+        if (header?.length) sh.getRange(1,1,1,header.length).setValues([header]);
+      } else if (header?.length) {
+        // ensure header is present
+        sh.getRange(1,1,1,header.length).setValues([header]);
+      }
+      lock.releaseLock();
+      return sh;
+    } catch (e) {
+      try { lock.releaseLock(); } catch(_) {}
+      Utilities.sleep(250 * Math.pow(2, a));    // 250ms, 500ms, 1s, 2s, 4s
+      if (a === 4) throw e;
     }
   }
-  return sh;
 }
 function _rewrite(sh, header, rows) {
-  sh.clearContents();
-  if (header && header.length) sh.getRange(1, 1, 1, header.length).setValues([header]);
-  if (rows && rows.length) sh.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+   const lock = LockService.getDocumentLock();
+  lock.waitLock(5000);
+  try {
+    if (header?.length) sh.getRange(1,1,1,header.length).setValues([header]);
+
+    // Ensure enough rows, write values, then clear trailing rows only
+    const needed = (rows.length || 0) + 1; // + header
+    const have = sh.getMaxRows();
+    if (have < needed) sh.insertRowsAfter(have, needed - have);
+
+    if (rows.length) {
+      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    }
+    const lastNow = rows.length + 1;
+    const lastHad = sh.getLastRow();
+    const extra = Math.max(0, lastHad - lastNow);
+    if (extra > 0) {
+      sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
+    }
+  } finally {
+    lock.releaseLock();
+  }
 }
 function _setValues(sh, startRow, rows) {
   if (!rows.length) return;
@@ -267,7 +302,7 @@ function getCharNamesFast() {
   const hit = c.get(k);
   if (hit) return JSON.parse(hit);
   const names = getAuthenticatedCharacterNames() || [];
-  c.put(k, JSON.stringify(names), TTL.chars);
+  c.put(k, JSON.stringify(names), GESI_TTL.chars);
   return names;
 }
 
@@ -280,7 +315,7 @@ function getContractItemsCached(charName, contractId, force = false) {
     if (hit) return JSON.parse(hit);
   }
   const items = invoke("characters_character_contract_id_items", [charName], { contract_id: contractId }) || [];
-  c.put(k, JSON.stringify(items), TTL.items);
+  c.put(k, JSON.stringify(items), GESI_TTL.items);
   return items;
 }
 
@@ -300,9 +335,6 @@ function _charIdMap() {
 function syncContracts() {
   const hdrC = ["char", "contract_id", "type", "status", "issuer_id", "acceptor_id", "date_issued", "date_expired", "price", "reward", "collateral", "volume", "title", "availability", "start_location_id", "end_location_id"];
   const hdrI = ["char", "contract_id", "type_id", "quantity", "is_included", "is_singleton"];
-
-  const shC = _sheet(CONTRACTS_RAW_SHEET, hdrC);
-  const shI = _sheet(CONTRACT_ITEMS_RAW_SHEET, hdrI);
 
   const names = getCharNamesFast();
   LOG_GESI.info('chars', names);
@@ -342,7 +374,8 @@ function syncContracts() {
     }
     LOG_GESI.info('char', ch, 'kept contracts so far', outC.length, 'item rows', outI.length);
   }
-
+  const shC = _sheet(CONTRACTS_RAW_SHEET, hdrC);
+  const shI = _sheet(CONTRACT_ITEMS_RAW_SHEET, hdrI);
   _rewrite(shC, hdrC, outC);
   _rewrite(shI, hdrI, outI);
   LOG_GESI.info('syncContracts done', { contracts: outC.length, items: outI.length });
