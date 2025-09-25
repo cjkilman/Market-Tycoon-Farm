@@ -213,66 +213,236 @@ function array_corporations_corporation_contracts_contract_items(
   return out.length ? out : [["No data"]];
 }
 
-// ContractPricer.gs.js — evaluates a contract against hub reference prices
-var ContractPricer = (function(){
-const CONTRACT_ITEMS_SHEET = 'contracts_items'; // raw ESI: contract_id | type_id | quantity | is_included
-const TRACKER_SHEET = 'Minerals Tracker';
-const OUT_SHEET = 'Contract Pricing';
+/***** CONFIG *****/
+const CONTRACT_LOOKBACK_DAYS = 90;
 
+/* Sheet names (feel free to tweak) */
+const CONTRACTS_RAW_SHEET = "Contracts (RAW)";
+const CONTRACT_ITEMS_RAW_SHEET = "Contract Items (RAW)";
+const MATERIAL_LEDGER_SHEET = "Material_Ledger";
 
-function price(contractId, hubRef, mode){
-const ss=SpreadsheetApp.getActive();
-const ci = ss.getSheetByName(CONTRACT_ITEMS_SHEET);
-if(!ci) throw new Error('Missing '+CONTRACT_ITEMS_SHEET);
-const cv = ci.getDataRange().getValues(); const ch = cv.shift().map(String);
-const cID=ch.indexOf('contract_id'), cT=ch.indexOf('type_id'), cQ=ch.indexOf('quantity'), cInc=ch.indexOf('is_included');
+/* Caching TTLs (seconds) */
+const TTL = Object.assign(typeof TTL === 'object' ? TTL : {}, {
+  chars: 21600,  // 6h (per DOCUMENT)
+  items: 900,   // 15m (per USER, per contract)
+});
 
+/* Optional strict inbound detection:
+   When TRUE, we only ledger items if the contract's acceptor_id matches our char's ID.
+   Provide a map sheet named "CharIDMap" with headers: char | character_id
+   When FALSE, we treat included items on finished item_exchange as inbound. */
+const STRICT_ACCEPTOR_CHECK = false;
 
-const items = cv.filter(r=>String(r[cID])==String(contractId) && (r[cInc]===true || r[cInc]==='TRUE'))
-.map(r=>({type_id:r[cT], qty:Number(r[cQ])||0}));
+/***** HELPERS *****/
+const LOG_GESI = LoggerEx.tag('GESI');
 
+function _sheet(name, header) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    if (header && header.length) {
+      sh.getRange(1, 1, 1, header.length).setValues([header]);
+    }
+  }
+  return sh;
+}
+function _rewrite(sh, header, rows) {
+  sh.clearContents();
+  if (header && header.length) sh.getRange(1, 1, 1, header.length).setValues([header]);
+  if (rows && rows.length) sh.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+}
+function _setValues(sh, startRow, rows) {
+  if (!rows.length) return;
+  sh.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+}
+function _isoDate(d) {
+  return Utilities.formatDate(new Date(d), "UTC", "yyyy-MM-dd");
+}
 
-const tr=ss.getSheetByName(TRACKER_SHEET); if(!tr) throw new Error('Run MineralTracker.build() first');
-const tv=tr.getDataRange().getValues(); const th=tv.shift().map(String);
-const tType=th.indexOf('type_id'), tHub=th.indexOf('Hub');
-const tSellMin=th.indexOf('sell_min (now)'), tMedSell=th.indexOf('median_sell_24h');
+/* Per-DOCUMENT cache for authenticated character names */
+function getCharNamesFast() {
+  const c = CacheService.getDocumentCache();
+  const k = 'gesi:chars';
+  const hit = c.get(k);
+  if (hit) return JSON.parse(hit);
+  const names = getAuthenticatedCharacterNames() || [];
+  c.put(k, JSON.stringify(names), TTL.chars);
+  return names;
+}
 
+/* Per-USER cache for per-contract items (personalized) */
+function getContractItemsCached(charName, contractId, force = false) {
+  const c = CacheService.getUserCache();
+  const k = `gesi:items:${charName}:${contractId}`;
+  if (!force) {
+    const hit = c.get(k);
+    if (hit) return JSON.parse(hit);
+  }
+  const items = invoke("characters_character_contract_id_items", [charName], { contract_id: contractId }) || [];
+  c.put(k, JSON.stringify(items), TTL.items);
+  return items;
+}
 
-const rows=[]; let total=0;
-for (const it of items){
-// pick ref
-const refRow = tv.find(r=>r[tType]==it.type_id && r[tHub]==hubRef);
-if(!refRow){ rows.push(['', it.type_id, '', it.qty, null, null, 'no ref']); continue; }
-let refPrice = null;
-if (mode==='median_sell') refPrice = refRow[tMedSell];
-else /* sell_min */ refPrice = refRow[tSellMin];
+/* Optional: read name→character_id map from a tiny sheet "CharIDMap" (char | character_id) */
+function _charIdMap() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName("CharIDMap");
+  if (!sh) return {};
+  const vals = sh.getDataRange().getValues();
+  vals.shift(); // header
+  const map = {};
+  vals.forEach(r => { if (r[0] && r[1]) map[String(r[0])] = String(r[1]); });
+  return map;
+}
 
+/***** 1) SYNC CONTRACTS (RAW) *****/
+function syncContracts() {
+  const hdrC = ["char", "contract_id", "type", "status", "issuer_id", "acceptor_id", "date_issued", "date_expired", "price", "reward", "collateral", "volume", "title", "availability", "start_location_id", "end_location_id"];
+  const hdrI = ["char", "contract_id", "type_id", "quantity", "is_included", "is_singleton"];
 
-const line = refPrice!=null ? refPrice * it.qty : null;
-if(line!=null) total += line;
-rows.push(['', it.type_id, '', it.qty, refPrice, line, '']);
+  const shC = _sheet(CONTRACTS_RAW_SHEET, hdrC);
+  const shI = _sheet(CONTRACT_ITEMS_RAW_SHEET, hdrI);
+
+  const names = getCharNamesFast();
+  LOG_GESI.info('chars', names);
+
+  const lookIso = _isoDate(Date.now() - CONTRACT_LOOKBACK_DAYS * 86400000);
+
+  LOG_GESI.time('contracts:list');
+  const lists = invokeMultiple("characters_character_contracts", names, { status: "all" }) || [];
+  LOG_GESI.timeEnd('contracts:list');
+
+  const outC = [];
+  const outI = [];
+
+  for (let i = 0; i < names.length; i++) {
+    const ch = names[i];
+    const list = lists[i] || [];
+    LOG_GESI.debug('char', ch, 'contracts', list.length);
+
+    for (const c of list) {
+      if (c.type !== "item_exchange" || c.status !== "finished") continue;
+      if (c.date_issued && c.date_issued.slice(0, 10) < lookIso) continue;
+
+      outC.push([
+        ch,
+        c.contract_id, c.type, c.status, c.issuer_id, c.acceptor_id,
+        c.date_issued || "", c.date_expired || "", c.price || 0, c.reward || 0, c.collateral || 0,
+        c.volume || 0, c.title || "", c.availability || "", c.start_location_id || "", c.end_location_id || ""
+      ]);
+
+      // Items are per-contract; cache per user
+      const items = getContractItemsCached(ch, c.contract_id);
+      for (const it of (items || [])) {
+        if (!it.is_included || !it.quantity) continue;   // only included stack(s)
+        outI.push([ch, c.contract_id, it.type_id, it.quantity, !!it.is_included, !!it.is_singleton]);
+      }
+      Utilities.sleep(150); // be kind to ESI
+    }
+    LOG_GESI.info('char', ch, 'kept contracts so far', outC.length, 'item rows', outI.length);
+  }
+
+  _rewrite(shC, hdrC, outC);
+  _rewrite(shI, hdrI, outI);
+  LOG_GESI.info('syncContracts done', { contracts: outC.length, items: outI.length });
+}
+
+/***** 2) RAW → Material_Ledger (normalized inflow) *****/
+function contractsToMaterialLedger() {
+  const hdrML = ["date", "type_id", "item_name", "qty", "unit_value", "source", "contract_id", "char"];
+  const shML = _sheet(MATERIAL_LEDGER_SHEET, hdrML);
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
+  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
+  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
+
+  const C = shC.getDataRange().getValues(); const hC = C.shift();
+  const I = shI.getDataRange().getValues(); const hI = I.shift();
+
+  const ixC = (name) => hC.indexOf(name);
+  const ixI = (name) => hI.indexOf(name);
+
+  const colC = {
+    char: ixC("char"),
+    contract_id: ixC("contract_id"),
+    type: ixC("type"),
+    status: ixC("status"),
+    acceptor_id: ixC("acceptor_id"),
+    date_issued: ixC("date_issued"),
+  };
+  const colI = {
+    char: ixI("char"),
+    contract_id: ixI("contract_id"),
+    type_id: ixI("type_id"),
+    quantity: ixI("quantity"),
+    is_included: ixI("is_included"),
+  };
+
+  // Join items by contract_id (included only)
+  const itemsByCid = {};
+  for (const r of I) {
+    if (!r[colI.is_included]) continue;
+    const cid = r[colI.contract_id];
+    if (!itemsByCid[cid]) itemsByCid[cid] = [];
+    itemsByCid[cid].push({
+      char: r[colI.char],
+      type_id: r[colI.type_id],
+      qty: Number(r[colI.quantity] || 0)
+    });
+
+  }
+
+  const idMap = STRICT_ACCEPTOR_CHECK ? _charIdMap() : null;
+  const out = [];
+
+  for (const r of C) {
+    const ctype = String(r[colC.type] || "").toLowerCase();
+    const status = String(r[colC.status] || "").toLowerCase();
+    if (ctype !== "item_exchange" || status !== "finished") continue;
+
+    // Inbound detection
+    let inbound = true;
+    if (STRICT_ACCEPTOR_CHECK) {
+      const ch = r[colC.char];
+      const myId = idMap && idMap[ch];
+      const acc = String(r[colC.acceptor_id] || "");
+      inbound = myId && acc && (String(myId) === acc);
+    }
+
+    if (!inbound) continue;
+
+    const cid = r[colC.contract_id];
+    const issued = r[colC.date_issued] ? _isoDate(r[colC.date_issued]) : "";
+
+    const items = itemsByCid[cid] || [];
+    for (const it of items) {
+      if (it.qty <= 0) continue;
+      out.push([
+        issued,            // date
+        it.type_id,        // type_id
+        "",                // item_name (fill later via Items map)
+        it.qty,            // qty
+        "",                // unit_value (leave blank; valuation modes FREE/WAVG/MEDIAN handle later)
+        "CONTRACT",        // source
+        cid,               // contract_id
+        r[colC.char] || "" // char
+      ]);
+    }
+  }
+
+  // De-dup on (contract_id|type_id|char)
+  const key = (row) => `${row[6]}|${row[1]}|${row[7]}`;
+  const have = shML.getLastRow() > 1 ? shML.getRange(2, 1, shML.getLastRow() - 1, hdrML.length).getValues() : [];
+  const seen = new Set(have.map(key));
+  const fresh = out.filter(row => (seen.has(key(row)) ? false : (seen.add(key(row)), true)));
+
+  if (fresh.length) {
+    const start = Math.max(2, shML.getLastRow() + 1);
+    _setValues(shML, start, fresh);
+  }
+  LOG_GESI.info('contracts→ledger', { appended: fresh.length, total_ledger_rows: shML.getLastRow() - 1 });
 }
 
 
-// write out
-const out = ss.getSheetByName(OUT_SHEET) || ss.insertSheet(OUT_SHEET);
-out.getRange('B1').setValue(contractId);
-out.getRange('B2').setValue(hubRef);
-out.getRange('B3').setValue(mode||'sell_min');
-out.getRange('B4').setValue(0.08);
-
-
-const hdr=['line','type_id','Item Name','Qty','Ref price','Line value','Notes'];
-const data=[hdr].concat(rows);
-out.getRange(6,1,data.length,data[0].length).setValues(data);
-
-
-// Totals & markdown
-const last = 6 + rows.length;
-out.getRange(last+1,4,1,2).setValues([["Subtotal:", total]]);
-out.getRange(last+2,4,1,2).setValues([["Fair offer (1 - markdown_pct):", total * (1 - Number(out.getRange('B4').getValue()||0))]]);
-}
-
-
-return { price: price };
-})();
