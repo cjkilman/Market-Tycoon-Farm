@@ -1,0 +1,3 @@
+# Force LF line endings for Google Apps Script and JS files
+*.js  text eol=lf
+*.gs  text eol=lf
