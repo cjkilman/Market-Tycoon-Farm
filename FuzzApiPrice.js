@@ -93,7 +93,7 @@ function _reshape(flat, rows, cols) {
 /* ------------------------- Cache key / scope helpers ---------------------- */
 
 const FUZ_CACHE_VER = 'v2';
-function cacheScope() { return CacheService.getScriptCache(); } // swap to getScriptCache() to share across bound scripts
+function cacheScope() { return CacheService.getDocumentCache(); } // swap to getScriptCache() to share across bound scripts
 
 function _fuzKey(location_type, location_id, type_id) {
   return `fuz:${FUZ_CACHE_VER}:${location_type}:${location_id}:${type_id}`;

@@ -1,285 +1,126 @@
 // ContractItems_Fetchers.gs.js
-// Minimal, drop-in hardening for Character/Corp contract item fetchers used as
-// custom functions in Google Sheets. Fixes "Loading…" loops by:
-//  - de-duplicating requests per recalculation (in‑memory memo)
-//  - partitioning cache keys by (name|contract_id|version|headerFlag)
-//  - merging results with exactly ONE header row when requested
+// Robust, GAS-safe contract sync for EVE (GESI):
+//   • Two-phase listing: CHARACTER → CORPORATION (no mixing of scopes)
+//   • Items fetched with HEADERS (boolean; default true in GESI)
+//   • Single canonical endpoints; positional args only (no named objects)
+//   • Per-doc cache for auth names; per-user cache for items (scope-partitioned)
+//   • LoggerEx integration (marketTracker style)
 //
-// Assumes the GESI library is available.
-/* global GESI, CacheService, Logger */
+// Assumes the GESI library + LoggerEx are available.
+/* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx */
 
-// ---------- Per-execution memos (avoid duplicate calls during one recalculation) ----------
-var _ccciMemo = Object.create(null); // characters
-var _cociMemo = Object.create(null); // corp
+// ==========================================================================================
+// CONFIG & CONSTANTS
+// ==========================================================================================
 
-// ---------- Safe helper: getObjType (fallback if not present in project) ----------
+// Optional override for corp auth character. May be:
+//  - a Named Range (e.g., "CORP_AUTH_CHAR"),
+//  - a Sheet!A1 range (e.g., "Utility!B3"),
+//  - or a literal character name (e.g., "CJ Kilman").
+// If omitted/blank/invalid, we default to GESI.name, then to first authed name.
+var CORP_AUTH_CHARACTER = "setting_director";
+
+// Rolling lookback (days) for finished item_exchange contracts.
+// You may also define a Named Range "LOOKBACK_DAYS" or put the value in Utility!B2.
+var CONTRACT_LOOKBACK_DAYS = 30;
+
+// SHEET NAMES
+var CONTRACTS_RAW_SHEET      = "Contracts (RAW)";
+var CONTRACT_ITEMS_RAW_SHEET = "Contract Items (RAW)";
+var MATERIAL_LEDGER_SHEET    = "Material_Ledger";
+
+// ENDPOINTS (canonical; let GESI handle versioning)
+var EP_LIST_CHAR = "characters_character_contracts";
+var EP_LIST_CORP = "corporations_corporation_contracts";
+
+var EP_ITEMS_CHAR = "characters_character_contracts_contract_items";
+var EP_ITEMS_CORP = "corporations_corporation_contracts_contract_items";
+
+// Contract list (headerless) column order fallback, if needed
+var GESI_CONTRACT_COLS = [
+  "acceptor_id","assignee_id","availability","buyout","collateral","contract_id",
+  "date_accepted","date_completed","date_expired","date_issued","days_to_complete",
+  "end_location_id","for_corporation","issuer_corporation_id","issuer_id","price",
+  "reward","start_location_id","status","title","type","volume","character_name"
+];
+
+// Cache TTLs (seconds)
+var GESI_TTL = (typeof GESI_TTL === 'object' && GESI_TTL) || {};
+GESI_TTL.chars     = (GESI_TTL.chars     != null) ? GESI_TTL.chars     : 21600; // 6h (document cache)
+GESI_TTL.contracts = (GESI_TTL.contracts != null) ? GESI_TTL.contracts : 900;   // 15m (unused here)
+GESI_TTL.items     = (GESI_TTL.items     != null) ? GESI_TTL.items     : 900;   // 15m (user cache)
+
+// ==========================================================================================
+// UTILITIES (GAS-SAFE)
+// ==========================================================================================
+
 if (typeof getObjType !== "function") {
-  /** @param {*} o */
   function getObjType(o) {
     var t = Object.prototype.toString.call(o);
-    return t.slice(8, -1); // e.g., "Number", "String", "Object"
+    return t.slice(8, -1);
   }
 }
 
-/***** CONFIG *****/
-const CONTRACT_LOOKBACK_DAYS = 90;
-
-/* Sheet names (feel free to tweak) */
-const CONTRACTS_RAW_SHEET = "Contracts (RAW)";
-const CONTRACT_ITEMS_RAW_SHEET = "Contract Items (RAW)";
-const MATERIAL_LEDGER_SHEET = "Material_Ledger";
-
-/* Caching TTLs (seconds) */
-// ---- Cache TTLs for GESI (file-scoped)
-var GESI_TTL = (typeof GESI_TTL === 'object' && GESI_TTL) || {};
-GESI_TTL.chars     = (GESI_TTL.chars     != null) ? GESI_TTL.chars     : 21600; // 6h
-GESI_TTL.contracts = (GESI_TTL.contracts != null) ? GESI_TTL.contracts : 900;   // 15m
-GESI_TTL.items     = (GESI_TTL.items     != null) ? GESI_TTL.items     : 900;   // 15m
-
-function LOG_GESI(){ return LoggerEx.tag('GESI'); }
-
-/* Optional strict inbound detection:
-   When TRUE, we only ledger items if the contract's acceptor_id matches our char's ID.
-   Provide a map sheet named "CharIDMap" with headers: char | character_id
-   When FALSE, we treat included items on finished item_exchange as inbound. */
-const STRICT_ACCEPTOR_CHECK = false;
-
-
-
-// ==========================================================================================
-// Character contract items
-// ==========================================================================================
-
-/**
- * RAW: Character contract items with proper cache partitioning.
- * @param {number} contract_id
- * @param {string} [name=GESI.name]
- * @param {boolean} [show_column_headings=true]
- * @param {string} [version="v1"]
- * @returns {any[][]}
- */
-function raw_characters_character_contract_items(
-  contract_id,
-  name /* = GESI.name */,
-  show_column_headings /* = true */,
-  version /* = "v1" */
-) {
-  if (contract_id == null) throw new Error("contract_id is required");
-  if (!name) name = GESI && GESI.name; // default to GESI.name
-  if (!name) throw new Error("name is required");
-  if (isNaN(contract_id)) throw new Error("contract_id is type " + getObjType(contract_id));
-  if (show_column_headings == null) show_column_headings = true;
-  if (version == null) version = "v1";
-
-  var key = "gesiCharContractItmz:" + name + ":" + contract_id + ":" + version + ":" + (show_column_headings ? 1 : 0);
-
-  if (_ccciMemo[key]) return _ccciMemo[key];
-
-  var cache = CacheService.getUserCache();
-  var jsonText = cache.get(key);
-  if (jsonText === null) {
-    var data = GESI.characters_character_contracts_contract_items(
-      parseInt(contract_id, 10), name, show_column_headings, version
-    );
-    jsonText = JSON.stringify(data);
-    cache.put(key, jsonText, 3600); // 1 hour TTL
-  }
-
-  var out = JSON.parse(jsonText);
-  _ccciMemo[key] = out;
-  return out;
+function _isoDate(d) {
+  return Utilities.formatDate(new Date(d), "UTC", "yyyy-MM-dd");
 }
 
-/**
- * ARRAY: Merge multiple (contract_id, name) pairs with EXACTLY one header row
- *        when show_column_headings=true; none otherwise.
- * @param {number[]|number} contract_ids
- * @param {string[]|string} names
- * @param {boolean} [show_column_headings=true]
- * @param {string} [version="v1"]
- * @returns {any[][]}
- */
-function array_characters_character_contract_items(
-  contract_ids, names, show_column_headings, version
-) {
-  if (contract_ids == null) throw new Error("contract_id is required");
-  if (!Array.isArray(contract_ids)) contract_ids = [contract_ids];
-  if (!Array.isArray(names)) names = [names];
-  if (show_column_headings == null) show_column_headings = true;
-  if (version == null) version = "v1";
-
-  // Build unique (name|id) pairs from the two arrays (zip by index)
-  var maxLen = Math.max(contract_ids.length, names.length);
-  var pairSet = Object.create(null); // use object as set for speed
-  for (var i = 0; i < maxLen; i++) {
-    var id = parseInt(contract_ids[i], 10);
-    var nm = names[i] == null ? "" : String(names[i]).trim();
-    if (!Number.isFinite(id) || !nm) continue; // skip invalid/blank
-    pairSet[nm + "|" + id] = true;
-  }
-
-  var pairs = Object.keys(pairSet);
-  if (pairs.length === 0) return [["No data"]];
-
-  var out = [];
-  var headerAdded = false;
-  var wantHeader = !!show_column_headings;
-
-  for (var p = 0; p < pairs.length; p++) {
-    var pair = pairs[p];
-    var cut = pair.lastIndexOf("|");
-    var name = pair.slice(0, cut);
-    var id = parseInt(pair.slice(cut + 1), 10);
-
-    // Always fetch with header; we will keep it only once if requested
-    var rows = raw_characters_character_contract_items(id, name, true, version);
-    if (!Array.isArray(rows) || rows.length === 0) continue;
-
-    var start = (wantHeader && !headerAdded) ? 0 : 1; // include header exactly once
-    for (var r = start; r < rows.length; r++) out.push(rows[r]);
-
-    if (wantHeader && !headerAdded) headerAdded = true;
-  }
-
-  return out.length ? out : [["No data"]];
+function _toIntOrNull(v) {
+  if (v == null) return null;
+  var s = String(v).trim().replace(/[^\d]/g, '');
+  if (!s) return null;
+  var n = parseInt(s, 10);
+  return (Number(n) === n && isFinite(n)) ? n : null;
 }
 
-// ==========================================================================================
-// Corp contract items
-// ==========================================================================================
-
-/**
- * RAW: Corp contract items with proper cache partitioning.
- * @param {number} contract_id
- * @param {string} [name=GESI.name]
- * @param {boolean} [show_column_headings=true]
- * @param {string} [version="v1"]
- * @returns {any[][]}
- */
-function raw_corporations_corporation_contracts_contract_items(
-  contract_id,
-  name /* = GESI.name */,
-  show_column_headings /* = true */,
-  version /* = "v1" */
-) {
-  if (contract_id == null) throw new Error("contract_id is required");
-  if (!name) name = GESI && GESI.name; // default
-  if (!name) throw new Error("name is required");
-  if (isNaN(contract_id)) throw new Error("contract_id is type " + getObjType(contract_id));
-  if (show_column_headings == null) show_column_headings = true;
-  if (version == null) version = "v1";
-
-  var key = "gesiCorpContractItmz:" + name + ":" + contract_id + ":" + version + ":" + (show_column_headings ? 1 : 0);
-
-  if (_cociMemo[key]) return _cociMemo[key];
-
-  var cache = CacheService.getUserCache();
-  var jsonText = cache.get(key);
-  if (jsonText === null) {
-    var data = GESI.corporations_corporation_contracts_contract_items(
-      parseInt(contract_id, 10), name, show_column_headings, version
-    );
-    jsonText = JSON.stringify(data);
-    cache.put(key, jsonText, 3600);
+function _toBoolStrict(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') {
+    var s = v.trim().toLowerCase();
+    if (s === 'true' || s === 't' || s === '1' || s === 'yes') return true;
+    if (s === 'false' || s === 'f' || s === '0' || s === 'no' || s === '') return false;
   }
-
-  var out = JSON.parse(jsonText);
-  _cociMemo[key] = out;
-  return out;
+  return false;
 }
-
-/**
- * ARRAY: Merge multiple corp contract_ids with EXACTLY one header when requested.
- * @param {number[]|number} contract_ids
- * @param {string} [name=GESI.name]
- * @param {boolean} [show_column_headings=true]
- * @param {string} [version="v1"]
- * @returns {any[][]}
- */
-function array_corporations_corporation_contracts_contract_items(
-  contract_ids, name, show_column_headings, version
-) {
-  if (contract_ids == null) throw new Error("contract_id is required");
-  if (!Array.isArray(contract_ids)) contract_ids = [contract_ids];
-  if (!name) name = GESI && GESI.name;
-  if (!name) throw new Error("name is required");
-  if (show_column_headings == null) show_column_headings = true;
-  if (version == null) version = "v1";
-
-  // sanitize + de-dup IDs
-  var i, id;
-  var ids = [];
-  for (i = 0; i < contract_ids.length; i++) {
-    id = parseInt(contract_ids[i], 10);
-    if (Number.isFinite(id)) ids.push(id);
-  }
-  var seen = Object.create(null), uniqIds = [];
-  for (i = 0; i < ids.length; i++) {
-    id = ids[i];
-    if (!seen[id]) { seen[id] = true; uniqIds.push(id); }
-  }
-  if (!uniqIds.length) return [["No data"]];
-
-  var out = [];
-  var headerAdded = false;
-  var wantHeader = !!show_column_headings;
-
-  for (i = 0; i < uniqIds.length; i++) {
-    id = uniqIds[i];
-    // Always fetch with header; keep it once if requested
-    var rows = raw_corporations_corporation_contracts_contract_items(id, name, true, version);
-    if (!Array.isArray(rows) || rows.length === 0) continue;
-
-    var start = (wantHeader && !headerAdded) ? 0 : 1;
-    for (var r = start; r < rows.length; r++) out.push(rows[r]);
-    if (wantHeader && !headerAdded) headerAdded = true;
-  }
-
-  return out.length ? out : [["No data"]];
-}
-
-
 
 function _sheet(name, header) {
-const ss = SpreadsheetApp.getActive();
-  const lock = LockService.getDocumentLock();
-  for (let a = 0; a < 5; a++) {
+  var ss = SpreadsheetApp.getActive();
+  var lock = LockService.getDocumentLock();
+  for (var a = 0; a < 5; a++) {
     try {
-      lock.waitLock(5000);                       // short hold
-      let sh = ss.getSheetByName(name);
+      lock.waitLock(5000);
+      var sh = ss.getSheetByName(name);
       if (!sh) {
         sh = ss.insertSheet(name);
-        if (header?.length) sh.getRange(1,1,1,header.length).setValues([header]);
-      } else if (header?.length) {
-        // ensure header is present
+        if (header && header.length) sh.getRange(1,1,1,header.length).setValues([header]);
+      } else if (header && header.length) {
         sh.getRange(1,1,1,header.length).setValues([header]);
       }
       lock.releaseLock();
       return sh;
     } catch (e) {
       try { lock.releaseLock(); } catch(_) {}
-      Utilities.sleep(250 * Math.pow(2, a));    // 250ms, 500ms, 1s, 2s, 4s
+      Utilities.sleep(250 * Math.pow(2, a));
       if (a === 4) throw e;
     }
   }
 }
+
 function _rewrite(sh, header, rows) {
-   const lock = LockService.getDocumentLock();
+  var lock = LockService.getDocumentLock();
   lock.waitLock(5000);
   try {
-    if (header?.length) sh.getRange(1,1,1,header.length).setValues([header]);
-
-    // Ensure enough rows, write values, then clear trailing rows only
-    const needed = (rows.length || 0) + 1; // + header
-    const have = sh.getMaxRows();
+    if (header && header.length) sh.getRange(1,1,1,header.length).setValues([header]);
+    var needed = (rows.length || 0) + 1;
+    var have = sh.getMaxRows();
     if (have < needed) sh.insertRowsAfter(have, needed - have);
-
     if (rows.length) {
       sh.getRange(2, 1, rows.length, header.length).setValues(rows);
     }
-    const lastNow = rows.length + 1;
-    const lastHad = sh.getLastRow();
-    const extra = Math.max(0, lastHad - lastNow);
+    var lastNow = rows.length + 1;
+    var lastHad = sh.getLastRow();
+    var extra = Math.max(0, lastHad - lastNow);
     if (extra > 0) {
       sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
     }
@@ -287,195 +128,557 @@ function _rewrite(sh, header, rows) {
     lock.releaseLock();
   }
 }
+
+function _sheetSafe(name, header){ return _sheet(name, header); }
+function _rewriteFast(sh, header, rows){ return _rewrite(sh, header, rows); }
+
 function _setValues(sh, startRow, rows) {
-  if (!rows.length) return;
+  if (!rows || !rows.length) return;
   sh.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
 }
-function _isoDate(d) {
-  return Utilities.formatDate(new Date(d), "UTC", "yyyy-MM-dd");
+
+// Lookback days resolver (Named Range "LOOKBACK_DAYS" → Utility!B2 → default)
+function getLookbackDays() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var v = null;
+  try {
+    var nr = ss.getRangeByName('LOOKBACK_DAYS');
+    if (nr) v = nr.getValue();
+  } catch(_) {}
+  if (v == null) {
+    var util = ss.getSheetByName('Utility');
+    if (util) { try { v = util.getRange(2, 2).getValue(); } catch(_) {} }
+  }
+  var n = parseInt(v, 10);
+  if (!(Number(n) === n && isFinite(n))) n = CONTRACT_LOOKBACK_DAYS;
+  if (n < 1) n = 1;
+  if (n > 365) n = 365;
+  return n;
 }
 
 /* Per-DOCUMENT cache for authenticated character names */
 function getCharNamesFast() {
-  const c = CacheService.getDocumentCache();
-  const k = 'gesi:chars';
-  const hit = c.get(k);
+  var c = CacheService.getDocumentCache();
+  var k = 'gesi:chars';
+  var hit = c.get(k);
   if (hit) return JSON.parse(hit);
-  const names = getAuthenticatedCharacterNames() || [];
+
+  var namesFn =
+    (GESI && typeof GESI.getAuthenticatedCharacterNames === 'function')
+      ? GESI.getAuthenticatedCharacterNames
+      : (typeof getAuthenticatedCharacterNames === 'function'
+          ? getAuthenticatedCharacterNames
+          : null);
+  if (!namesFn) throw new Error('getAuthenticatedCharacterNames not found (GESI or global).');
+
+  var names = namesFn() || [];
   c.put(k, JSON.stringify(names), GESI_TTL.chars);
   return names;
 }
 
-/* Per-USER cache for per-contract items (personalized) */
-function getContractItemsCached(charName, contractId, force = false) {
-  const c = CacheService.getUserCache();
-  const k = `gesi:items:${charName}:${contractId}`;
+// Resolve corp auth character (override → GESI.name → NamedRange/Utility → first authed)
+function getCorpAuthChar() {
+  var log = LoggerEx.withTag('GESI');
+  var ss  = SpreadsheetApp.getActiveSpreadsheet();
+  var names = getCharNamesFast();
+  var desired = "";
+
+  function _resolve(spec) {
+    if (!spec) return "";
+    spec = String(spec).trim();
+    var got = null;
+    // Named range?
+    try {
+      var nr = ss.getRangeByName(spec);
+      if (nr) got = nr.getValue();
+    } catch(_) {}
+    // Sheet!A1?
+    if (!got && spec.indexOf('!') > 0) {
+      var cut = spec.indexOf('!');
+      var shn = spec.slice(0, cut);
+      var a1  = spec.slice(cut + 1);
+      var sh  = ss.getSheetByName(shn);
+      if (sh) { try { got = sh.getRange(a1).getValue(); } catch(_) {} }
+    }
+    if (!got) got = spec;
+    return String(got).trim();
+  }
+
+  if (typeof CORP_AUTH_CHARACTER !== 'undefined' && CORP_AUTH_CHARACTER != null) {
+    desired = _resolve(CORP_AUTH_CHARACTER);
+  }
+
+  if (!desired && GESI && GESI.name) desired = String(GESI.name).trim();
+
+  if (!desired) {
+    desired = _resolve('CORP_AUTH_CHAR');
+    if (!desired) desired = _resolve('Utility!B3');
+  }
+
+  if (names.indexOf(desired) === -1) {
+    var fallback = names[0] || "";
+    if (desired) log.warn('Corp auth override not in authenticated names; falling back', { wanted: desired, using: fallback, list: names });
+    desired = fallback;
+  }
+
+  log.debug('corp auth character', { using: desired });
+  return desired;
+}
+
+// ==========================================================================================
+// NORMALIZERS
+// ==========================================================================================
+
+// Normalize CONTRACT LIST results → [{ ch, c }]
+function _normalizeCharContracts(res, names) {
+  var tuples = [];
+  if (!res || !res.length) return tuples;
+
+  // headerless rows
+  if (Array.isArray(res[0]) && typeof res[0][0] !== 'string') {
+    for (var r = 0; r < res.length; r++) {
+      var row = res[r];
+      var c = {};
+      var n = Math.min(row.length, GESI_CONTRACT_COLS.length);
+      for (var k = 0; k < n; k++) c[GESI_CONTRACT_COLS[k]] = row[k];
+      var ch = c.character_name || (names && names.length === 1 ? names[0] : '');
+      tuples.push({ ch: String(ch), c: c });
+    }
+    return tuples;
+  }
+
+  // tabular (header row)
+  if (Array.isArray(res[0]) && typeof res[0][0] === 'string') {
+    var hdr = res[0];
+    for (var i = 1; i < res.length; i++) {
+      var row2 = res[i]; if (!Array.isArray(row2)) continue;
+      var c2 = {};
+      for (var j = 0; j < hdr.length; j++) c2[String(hdr[j]).trim()] = row2[j];
+      var ch2 = c2.character_name || '';
+      tuples.push({ ch: String(ch2), c: c2 });
+    }
+    return tuples;
+  }
+
+  // per-char arrays (aligned to names)
+  if (Array.isArray(res[0])) {
+    for (var a = 0; a < names.length; a++) {
+      var arr = res[a] || [];
+      for (var b = 0; b < arr.length; b++) {
+        var cA = arr[b]; if (!cA || typeof cA !== 'object') continue;
+        var chA = cA.character_name || cA.char || names[a] || '';
+        tuples.push({ ch: String(chA), c: cA });
+      }
+    }
+    return tuples;
+  }
+
+  // flat objects
+  if (typeof res[0] === 'object') {
+    for (var m = 0; m < res.length; m++) {
+      var cB = res[m]; if (!cB || typeof cB !== 'object') continue;
+      var chB = cB.character_name || cB.char || '';
+      tuples.push({ ch: String(chB), c: cB });
+    }
+  }
+  return tuples;
+}
+
+// Corp list: same mapping, but force auth name (corp lists usually lack char names)
+function _normalizeCorpContracts(res, corpAuthName) {
+  var tuples = [];
+  if (!res || !res.length) return tuples;
+
+  if (Array.isArray(res[0]) && typeof res[0][0] !== 'string') {
+    for (var r = 0; r < res.length; r++) {
+      var row = res[r], c = {};
+      var n = Math.min(row.length, GESI_CONTRACT_COLS.length);
+      for (var k = 0; k < n; k++) c[GESI_CONTRACT_COLS[k]] = row[k];
+      tuples.push({ ch: String(corpAuthName), c: c });
+    }
+    return tuples;
+  }
+
+  if (Array.isArray(res[0]) && typeof res[0][0] === 'string') {
+    var hdr = res[0];
+    for (var i = 1; i < res.length; i++) {
+      var row2 = res[i]; if (!Array.isArray(row2)) continue;
+      var c2 = {};
+      for (var j = 0; j < hdr.length; j++) c2[String(hdr[j]).trim()] = row2[j];
+      tuples.push({ ch: String(corpAuthName), c: c2 });
+    }
+    return tuples;
+  }
+
+  if (typeof res[0] === 'object') {
+    for (var m = 0; m < res.length; m++) {
+      var cB = res[m]; if (!cB || typeof cB !== 'object') continue;
+      tuples.push({ ch: String(corpAuthName), c: cB });
+    }
+  }
+  return tuples;
+}
+
+// ITEMS: we always request headers; normalize header/object → {is_included, is_singleton, quantity, type_id}
+function normalizeItemRows(rows) {
+  if (!rows || !rows.length) return [];
+  // Tabular with header row
+  if (Array.isArray(rows[0]) && typeof rows[0][0] === 'string') {
+    var hdr = rows[0];
+    var idx = {};
+    for (var h = 0; h < hdr.length; h++) idx[String(hdr[h]).trim()] = h;
+    var out = [];
+    for (var r = 1; r < rows.length; r++) {
+      var a = rows[r]; if (!Array.isArray(a)) continue;
+      out.push({
+        is_included: !!a[idx.is_included],
+        is_singleton: !!a[idx.is_singleton],
+        quantity: Number(a[idx.quantity] || 0),
+        type_id: Number(a[idx.type_id] || 0)
+      });
+    }
+    return out;
+  }
+  // Objects (some GESI builds)
+  if (rows[0] && !Array.isArray(rows[0]) && typeof rows[0] === 'object') {
+    var out2 = [];
+    for (var i = 0; i < rows.length; i++) {
+      var x = rows[i] || {};
+      out2.push({
+        is_included: !!x.is_included,
+        is_singleton: !!x.is_singleton,
+        quantity: Number(x.quantity || x.qty || 0),
+        type_id: Number(x.type_id || x.typeId || 0)
+      });
+    }
+    return out2;
+  }
+  return [];
+}
+
+
+function _fetchCharContractItems(charName, contractId) {
+  var cid = _toIntOrNull(contractId);
+  if (cid == null) throw new Error('contract_id must be an integer');
+  return GESI.characters_character_contracts_contract_items(
+    cid,
+    charName,
+      true
+  );
+}
+
+function _fetchCorpContractItems(charName, contractId) {
+  var cid = _toIntOrNull(contractId);
+  if (cid == null) throw new Error('contract_id must be an integer');
+  return GESI.corporations_corporation_contracts_contract_items(
+     cid, 
+    charName,
+     true 
+  );
+}
+
+
+// Per-USER cached items (partition by scope + auth name; HEADERS shape)
+function getContractItemsCached(charName, contractId, force, forCorp) {
+  if (force === void 0) force = false;
+  var log = LoggerEx.withTag('GESI');
+
+  var cid = _toIntOrNull(contractId);
+  if (cid == null) {
+    log.warn('getContractItemsCached: invalid contract_id', { char: charName, contractId: contractId });
+    return [];
+  }
+
+  var authName = forCorp ? getCorpAuthChar() : String(charName);
+  var scope    = forCorp ? 'corp' : 'char';
+
+  var c = CacheService.getUserCache();
+  var k = 'gesi:items:' + (forCorp ? ('CORP:' + authName) : authName) + ':' + cid + ':' + scope + ':hdr';
   if (!force) {
-    const hit = c.get(k);
+    var hit = c.get(k);
     if (hit) return JSON.parse(hit);
   }
-  const items = invoke("characters_character_contract_id_items", [charName], { contract_id: contractId }) || [];
-  c.put(k, JSON.stringify(items), GESI_TTL.items);
-  return items;
+
+  var items = forCorp
+    ? _fetchCorpContractItems(authName, cid)
+    : _fetchCharContractItems(authName, cid);
+
+  c.put(k, JSON.stringify(items || []), GESI_TTL.items);
+  return items || [];
 }
 
-/* Optional: read name→character_id map from a tiny sheet "CharIDMap" (char | character_id) */
-function _charIdMap() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sh = ss.getSheetByName("CharIDMap");
-  if (!sh) return {};
-  const vals = sh.getDataRange().getValues();
-  vals.shift(); // header
-  const map = {};
-  vals.forEach(r => { if (r[0] && r[1]) map[String(r[0])] = String(r[1]); });
-  return map;
+// ==========================================================================================
+// RAW SHEET FUNCTIONS (mirror the same signature/shape as invoke fetchers)
+// ==========================================================================================
+function raw_characters_character_contract_items(contract_id, name, show_column_headings) {
+  if (show_column_headings == null) show_column_headings = true;
+  var cid = _toIntOrNull(contract_id);
+  var cache = CacheService.getUserCache();
+  var key = "gesiCharContractItmz:" + name + ":" + cid + ":" + (show_column_headings ? 1 : 0);
+  var hit = cache.get(key);
+  if (hit !== null) return JSON.parse(hit);
+
+  var data = GESI.invoke(
+    EP_ITEMS_CHAR,
+    [String(name)],
+    { contract_id: cid, show_column_headings: !!show_column_headings }
+  ) || [];
+
+  cache.put(key, JSON.stringify(data), 3600);
+  return data;
 }
 
-/***** 1) SYNC CONTRACTS (RAW) *****/
-function syncContracts() {
-  const hdrC = ["char", "contract_id", "type", "status", "issuer_id", "acceptor_id", "date_issued", "date_expired", "price", "reward", "collateral", "volume", "title", "availability", "start_location_id", "end_location_id"];
-  const hdrI = ["char", "contract_id", "type_id", "quantity", "is_included", "is_singleton"];
+function raw_corporations_corporation_contracts_contract_items(contract_id, name, show_column_headings) {
+  if (show_column_headings == null) show_column_headings = true;
+  var cid = _toIntOrNull(contract_id);
+  var cache = CacheService.getUserCache();
+  var key = "gesiCorpContractItmz:" + name + ":" + cid + ":" + (show_column_headings ? 1 : 0);
+  var hit = cache.get(key);
+  if (hit !== null) return JSON.parse(hit);
 
-  const names = getCharNamesFast();
-  LOG_GESI.info('chars', names);
+  var data = GESI.invoke(
+    EP_ITEMS_CORP,
+    [String(name)],
+    { contract_id: cid, show_column_headings: !!show_column_headings }
+  ) || [];
 
-  const lookIso = _isoDate(Date.now() - CONTRACT_LOOKBACK_DAYS * 86400000);
+  cache.put(key, JSON.stringify(data), 3600);
+  return data;
+}
 
-  LOG_GESI.time('contracts:list');
-  const lists = invokeMultiple("characters_character_contracts", names, { status: "all" }) || [];
-  LOG_GESI.timeEnd('contracts:list');
+function _pickCharForContract(candidates, contractRow, idMap) {
+  // candidates: array of { ch, c } for the same contract_id
+  // contractRow: any one of those (for acceptor_id, etc.)
+  // idMap: { name → character_id } from CharIDMap()
+  if (!candidates || !candidates.length) return '';
 
-  const outC = [];
-  const outI = [];
-
-  for (let i = 0; i < names.length; i++) {
-    const ch = names[i];
-    const list = lists[i] || [];
-    LOG_GESI.debug('char', ch, 'contracts', list.length);
-
-    for (const c of list) {
-      if (c.type !== "item_exchange" || c.status !== "finished") continue;
-      if (c.date_issued && c.date_issued.slice(0, 10) < lookIso) continue;
-
-      outC.push([
-        ch,
-        c.contract_id, c.type, c.status, c.issuer_id, c.acceptor_id,
-        c.date_issued || "", c.date_expired || "", c.price || 0, c.reward || 0, c.collateral || 0,
-        c.volume || 0, c.title || "", c.availability || "", c.start_location_id || "", c.end_location_id || ""
-      ]);
-
-      // Items are per-contract; cache per user
-      const items = getContractItemsCached(ch, c.contract_id);
-      for (const it of (items || [])) {
-        if (!it.is_included || !it.quantity) continue;   // only included stack(s)
-        outI.push([ch, c.contract_id, it.type_id, it.quantity, !!it.is_included, !!it.is_singleton]);
-      }
-      Utilities.sleep(150); // be kind to ESI
+  var acc = String(contractRow.acceptor_id || '').trim();
+  if (acc && idMap) {
+    for (var i = 0; i < candidates.length; i++) {
+      var ch = candidates[i].ch || '';
+      if (ch && idMap[ch] && String(idMap[ch]) === acc) return ch;
     }
-    LOG_GESI.info('char', ch, 'kept contracts so far', outC.length, 'item rows', outI.length);
   }
-  const shC = _sheet(CONTRACTS_RAW_SHEET, hdrC);
-  const shI = _sheet(CONTRACT_ITEMS_RAW_SHEET, hdrI);
-  _rewrite(shC, hdrC, outC);
-  _rewrite(shI, hdrI, outI);
-  LOG_GESI.info('syncContracts done', { contracts: outC.length, items: outI.length });
+  // fallback: first seen
+  return candidates[0].ch || '';
 }
 
-/***** 2) RAW → Material_Ledger (normalized inflow) *****/
-function contractsToMaterialLedger() {
-  const hdrML = ["date", "type_id", "item_name", "qty", "unit_value", "source", "contract_id", "char"];
-  const shML = _sheet(MATERIAL_LEDGER_SHEET, hdrML);
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
-  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
+
+// ==========================================================================================
+// SYNC: Two-phase (CHAR first → CORP). No scope mixing.
+// ==========================================================================================
+function syncContracts() {
+  var log = LoggerEx.withTag('GESI');
+  var hdrC = ["char","contract_id","type","status","issuer_id","acceptor_id","date_issued","date_expired","price","reward","collateral","volume","title","availability","start_location_id","end_location_id"];
+  var hdrI = ["char","contract_id","type_id","quantity","is_included","is_singleton"];
+
+  var names = getCharNamesFast();
+  var corpAuth = getCorpAuthChar();
+  log.log('chars', names);
+
+  var MS_PER_DAY = 86400000;
+  var lookbackDays = getLookbackDays();
+  var lookIso = _isoDate(Date.now() - lookbackDays * MS_PER_DAY);
+
+  var outC = [];
+  var outI = [];
+
+  // ---------------- PHASE 1: CHARACTER CONTRACTS ----------------
+  var tListChar = log.startTimer('contracts:list:char');
+  var resChar = GESI.invokeMultiple(EP_LIST_CHAR, names, { status: "all" }) || [];
+  tListChar.stamp('listed');
+
+  var tuplesChar = _normalizeCharContracts(resChar, names);
+  log.log('normalized char contracts', tuplesChar.length);
+
+  var seenChar = {}; // track char contract_ids to avoid double insert if corp list repeats
+ // Group all char contracts by contract_id first
+var byCid = Object.create(null);
+for (var t = 0; t < tuplesChar.length; t++) {
+  var c1 = tuplesChar[t].c;
+  var type1 = String(c1.type || '').toLowerCase();
+  var stat1 = String(c1.status || '').toLowerCase();
+  if (type1 !== 'item_exchange' || stat1 !== 'finished') continue;
+
+  var issued1 = c1.date_issued ? String(c1.date_issued).slice(0,10) : '';
+  if (issued1 && issued1 < lookIso) continue;
+
+  var cid1 = _toIntOrNull(c1.contract_id);
+  if (cid1 == null) continue;
+
+  if (!byCid[cid1]) byCid[cid1] = [];
+  byCid[cid1].push(tuplesChar[t]); // keep all sightings for this cid
+}
+
+var idMap = (typeof _charIdMap === 'function') ? _charIdMap() : null;
+
+for (var cid in byCid) {
+  if (!byCid.hasOwnProperty(cid)) continue;
+  var group = byCid[cid];             // [{ ch, c }, ...] same contract_id
+  var cRow  = group[0].c;             // representative row (dates, price, etc.)
+  var ch1   = _pickCharForContract(group, cRow, idMap);
+
+  var cidNum = _toIntOrNull(cid);
+  if (cidNum == null) continue;
+
+  // Fetch items once (character scope)
+  var items1Raw = getContractItemsCached(ch1, cidNum, false, false) || [];
+  var items1 = normalizeItemRows(items1Raw);
+
+  // Write contract & items under the chosen character (usually the acceptor)
+  outC.push([
+    ch1, cidNum, cRow.type, cRow.status, cRow.issuer_id, cRow.acceptor_id,
+    cRow.date_issued || "", cRow.date_expired || "", cRow.price || 0, cRow.reward || 0, cRow.collateral || 0,
+    cRow.volume || 0, cRow.title || "", cRow.availability || "", cRow.start_location_id || "", cRow.end_location_id || ""
+  ]);
+
+  for (var j1 = 0; j1 < items1.length; j1++) {
+    var it1 = items1[j1];
+    if (!it1.is_included || !it1.quantity) continue;
+    outI.push([ch1, cidNum, it1.type_id, it1.quantity, true, !!it1.is_singleton]);
+  }
+
+  seenChar[''+cidNum] = true; // so corp phase won’t re-add it
+  Utilities.sleep(150);
+}
+
+
+  // ---------------- PHASE 2: CORPORATION CONTRACTS ----------------
+  var tListCorp = log.startTimer('contracts:list:corp');
+  var resCorp = GESI.invoke(EP_LIST_CORP, [corpAuth], { status: "all" }) || [];
+  tListCorp.stamp('listed');
+
+  var tuplesCorp = _normalizeCorpContracts(resCorp, corpAuth);
+  log.log('normalized corp contracts', tuplesCorp.length);
+
+  for (var u = 0; u < tuplesCorp.length; u++) {
+    var ch2 = tuplesCorp[u].ch || corpAuth; // always corp auth name
+    var c2  = tuplesCorp[u].c;
+
+    var type2 = String(c2.type || '').toLowerCase();
+    var stat2 = String(c2.status || '').toLowerCase();
+    if (type2 !== 'item_exchange' || stat2 !== 'finished') continue;
+
+    var issued2 = c2.date_issued ? String(c2.date_issued).slice(0,10) : '';
+    if (issued2 && issued2 < lookIso) continue;
+
+    var cid2 = _toIntOrNull(c2.contract_id);
+    if (cid2 == null) { log.warn('corp: invalid contract_id; skip', { char: ch2, raw: c2.contract_id }); continue; }
+
+    // If this ID already appeared in CHAR phase, skip (keep scopes cleanly separated)
+    if (seenChar[''+cid2]) continue;
+
+    var items2Raw = getContractItemsCached(ch2, cid2, false, true) || [];
+    var items2 = normalizeItemRows(items2Raw);
+
+    outC.push([
+      ch2, cid2, c2.type, c2.status, c2.issuer_id, c2.acceptor_id,
+      c2.date_issued || "", c2.date_expired || "", c2.price || 0, c2.reward || 0, c2.collateral || 0,
+      c2.volume || 0, c2.title || "", c2.availability || "", c2.start_location_id || "", c2.end_location_id || ""
+    ]);
+
+    for (var j2 = 0; j2 < items2.length; j2++) {
+      var it2 = items2[j2];
+      if (!it2.is_included || !it2.quantity) continue;
+      outI.push([ch2, cid2, it2.type_id, it2.quantity, true, !!it2.is_singleton]);
+    }
+
+    Utilities.sleep(150);
+  }
+
+  // ---------------- WRITE SHEETS ----------------
+  var shC = _sheetSafe(CONTRACTS_RAW_SHEET, hdrC);
+  var shI = _sheetSafe(CONTRACT_ITEMS_RAW_SHEET, hdrI);
+  _rewriteFast(shC, hdrC, outC);
+  _rewriteFast(shI, hdrI, outI);
+
+  log.log('syncContracts done', { contracts: outC.length, items: outI.length, lookback_days: lookbackDays, lookIso: lookIso });
+}
+
+// ==========================================================================================
+// RAW → Material_Ledger (optional helper to normalize inflow)
+// ==========================================================================================
+function contractsToMaterialLedger() {
+  var log = LoggerEx.withTag('GESI');
+
+  var hdrML = ["date","type_id","item_name","qty","unit_value","source","contract_id","char"];
+  var shML = _sheetSafe(MATERIAL_LEDGER_SHEET, hdrML);
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
+  var shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
   if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
 
-  const C = shC.getDataRange().getValues(); const hC = C.shift();
-  const I = shI.getDataRange().getValues(); const hI = I.shift();
+  var C = shC.getDataRange().getValues(); var hC = C.shift();
+  var I = shI.getDataRange().getValues(); var hI = I.shift();
 
-  const ixC = (name) => hC.indexOf(name);
-  const ixI = (name) => hI.indexOf(name);
+  function ix(arr, name){ return arr.indexOf(name); }
 
-  const colC = {
-    char: ixC("char"),
-    contract_id: ixC("contract_id"),
-    type: ixC("type"),
-    status: ixC("status"),
-    acceptor_id: ixC("acceptor_id"),
-    date_issued: ixC("date_issued"),
+  var colC = {
+    char: ix(hC,"char"),
+    contract_id: ix(hC,"contract_id"),
+    type: ix(hC,"type"),
+    status: ix(hC,"status"),
+    acceptor_id: ix(hC,"acceptor_id"),
+    date_issued: ix(hC,"date_issued")
   };
-  const colI = {
-    char: ixI("char"),
-    contract_id: ixI("contract_id"),
-    type_id: ixI("type_id"),
-    quantity: ixI("quantity"),
-    is_included: ixI("is_included"),
+  var colI = {
+    char: ix(hI,"char"),
+    contract_id: ix(hI,"contract_id"),
+    type_id: ix(hI,"type_id"),
+    quantity: ix(hI,"quantity"),
+    is_included: ix(hI,"is_included")
   };
 
-  // Join items by contract_id (included only)
-  const itemsByCid = {};
-  for (const r of I) {
-    if (!r[colI.is_included]) continue;
-    const cid = r[colI.contract_id];
+  var itemsByCid = {};
+  for (var r = 0; r < I.length; r++) {
+    var rowI = I[r];
+    if (!rowI[colI.is_included]) continue;
+    var cid = rowI[colI.contract_id];
     if (!itemsByCid[cid]) itemsByCid[cid] = [];
     itemsByCid[cid].push({
-      char: r[colI.char],
-      type_id: r[colI.type_id],
-      qty: Number(r[colI.quantity] || 0)
+      char: rowI[colI.char],
+      type_id: rowI[colI.type_id],
+      qty: Number(rowI[colI.quantity] || 0)
     });
-
   }
 
-  const idMap = STRICT_ACCEPTOR_CHECK ? _charIdMap() : null;
-  const out = [];
-
-  for (const r of C) {
-    const ctype = String(r[colC.type] || "").toLowerCase();
-    const status = String(r[colC.status] || "").toLowerCase();
+  var out = [];
+  for (var q = 0; q < C.length; q++) {
+    var rowC = C[q];
+    var ctype  = String(rowC[colC.type]||"").toLowerCase();
+    var status = String(rowC[colC.status]||"").toLowerCase();
     if (ctype !== "item_exchange" || status !== "finished") continue;
 
-    // Inbound detection
-    let inbound = true;
-    if (STRICT_ACCEPTOR_CHECK) {
-      const ch = r[colC.char];
-      const myId = idMap && idMap[ch];
-      const acc = String(r[colC.acceptor_id] || "");
-      inbound = myId && acc && (String(myId) === acc);
-    }
-
-    if (!inbound) continue;
-
-    const cid = r[colC.contract_id];
-    const issued = r[colC.date_issued] ? _isoDate(r[colC.date_issued]) : "";
-
-    const items = itemsByCid[cid] || [];
-    for (const it of items) {
+    var cid2 = rowC[colC.contract_id];
+    var issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+    var items = itemsByCid[cid2] || [];
+    for (var s = 0; s < items.length; s++) {
+      var it = items[s];
       if (it.qty <= 0) continue;
-      out.push([
-        issued,            // date
-        it.type_id,        // type_id
-        "",                // item_name (fill later via Items map)
-        it.qty,            // qty
-        "",                // unit_value (leave blank; valuation modes FREE/WAVG/MEDIAN handle later)
-        "CONTRACT",        // source
-        cid,               // contract_id
-        r[colC.char] || "" // char
-      ]);
+      out.push([ issued, it.type_id, "", it.qty, "", "CONTRACT", cid2, rowC[colC.char] || "" ]);
     }
   }
 
-  // De-dup on (contract_id|type_id|char)
-  const key = (row) => `${row[6]}|${row[1]}|${row[7]}`;
-  const have = shML.getLastRow() > 1 ? shML.getRange(2, 1, shML.getLastRow() - 1, hdrML.length).getValues() : [];
-  const seen = new Set(have.map(key));
-  const fresh = out.filter(row => (seen.has(key(row)) ? false : (seen.add(key(row)), true)));
-
-  if (fresh.length) {
-    const start = Math.max(2, shML.getLastRow() + 1);
-    _setValues(shML, start, fresh);
-  }
-  LOG_GESI.info('contracts→ledger', { appended: fresh.length, total_ledger_rows: shML.getLastRow() - 1 });
+// --- de-dup against existing rows ---
+var have = shML.getLastRow() > 1 ? shML.getRange(2,1,shML.getLastRow()-1,hdrML.length).getValues() : [];
+var seen = Object.create(null);
+for (var i = 0; i < have.length; i++) {
+  var k = have[i][6] + '|' + have[i][1] + '|' + have[i][7]; // contract_id|type_id|char
+  seen[k] = true;
+}
+var fresh = [];
+for (var j = 0; j < out.length; j++) {
+  var key = out[j][6] + '|' + out[j][1] + '|' + out[j][7];
+  if (seen[key]) continue;
+  seen[key] = true;
+  fresh.push(out[j]);
 }
 
-
+if (fresh.length) {
+  var start = Math.max(2, shML.getLastRow()+1);
+  _setValues(shML, start, fresh);
+}
+log.log('contracts→ledger', { appended: fresh.length, total_ledger_rows: shML.getLastRow()-1 });
+}
