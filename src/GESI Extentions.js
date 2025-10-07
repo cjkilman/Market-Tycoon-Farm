@@ -694,3 +694,221 @@ if (fresh.length) {
 }
 log.log('contracts→ledger', { appended: fresh.length, total_ledger_rows: shML.getLastRow()-1 });
 }
+
+
+/******************************************************
+ * Contract → unit costs table (for Material_Ledger fill)
+ * - Lists finished item_exchange in the lookback window
+ * - Pulls items per contract (character, then corp)
+ * - Allocates NET price across included items
+ * - Returns rows: [contract_id, type_id, qty, unit_cost, price, total_qty, issuer_id, acceptor_id, date_issued]
+ *
+ * Dependencies:
+ *   - GESI lib (contracts + contract_items)
+ *   - raw_characters_character_contract_items / raw_corporations_corporation_contracts_contract_items (already in this file)
+ * Optional:
+ *   - Sheet "CharIDMap"  headers: [char | character_id]  (for STRICT_ACCEPTOR_CHECK)
+ ******************************************************/
+
+/* ===== Config ===== */
+var LOOKBACK_DAYS = (typeof LOOKBACK_DAYS !== 'undefined') ? LOOKBACK_DAYS : 90;   // rolling window
+var CONTRACT_ALLOC_MODE = (typeof CONTRACT_ALLOC_MODE !== 'undefined') ? CONTRACT_ALLOC_MODE : "qty"; // "qty" | "ref"
+var STRICT_ACCEPTOR_CHECK = (typeof STRICT_ACCEPTOR_CHECK !== 'undefined') ? STRICT_ACCEPTOR_CHECK : false;
+
+/* ===== Helpers ===== */
+function _nowUtcYmd() {
+  var tz = "UTC";
+  return Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+}
+function _daysAgo(days) {
+  var d = new Date();
+  d.setUTCDate(d.getUTCDate() - Math.max(0, +days||0));
+  return d;
+}
+function _dateGE(a, b) { return new Date(a).getTime() >= new Date(b).getTime(); }
+
+function _getCharIdFromMap_(name) {
+  try {
+    var ss = SpreadsheetApp.getActive();
+    var sh = ss.getSheetByName("CharIDMap");
+    if (!sh) return null;
+    var vals = sh.getDataRange().getValues();
+    var hdr = vals.shift();
+    var cChar = hdr.indexOf("char"), cId = hdr.indexOf("character_id");
+    if (cChar < 0 || cId < 0) return null;
+    for (var i=0; i<vals.length; i++) {
+      if (String(vals[i][cChar]).trim() === String(name).trim()) return +vals[i][cId] || null;
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Try both scopes and return merged finished item_exchange contracts in lookback.
+ * Row shape (subset of ESI): {contract_id, date_issued, date_accepted, type, status, price, issuer_id, acceptor_id}
+ */
+function _listFinishedItemExchange_(name, lookbackDays) {
+  var since = _daysAgo(lookbackDays || LOOKBACK_DAYS);
+  var sinceISO = since.toISOString();
+
+  var out = [];
+
+  // CHARACTER scope
+  try {
+    var rowsC = GESI.characters_character_contracts(name, true, "v1");
+    // rowsC includes header; find columns
+    if (Array.isArray(rowsC) && rowsC.length > 1) {
+      var h = rowsC[0].map(String);
+      var idx = {};
+      ["contract_id","date_issued","date_accepted","type","status","price","issuer_id","acceptor_id"].forEach(function(k){ idx[k]=h.indexOf(k); });
+      for (var i=1;i<rowsC.length;i++){
+        var r = rowsC[i];
+        if (!r || !r.length) continue;
+        if (String(r[idx.type]) !== "item_exchange") continue;
+        if (String(r[idx.status]) !== "finished") continue;
+        var di = r[idx.date_issued]; if (di && new Date(di).getTime() < since.getTime()) continue;
+        out.push({
+          scope:"char",
+          contract_id: +r[idx.contract_id],
+          date_issued: r[idx.date_issued],
+          date_accepted: r[idx.date_accepted],
+          type: r[idx.type],
+          status: r[idx.status],
+          price: +r[idx.price] || 0,
+          issuer_id: +r[idx.issuer_id] || null,
+          acceptor_id: +r[idx.acceptor_id] || null,
+          name: name
+        });
+      }
+    }
+  } catch (e) {
+    LOG_GESI && LOG_GESI().warn("[contracts:list] char scope failed %s", e);
+  }
+
+  // CORPORATION scope (optional; uses configured name or GESI.name)
+  try {
+    var rowsCo = GESI.corporations_corporation_contracts(name, true, "v1");
+    if (Array.isArray(rowsCo) && rowsCo.length > 1) {
+      var h2 = rowsCo[0].map(String);
+      var idy = {};
+      ["contract_id","date_issued","date_accepted","type","status","price","issuer_id","acceptor_id"].forEach(function(k){ idy[k]=h2.indexOf(k); });
+      for (var j=1;j<rowsCo.length;j++){
+        var rc = rowsCo[j];
+        if (!rc || !rc.length) continue;
+        if (String(rc[idy.type]) !== "item_exchange") continue;
+        if (String(rc[idy.status]) !== "finished") continue;
+        var di2 = rc[idy.date_issued]; if (di2 && new Date(di2).getTime() < since.getTime()) continue;
+        out.push({
+          scope:"corp",
+          contract_id: +rc[idy.contract_id],
+          date_issued: rc[idy.date_issued],
+          date_accepted: rc[idy.date_accepted],
+          type: rc[idy.type],
+          status: rc[idy.status],
+          price: +rc[idy.price] || 0,
+          issuer_id: +rc[idy.issuer_id] || null,
+          acceptor_id: +rc[idy.acceptor_id] || null,
+          name: name
+        });
+      }
+    }
+  } catch (e2) {
+    LOG_GESI && LOG_GESI().warn("[contracts:list] corp scope failed %s", e2);
+  }
+
+  return out;
+}
+
+/** Allocation mode hook: change how we apportion price across item rows. */
+function _allocateUnitCosts_(items, netPriceISK, mode) {
+  // items: [{type_id, qty, is_included}]
+  var inc = items.filter(function(it){ return it.is_included !== false; }); // treat missing as included
+  var totalQty = inc.reduce(function(s, it){ return s + (it.qty || 0); }, 0);
+
+  if (mode === "ref") {
+    // Optional: apportion by reference price weight (e.g., hub buy). Implement your own lookup.
+    // For now, fallback to quantity if ref is missing.
+    var wSum = 0;
+    inc.forEach(function(it){ it._ref = _refPriceForTypeId_(it.type_id) || 0; wSum += (it._ref * (it.qty||0)); });
+    if (wSum > 0) {
+      return inc.map(function(it){
+        var share = (it._ref * (it.qty||0)) / wSum;
+        var cost = (share * netPriceISK) / Math.max(1, (it.qty||0));
+        return {type_id: it.type_id, qty: it.qty||0, unit_cost: cost, total_qty: totalQty};
+      });
+    }
+  }
+
+  // Default: simple per-quantity allocation
+  if (totalQty <= 0) return inc.map(function(it){ return {type_id: it.type_id, qty: it.qty||0, unit_cost: null, total_qty: 0}; });
+  var unitPool = netPriceISK / totalQty;
+  return inc.map(function(it){
+    return {type_id: it.type_id, qty: it.qty||0, unit_cost: unitPool, total_qty: totalQty};
+  });
+}
+
+// TODO: Replace this with your real reference-price function if using CONTRACT_ALLOC_MODE="ref"
+function _refPriceForTypeId_(type_id) { return 0; }
+
+/**
+ * Public: Build a sheet-ready table of per-item unit costs for recent finished contracts.
+ * @param {string} [name=GESI.name] - authed character (used for both char + corp scopes)
+ * @param {number} [lookbackDays=LOOKBACK_DAYS]
+ * @param {boolean} [withHeader=true]
+ * @returns {any[][]} rows: [contract_id, type_id, qty, unit_cost, price, total_qty, issuer_id, acceptor_id, date_issued]
+ */
+function CONTRACT_unit_costs_table(name, lookbackDays, withHeader) {
+  if (!name) name = GESI && GESI.name;
+  if (!name) throw new Error("name is required (GESI.name is blank)");
+  if (withHeader == null) withHeader = true;
+
+  var meCharId = _getCharIdFromMap_(name); // optional
+  var contracts = _listFinishedItemExchange_(name, lookbackDays);
+
+  // Strict acceptor filter (optional)
+  if (STRICT_ACCEPTOR_CHECK && meCharId) {
+    contracts = contracts.filter(function(c){ return +c.acceptor_id === +meCharId; });
+  }
+
+  var table = [];
+  if (withHeader) {
+    table.push(["contract_id","type_id","qty","unit_cost","price","total_qty","issuer_id","acceptor_id","date_issued"]);
+  }
+
+  for (var i=0; i<contracts.length; i++) {
+    var c = contracts[i];
+    // fetch items using your cached RAW helpers
+    var itemsRows;
+    if (c.scope === "char") {
+      itemsRows = raw_characters_character_contract_items(c.contract_id, c.name, true, "v1");
+    } else {
+      itemsRows = raw_corporations_corporation_contracts_contract_items(c.contract_id, c.name, true, "v1");
+    }
+    if (!Array.isArray(itemsRows) || itemsRows.length < 2) continue;
+
+    // header map
+    var hdr = itemsRows[0].map(String);
+    var ix = {
+      type_id: hdr.indexOf("type_id"),
+      quantity: hdr.indexOf("quantity"),
+      is_included: hdr.indexOf("is_included")
+    };
+    var items = [];
+    for (var r=1; r<itemsRows.length; r++) {
+      var row = itemsRows[r];
+      items.push({
+        type_id: +row[ix.type_id],
+        qty: +row[ix.quantity] || 0,
+        is_included: (ix.is_included >= 0) ? !!row[ix.is_included] : true
+      });
+    }
+
+    var alloc = _allocateUnitCosts_(items, +c.price || 0, CONTRACT_ALLOC_MODE);
+    for (var k=0; k<alloc.length; k++) {
+      var a = alloc[k];
+      table.push([c.contract_id, a.type_id, a.qty, a.unit_cost, c.price, a.total_qty, c.issuer_id, c.acceptor_id, c.date_issued]);
+    }
+  }
+
+  return table.length ? table : (withHeader ? [["contract_id","type_id","qty","unit_cost","price","total_qty","issuer_id","acceptor_id","date_issued"],["No data","","","","","","","",""]] : [["No data"]]);
+}
