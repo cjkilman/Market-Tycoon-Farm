@@ -9,6 +9,18 @@
 // Assumes the GESI library + LoggerEx are available.
 /* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx */
 
+
+
+
+// TODO: Impliment Market Journal Costs Source: GESI
+// TODO: Impliment Loot Transfers Source: importrange calculation
+/* 
+date  type_id Quantity  unit_price
+45908.33971 178 100 5.79
+45908.33971	179	100	2.21
+45908.33971	180	200	4.94
+
+*/
 // ==========================================================================================
 // CONFIG & CONSTANTS
 // ==========================================================================================
@@ -512,10 +524,10 @@ for (var t = 0; t < tuplesChar.length; t++) {
 }
 
 var idMap = (typeof _charIdMap === 'function') ? _charIdMap() : null;
-
-for (var cid in byCid) {
-  if (!byCid.hasOwnProperty(cid)) continue;
-  var group = byCid[cid];             // [{ ch, c }, ...] same contract_id
+var cids = Object.keys(byCid);
+for (var g = 0; g < cids.length; g++) {
+var cid   = cids[g];
+ var group = byCid[cid];             // [{ ch, c }, ...] same contract_id
   var cRow  = group[0].c;             // representative row (dates, price, etc.)
   var ch1   = _pickCharForContract(group, cRow, idMap);
 

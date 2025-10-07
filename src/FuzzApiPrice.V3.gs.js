@@ -14,7 +14,7 @@
  *    marketStatDataBothCache(type_ids, location_type, location_id, order_level)
  */
 
-const FUZ_CACHE_VER = 'v4';
+const FUZ_CACHE_VER = 'v5';
 const FUZ_NEG_TTL = 6 * 60 * 60;  // 6 hours for negative (not-found)
 const CLAIM_TTL_S = 45;          // was 20s — give slow calls room
 const WAIT_FOR_CLAIM_MS = 6000;  // non-claimers will wait up to ~6s
@@ -43,11 +43,11 @@ function toNumOrNull(x) {
   return null;
 }
 
- function withDocLock(fn, ms = 1200) {         // keep small (< 1.5s)
-   const lock = LockService.getScriptLock();
-   if (!lock.tryLock(ms)) return fn();         // skip claiming; proceed
-   try { return fn(); } finally { lock.releaseLock(); }
- }
+function withDocLock(fn, ms = 1200) {         // keep small (< 1.5s)
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(ms)) return fn();         // skip claiming; proceed
+  try { return fn(); } finally { lock.releaseLock(); }
+}
 
 function _fuzKey(location_type, location_id, type_id) {
   return ['fuz', FUZ_CACHE_VER, location_type, location_id, type_id].join(':');
@@ -79,19 +79,20 @@ function _parseCached_(s) {
 function withRetries(fn, triesOrOpts, baseMs) {
   // defaults
   var tries = 3, base = 300;
-  // retry on: 429/420/5xx + common network terms (dns/ssl/socket/timeout/rate/quota)
-  var retryPattern = /(?:\b(429|420|5\d\d)\b|dns|socket|ssl|handsh|timeout|temporar|rate|quota|Service invoked)/i;
+  // retry on: 429/420/5xx + common network terms + our data-shape tripwires
+  var retryPattern = /(?:\b(429|420|5\d\d)\b|dns|socket|ssl|handsh|timeout|temporar|rate|quota|Service invoked|empty-200|bad[-\s]?json)/i;
 
   if (typeof triesOrOpts === 'number') {
     tries = triesOrOpts;
     if (baseMs != null) base = baseMs;
   } else if (triesOrOpts && typeof triesOrOpts === 'object') {
     // old callsites: {max, base, retryPattern?}
-    if (Number(triesOrOpts.max)) tries = triesOrOpts.max;
-    if (Number(triesOrOpts.base)) base = triesOrOpts.base;
+    if (Number(triesOrOpts.max))  tries = Number(triesOrOpts.max);
+    if (Number(triesOrOpts.base)) base  = Number(triesOrOpts.base);
     if (triesOrOpts.retryPattern instanceof RegExp) retryPattern = triesOrOpts.retryPattern;
   }
 
+  var lastErr;
   for (var i = 0; i < tries; i++) {
     try {
       var res = fn();
@@ -105,12 +106,16 @@ function withRetries(fn, triesOrOpts, baseMs) {
       }
       return res;
     } catch (e) {
+      lastErr = e;
       var s = String((e && e.message) || e);
       if (!retryPattern.test(s) || i === tries - 1) throw e;
+      // exp backoff + jitter
       Utilities.sleep(base * Math.pow(2, i) + Math.floor(Math.random() * 200));
     }
   }
+  throw lastErr;
 }
+
 
 const _FUZZ_FIELDS = [
   'min', 'max', 'avg', 'median', 'volume',
@@ -146,6 +151,14 @@ function sanitizeAgg_(row) {
  * Prefers JSON POST, then falls back to form POST, then GET.
  * Returns: { id -> rawRow | null }  (null on error/missing)
  */
+/**
+ * Batch-fetch aggregates from Fuzzwork with robust fallbacks.
+ * Prefers JSON POST, then form POST, then GET.
+ * Returns: { id -> (rawRow | null | undefined) }
+ *   - object: good row from server
+ *   - null:   server positively says "no data / not found" for that id
+ *   - undefined: fetch failed for the whole batch → DO NOT CACHE
+ */
 function fetchFuzzAggsInBatches_(ids, location_type, location_id) {
   if (!Array.isArray(ids)) ids = [ids];
   ids = ids.map(Number).filter(Number.isFinite);
@@ -155,18 +168,27 @@ function fetchFuzzAggsInBatches_(ids, location_type, location_id) {
   const lt = String(location_type || 'station').toLowerCase();
   if (!/^(region|system|station)$/.test(lt)) throw new Error('bad location_type: ' + location_type);
 
-  const url   = 'https://market.fuzzwork.co.uk/aggregates/';
+  const url = 'https://market.fuzzwork.co.uk/aggregates/';
   const BATCH = Math.max(1, Math.min(FETCH_BATCH || 700, 1000));
   const SLEEP = 100;
+
+  // helper: parse JSON safely, return null on empty-200, throw on non-JSON
+  function _parseOrNull_(txt) {
+    if (!txt || !String(txt).trim()) return null; // empty-200
+    try {
+      return JSON.parse(txt);
+    } catch (_) {
+      throw new Error('bad-json');
+    }
+  }
 
   for (let i = 0; i < ids.length; i += BATCH) {
     const slice = ids.slice(i, i + BATCH);
     const typesCsv = slice.join(',');
+    let obj = null;
+    let succeeded = false;
 
-    // --- 1) JSON POST (preferred)
-    let json = {};
-    let ok = false;
-
+    // 1) JSON POST
     try {
       const payloadJson = JSON.stringify({ [lt]: location_id, types: typesCsv });
       const resp = withRetries(() => UrlFetchApp.fetch(url, {
@@ -177,75 +199,82 @@ function fetchFuzzAggsInBatches_(ids, location_type, location_id) {
         validateHttpsCertificates: true
       }), { max: 4, base: 300 });
 
-      const code = resp ? resp.getResponseCode() : -1;
-      if (code === 200) {
-        json = JSON.parse(resp.getContentText() || '{}');
-        ok = true;
+      if (resp && resp.getResponseCode && resp.getResponseCode() === 200) {
+        const parsed = _parseOrNull_(resp.getContentText());
+        if (parsed === null) throw new Error('empty-200');
+        obj = parsed;
+        succeeded = true;
       } else {
-        _L_warn('fuz.fetch.json.non200', { code, lt, location_id, count: slice.length });
+        _L_warn('fuz.non200.json', { code: resp && resp.getResponseCode && resp.getResponseCode() });
       }
     } catch (e) {
       _L_warn('fuz.fetch.json.fail', { msg: String(e && e.message || e), lt, location_id, count: slice.length });
     }
 
-    // --- 2) Form-POST fallback
-    if (!ok) {
+    // 2) form POST fallback
+    if (!succeeded) {
       try {
-        const formBody = lt + '=' + encodeURIComponent(String(location_id)) +
-                         '&types=' + encodeURIComponent(typesCsv);
-
-        const resp2 = withRetries(() => UrlFetchApp.fetch(url, {
+        const payload = lt + '=' + encodeURIComponent(location_id) + '&types=' + encodeURIComponent(typesCsv);
+        const resp = withRetries(() => UrlFetchApp.fetch(url, {
           method: 'post',
           contentType: 'application/x-www-form-urlencoded',
-          payload: formBody,
+          payload: payload,
           muteHttpExceptions: true,
           validateHttpsCertificates: true
-        }), { max: 3, base: 300 });
+        }), { max: 4, base: 300 });
 
-        const code2 = resp2 ? resp2.getResponseCode() : -1;
-        if (code2 === 200) {
-          json = JSON.parse(resp2.getContentText() || '{}');
-          ok = true;
+        if (resp && resp.getResponseCode && resp.getResponseCode() === 200) {
+          const parsed = _parseOrNull_(resp.getContentText());
+          if (parsed === null) throw new Error('empty-200');
+          obj = parsed;
+          succeeded = true;
         } else {
-          _L_warn('fuz.fetch.form.non200', { code: code2, lt, location_id, count: slice.length });
+          _L_warn('fuz.non200.form', { code: resp && resp.getResponseCode && resp.getResponseCode() });
         }
-      } catch (e2) {
-        _L_warn('fuz.fetch.form.fail', { msg: String(e2 && e2.message || e2), lt, location_id, count: slice.length });
+      } catch (e) {
+        _L_warn('fuz.fetch.form.fail', { msg: String(e && e.message || e), lt, location_id, count: slice.length });
       }
     }
 
-    // --- 3) GET fallback
-    if (!ok) {
+    // 3) GET fallback
+    if (!succeeded) {
       try {
-        const getUrl = url + '?' + lt + '=' + encodeURIComponent(String(location_id)) +
-                             '&types=' + encodeURIComponent(typesCsv);
-
-        const resp3 = withRetries(() => UrlFetchApp.fetch(getUrl, {
+        const qs = '?' + lt + '=' + encodeURIComponent(location_id) + '&types=' + encodeURIComponent(typesCsv);
+        const resp = withRetries(() => UrlFetchApp.fetch(url + qs, {
           method: 'get',
           muteHttpExceptions: true,
           validateHttpsCertificates: true
-        }), { max: 2, base: 300 });
+        }), { max: 4, base: 300 });
 
-        const code3 = resp3 ? resp3.getResponseCode() : -1;
-        if (code3 === 200) {
-          json = JSON.parse(resp3.getContentText() || '{}');
-          ok = true;
+        if (resp && resp.getResponseCode && resp.getResponseCode() === 200) {
+          const parsed = _parseOrNull_(resp.getContentText());
+          if (parsed === null) throw new Error('empty-200');
+          obj = parsed;
+          succeeded = true;
         } else {
-          _L_warn('fuz.fetch.get.non200', { code: code3, lt, location_id, count: slice.length });
+          _L_warn('fuz.non200.get', { code: resp && resp.getResponseCode && resp.getResponseCode() });
         }
-      } catch (e3) {
-        _L_warn('fuz.fetch.get.fail', { msg: String(e3 && e3.message || e3), lt, location_id, count: slice.length });
+      } catch (e) {
+        _L_warn('fuz.fetch.get.fail', { msg: String(e && e.message || e), lt, location_id, count: slice.length });
       }
     }
 
-    // Fill outputs for this batch
-    for (const id of slice) out[id] = ok ? (json[id] || null) : null;
+    if (succeeded && obj && typeof obj === 'object') {
+      // Success → fill each id either with row or null (not-found)
+      for (const id of slice) {
+        out[id] = Object.prototype.hasOwnProperty.call(obj, String(id)) ? obj[id] : null;
+      }
+    } else {
+      // Failure → mark as undefined: caller will SKIP caching for these
+      for (const id of slice) out[id] = undefined;
+    }
 
     if (SLEEP) Utilities.sleep(SLEEP);
   }
 
   return out;
 }
+
 
 
 
@@ -303,25 +332,25 @@ function postFetch(type_ids, location_id, location_type = "station") {
   });
 
   const fetchList = claimables;
-let fetched = Object.create(null);
+  let fetched = Object.create(null);
 
-// If we didn't claim, give the claimer a short window to finish.
-if (!fetchList.length) {
-  const tries = Math.floor(WAIT_FOR_CLAIM_MS / WAIT_STEP_MS);
-  for (let t = 0; t < tries; t++) {
-    Utilities.sleep(WAIT_STEP_MS);
-    const recheck = cache.getAll(misses.map(id => _fuzKey(location_type, location_id, id))) || {};
-    let ready = true;
-    for (let i = 0; i < misses.length; i++) {
-      const dk = _fuzKey(location_type, location_id, misses[i]);
-      if (recheck[dk] == null) { ready = false; break; }
+  // If we didn't claim, give the claimer a short window to finish.
+  if (!fetchList.length) {
+    const tries = Math.floor(WAIT_FOR_CLAIM_MS / WAIT_STEP_MS);
+    for (let t = 0; t < tries; t++) {
+      Utilities.sleep(WAIT_STEP_MS);
+      const recheck = cache.getAll(misses.map(id => _fuzKey(location_type, location_id, id))) || {};
+      let ready = true;
+      for (let i = 0; i < misses.length; i++) {
+        const dk = _fuzKey(location_type, location_id, misses[i]);
+        if (recheck[dk] == null) { ready = false; break; }
+      }
+      if (ready) break;  // claimer populated; proceed to read below
     }
-    if (ready) break;  // claimer populated; proceed to read below
+  } else {
+    // We are the claimer → do the network
+    fetched = fetchFuzzAggsInBatches_(fetchList, location_type, location_id);
   }
-} else {
-  // We are the claimer → do the network
-  fetched = fetchFuzzAggsInBatches_(fetchList, location_type, location_id);
-}
 
 
   const toPutPos = {};
@@ -445,7 +474,7 @@ function _extractMetric_(aggRow, side, field) {
 
   // Treat missing volume/orderCount as 0
   if ((field === 'volume' || field === 'orderCount') &&
-      (raw === null || raw === undefined || raw === "")) return 0;
+    (raw === null || raw === undefined || raw === "")) return 0;
 
   if (raw === null || raw === undefined || raw === "") return "";
   const n = Number(raw);
