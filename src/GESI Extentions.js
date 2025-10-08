@@ -12,15 +12,6 @@
 
 
 
-// TODO: Impliment Market Journal Costs Source: GESI
-// TODO: Impliment Loot Transfers Source: importrange calculation
-/* 
-date  type_id Quantity  unit_price
-45908.33971 178 100 5.79
-45908.33971	179	100	2.21
-45908.33971	180	200	4.94
-
-*/
 // ==========================================================================================
 // CONFIG & CONSTANTS
 // ==========================================================================================
@@ -1024,32 +1015,32 @@ function rebuildContractUnitCosts() {
 }
 
 /** Fill Material_Ledger.unit_value_filled from CI.unit_cost_alloc for source="CONTRACT" */
-function fillLedgerUnitValuesFromItems_(){
-  const ci=_getData_(CONTRACT_ITEMS_RAW_SHEET);
-  const iCID=ci.h['contract_id'], iTID=ci.h['type_id'], iUnit=ci.h['unit_cost_alloc'];
-  if([iCID,iTID,iUnit].some(v=>v==null)) throw new Error(`'${CONTRACT_ITEMS_RAW_SHEET}' missing headers: contract_id,type_id,unit_cost_alloc`);
+function fillLedgerUnitValuesFromItems_() {
+  const ci = _getData_(CONTRACT_ITEMS_RAW_SHEET);
+  const iCID = ci.h['contract_id'], iTID = ci.h['type_id'], iUnit = ci.h['unit_cost_alloc'];
+  if ([iCID, iTID, iUnit].some(v => v == null)) throw new Error(`'${CONTRACT_ITEMS_RAW_SHEET}' missing headers: contract_id,type_id,unit_cost_alloc`);
 
   // index contractId|typeId → unit
-  const key=(cid,tid)=>`${cid}§${tid}`;
-  const unitMap=new Map();
-  for(const r of ci.rows){
-    const u=Number(r[iUnit]); if(!isFinite(u) || u<=0) continue;
-    unitMap.set(key(String(r[iCID]), Number(r[iTID])||0), u);
+  const key = (cid, tid) => `${cid}§${tid}`;
+  const unitMap = new Map();
+  for (const r of ci.rows) {
+    const u = Number(r[iUnit]); if (!isFinite(u) || u <= 0) continue;
+    unitMap.set(key(String(r[iCID]), Number(r[iTID]) || 0), u);
   }
 
-  const lg=_getData_(LEDGER_SHEET);
-  const s=lg.h['source'], c=lg.h['contract_id'], t=lg.h['type_id'], u0=lg.h['unit_value'];
-  if([s,c,t].some(v=>v==null)) throw new Error(`'${LEDGER_SHEET}' missing headers: source, contract_id, type_id`);
+  const lg = _getData_(LEDGER_SHEET);
+  const s = lg.h['source'], c = lg.h['contract_id'], t = lg.h['type_id'], u0 = lg.h['unit_value'];
+  if ([s, c, t].some(v => v == null)) throw new Error(`'${LEDGER_SHEET}' missing headers: source, contract_id, type_id`);
   const outIdx = _ensureColumn_(lg.sh, 1, 'unit_value_filled');
 
-  const out=new Array(lg.rows.length);
-  for(let i=0;i<lg.rows.length;i++){
-    const row=lg.rows[i]; const src=String(row[s]).toUpperCase().trim();
-    if(src!=='CONTRACT'){ out[i] = [u0!=null? row[u0] : '']; continue; }
-    const unit = unitMap.get(key(String(row[c]), Number(row[t])||0)) || '';
-    out[i]=[unit];
+  const out = new Array(lg.rows.length);
+  for (let i = 0; i < lg.rows.length; i++) {
+    const row = lg.rows[i]; const src = String(row[s]).toUpperCase().trim();
+    if (src !== 'CONTRACT') { out[i] = [u0 != null ? row[u0] : '']; continue; }
+    const unit = unitMap.get(key(String(row[c]), Number(row[t]) || 0)) || '';
+    out[i] = [unit];
   }
-  if (out.length) lg.sh.getRange(2, outIdx+1, out.length, 1).setValues(out);
+  if (out.length) lg.sh.getRange(2, outIdx + 1, out.length, 1).setValues(out);
 }
 
 
@@ -1084,36 +1075,36 @@ const RAW_LOOT_SHEET = 'Raw_loot';
 const SNAP_KEY = 'raw_loot:snapshot:v2'; // doc properties key
 
 function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
-  const dateStr  = asOfDate ? _isoDate(asOfDate) : _isoDate(Date.now());
-  const source   = sourceLabel || 'LOOT';
+  const dateStr = asOfDate ? _isoDate(asOfDate) : _isoDate(Date.now());
+  const source = sourceLabel || 'LOOT';
   const allowNeg = !!writeNegatives;
   const charName = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar() : (GESI && GESI.name) || '';
 
   const lock = LockService.getDocumentLock(); lock.waitLock(5000);
   try {
     // Ensure ledger sheet + required columns exist
-    const hdrML = ["date","type_id","item_name","qty","unit_value","source","contract_id","char"];
+    const hdrML = ["date", "type_id", "item_name", "qty", "unit_value", "source", "contract_id", "char"];
     let shML = SpreadsheetApp.getActive().getSheetByName(LEDGER_SHEET);
     if (!shML) shML = _sheetSafe(LEDGER_SHEET, hdrML);
 
     let lgAll = _getData_(LEDGER_SHEET);
-    const needCols = ['date','type_id','item_name','qty','unit_value','source','contract_id','char'];
+    const needCols = ['date', 'type_id', 'item_name', 'qty', 'unit_value', 'source', 'contract_id', 'char'];
     needCols.forEach(col => { if (lgAll.h[col] == null) _ensureColumn_(lgAll.sh, 1, col); });
     // re-read to refresh header map/indexes if we just added columns
     const lg = _getData_(LEDGER_SHEET);
     const H = lg.h, rows = lg.rows, SH = lg.sh;
 
     const iDate = H['date'], iTid = H['type_id'], iQty = H['qty'], iUnit = H['unit_value'],
-          iSrc  = H['source'];
+      iSrc = H['source'];
 
     // Read Raw_loot (30-day rolling totals)
     const loot = _getData_(RAW_LOOT_SHEET);
     const h = loot.h;
     const cTid = h['type_id'],
-          cQty = h['total_quantity'],
-          cBuy = h['weighted_average_buy'],
-          cVal = h['weighted_average_value'];
-    if ([cTid,cQty,cBuy,cVal].some(v => v == null)) {
+      cQty = h['total_quantity'],
+      cBuy = h['weighted_average_buy'],
+      cVal = h['weighted_average_value'];
+    if ([cTid, cQty, cBuy, cVal].some(v => v == null)) {
       throw new Error(`'${RAW_LOOT_SHEET}' must have headers: type_id, total_quantity, weighted_average_buy, weighted_average_value`);
     }
 
@@ -1121,16 +1112,16 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
     const curr = new Map();
     for (const r of loot.rows) {
       const tid = Number(r[cTid]) || 0; if (!tid) continue;
-      const qty = Number(String(r[cQty]).replace(/[^\d.\-]/g,'')) || 0;
+      const qty = Number(String(r[cQty]).replace(/[^\d.\-]/g, '')) || 0;
       const buy = _toNumberISK_(r[cBuy]);
       const val = _toNumberISK_(r[cVal]); // usually ≈ qty*buy
       curr.set(tid, { qty, val, buy });
     }
 
     // Load previous snapshot
-    const props   = PropertiesService.getDocumentProperties();
+    const props = PropertiesService.getDocumentProperties();
     const prevRaw = props.getProperty(SNAP_KEY);
-    const prev    = prevRaw ? JSON.parse(prevRaw) : {}; // { tid: {qty,val} }
+    const prev = prevRaw ? JSON.parse(prevRaw) : {}; // { tid: {qty,val} }
 
     // Index existing same-day rows (for upserts)
     const key = (d, tid, src) => `${d}|${tid}|${src}`;
@@ -1141,7 +1132,7 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
       if (_isoDate(d) !== dateStr || src !== source) continue;
       const tid = Number(rows[r][iTid]) || 0; if (!tid) continue;
       existing.set(key(dateStr, tid, source), {
-        ri:  r,
+        ri: r,
         qty: Number(rows[r][iQty]) || 0,
         unit: _toNumberISK_(rows[r][iUnit])
       });
@@ -1158,7 +1149,7 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
 
     for (const tid of allTids) {
       const cur = curr.get(tid) || { qty: 0, val: 0, buy: 0 };
-      const p   = prev[String(tid)] || { qty: 0, val: 0 };
+      const p = prev[String(tid)] || { qty: 0, val: 0 };
 
       const dq = cur.qty - (Number(p.qty) || 0);
       const dv = cur.val - (Number(p.val) || 0);
@@ -1175,7 +1166,7 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
 
       if (hit) {
         // upsert: combine with prior same-day row; keep weighted unit
-        const oldQty = Number(hit.qty)  || 0;
+        const oldQty = Number(hit.qty) || 0;
         const oldVal = (Number(hit.qty) || 0) * (Number(hit.unit) || 0);
         const newQty = oldQty + dq;
         const newVal = oldVal + (dq * unit);
@@ -1226,11 +1217,11 @@ function Ledger_Import_Journal_Default() {
 
 function Ledger_Import_Journal(opts) {
   opts = opts || {};
-  var division      = Number(opts.division || 3);
-  var sinceDays     = Number(opts.sinceDays || 14);
-  var maxPages      = Math.max(1, Number(opts.maxPages || 5));
-  var includeSells  = !!opts.includeSells;       // false = buys only
-  var sourceLabel   = String(opts.sourceLabel || 'JOURNAL');
+  var division = Number(opts.division || 3);
+  var sinceDays = Number(opts.sinceDays || 14);
+  var maxPages = Math.max(1, Number(opts.maxPages || 5));
+  var includeSells = !!opts.includeSells;       // false = buys only
+  var sourceLabel = String(opts.sourceLabel || 'JOURNAL');
   var cellsPerChunk = Math.max(4000, Number(opts.cellsPerChunk || 7000)); // batch writes
 
   // Auth character (your helper)
@@ -1239,8 +1230,11 @@ function Ledger_Import_Journal(opts) {
 
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var SHEET = 'Material_Ledger';
-  var HEAD  = ['date','type_id','item_name','qty','unit_value','source','contract_id','char','unit_value_filled'];
+  var HEAD = ['date', 'type_id', 'item_name', 'qty', 'unit_value', 'source', 'contract_id', 'char', 'unit_value_filled'];
   var shOut = getOrCreateSheet(ss, SHEET, HEAD);   // from Utility.js
+
+  // Build once per run
+  var TYPE_NAME = _typeNameMapFromSDE_('sde_typeid_name');
 
   // Build existing keys (source="JOURNAL") → Set(contract_id)
   var hdr = shOut.getRange(1, 1, 1, HEAD.length).getValues()[0];
@@ -1292,29 +1286,30 @@ function Ledger_Import_Journal(opts) {
       var isBuy = !!r.is_buy;
       if (!isBuy && !includeSells) continue;
 
-      var qty   = Number(r.quantity || 0) || 0;
+      var qty = Number(r.quantity || 0) || 0;
       var price = Number(r.unit_price || 0) || 0;
-      var tid   = Number(r.type_id || 0) || 0;
+      var tid = Number(r.type_id || 0) || 0;
       if (!isFinite(qty) || !isFinite(price) || !isFinite(tid) || qty === 0 || price === 0) continue;
 
       // journal_ref_id preferred; fallback to transaction_id
       var refJ = Number(r.journal_ref_id || 0) || 0;
       var refT = Number(r.transaction_id || 0) || 0;
-      var ref  = refJ ? String(refJ) : (refT ? String(refT) : '');
+      var ref = refJ ? String(refJ) : (refT ? String(refT) : '');
       if (!ref || existing.has(ref)) continue;
 
       // Normalize to project-local midnight (Apps Script project tz)
       var day = PT.projectDate(dObj.getFullYear(), dObj.getMonth(), dObj.getDate(), 0, 0, 0);
 
+      const friendly = TYPE_NAME.get(tid) || '';
       toAppend.push([
         day,                 // date
         tid,                 // type_id
-        '',                  // item_name (leave blank; your lookup fills)
-        isBuy ? qty : -qty,  // qty (sells negative if included)
+        friendly,            // item_name ← filled from sde_typeid_name
+        isBuy ? qty : -qty,  // qty
         price,               // unit_value
         sourceLabel,         // source ("JOURNAL")
-        ref,                 // contract_id (stores journal_ref/txn id)
-        charName,            // char (auth name)
+        ref,                 // contract_id (journal_ref/txn id)
+        charName,            // char
         price                // unit_value_filled
       ]);
 
@@ -1352,9 +1347,59 @@ function Ledger_Import_Journal(opts) {
     shOut.getRange(start, 4, n, 1).setNumberFormat('#,##0');   // qty
     shOut.getRange(start, 5, n, 1).setNumberFormat('#,##0.00');// unit_value
     shOut.getRange(start, 9, n, 1).setNumberFormat('#,##0.00');// unit_value_filled
-  } catch (_fmtErr) {}
+  } catch (_fmtErr) { }
 
   return { appended: toAppend.length, pages: pages };
 }
 
+function ML_fillEffectiveCost() {
+  var sh = SpreadsheetApp.getActive().getSheetByName('Material_Ledger');
+  var last = sh.getLastRow(); if (last < 2) return;
+  var vals = sh.getRange(2, 1, last-1, 9).getValues(); // A..I
+  var out = new Array(vals.length);
+  var state = new Map(); // type_id -> {Q, C}
+
+  for (var i = 0; i < vals.length; i++) {
+    var tid = +vals[i][1];                 // B type_id
+    var qty = +vals[i][3];                 // D qty
+    var price = +(vals[i][4] || vals[i][8]); // E unit_value or I unit_value_filled
+    if (!Number.isFinite(tid) || !Number.isFinite(qty) || !Number.isFinite(price)) { out[i]=['']; continue; }
+
+    var s = state.get(tid) || { Q:0, C:price };
+    if (qty > 0) { s.C = (s.Q*s.C + qty*price) / (s.Q + qty); s.Q += qty; }
+    else if (qty < 0) { s.Q += qty; } // sells don’t change avg cost
+    state.set(tid, s);
+    out[i] = [s.C];
+  }
+
+  // Ensure header, then write K
+  sh.getRange(1, 11).setValue('effective_cost');
+  sh.getRange(2, 11, out.length, 1).setValues(out);
+}
+
+
+/**
+ * Build a map: type_id → typeName from a Named Range.
+ * Expects columns: [typeID, groupID, typeName, volume].
+ * Skips header/blank lines automatically.
+ */
+function _typeNameMapFromSDE_(rangeName) {
+  rangeName = rangeName || 'sde_typeid_name';
+  const ss = SpreadsheetApp.getActive();
+  const rng = ss.getRangeByName(rangeName);
+  if (!rng) throw new Error('Named range not found: ' + rangeName);
+
+  const vals = rng.getValues();        // 2D array
+  const map = new Map();
+  for (let i = 0; i < vals.length; i++) {
+    const row = vals[i];
+    // Column 0: typeID, Column 2: typeName
+    const rawId = row[0];
+    const name = String(row[2] || '').trim();
+    // Parse typeID robustly (handles scientific notation)
+    const tid = Number(String(rawId).replace(/[^\d+Ee\.-]/g, ''));
+    if (Number.isFinite(tid) && name) map.set(Math.floor(tid), name);
+  }
+  return map;
+}
 

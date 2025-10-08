@@ -14,7 +14,7 @@
  *    marketStatDataBothCache(type_ids, location_type, location_id, order_level)
  */
 
-const FUZ_CACHE_VER = 'v5';
+const FUZ_CACHE_VER = 'v3';
 const FUZ_NEG_TTL = 6 * 60 * 60;  // 6 hours for negative (not-found)
 const CLAIM_TTL_S = 45;          // was 20s — give slow calls room
 const WAIT_FOR_CLAIM_MS = 6000;  // non-claimers will wait up to ~6s
