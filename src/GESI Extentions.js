@@ -71,7 +71,7 @@ function _toIntOrNull(v) {
 }
 
 
-function _sheet(name, header) {
+function _sheetSafe(name, header) {
   var ss = SpreadsheetApp.getActive();
   var lock = LockService.getDocumentLock();
   for (var a = 0; a < 5; a++) {
@@ -94,7 +94,7 @@ function _sheet(name, header) {
   }
 }
 
-function _rewrite(sh, header, rows) {
+function rewrite(sh, header, rows) {
   var lock = LockService.getDocumentLock();
   lock.waitLock(5000);
   try {
@@ -115,9 +115,6 @@ function _rewrite(sh, header, rows) {
     lock.releaseLock();
   }
 }
-
-function _sheetSafe(name, header) { return _sheet(name, header); }
-function _rewriteFast(sh, header, rows) { return _rewrite(sh, header, rows); }
 
 function _setValues(sh, startRow, rows) {
   if (!rows || !rows.length) return;
@@ -150,12 +147,7 @@ function getCharNamesFast() {
   var hit = c.get(k);
   if (hit) return JSON.parse(hit);
 
-  var namesFn =
-    (GESI && typeof GESI.getAuthenticatedCharacterNames === 'function')
-      ? GESI.getAuthenticatedCharacterNames
-      : (typeof getAuthenticatedCharacterNames === 'function'
-        ? getAuthenticatedCharacterNames
-        : null);
+  var namesFn = GESI.getAuthenticatedCharacterNames();
   if (!namesFn) throw new Error('getAuthenticatedCharacterNames not found (GESI or global).');
 
   var names = namesFn() || [];
@@ -579,8 +571,8 @@ function syncContracts() {
   // ---------------- WRITE SHEETS ----------------
   var shC = _sheetSafe(CONTRACTS_RAW_SHEET, hdrC);
   var shI = _sheetSafe(CONTRACT_ITEMS_RAW_SHEET, hdrI);
-  _rewriteFast(shC, hdrC, outC);
-  _rewriteFast(shI, hdrI, outI);
+  rewrite(shC, hdrC, outC);
+  rewrite(shI, hdrI, outI);
 
   log.log('syncContracts done', { contracts: outC.length, items: outI.length, lookback_days: lookbackDays, lookIso: lookIso });
 }
@@ -588,88 +580,86 @@ function syncContracts() {
 // ==========================================================================================
 // RAW → Material_Ledger (optional helper to normalize inflow)
 // ==========================================================================================
+// GESI Extentions.js
+
 function contractsToMaterialLedger() {
-  var log = LoggerEx.withTag('GESI');
+  const log = LoggerEx.withTag('GESI');
 
-  var hdrML = ["date", "type_id", "item_name", "qty", "unit_value", "source", "contract_id", "char"];
-  var shML = _sheetSafe(LEDGER_SHEET, hdrML);
+  return withSheetLock(function () {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
+    const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
+    if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
-  var shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
-  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
+    const C = shC.getDataRange().getValues();
+    const hC = C.shift();
+    const I = shI.getDataRange().getValues();
+    const hI = I.shift();
 
-  var C = shC.getDataRange().getValues(); var hC = C.shift();
-  var I = shI.getDataRange().getValues(); var hI = I.shift();
+    const ix = (arr, name) => arr.indexOf(name);
 
-  function ix(arr, name) { return arr.indexOf(name); }
+    const colC = {
+      char: ix(hC, "char"),
+      contract_id: ix(hC, "contract_id"),
+      type: ix(hC, "type"),
+      status: ix(hC, "status"),
+      date_issued: ix(hC, "date_issued")
+    };
+    const colI = {
+      char: ix(hI, "char"),
+      contract_id: ix(hI, "contract_id"),
+      type_id: ix(hI, "type_id"),
+      quantity: ix(hI, "quantity"),
+      is_included: ix(hI, "is_included")
+    };
 
-  var colC = {
-    char: ix(hC, "char"),
-    contract_id: ix(hC, "contract_id"),
-    type: ix(hC, "type"),
-    status: ix(hC, "status"),
-    acceptor_id: ix(hC, "acceptor_id"),
-    date_issued: ix(hC, "date_issued")
-  };
-  var colI = {
-    char: ix(hI, "char"),
-    contract_id: ix(hI, "contract_id"),
-    type_id: ix(hI, "type_id"),
-    quantity: ix(hI, "quantity"),
-    is_included: ix(hI, "is_included")
-  };
-
-  var itemsByCid = {};
-  for (var r = 0; r < I.length; r++) {
-    var rowI = I[r];
-    if (!rowI[colI.is_included]) continue;
-    var cid = rowI[colI.contract_id];
-    if (!itemsByCid[cid]) itemsByCid[cid] = [];
-    itemsByCid[cid].push({
-      char: rowI[colI.char],
-      type_id: rowI[colI.type_id],
-      qty: Number(rowI[colI.quantity] || 0)
-    });
-  }
-
-  var out = [];
-  for (var q = 0; q < C.length; q++) {
-    var rowC = C[q];
-    var ctype = String(rowC[colC.type] || "").toLowerCase();
-    var status = String(rowC[colC.status] || "").toLowerCase();
-    if (ctype !== "item_exchange" || status !== "finished") continue;
-
-    var cid2 = rowC[colC.contract_id];
-    var issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
-    var items = itemsByCid[cid2] || [];
-    for (var s = 0; s < items.length; s++) {
-      var it = items[s];
-      if (it.qty <= 0) continue;
-      out.push([issued, it.type_id, "", it.qty, "", "CONTRACT", cid2, rowC[colC.char] || ""]);
+    const itemsByCid = {};
+    for (let r = 0; r < I.length; r++) {
+      const rowI = I[r];
+      if (!rowI[colI.is_included]) continue;
+      const cid = rowI[colI.contract_id];
+      if (!itemsByCid[cid]) itemsByCid[cid] = [];
+      itemsByCid[cid].push({
+        char: rowI[colI.char],
+        type_id: rowI[colI.type_id],
+        qty: Number(rowI[colI.quantity] || 0)
+      });
     }
-  }
 
-  // --- de-dup against existing rows ---
-  var have = shML.getLastRow() > 1 ? shML.getRange(2, 1, shML.getLastRow() - 1, hdrML.length).getValues() : [];
-  var seen = Object.create(null);
-  for (var i = 0; i < have.length; i++) {
-    var k = have[i][6] + '|' + have[i][1] + '|' + have[i][7]; // contract_id|type_id|char
-    seen[k] = true;
-  }
-  var fresh = [];
-  for (var j = 0; j < out.length; j++) {
-    var key = out[j][6] + '|' + out[j][1] + '|' + out[j][7];
-    if (seen[key]) continue;
-    seen[key] = true;
-    fresh.push(out[j]);
-  }
+    const outRows = [];
+    for (let q = 0; q < C.length; q++) {
+      const rowC = C[q];
+      const ctype = String(rowC[colC.type] || "").toLowerCase();
+      const status = String(rowC[colC.status] || "").toLowerCase();
+      if (ctype !== "item_exchange" || status !== "finished") continue;
 
-  if (fresh.length) {
-    var start = Math.max(2, shML.getLastRow() + 1);
-    _setValues(shML, start, fresh);
-  }
-  log.log('contracts→ledger', { appended: fresh.length, total_ledger_rows: shML.getLastRow() - 1 });
+      const cid2 = rowC[colC.contract_id];
+      const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+      const items = itemsByCid[cid2] || [];
+      for (let s = 0; s < items.length; s++) {
+        const it = items[s];
+        if (it.qty <= 0) continue;
+        outRows.push({
+          date: issued,
+          type_id: it.type_id,
+          qty: it.qty,
+          source: "CONTRACT",
+          contract_id: cid2,
+          char: rowC[colC.char] || ""
+        });
+      }
+    }
+
+    // Use ML.upsertBy to handle the de-duplication and writing
+    const keys = ['source', 'char', 'contract_id', 'type_id'];
+    const count = ML.upsertBy(keys, outRows);
+
+    log.log('contracts→ledger', {
+      appended_or_updated: count,
+      processed_rows: outRows.length
+    });
+    return count;
+  });
 }
 
 
@@ -758,7 +748,7 @@ function _listFinishedItemExchange_(name, lookbackDays) {
 
   // CORPORATION scope (optional; uses configured name or GESI.name)
   try {
-    var rowsCo = GESI.corporations_corporation_contracts(name, true, "v1");
+    var rowsCo = GESI.corporations_corporation_contracts(name, true);
     if (Array.isArray(rowsCo) && rowsCo.length > 1) {
       var h2 = rowsCo[0].map(String);
       var idy = {};
@@ -1070,6 +1060,9 @@ function _ensureColumn_(sh, headerRow, name) {
 }
 // ---------------------------------------------------------------------------
 
+// GESI Extentions.js
+// ... (previous functions) ...
+
 // --- Raw_loot (rolling 30d total) → Material_Ledger (post deltas) ------------
 const RAW_LOOT_SHEET = 'Raw_loot';
 const SNAP_KEY = 'raw_loot:snapshot:v2'; // doc properties key
@@ -1080,23 +1073,7 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
   const allowNeg = !!writeNegatives;
   const charName = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar() : (GESI && GESI.name) || '';
 
-  const lock = LockService.getDocumentLock(); lock.waitLock(5000);
-  try {
-    // Ensure ledger sheet + required columns exist
-    const hdrML = ["date", "type_id", "item_name", "qty", "unit_value", "source", "contract_id", "char"];
-    let shML = SpreadsheetApp.getActive().getSheetByName(LEDGER_SHEET);
-    if (!shML) shML = _sheetSafe(LEDGER_SHEET, hdrML);
-
-    let lgAll = _getData_(LEDGER_SHEET);
-    const needCols = ['date', 'type_id', 'item_name', 'qty', 'unit_value', 'source', 'contract_id', 'char'];
-    needCols.forEach(col => { if (lgAll.h[col] == null) _ensureColumn_(lgAll.sh, 1, col); });
-    // re-read to refresh header map/indexes if we just added columns
-    const lg = _getData_(LEDGER_SHEET);
-    const H = lg.h, rows = lg.rows, SH = lg.sh;
-
-    const iDate = H['date'], iTid = H['type_id'], iQty = H['qty'], iUnit = H['unit_value'],
-      iSrc = H['source'];
-
+  return withSheetLock(function () {
     // Read Raw_loot (30-day rolling totals)
     const loot = _getData_(RAW_LOOT_SHEET);
     const h = loot.h;
@@ -1111,32 +1088,22 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
     // Build current snapshot map: tid → {qty,val,buy}
     const curr = new Map();
     for (const r of loot.rows) {
-      const tid = Number(r[cTid]) || 0; if (!tid) continue;
+      const tid = Number(r[cTid]) || 0;
+      if (!tid) continue;
       const qty = Number(String(r[cQty]).replace(/[^\d.\-]/g, '')) || 0;
       const buy = _toNumberISK_(r[cBuy]);
-      const val = _toNumberISK_(r[cVal]); // usually ≈ qty*buy
-      curr.set(tid, { qty, val, buy });
+      const val = _toNumberISK_(r[cVal]);
+      curr.set(tid, {
+        qty,
+        val,
+        buy
+      });
     }
 
     // Load previous snapshot
     const props = PropertiesService.getDocumentProperties();
     const prevRaw = props.getProperty(SNAP_KEY);
-    const prev = prevRaw ? JSON.parse(prevRaw) : {}; // { tid: {qty,val} }
-
-    // Index existing same-day rows (for upserts)
-    const key = (d, tid, src) => `${d}|${tid}|${src}`;
-    const existing = new Map(); // key → {ri, qty, unit}
-    for (let r = 0; r < rows.length; r++) {
-      const d = rows[r][iDate];
-      const src = String(rows[r][iSrc] || '');
-      if (_isoDate(d) !== dateStr || src !== source) continue;
-      const tid = Number(rows[r][iTid]) || 0; if (!tid) continue;
-      existing.set(key(dateStr, tid, source), {
-        ri: r,
-        qty: Number(rows[r][iQty]) || 0,
-        unit: _toNumberISK_(rows[r][iUnit])
-      });
-    }
+    const prev = prevRaw ? JSON.parse(prevRaw) : {};
 
     // UNION of tids (handles day-31 disappearances)
     const allTids = new Set([
@@ -1144,60 +1111,58 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
       ...Object.keys(prev).map(x => Number(x) || 0)
     ]);
 
-    const updates = [];   // {ri, newQty, newUnit}
-    const appends = [];   // rows to append: [date,type_id,item_name,qty,unit_value,source,contract_id,char]
+    const outRows = [];
 
     for (const tid of allTids) {
-      const cur = curr.get(tid) || { qty: 0, val: 0, buy: 0 };
-      const p = prev[String(tid)] || { qty: 0, val: 0 };
+      const cur = curr.get(tid) || {
+        qty: 0,
+        val: 0,
+        buy: 0
+      };
+      const p = prev[String(tid)] || {
+        qty: 0,
+        val: 0
+      };
 
       const dq = cur.qty - (Number(p.qty) || 0);
       const dv = cur.val - (Number(p.val) || 0);
 
       if (dq === 0) continue;
-      if (!allowNeg && dq < 0) continue; // ignore pruning drops unless allowed
+      if (!allowNeg && dq < 0) continue;
 
-      // Unit for this delta: prefer dv/dq; fallback to current buy
       let unit = (isFinite(dv / dq) && Math.abs(dv) > 0) ? Math.abs(dv / dq) : (cur.buy || 0);
       if (!(unit > 0)) unit = cur.buy || 0;
 
-      const k = key(dateStr, tid, source);
-      const hit = existing.get(k);
-
-      if (hit) {
-        // upsert: combine with prior same-day row; keep weighted unit
-        const oldQty = Number(hit.qty) || 0;
-        const oldVal = (Number(hit.qty) || 0) * (Number(hit.unit) || 0);
-        const newQty = oldQty + dq;
-        const newVal = oldVal + (dq * unit);
-        const newUnit = (newQty !== 0) ? (newVal / newQty) : 0;
-        updates.push({ ri: hit.ri, newQty, newUnit });
-      } else {
-        appends.push([dateStr, tid, "", dq, unit, source, "", charName]);
-      }
+      outRows.push({
+        date: dateStr,
+        type_id: tid,
+        qty: dq,
+        unit_value_filled: unit,
+        source: source,
+        char: charName
+      });
     }
 
-    // Apply updates (one call per row)
-    for (const u of updates) {
-      const row1 = u.ri + 2; // body index -> sheet row
-      SH.getRange(row1, iQty + 1, 1, 2).setValues([[u.newQty, u.newUnit]]);
-    }
+    const keys = ['source', 'char', 'type_id', 'date'];
+    const count = ML.upsertBy(keys, outRows);
 
-    // Append new rows
-    if (appends.length) {
-      const start = Math.max(2, SH.getLastRow() + 1);
-      _setValues(SH, start, appends);
-    }
-
-    // Save new snapshot = current totals (present tids only)
     const nextSnap = {};
     for (const [tid, cur] of curr.entries()) {
-      nextSnap[String(tid)] = { qty: cur.qty, val: cur.val };
+      nextSnap[String(tid)] = {
+        qty: cur.qty,
+        val: cur.val
+      };
     }
     props.setProperty(SNAP_KEY, JSON.stringify(nextSnap));
-  } finally {
-    lock.releaseLock();
-  }
+
+    Logger.log('loot_import', {
+      appended_or_updated: count,
+      processed: allTids.size,
+      date: dateStr,
+    });
+    
+    return count;
+  });
 }
 
 function resetRawLootSnapshot() {
