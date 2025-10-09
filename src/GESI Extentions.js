@@ -1215,127 +1215,110 @@ function Ledger_Import_Journal_Default() {
   return Ledger_Import_Journal({ division: 3, sinceDays: 30, maxPages: 8 });
 }
 
-function Ledger_Import_Journal(opts) {
+/**
+ * Ledger_Import_CorpJournal - Imports EVE Corporation Market Transactions (buy only)
+ * by looping through all 7 wallet divisions (1-7) using the GESI function.
+ * * @param {object} [opts] - Options object.
+ * @param {number} [opts.sinceDays=30] - How many days back to fetch data.
+ * @param {string} [opts.sourceName='CORP_TXN'] - The source label for the ledger entry.
+ * @returns {object} The result from ML.append().
+ */
+function Ledger_Import_CorpJournal(opts) {
   opts = opts || {};
-  var SHEET_NAME = opts.sheet || 'Material_Ledger';
-  var SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
-  var SOURCE     = String(opts.sourceName || 'JOURNAL').toUpperCase();
-
-  // Canonical header
-  var HEAD = (typeof ML !== 'undefined' && ML.HEAD)
-    ? ML.HEAD
-    : ['date','type_id','item_name','qty','unit_value','source','contract_id','char','unit_value_filled'];
-
-  // 1) Fetch/normalize entries OUTSIDE the lock (slow stuff)
-  var nowMs  = Date.now();
-  var cutoff = new Date(nowMs - SINCE_DAYS * 86400000);
-
-  var rawEntries = Array.isArray(opts.entries) ? opts.entries
-                  : (typeof GESI_GetMarketTransactionsForAllChars === 'function')
-                    ? GESI_GetMarketTransactionsForAllChars({ since: cutoff })
-                  : (typeof GESI_GetWalletJournalForAllChars === 'function')
-                    ? GESI_GetWalletJournalForAllChars({ since: cutoff })
-                  : [];
-
-  // Normalize to a compact shape
-  var norm = [];
-  for (var i = 0; i < rawEntries.length; i++) {
-    var e = rawEntries[i] || {};
-    var dt = e.date || e.timestamp || e.time;
-    var d  = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
-    if (!(d instanceof Date) || isNaN(d.getTime()) || d < cutoff) continue;
-
-    var isBuy = (e.is_buy === true) || /buy/i.test(String(e.ref_type || ''));
-    if (!isBuy) continue;
-
-    var typeId = Number(e.type_id || e.typeID || 0);
-    var qty    = Number(e.quantity || e.qty || 0);
-    var price  = Number(e.unit_price || e.price || e.amount_per_unit || 0);
-    if (!(typeId > 0 && qty > 0 && price > 0)) continue;
-
-    var keyRaw = e.transaction_id || e.id || e.journal_ref_id || e.context_id;
-    var key    = (keyRaw != null) ? String(keyRaw) : (String(typeId) + '|' + d.toISOString());
-
-    norm.push({
-      date: d,
-      type_id: typeId,
-      item_name: e.type_name || '',
-      qty: qty,
-      unit_price: price,         // <- we’ll write this only to unit_value_filled
-      contract_id: key,
-      char_name: e.char_name || e.char || e.character || '',
-    });
+  
+  if (typeof ML === 'undefined' || typeof ML.append !== 'function') {
+      throw new Error("ML API not found. Ensure MaterialLedger.gs.js is included and the ML object is global.");
   }
 
-  // 2) Lock + sheet I/O + de-dupe + write
+  // GESI ESI function name for a specific division
+  const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions';
+  
+  if (typeof GESI === 'undefined' || typeof GESI.invokeRaw !== 'function') {
+      throw new Error("GESI Library/invokeRaw not found. Ensure GESI is added as a library to your script.");
+  }
+  
+  const SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
+  const SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase(); 
+
+  // 1) Fetch data by looping through divisions (Divisions 1 through 7)
+  var nowMs = Date.now();
+  var cutoff = new Date(nowMs - SINCE_DAYS * 86400000);
+  const allCorpTransactions = [];
+
+  for (let div = 1; div <= 7; div++) {
+      // Use GESI.invokeRaw to get raw JSON data, which is faster and easier to parse
+      // We pass the division ID as a parameter to the GESI function
+      try {
+          const rawEntries = GESI.invokeRaw(GESI_FUNC_NAME, {
+              division: div
+              // NOTE: GESI does not expose a 'since' parameter for Transactions. 
+              // Instead, it returns the latest set of results (often page-limited).
+              // The deduplication logic in ML.append handles duplicates on subsequent runs.
+          });
+          
+          if (Array.isArray(rawEntries)) {
+              allCorpTransactions.push(...rawEntries);
+          }
+      } catch (e) {
+          // Typically handles errors like "Character does not have required role(s)"
+          if (typeof LoggerEx !== 'undefined') LoggerEx.withTag('CORP_TXN').log(`Error fetching Division ${div}: ${e.message}`);
+      }
+  }
+
+  // 2) Convert raw ESI objects into ML-compliant row arrays
+  const mlEntries = [];
+  for (var i = 0; i < allCorpTransactions.length; i++) {
+    var e = allCorpTransactions[i] || {};
+    
+    // Transactions only return transaction_id, not a character name directly.
+    // The "char" field will remain blank unless you perform an additional ESI call
+    // or rely on an aggregation helper that includes it. We keep it blank for now.
+    
+    var d = new Date(e.date);
+    if (!(d instanceof Date) || isNaN(d.getTime())) continue; // Skip bad dates
+
+    // The ESI Market Transactions endpoint only includes buy or sell, 
+    // we must filter for buy: is_buy === true
+    var isBuy = (e.is_buy === true);
+    if (!isBuy) continue; 
+
+    var typeId = Number(e.type_id || 0);
+    var qty = Number(e.quantity || 0);
+    var price = Number(e.unit_price || 0);
+    
+    if (!(typeId > 0 && qty > 0 && price > 0)) continue;
+
+    var contractId = String(e.transaction_id); // transaction_id is the unique key
+    
+    // ML.HEAD: ['date', 'type_id', 'item_name', 'qty', 'unit_value', 'source', 'contract_id', 'char', 'unit_value_filled']
+    mlEntries.push([
+      d,                        // 0: date
+      typeId,                   // 1: type_id
+      '',                       // 2: item_name (ML will fill this via SDE)
+      qty,                      // 3: qty
+      "",                        // 4: unit_value (Left for Sheet formula/later calculation)
+      SOURCE,                   // 5: source (e.g., CORP_TXN)
+      contractId,               // 6: contract_id (Unique transaction ID for dedupe)
+      '',                       // 7: char (Blank, as it's corp-wide)
+      price                     // 8: unit_value_filled (The actual transaction price)
+    ]);
+  }
+
+  // 3) Lock + Sheet I/O + Write via ML API
   return withSheetLock(function () {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sh =  getOrCreateSheet(ss, SHEET_NAME, HEAD); 
-
-    // Header map (name -> index)
-    var H = {};
-    (function () {
-      var width = Math.max(HEAD.length, sh.getLastColumn());
-      var row = sh.getRange(1,1,1,width).getValues()[0];
-      for (var i = 0; i < row.length; i++) {
-        var k = String(row[i] || '').trim();
-        if (k) H[k] = i;
-      }
-      // Ensure required headers exist (esp. unit_value_filled)
-      HEAD.forEach(function (name, ix) {
-        if (row[ix] !== name) {
-          sh.getRange(1, ix+1).setValue(name);
-          H[name] = ix;
-        }
-      });
-    })();
-
-    // Build existing key set for de-dupe
-    var seen = new Set();
-    var last = sh.getLastRow();
-    var width = Math.max(HEAD.length, sh.getLastColumn());
-    if (last > 1 && H.source != null && H.contract_id != null) {
-      var vals = sh.getRange(2,1,last-1,width).getValues();
-      for (var r = 0; r < vals.length; r++) {
-        var src = (vals[r][H.source] || '').toString().toUpperCase();
-        var key = (vals[r][H.contract_id] || '').toString();
-        if (src && key) seen.add(src + '|' + key);
-      }
-    }
-
-    // Convert normalized entries -> rows, enforce unit_value rule
-    var out = [];
-    for (var j = 0; j < norm.length; j++) {
-      var n = norm[j];
-      var sig = SOURCE + '|' + n.contract_id;
-      if (seen.has(sig)) continue;
-
-      var row = new Array(width).fill('');
-      function set(colName, val) {
-        var idx = H[colName];
-        if (idx != null) row[idx] = val;
-      }
-
-      set('date', n.date);
-      set('type_id', n.type_id);
-      set('item_name', n.item_name);
-      set('qty', n.qty);
-      set('source', SOURCE);
-      set('contract_id', n.contract_id);
-      set('char', n.char_name);
-
-      // HARD RULE: never write to unit_value
-      set('unit_value', '');                 // always blank
-      set('unit_value_filled', n.unit_price);// price goes here only
-
-      out.push(row);
-    }
-
-    if (out.length) {
-      sh.getRange(sh.getLastRow() + 1, 1, out.length, out[0].length).setValues(out);
-    }
-
-    return { appended: out.length, sheet: SHEET_NAME, locked: true };
+    const result = ML.append(mlEntries, {
+        fillNamesFromSDE: true, 
+        sdeRangeName: 'sde_typeid_name',
+        dedupeWithinBatch: true
+    });
+    
+    return { 
+        appended: result.appended, 
+        skippedExisting: result.skippedExisting,
+        bad: result.bad,
+        sheet: ML.SHEET, 
+        locked: true 
+    };
   });
 }
 
