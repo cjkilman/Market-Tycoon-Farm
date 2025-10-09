@@ -1217,140 +1217,129 @@ function Ledger_Import_Journal_Default() {
 
 function Ledger_Import_Journal(opts) {
   opts = opts || {};
-  var division = Number(opts.division || 3);
-  var sinceDays = Number(opts.sinceDays || 14);
-  var maxPages = Math.max(1, Number(opts.maxPages || 5));
-  var includeSells = !!opts.includeSells;       // false = buys only
-  var sourceLabel = String(opts.sourceLabel || 'JOURNAL');
-  var cellsPerChunk = Math.max(4000, Number(opts.cellsPerChunk || 7000)); // batch writes
+  var SHEET_NAME = opts.sheet || 'Material_Ledger';
+  var SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
+  var SOURCE     = String(opts.sourceName || 'JOURNAL').toUpperCase();
 
-  // Auth character (your helper)
-  var charName = '';
-  try { charName = String(getCorpAuthChar() || ''); } catch (_e) { charName = ''; }
+  // Canonical header
+  var HEAD = (typeof ML !== 'undefined' && ML.HEAD)
+    ? ML.HEAD
+    : ['date','type_id','item_name','qty','unit_value','source','contract_id','char','unit_value_filled'];
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var SHEET = 'Material_Ledger';
-  var HEAD = ['date', 'type_id', 'item_name', 'qty', 'unit_value', 'source', 'contract_id', 'char', 'unit_value_filled'];
-  var shOut = getOrCreateSheet(ss, SHEET, HEAD);   // from Utility.js
+  // 1) Fetch/normalize entries OUTSIDE the lock (slow stuff)
+  var nowMs  = Date.now();
+  var cutoff = new Date(nowMs - SINCE_DAYS * 86400000);
 
-  // Build once per run
-  var TYPE_NAME = _typeNameMapFromSDE_('sde_typeid_name');
+  var rawEntries = Array.isArray(opts.entries) ? opts.entries
+                  : (typeof GESI_GetMarketTransactionsForAllChars === 'function')
+                    ? GESI_GetMarketTransactionsForAllChars({ since: cutoff })
+                  : (typeof GESI_GetWalletJournalForAllChars === 'function')
+                    ? GESI_GetWalletJournalForAllChars({ since: cutoff })
+                  : [];
 
-  // Build existing keys (source="JOURNAL") → Set(contract_id)
-  var hdr = shOut.getRange(1, 1, 1, HEAD.length).getValues()[0];
-  var iSrc = hdr.indexOf('source');
-  var iKey = hdr.indexOf('contract_id');
-  var last = shOut.getLastRow();
-  var existing = new Set();
-  if (last >= 2 && iSrc > -1 && iKey > -1) {
-    var srcCol = shOut.getRange(2, iSrc + 1, last - 1, 1).getValues();
-    var keyCol = shOut.getRange(2, iKey + 1, last - 1, 1).getValues();
-    for (var r = 0; r < srcCol.length; r++) {
-      if (String(srcCol[r][0] || '').toUpperCase() !== 'JOURNAL') continue;
-      var k = String(keyCol[r][0] || '').trim();
-      if (k) existing.add(k);
-    }
+  // Normalize to a compact shape
+  var norm = [];
+  for (var i = 0; i < rawEntries.length; i++) {
+    var e = rawEntries[i] || {};
+    var dt = e.date || e.timestamp || e.time;
+    var d  = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
+    if (!(d instanceof Date) || isNaN(d.getTime()) || d < cutoff) continue;
+
+    var isBuy = (e.is_buy === true) || /buy/i.test(String(e.ref_type || ''));
+    if (!isBuy) continue;
+
+    var typeId = Number(e.type_id || e.typeID || 0);
+    var qty    = Number(e.quantity || e.qty || 0);
+    var price  = Number(e.unit_price || e.price || e.amount_per_unit || 0);
+    if (!(typeId > 0 && qty > 0 && price > 0)) continue;
+
+    var keyRaw = e.transaction_id || e.id || e.journal_ref_id || e.context_id;
+    var key    = (keyRaw != null) ? String(keyRaw) : (String(typeId) + '|' + d.toISOString());
+
+    norm.push({
+      date: d,
+      type_id: typeId,
+      item_name: e.type_name || '',
+      qty: qty,
+      unit_price: price,         // <- we’ll write this only to unit_value_filled
+      contract_id: key,
+      char_name: e.char_name || e.char || e.character || '',
+    });
   }
 
-  // GESI client
-  var client = GESI.getClient().setFunction('corporations_corporation_wallets_division_transactions');
-  if (typeof client.setCharacter === 'function' && charName) {
-    client.setCharacter(charName);
-  }
+  // 2) Lock + sheet I/O + de-dupe + write
+  return withSheetLock(function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sh =  getOrCreateSheet(ss, SHEET_NAME, HEAD); 
 
-  var cutoffMs = Date.now() - sinceDays * 86400000;
-  var toAppend = [];
-  var fromId = null, pages = 0;
+    // Header map (name -> index)
+    var H = {};
+    (function () {
+      var width = Math.max(HEAD.length, sh.getLastColumn());
+      var row = sh.getRange(1,1,1,width).getValues()[0];
+      for (var i = 0; i < row.length; i++) {
+        var k = String(row[i] || '').trim();
+        if (k) H[k] = i;
+      }
+      // Ensure required headers exist (esp. unit_value_filled)
+      HEAD.forEach(function (name, ix) {
+        if (row[ix] !== name) {
+          sh.getRange(1, ix+1).setValue(name);
+          H[name] = ix;
+        }
+      });
+    })();
 
-  while (pages < maxPages) {
-    var args = { division: division };
-    if ((!client.setCharacter) && charName) args.character = charName; // fallback
-    if (fromId != null) args.from_id = fromId;
-
-    // Fetch one page (newest first)
-    var rows = client.executeRaw(args);
-    if (!Array.isArray(rows) || rows.length === 0) break;
-    pages++;
-
-    var minTxnId = null;
-
-    for (var i = 0; i < rows.length; i++) {
-      var r = rows[i];
-
-      // date cutoff
-      var dRaw = r.date || '';
-      var dObj = PT.parseDateSafe(dRaw);   // from project Time
-      if (isNaN(dObj)) continue;
-      if (dObj.getTime() < cutoffMs) { minTxnId = null; break; }
-
-      var isBuy = !!r.is_buy;
-      if (!isBuy && !includeSells) continue;
-
-      var qty = Number(r.quantity || 0) || 0;
-      var price = Number(r.unit_price || 0) || 0;
-      var tid = Number(r.type_id || 0) || 0;
-      if (!isFinite(qty) || !isFinite(price) || !isFinite(tid) || qty === 0 || price === 0) continue;
-
-      // journal_ref_id preferred; fallback to transaction_id
-      var refJ = Number(r.journal_ref_id || 0) || 0;
-      var refT = Number(r.transaction_id || 0) || 0;
-      var ref = refJ ? String(refJ) : (refT ? String(refT) : '');
-      if (!ref || existing.has(ref)) continue;
-
-      // Normalize to project-local midnight (Apps Script project tz)
-      var day = PT.projectDate(dObj.getFullYear(), dObj.getMonth(), dObj.getDate(), 0, 0, 0);
-
-      const friendly = TYPE_NAME.get(tid) || '';
-      toAppend.push([
-        day,                 // date
-        tid,                 // type_id
-        friendly,            // item_name ← filled from sde_typeid_name
-        isBuy ? qty : -qty,  // qty
-        price,               // unit_value
-        sourceLabel,         // source ("JOURNAL")
-        ref,                 // contract_id (journal_ref/txn id)
-        charName,            // char
-        price                // unit_value_filled
-      ]);
-
-      existing.add(ref);
-      if (!minTxnId || (r.transaction_id && r.transaction_id < minTxnId)) {
-        minTxnId = r.transaction_id;
+    // Build existing key set for de-dupe
+    var seen = new Set();
+    var last = sh.getLastRow();
+    var width = Math.max(HEAD.length, sh.getLastColumn());
+    if (last > 1 && H.source != null && H.contract_id != null) {
+      var vals = sh.getRange(2,1,last-1,width).getValues();
+      for (var r = 0; r < vals.length; r++) {
+        var src = (vals[r][H.source] || '').toString().toUpperCase();
+        var key = (vals[r][H.contract_id] || '').toString();
+        if (src && key) seen.add(src + '|' + key);
       }
     }
 
-    if (!minTxnId) break;
-    fromId = Number(minTxnId) - 1; // older page
-    if (rows.length < 1000) break; // GESI paginates at 1000
-    Utilities.sleep(120); // be gentle
-  }
+    // Convert normalized entries -> rows, enforce unit_value rule
+    var out = [];
+    for (var j = 0; j < norm.length; j++) {
+      var n = norm[j];
+      var sig = SOURCE + '|' + n.contract_id;
+      if (seen.has(sig)) continue;
 
-  if (!toAppend.length) {
-    return { appended: 0, pages: pages, note: 'No new rows' };
-  }
+      var row = new Array(width).fill('');
+      function set(colName, val) {
+        var idx = H[colName];
+        if (idx != null) row[idx] = val;
+      }
 
-  // Batched append
-  var COLS = HEAD.length;
-  var rowsPerBatch = Math.max(50, Math.floor(cellsPerChunk / COLS));
-  var start = shOut.getLastRow() + 1;
+      set('date', n.date);
+      set('type_id', n.type_id);
+      set('item_name', n.item_name);
+      set('qty', n.qty);
+      set('source', SOURCE);
+      set('contract_id', n.contract_id);
+      set('char', n.char_name);
 
-  for (var off = 0; off < toAppend.length; off += rowsPerBatch) {
-    var seg = toAppend.slice(off, off + rowsPerBatch);
-    shOut.getRange(start + off, 1, seg.length, COLS).setValues(seg);
-  }
+      // HARD RULE: never write to unit_value
+      set('unit_value', '');                 // always blank
+      set('unit_value_filled', n.unit_price);// price goes here only
 
-  // Cheap formats only (won’t bloat)
-  try {
-    var n = toAppend.length;
-    shOut.getRange(start, 1, n, 1).setNumberFormat('yyyy-mm-dd');
-    shOut.getRange(start, 2, n, 1).setNumberFormat('0');       // type_id
-    shOut.getRange(start, 4, n, 1).setNumberFormat('#,##0');   // qty
-    shOut.getRange(start, 5, n, 1).setNumberFormat('#,##0.00');// unit_value
-    shOut.getRange(start, 9, n, 1).setNumberFormat('#,##0.00');// unit_value_filled
-  } catch (_fmtErr) { }
+      out.push(row);
+    }
 
-  return { appended: toAppend.length, pages: pages };
+    if (out.length) {
+      sh.getRange(sh.getLastRow() + 1, 1, out.length, out[0].length).setValues(out);
+    }
+
+    return { appended: out.length, sheet: SHEET_NAME, locked: true };
+  });
 }
+
+
 
 function ML_fillEffectiveCost() {
   var sh = SpreadsheetApp.getActive().getSheetByName('Material_Ledger');

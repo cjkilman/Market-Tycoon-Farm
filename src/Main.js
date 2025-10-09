@@ -110,72 +110,7 @@ function getChacterNameFromID(charIds,show_column_headings=true)
     return chars;
 }
 
-/**
- * Replace [Header Name] tokens in a QUERY-like SQL with ColN or A1 letters,
- * based on the first row (header) of the given range.
- *
- * @param {Range|string} rangeRef  Range object, A1 string ("Sheet!B1:J1"), or Named Range
- * @param {string} queryString     SQL containing bracketed headers: [Item], [Goal], ...
- * @param {boolean} [useColNums=true]  true -> Col1, Col2... ; false -> letters A,B,...
- * @returns {string}
- */
-function sqlFromHeaderNamesEx(rangeRef, queryString, useColNums) {
-  if (useColNums == null) useColNums = true;
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let range = null;
-
-  // 1) If a Range object was passed
-  if (rangeRef && typeof rangeRef.getA1Notation === 'function') {
-    range = rangeRef;
-  } else if (typeof rangeRef === 'string') {
-    // 2) Try Named Range first (doesn't throw; returns null if missing)
-    range = ss.getRangeByName(rangeRef);
-    if (!range) {
-      // 3) Try A1 notation (may throw)
-      try {
-        range = ss.getRange(rangeRef); // Supports "Sheet!A1:B" as well
-      } catch (e) {
-        // Fall through; we'll error below with a clear message
-      }
-    }
-  }
-
-  if (!range) {
-    throw new Error(`sqlFromHeaderNamesEx: could not resolve range from "${rangeRef}". 
-Pass a Range, a valid A1 like "Sheet!B1:J1", or an existing Named Range.`);
-  }
-
-  // Build header row (first row of the range)
-  const headerWidth = range.getNumColumns();
-  const headerRow = range.offset(0, 0, 1, headerWidth).getValues()[0];
-
-  // Map header text -> replacement (ColN or letters)
-  const map = {};
-  for (let i = 0; i < headerRow.length; i++) {
-    const raw = headerRow[i];
-    if (raw == null) continue;
-    const h = String(raw).trim();
-    if (!h) continue;
-
-    const replacement = useColNums
-      ? `Col${i + 1}`
-      : range.getCell(1, i + 1).getA1Notation().replace(/\d+/g, ""); // letters only
-
-    // keep last-seen on duplicates
-    map[h] = replacement;
-  }
-
-  // Replace [Header Name] tokens (case-insensitive label match)
-  const rewritten = String(queryString).replace(/\[([^\]]+)\]/g, (m, label) => {
-    const key = String(label || "").trim();
-    if (map.hasOwnProperty(key)) return map[key];
-    const found = Object.keys(map).find(k => k.toLowerCase() === key.toLowerCase());
-    return found ? map[found] : m; // leave untouched if no match
-  });
-
-  return rewritten;
-}
 
 
 /**

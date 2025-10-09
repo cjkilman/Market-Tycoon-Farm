@@ -45,6 +45,17 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 
+function withSheetLock(fn, timeoutMs) {
+  var lock = LockService.getDocumentLock();     // document-scoped: safest for Sheets
+  lock.waitLock(timeoutMs || 30000);           // waits up to 30s
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();                         // releases even if fn throws
+  }
+}
+
+
 /**
  * Utility helpers — generic functions reused across modules.
  * Keep this file focused on non-domain-specific helpers.
