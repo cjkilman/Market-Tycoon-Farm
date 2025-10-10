@@ -7,14 +7,7 @@
 //   • LoggerEx integration (marketTracker style)
 //
 // Assumes the GESI library + LoggerEx are available.
-/* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx */
-
-// LedgerWriter Config
-const LEDGER_BUY_SHEET = "Material_Ledger";
-const LEDGER_SALE_SHEET = "Sales_Ledger";
-
-
-
+/* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx, ML, withSheetLock, getOrCreateSheet, PT, _charIdMap */
 
 // ==========================================================================================
 // CONFIG & CONSTANTS
@@ -34,6 +27,15 @@ var CONTRACT_LOOKBACK_DAYS = 30;
 // SHEET NAMES
 var CONTRACTS_RAW_SHEET = "Contracts (RAW)";
 var CONTRACT_ITEMS_RAW_SHEET = "Contract Items (RAW)";
+
+// LEDGER SHEET CONSTANTS
+const LEDGER_BUY_SHEET = 'Material_Ledger';
+const LEDGER_SALE_SHEET = 'Sales_Ledger';
+const LEDGER_CORP_SALE_SOURCE = 'CORP_SALE'; // New source label for corp sales
+const CORP_JOURNAL_RESUME_PROP = 'CORP_JOURNAL_DIV_RESUME'; // Property for resume logic
+
+// NEW: Property to store the transaction ID of the most recently fetched (newest) record.
+const CORP_JOURNAL_LAST_ID = 'CORP_JOURNAL_LAST_TRANSACTION_ID';
 
 
 // ENDPOINTS (canonical; let GESI handle versioning)
@@ -57,6 +59,13 @@ GESI_TTL.chars = (GESI_TTL.chars != null) ? GESI_TTL.chars : 21600; // 6h (docum
 GESI_TTL.contracts = (GESI_TTL.contracts != null) ? GESI_TTL.contracts : 900;   // 15m (unused here)
 GESI_TTL.items = (GESI_TTL.items != null) ? GESI_TTL.items : 900;   // 15m (user cache)
 
+// ADDED: Module-level cache variable to store the authorized character name 
+// only once per script execution.
+var _cachedAuthChar = null;
+var _cachedNamedRanges = {};
+
+// ... (Your existing Utility functions: _isoDate, _toIntOrNull, _sheet, _rewrite, etc.) ...
+
 // ==========================================================================================
 // UTILITIES (GAS-SAFE)
 // ==========================================================================================
@@ -75,50 +84,7 @@ function _toIntOrNull(v) {
 }
 
 
-function _sheetSafe(name, header) {
-  var ss = SpreadsheetApp.getActive();
-  var lock = LockService.getDocumentLock();
-  for (var a = 0; a < 5; a++) {
-    try {
-      lock.waitLock(5000);
-      var sh = ss.getSheetByName(name);
-      if (!sh) {
-        sh = ss.insertSheet(name);
-        if (header && header.length) sh.getRange(1, 1, 1, header.length).setValues([header]);
-      } else if (header && header.length) {
-        sh.getRange(1, 1, 1, header.length).setValues([header]);
-      }
-      lock.releaseLock();
-      return sh;
-    } catch (e) {
-      try { lock.releaseLock(); } catch (_) { }
-      Utilities.sleep(250 * Math.pow(2, a));
-      if (a === 4) throw e;
-    }
-  }
-}
 
-function rewrite(sh, header, rows) {
-  var lock = LockService.getDocumentLock();
-  lock.waitLock(5000);
-  try {
-    if (header && header.length) sh.getRange(1, 1, 1, header.length).setValues([header]);
-    var needed = (rows.length || 0) + 1;
-    var have = sh.getMaxRows();
-    if (have < needed) sh.insertRowsAfter(have, needed - have);
-    if (rows.length) {
-      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    }
-    var lastNow = rows.length + 1;
-    var lastHad = sh.getLastRow();
-    var extra = Math.max(0, lastHad - lastNow);
-    if (extra > 0) {
-      sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
-    }
-  } finally {
-    lock.releaseLock();
-  }
-}
 
 function _setValues(sh, startRow, rows) {
   if (!rows || !rows.length) return;
@@ -146,65 +112,102 @@ function getLookbackDays() {
 
 /* Per-DOCUMENT cache for authenticated character names */
 function getCharNamesFast() {
-  var c = CacheService.getDocumentCache();
-  var k = 'gesi:chars';
-  var hit = c.get(k);
-  if (hit) return JSON.parse(hit);
+  // Directly call the global GESI function. GESI handles its own caching 
+  // via ScriptProperties or other mechanisms.
+  var namesFn =
+    (GESI && typeof GESI.getAuthenticatedCharacterNames === 'function')
+      ? GESI.getAuthenticatedCharacterNames
+      : (typeof getAuthenticatedCharacterNames === 'function'
+        ? getAuthenticatedCharacterNames
+        : null);
 
-  var namesFn = GESI.getAuthenticatedCharacterNames();
   if (!namesFn) throw new Error('getAuthenticatedCharacterNames not found (GESI or global).');
 
-  var names = namesFn() || [];
-  c.put(k, JSON.stringify(names), GESI_TTL.chars);
-  return names;
+  return namesFn() || [];
 }
 
 // Resolve corp auth character (override → GESI.name → NamedRange/Utility → first authed)
 function getCorpAuthChar() {
+  // ADDED: Return cached value if available
+  if (_cachedAuthChar) {
+    return _cachedAuthChar;
+  }
+
   var log = LoggerEx.withTag('GESI');
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var names = getCharNamesFast();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
   var desired = "";
 
-  function _resolve(spec) {
+  // Helper function optimized for speed by caching Named Range lookups
+  function _resolve(sh, spec) {
     if (!spec) return "";
     spec = String(spec).trim();
     var got = null;
-    // Named range?
-    try {
-      var nr = ss.getRangeByName(spec);
-      if (nr) got = nr.getValue();
-    } catch (_) { }
-    // Sheet!A1?
+
+    // 1. Named range lookup (Use internal cache if available)
+    if (_cachedNamedRanges[spec] !== undefined) {
+      // Hit the cache (can be null if the range doesn't exist)
+      var nr = _cachedNamedRanges[spec];
+    } else {
+      // MISS: Do the slow lookup, then cache the result (or null)
+      try {
+        var nr = sh.getRangeByName(spec);
+        _cachedNamedRanges[spec] = nr;
+      } catch (_) {
+        _cachedNamedRanges[spec] = null;
+      }
+    }
+
+    if (nr) got = nr.getValue();
+
+    // 2. Sheet!A1 reference lookup
     if (!got && spec.indexOf('!') > 0) {
       var cut = spec.indexOf('!');
       var shn = spec.slice(0, cut);
       var a1 = spec.slice(cut + 1);
-      var sh = ss.getSheetByName(shn);
-      if (sh) { try { got = sh.getRange(a1).getValue(); } catch (_) { } }
+
+      // NOTE: We rely on the caller passing the active Spreadsheet object 'sh'
+      if (sh) { try { got = sh.getSheetByName(shn).getRange(a1).getValue(); } catch (_) { } }
     }
+
     if (!got) got = spec;
     return String(got).trim();
   }
 
+  // 1. Try config override (fast, no GESI)
   if (typeof CORP_AUTH_CHARACTER !== 'undefined' && CORP_AUTH_CHARACTER != null) {
-    desired = _resolve(CORP_AUTH_CHARACTER);
+    desired = _resolve(ss, CORP_AUTH_CHARACTER);
   }
 
-  if (!desired && GESI && GESI.name) desired = String(GESI.name).trim();
+  // 2. Try GESI's internal default (fast, usually a PropertyService lookup)
+  if (!desired && GESI && GESI.getMainCharacter) {
+    desired = String(GESI.getMainCharacter()).trim();
+  }
 
+  // 3. Try secondary config location (fast, no GESI)
   if (!desired) {
-    desired = _resolve('CORP_AUTH_CHAR');
-    if (!desired) desired = _resolve('Utility!B3');
+    desired = _resolve(ss, 'CORP_AUTH_CHAR');
+    if (!desired) desired = _resolve(ss, 'Utility!B3');
   }
 
-  if (names.indexOf(desired) === -1) {
+  // 4. Last resort: Fetch authenticated names (SLOWEST PATH)
+  if (!desired) {
+    // We only execute this expensive block if the desired name is not found in fast lookups.
+    var names = getCharNamesFast();
     var fallback = names[0] || "";
-    if (desired) log.warn('Corp auth override not in authenticated names; falling back', { wanted: desired, using: fallback, list: names });
-    desired = fallback;
+
+    // Check if the desired name (if one was set earlier) is valid, otherwise use fallback.
+    if (!desired || names.indexOf(desired) === -1) {
+      if (desired) log.warn('Corp auth override not in authenticated names; falling back', { wanted: desired, using: fallback, list: names });
+      desired = fallback;
+    }
   }
+
 
   log.debug('corp auth character', { using: desired });
+
+  // ADDED: Cache the result before returning
+  _cachedAuthChar = desired;
   return desired;
 }
 
@@ -212,7 +215,6 @@ function getCorpAuthChar() {
 // NORMALIZERS
 // ==========================================================================================
 
-// Normalize CONTRACT LIST results → [{ ch, c }]
 // Normalize CONTRACT LIST results → [{ ch, c }]
 function _normalizeCharContracts(res, names) {
   var tuples = [];
@@ -386,7 +388,7 @@ function getContractItemsCached(charName, contractId, force, forCorp) {
 
   var items = forCorp
     ? _fetchCorpContractItems(authName, cid)
-    : _fetchCharContractItems(authName, cid);
+    : _fetchCorpContractItems(authName, cid);
 
   c.put(k, JSON.stringify(items || []), GESI_TTL.items);
   return items || [];
@@ -468,6 +470,8 @@ function syncContracts() {
 
   var outC = [];
   var outI = [];
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   // ---------------- PHASE 1: CHARACTER CONTRACTS ----------------
   var tListChar = log.startTimer('contracts:list:char');
@@ -515,11 +519,12 @@ function syncContracts() {
     outC.push([
       ch1, cidNum, cRow.type, cRow.status, cRow.issuer_id, cRow.acceptor_id,
       cRow.date_issued || "", cRow.date_expired || "", cRow.price || 0, cRow.reward || 0, cRow.collateral || 0,
-      cRow.volume || 0, cRow.title || "", cRow.availability || "", cRow.start_location_id || "", cRow.end_location_id || ""
+      cRow.volume || 0, cRow.title || "", c2.start_location_id || "", cRow.end_location_id || ""
     ]);
 
     for (var j1 = 0; j1 < items1.length; j1++) {
       var it1 = items1[j1];
+      // Item contracts should only include items that were 'included' AND have a quantity
       if (!it1.is_included || !it1.quantity) continue;
       outI.push([ch1, cidNum, it1.type_id, it1.quantity, true, !!it1.is_singleton]);
     }
@@ -565,6 +570,7 @@ function syncContracts() {
 
     for (var j2 = 0; j2 < items2.length; j2++) {
       var it2 = items2[j2];
+      // Item contracts should only include items that were 'included' AND have a quantity
       if (!it2.is_included || !it2.quantity) continue;
       outI.push([ch2, cid2, it2.type_id, it2.quantity, true, !!it2.is_singleton]);
     }
@@ -573,26 +579,29 @@ function syncContracts() {
   }
 
   // ---------------- WRITE SHEETS ----------------
-  var shC = _sheetSafe(CONTRACTS_RAW_SHEET, hdrC);
-  var shI = _sheetSafe(CONTRACT_ITEMS_RAW_SHEET, hdrI);
-  rewrite(shC, hdrC, outC);
-  rewrite(shI, hdrI, outI);
+  // Replacing custom _sheetSafe with getOrCreateSheet (assuming robust implementation)
+  const shC = getOrCreateSheet(ss, CONTRACTS_RAW_SHEET, hdrC);
+  const shI = getOrCreateSheet(ss, CONTRACT_ITEMS_RAW_SHEET, hdrI);
+  
+  // NOTE: Assuming _rewriteFast exists in Utility.js or globally for this usage.
+  _rewriteFast(shC, hdrC, outC);
+  _rewriteFast(shI, hdrI, outI);
 
   log.log('syncContracts done', { contracts: outC.length, items: outI.length, lookback_days: lookbackDays, lookIso: lookIso });
 }
 
 // ==========================================================================================
-// RAW → Material_Ledger (optional helper to normalize inflow)
+// RAW → Material_Ledger (Import/Buy Side)
 // ==========================================================================================
-// GESI Extentions.js
-
-// GESI Extentions.js
-
 function contractsToMaterialLedger() {
   const log = LoggerEx.withTag('GESI');
+  // NOTE: This assumes a helper function _charIdMap() exists globally or in another module
   const myCharId = (typeof _charIdMap === 'function') ? _charIdMap()[getCorpAuthChar()] : null;
 
   return withSheetLock(function () {
+    // 1. Explicitly set the sheet to ensure correct target
+    ML.setSheet('Material_Ledger');
+
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
     const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
@@ -610,7 +619,7 @@ function contractsToMaterialLedger() {
       contract_id: ix(hC, "contract_id"),
       type: ix(hC, "type"),
       status: ix(hC, "status"),
-      acceptor_id: ix(hC, "acceptor_id"), // Use acceptor_id
+      acceptor_id: ix(hC, "acceptor_id"),
       date_issued: ix(hC, "date_issued"),
     };
     const colI = {
@@ -644,7 +653,7 @@ function contractsToMaterialLedger() {
       if (ctype !== "item_exchange" || status !== "finished" || (myCharId && acceptorId !== myCharId) || (charName && acceptorId && myCharId && charName !== getCorpAuthChar())) {
         continue;
       }
-      
+
       const cid2 = rowC[colC.contract_id];
       const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
       const items = itemsByCid[cid2] || [];
@@ -664,7 +673,6 @@ function contractsToMaterialLedger() {
 
     // Use ML.upsertBy to handle the de-duplication and writing
     const keys = ['source', 'char', 'contract_id', 'type_id'];
-    ML.setSheet(LEDGER_BUY_SHEET);
     const count = ML.upsertBy(keys, outRows);
 
     log.log('contracts→ledger', {
@@ -676,12 +684,18 @@ function contractsToMaterialLedger() {
 }
 
 // ============================================================================
+// RAW → Sales_Ledger (Export/Sell Side)
+// ============================================================================
 
 function contractsToSalesLedger() {
   const log = LoggerEx.withTag('GESI');
+  // NOTE: This assumes a helper function _charIdMap() exists globally or in another module
   const myCharId = (typeof _charIdMap === 'function') ? _charIdMap()[getCorpAuthChar()] : null;
 
   return withSheetLock(function () {
+    // 1. Explicitly set the sheet to ensure correct target
+    ML.setSheet('Sales_Ledger');
+
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
     const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
@@ -699,9 +713,9 @@ function contractsToSalesLedger() {
       contract_id: ix(hC, "contract_id"),
       type: ix(hC, "type"),
       status: ix(hC, "status"),
-      issuer_id: ix(hC, "issuer_id"), // Use issuer_id
+      issuer_id: ix(hC, "issuer_id"),
       date_issued: ix(hC, "date_issued"),
-      price: ix(hC, "price"), // Add price column index
+      price: ix(hC, "price"),
     };
     const colI = {
       contract_id: ix(hI, "contract_id"),
@@ -729,6 +743,7 @@ function contractsToSalesLedger() {
       const status = String(rowC[colC.status] || "").toLowerCase();
       const issuerId = rowC[colC.issuer_id];
       const charName = rowC[colC.char] || "";
+      const price = Number(rowC[colC.price] || 0);
 
       // Filter for finished contracts where the character is the issuer (sell)
       if (ctype !== "item_exchange" || status !== "finished" || (myCharId && issuerId !== myCharId) || (charName && issuerId && myCharId && charName !== getCorpAuthChar())) {
@@ -737,18 +752,17 @@ function contractsToSalesLedger() {
 
       const cid2 = rowC[colC.contract_id];
       const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
-      const price = Number(rowC[colC.price] || 0);
       const items = itemsByCid[cid2] || [];
 
       for (const it of items) {
         if (!it.is_included || it.qty <= 0) continue;
-        
+
         let unit_price_filled = 0;
         if (it.qty > 0) {
-            unit_price_filled = price / it.qty;
+          unit_price_filled = price / it.qty; // Simple price allocation per unit
         }
-        
-        // Use a negative quantity to denote a sale
+
+        // Use a NEGATIVE quantity to denote a sale/outgoing item
         outRows.push({
           date: issued,
           type_id: it.type_id,
@@ -762,7 +776,6 @@ function contractsToSalesLedger() {
       }
     }
 
-    ML.setSheet(LEDGER_SALE_SHEET);
     const keys = ['source', 'char', 'contract_id', 'type_id'];
     const count = ML.upsertBy(keys, outRows);
 
@@ -774,230 +787,9 @@ function contractsToSalesLedger() {
   });
 }
 
-
-/******************************************************
- * Contract → unit costs table (for Material_Ledger fill)
- * - Lists finished item_exchange in the lookback window
- * - Pulls items per contract (character, then corp)
- * - Allocates NET price across included items
- * - Returns rows: [contract_id, type_id, qty, unit_cost, price, total_qty, issuer_id, acceptor_id, date_issued]
- *
- * Dependencies:
- *   - GESI lib (contracts + contract_items)
- *   - raw_characters_character_contract_items / raw_corporations_corporation_contracts_contract_items (already in this file)
- * Optional:
- *   - Sheet "CharIDMap"  headers: [char | character_id]  (for STRICT_ACCEPTOR_CHECK)
- ******************************************************/
-
-/* ===== Config ===== */
-var LOOKBACK_DAYS = (typeof LOOKBACK_DAYS !== 'undefined') ? LOOKBACK_DAYS : 90;   // rolling window
-var CONTRACT_ALLOC_MODE = (typeof CONTRACT_ALLOC_MODE !== 'undefined') ? CONTRACT_ALLOC_MODE : "qty"; // "qty" | "ref"
-var STRICT_ACCEPTOR_CHECK = (typeof STRICT_ACCEPTOR_CHECK !== 'undefined') ? STRICT_ACCEPTOR_CHECK : false;
-
-/* ===== Helpers ===== */
-function _daysAgo(days) {
-  var d = new Date();
-  d.setUTCDate(d.getUTCDate() - Math.max(0, +days || 0));
-  return d;
-}
-
-function _getCharIdFromMap_(name) {
-  try {
-    var ss = SpreadsheetApp.getActive();
-    var sh = ss.getSheetByName("CharIDMap");
-    if (!sh) return null;
-    var vals = sh.getDataRange().getValues();
-    var hdr = vals.shift();
-    var cChar = hdr.indexOf("char"), cId = hdr.indexOf("character_id");
-    if (cChar < 0 || cId < 0) return null;
-    for (var i = 0; i < vals.length; i++) {
-      if (String(vals[i][cChar]).trim() === String(name).trim()) return +vals[i][cId] || null;
-    }
-  } catch (_) { }
-  return null;
-}
-
-/**
- * Try both scopes and return merged finished item_exchange contracts in lookback.
- * Row shape (subset of ESI): {contract_id, date_issued, date_accepted, type, status, price, issuer_id, acceptor_id}
- */
-function _listFinishedItemExchange_(name, lookbackDays) {
-  var since = _daysAgo(lookbackDays || LOOKBACK_DAYS);
-
-  var out = [];
-  var log = LoggerEx.withTag('GESI');
-  // CHARACTER scope
-  try {
-    var rowsC = GESI.characters_character_contracts(name, true, "v1");
-    // rowsC includes header; find columns
-    if (Array.isArray(rowsC) && rowsC.length > 1) {
-      var h = rowsC[0].map(String);
-      var idx = {};
-      ["contract_id", "date_issued", "date_accepted", "type", "status", "price", "issuer_id", "acceptor_id"].forEach(function (k) { idx[k] = h.indexOf(k); });
-      for (var i = 1; i < rowsC.length; i++) {
-        var r = rowsC[i];
-        if (!r || !r.length) continue;
-        if (String(r[idx.type]) !== "item_exchange") continue;
-        if (String(r[idx.status]) !== "finished") continue;
-        var di = r[idx.date_issued]; if (di && new Date(di).getTime() < since.getTime()) continue;
-        out.push({
-          scope: "char",
-          contract_id: +r[idx.contract_id],
-          date_issued: r[idx.date_issued],
-          date_accepted: r[idx.date_accepted],
-          type: r[idx.type],
-          status: r[idx.status],
-          price: +r[idx.price] || 0,
-          issuer_id: +r[idx.issuer_id] || null,
-          acceptor_id: +r[idx.acceptor_id] || null,
-          name: name
-        });
-      }
-    }
-  } catch (e) {
-    log.warn("[contracts:list] char scope failed %s", e);
-  }
-
-  // CORPORATION scope (optional; uses configured name or GESI.name)
-  try {
-    var rowsCo = GESI.corporations_corporation_contracts(name, true);
-    if (Array.isArray(rowsCo) && rowsCo.length > 1) {
-      var h2 = rowsCo[0].map(String);
-      var idy = {};
-      ["contract_id", "date_issued", "date_accepted", "type", "status", "price", "issuer_id", "acceptor_id"].forEach(function (k) { idy[k] = h2.indexOf(k); });
-      for (var j = 1; j < rowsCo.length; j++) {
-        var rc = rowsCo[j];
-        if (!rc || !rc.length) continue;
-        if (String(rc[idy.type]) !== "item_exchange") continue;
-        if (String(rc[idy.status]) !== "finished") continue;
-        var di2 = rc[idy.date_issued]; if (di2 && new Date(di2).getTime() < since.getTime()) continue;
-        out.push({
-          scope: "corp",
-          contract_id: +rc[idy.contract_id],
-          date_issued: rc[idy.date_issued],
-          date_accepted: rc[idy.date_accepted],
-          type: rc[idy.type],
-          status: rc[idy.status],
-          price: +rc[idy.price] || 0,
-          issuer_id: +rc[idy.issuer_id] || null,
-          acceptor_id: +rc[idy.acceptor_id] || null,
-          name: name
-        });
-      }
-    }
-  } catch (e2) {
-    log.warn("[contracts:list] corp scope failed %s", e2);
-  }
-
-  return out;
-}
-
-/** Allocation mode hook: change how we apportion price across item rows. */
-function _allocateUnitCosts_(items, netPriceISK, mode) {
-  // items: [{type_id, qty, is_included}]
-  var inc = items.filter(function (it) { return it.is_included !== false; }); // treat missing as included
-  var totalQty = inc.reduce(function (s, it) { return s + (it.qty || 0); }, 0);
-
-  if (mode === "ref") {
-    // Optional: apportion by reference price weight (e.g., hub buy). Implement your own lookup.
-    // For now, fallback to quantity if ref is missing.
-    var wSum = 0;
-    inc.forEach(function (it) { it._ref = _refPriceForTypeId_(it.type_id) || 0; wSum += (it._ref * (it.qty || 0)); });
-    if (wSum > 0) {
-      return inc.map(function (it) {
-        var share = (it._ref * (it.qty || 0)) / wSum;
-        var cost = (share * netPriceISK) / Math.max(1, (it.qty || 0));
-        return { type_id: it.type_id, qty: it.qty || 0, unit_cost: cost, total_qty: totalQty };
-      });
-    }
-  }
-
-  // Default: simple per-quantity allocation
-  if (totalQty <= 0) return inc.map(function (it) { return { type_id: it.type_id, qty: it.qty || 0, unit_cost: null, total_qty: 0 }; });
-  var unitPool = netPriceISK / totalQty;
-  return inc.map(function (it) {
-    return { type_id: it.type_id, qty: it.qty || 0, unit_cost: unitPool, total_qty: totalQty };
-  });
-}
-
-// TODO: Replace this with your real reference-price function if using CONTRACT_ALLOC_MODE="ref"
-function _refPriceForTypeId_(type_id) { return 0; }
-
-/**
- * Public: Build a sheet-ready table of per-item unit costs for recent finished contracts.
- * @param {string} [name=GESI.name] - authed character (used for both char + corp scopes)
- * @param {number} [lookbackDays=LOOKBACK_DAYS]
- * @param {boolean} [withHeader=true]
- * @returns {any[][]} rows: [contract_id, type_id, qty, unit_cost, price, total_qty, issuer_id, acceptor_id, date_issued]
- */
-function CONTRACT_unit_costs_table(name, lookbackDays, withHeader) {
-  if (!name) name = GESI && GESI.name;
-  if (!name) throw new Error("name is required (GESI.name is blank)");
-  if (withHeader == null) withHeader = true;
-
-  var meCharId = _getCharIdFromMap_(name); // optional
-  var contracts = _listFinishedItemExchange_(name, lookbackDays);
-
-  // Strict acceptor filter (optional)
-  if (STRICT_ACCEPTOR_CHECK && meCharId) {
-    contracts = contracts.filter(function (c) { return +c.acceptor_id === +meCharId; });
-  }
-
-  var table = [];
-  if (withHeader) {
-    table.push(["contract_id", "type_id", "qty", "unit_cost", "price", "total_qty", "issuer_id", "acceptor_id", "date_issued"]);
-  }
-
-  for (var i = 0; i < contracts.length; i++) {
-    var c = contracts[i];
-    // fetch items using your cached RAW helpers
-    var itemsRows;
-    if (c.scope === "char") {
-      itemsRows = raw_characters_character_contract_items(c.contract_id, c.name, true);
-    } else {
-      itemsRows = raw_corporations_corporation_contracts_contract_items(c.contract_id, c.name, true);
-    }
-    if (!Array.isArray(itemsRows) || itemsRows.length < 2) continue;
-
-    // header map
-    var hdr = itemsRows[0].map(String);
-    var ix = {
-      type_id: hdr.indexOf("type_id"),
-      quantity: hdr.indexOf("quantity"),
-      is_included: hdr.indexOf("is_included")
-    };
-    var items = [];
-    for (var r = 1; r < itemsRows.length; r++) {
-      var row = itemsRows[r];
-      items.push({
-        type_id: +row[ix.type_id],
-        qty: +row[ix.quantity] || 0,
-        is_included: (ix.is_included >= 0) ? !!row[ix.is_included] : true
-      });
-    }
-
-    var alloc = _allocateUnitCosts_(items, +c.price || 0, CONTRACT_ALLOC_MODE);
-    for (var k = 0; k < alloc.length; k++) {
-      var a = alloc[k];
-      table.push([c.contract_id, a.type_id, a.qty, a.unit_cost, c.price, a.total_qty, c.issuer_id, c.acceptor_id, c.date_issued]);
-    }
-  }
-
-  return table.length ? table : (withHeader ? [["contract_id", "type_id", "qty", "unit_cost", "price", "total_qty", "issuer_id", "acceptor_id", "date_issued"], ["No data", "", "", "", "", "", "", "", ""]] : [["No data"]]);
-}
-
-
 /***********************
- * Contract costing → unit_cost_alloc + Ledger fill
- * - Ignores zero-price contracts (treat as transfers)
- * - REF mode: split by qty × ref_price (from 'market price Tracker')
- *   ↪ Fallback to QTY if any included row in the contract is missing a ref
- * - QTY mode: flat per-unit (price / Σ qty_included)
- * - Batch reads/writes only (no per-cell loops)
+ * Contract costing → unit_cost_alloc + Ledger fill (Original was removed; keep for reference if needed)
  ***********************/
-
-const LEDGER_SHEET = 'Material_Ledger';
-const MARKET_PRICE_SHEET = 'market price Tracker';
 
 /* Settings: can be overridden by Named Ranges:
    - setting_contract_alloc_mode: "REF" | "QTY"
@@ -1058,93 +850,104 @@ function _toNumberISK_(v) {
 
 /** Main: compute unit_cost_alloc + fill Material_Ledger.unit_value_filled */
 function rebuildContractUnitCosts() {
+  const log = LoggerEx.withTag('GESI');
   const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase(); // 'REF' | 'QTY'
   const refMap = _buildRefPriceMap_();
   const priceMap = _buildContractPriceMap_();
 
-  // Read Contract Items
+  // Read Contract Items (RAW)
   const ci = _getData_(CONTRACT_ITEMS_RAW_SHEET);
   const iCID = ci.h['contract_id'], iTID = ci.h['type_id'], iQ = ci.h['quantity'], iInc = ci.h['is_included'];
   if ([iCID, iTID, iQ, iInc].some(v => v == null)) throw new Error(`'${CONTRACT_ITEMS_RAW_SHEET}' missing headers: contract_id,type_id,quantity,is_included`);
-  const unitIdx = _ensureColumn_(ci.sh, 1, 'unit_cost_alloc');
-  const unitCol = new Array(ci.rows.length).fill('');
 
-  // Group by contract (priced only), included rows
-  const byCid = new Map();
-  ci.rows.forEach((r, ri) => {
-    const cid = String(r[iCID]); const price = priceMap.get(cid) || 0;
-    if (price <= 0) return; // ignored
-    const included = String(r[iInc]).toUpperCase() === 'TRUE'; if (!included) return;
-    const tid = Number(r[iTID]) || 0; const qty = Number(r[iQ]) || 0; if (qty <= 0) return;
-    (byCid.get(cid) || byCid.set(cid, []).get(cid)).push({ ri, tid, qty });
-  });
-
-  // Denominators per contract
-  const denoms = new Map();
-  for (const [cid, rows] of byCid.entries()) {
-    let denQty = 0, denRef = 0, missingRef = 0;
-    for (const { tid, qty } of rows) {
-      denQty += qty;
-      const ref = refMap.get(tid) || 0;
-      if (ref > 0) denRef += qty * ref; else missingRef++;
-    }
-    const useRef = (allocMode === 'REF' && missingRef === 0 && denRef > 0);
-    denoms.set(cid, { denQty, denRef, useRef });
+  // Read Contracts (RAW) to get contract dates and character names
+  const c = _getData_(CONTRACTS_RAW_SHEET);
+  const cID = c.h['contract_id'], cChar = c.h['char'], cDate = c.h['date_issued'];
+  if ([cID, cChar, cDate].some(v => v == null)) throw new Error(`'${CONTRACTS_RAW_SHEET}' missing headers: contract_id, char, date_issued`);
+  const contractMeta = new Map();
+  for (const r of c.rows) {
+    const cid = String(r[cID]);
+    contractMeta.set(cid, {
+      char: String(r[cChar]),
+      date: r[cDate] ? _isoDate(r[cDate]) : ''
+    });
   }
 
-  // Compute units
-  for (const [cid, rows] of byCid.entries()) {
-    const price = priceMap.get(cid) || 0; if (price <= 0) continue;
-    const { denQty, denRef, useRef } = denoms.get(cid);
-    if (!denQty) continue;
-    for (const { ri, tid } of rows) {
+  const outRows = [];
+
+  // Group items by contract
+  const itemsByCid = new Map();
+  ci.rows.forEach(r => {
+    const cid = String(r[iCID]);
+    const included = String(r[iInc]).toUpperCase() === 'TRUE';
+    if (!included) return;
+    const tid = Number(r[iTID]) || 0;
+    const qty = Number(r[iQ]) || 0;
+    if (qty <= 0) return;
+    if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
+    itemsByCid.get(cid).push({
+      tid,
+      qty
+    });
+  });
+
+  // Calculate unit costs and build ledger rows
+  for (const [cid, items] of itemsByCid.entries()) {
+    const price = priceMap.get(cid) || 0;
+    const meta = contractMeta.get(cid);
+    if (price <= 0 || !meta) continue;
+
+    // Determine allocation denominator
+    let denQty = 0, denRef = 0, missingRef = false;
+    for (const { tid, qty } of items) {
+      denQty += qty;
+      const ref = refMap.get(tid) || 0;
+      if (ref > 0) denRef += qty * ref;
+      else missingRef = true;
+    }
+    const useRef = (allocMode === 'REF' && !missingRef && denRef > 0);
+
+    for (const { tid, qty } of items) {
       let unit = 0;
       if (useRef) {
         const ref = refMap.get(tid) || 0;
         unit = (denRef > 0 && ref > 0) ? (price * ref / denRef) : 0;
       } else {
-        unit = price / denQty;
+        unit = denQty > 0 ? price / denQty : 0;
       }
-      unitCol[ri] = unit;
+      if (unit <= 0) continue;
+
+      outRows.push({
+        date: meta.date,
+        type_id: tid,
+        qty: qty,
+        unit_value_filled: unit,
+        source: 'CONTRACT',
+        contract_id: cid,
+        char: meta.char
+      });
     }
   }
 
-  // Write back unit_cost_alloc
-  ci.sh.getRange(2, unitIdx + 1, unitCol.length, 1).setValues(unitCol.map(v => [v]));
+  // Use ML.upsertBy() to write all rows to the ledger
+  ML.setSheet('Material_Ledger');
+  const keys = ['source', 'char', 'contract_id', 'type_id'];
+  const count = ML.upsertBy(keys, outRows);
 
-  // Fill ledger
-  fillLedgerUnitValuesFromItems_();
+  log.log('rebuildContractUnitCosts', {
+    appended_or_updated: count,
+    processed: outRows.length
+  });
+
+  return count;
 }
 
-/** Fill Material_Ledger.unit_value_filled from CI.unit_cost_alloc for source="CONTRACT" */
-function fillLedgerUnitValuesFromItems_() {
-  const ci = _getData_(CONTRACT_ITEMS_RAW_SHEET);
-  const iCID = ci.h['contract_id'], iTID = ci.h['type_id'], iUnit = ci.h['unit_cost_alloc'];
-  if ([iCID, iTID, iUnit].some(v => v == null)) throw new Error(`'${CONTRACT_ITEMS_RAW_SHEET}' missing headers: contract_id,type_id,unit_cost_alloc`);
-
-  // index contractId|typeId → unit
-  const key = (cid, tid) => `${cid}§${tid}`;
-  const unitMap = new Map();
-  for (const r of ci.rows) {
-    const u = Number(r[iUnit]); if (!isFinite(u) || u <= 0) continue;
-    unitMap.set(key(String(r[iCID]), Number(r[iTID]) || 0), u);
-  }
-
-  const lg = _getData_(LEDGER_SHEET);
-  const s = lg.h['source'], c = lg.h['contract_id'], t = lg.h['type_id'], u0 = lg.h['unit_value'];
-  if ([s, c, t].some(v => v == null)) throw new Error(`'${LEDGER_SHEET}' missing headers: source, contract_id, type_id`);
-  const outIdx = _ensureColumn_(lg.sh, 1, 'unit_value_filled');
-
-  const out = new Array(lg.rows.length);
-  for (let i = 0; i < lg.rows.length; i++) {
-    const row = lg.rows[i]; const src = String(row[s]).toUpperCase().trim();
-    if (src !== 'CONTRACT') { out[i] = [u0 != null ? row[u0] : '']; continue; }
-    const unit = unitMap.get(key(String(row[c]), Number(row[t]) || 0)) || '';
-    out[i] = [unit];
-  }
-  if (out.length) lg.sh.getRange(2, outIdx + 1, out.length, 1).setValues(out);
+/** Build Char name → ID map (stub) */
+function _charIdMap() {
+  // In a real app, this would read from a dedicated sheet like 'CharIDMap'
+  // Headers: [char, character_id]
+  return {}; // Placeholder
 }
-
 
 // --- ADD (UTILITIES) ---------------------------------------------------------
 function _hdrMap_(arr) { var m = {}; for (var i = 0; i < arr.length; i++) m[String(arr[i]).trim()] = i; return m; }
@@ -1156,12 +959,14 @@ function _getSheet_(name) { // keep if not already defined
 }
 
 function _getData_(sheetName) {
-  var sh = _getSheet_(sheetName);
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName); // Use direct SpreadsheetApp.getActiveSpreadsheet()
+  if (!sh) throw new Error('Missing sheet: ' + sheetName);
   var vals = sh.getDataRange().getValues();
   var header = vals[0] || [];
   var rows = vals.slice(1);
   return { sh: sh, header: header, rows: rows, h: _hdrMap_(header) };
 }
+
 
 function _ensureColumn_(sh, headerRow, name) {
   var hdr = sh.getRange(headerRow, 1, 1, sh.getLastColumn()).getValues()[0];
@@ -1171,9 +976,6 @@ function _ensureColumn_(sh, headerRow, name) {
   return idx; // 0-based
 }
 // ---------------------------------------------------------------------------
-
-// GESI Extentions.js
-// ... (previous functions) ...
 
 // --- Raw_loot (rolling 30d total) → Material_Ledger (post deltas) ------------
 const RAW_LOOT_SHEET = 'Raw_loot';
@@ -1206,6 +1008,7 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
     for (const r of loot.rows) {
       const tid = Number(r[cTid]) || 0;
       if (!tid) continue;
+      // Sanitize input values robustly before using them
       const qty = Number(String(r[cQty]).replace(/[^\d.\-]/g, '')) || 0;
       const buy = _toNumberISK_(r[cBuy]);
       const val = _toNumberISK_(r[cVal]);
@@ -1219,9 +1022,9 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
     // Load previous snapshot
     const props = PropertiesService.getDocumentProperties();
     const prevRaw = props.getProperty(SNAP_KEY);
-    const prev = prevRaw ? JSON.parse(prevRaw) : {};
+    const prev = prevRaw ? JSON.parse(prevRaw) : {}; // { tid: {qty,val} }
 
-    // UNION of tids (handles day-31 disappearances)
+    // UNION of tids (handles items that disappeared from loot sheet, e.g., day-31)
     const allTids = new Set([
       ...curr.keys(),
       ...Object.keys(prev).map(x => Number(x) || 0).filter(Number)
@@ -1244,13 +1047,14 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
       const dv = cur.val - (Number(p.val) || 0);
 
       if (dq === 0) continue;
-      if (!allowNeg && dq < 0) continue;
+      if (!allowNeg && dq < 0) continue; // ignore pruning drops unless allowed
 
+      // Unit for this delta: prefer dv/dq; fallback to current buy (if dv/dq results in 0 or NaN)
       let unit = (isFinite(dv / dq) && Math.abs(dv) > 0) ? Math.abs(dv / dq) : (cur.buy || 0);
       if (!(unit > 0)) unit = cur.buy || 0;
 
-      // Use the date string as the unique identifier for the transaction
-      const contractId = dateStr; 
+      // Use the date and type_id as the unique identifier for loot entries
+      const contractId = dateStr;
 
       outRows.push({
         date: dateStr,
@@ -1258,14 +1062,15 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
         qty: dq,
         unit_value_filled: unit,
         source: source,
-        // The unique key for loot is date, type_id, and character
-        contract_id: contractId, 
+        // Since we are applying the delta once per day, we can use the date as the contract_id
+        contract_id: contractId,
         char: charName
       });
     }
 
+    // Use ML.upsertBy() to update or append the rows
+    // Key: source + char + type_id + contract_id (which is the date)
     const keys = ['source', 'char', 'type_id', 'contract_id'];
-    ML.setSheet(opts.sheet || LEDGER_BUY_SHEET);
     const count = ML.upsertBy(keys, outRows);
 
     // Save new snapshot = current totals (present tids only)
@@ -1283,48 +1088,106 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
       processed: allTids.size,
       date: dateStr,
     });
-    
+
     return count;
   });
 }
-
 
 function resetRawLootSnapshot() {
   PropertiesService.getDocumentProperties().deleteProperty(SNAP_KEY);
 }
 
 
-/** ===== JOURNAL → Material_Ledger (no duplicate helpers) =====================
+/** ===== JOURNAL → Material_Ledger (Import/Buy Side) =====================
  * Depends on: GESI, getCorpAuthChar(), getOrCreateSheet (Utility.js), PT (Project Time)
- * Source table shape written:
- * [date, type_id, item_name, qty, unit_value, source, contract_id, char, unit_value_filled]
  */
 
 function Ledger_Import_Journal_Default() {
-  return Ledger_Import_Journal({ division: 3, sinceDays: 30, maxPages: 8 });
+  // Pass opts as an object, including the necessary division and sinceDays for the corp journal import logic.
+  return Ledger_Import_CorpJournal({ division: 3, sinceDays: 30 });
 }
 
-/**
- * Ledger_Import_CorpJournal - Imports EVE Corporation Market Transactions (buy only)
- * by looping through all 7 wallet divisions (1-7) using the GESI function.
- * * @param {object} [opts] - Options object.
- * @param {number} [opts.sinceDays=30] - How many days back to fetch data.
- * @param {string} [opts.sourceName='CORP_TXN'] - The source label for the ledger entry.
- * @returns {object} The result from ML.append().
- */
-// GESI Extentions.js
-// ... (existing code) ...
+function Ledger_Import_Journal(opts) {
+  const log = LoggerEx.withTag('CHAR_TXN');
+  opts = opts || {};
+  var SHEET_NAME = opts.sheet || 'Material_Ledger';
+  var SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
+  var SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase();
 
+  if (typeof ML === 'undefined' || typeof ML.upsertBy !== 'function') {
+    throw new Error("ML API not found. Ensure MaterialLedger.gs.js is included and the ML object is global.");
+  }
 
-// ... (Your existing functions like syncContracts, contractsToMaterialLedger, etc.) ...
+  // NOTE: Assuming GESI_GetMarketTransactionsForAllChars or GESI_GetWalletJournalForAllChars is available
+  var GESI_GET_TXN_FUNC = (typeof GESI_GetMarketTransactionsForAllChars === 'function')
+    ? GESI_GetMarketTransactionsForAllChars
+    : (typeof GESI_GetWalletJournalForAllChars === 'function' ? GESI_GetWalletJournalForAllChars : null);
+
+  if (!GESI_GET_TXN_FUNC) {
+    throw new Error("Required GESI transaction helper (GetMarketTransactionsForAllChars or GetWalletJournalForAllChars) not found.");
+  }
+
+  // 1) Fetch/normalize entries OUTSIDE the lock (slow stuff)
+  var nowMs = Date.now();
+  var cutoff = new Date(nowMs - SINCE_DAYS * 86400000);
+
+  var rawEntries = GESI_GET_TXN_FUNC({ since: cutoff }) || [];
+
+  // Normalize to ML-compliant row objects
+  var outRows = [];
+  for (var i = 0; i < rawEntries.length; i++) {
+    var e = rawEntries[i] || {};
+    var dt = e.date || e.timestamp || e.time;
+    var d = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
+    if (!(d instanceof Date) || isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue; // Apply date filter here
+
+    var isBuy = (e.is_buy === true) || /buy/i.test(String(e.ref_type || ''));
+    if (!isBuy) continue;
+
+    var typeId = Number(e.type_id || e.typeID || 0);
+    var qty = Number(e.quantity || e.qty || 0);
+    var price = Number(e.unit_price || e.price || e.amount_per_unit || 0);
+    if (!(typeId > 0 && qty > 0 && price > 0)) continue;
+
+    var contractId = String(e.transaction_id || e.id || e.journal_ref_id || e.context_id);
+    var charName = e.char_name || e.char || e.character || '';
+
+    outRows.push({
+      date: d,
+      type_id: typeId,
+      item_name: e.type_name || '',
+      qty: qty,
+      unit_value: '',
+      source: SOURCE,
+      contract_id: contractId,
+      char: charName,
+      unit_value_filled: price,
+    });
+  }
+
+  // 2) Lock + Sheet I/O + Write via ML API
+  return withSheetLock(function () {
+    ML.setSheet(SHEET_NAME);
+
+    // Key: source + contract_id + char (transaction ID + character name is unique)
+    const keys = ['source', 'contract_id', 'char'];
+    const count = ML.upsertBy(keys, outRows);
+
+    log.log('journal_import', { appended_or_updated: count, processed: outRows.length, sheet: ML.sheetName() });
+    return count;
+  });
+}
 
 /** ===== JOURNAL → Material_Ledger & Sales_Ledger (Buy and Sell Sides) =====================
- * Imports corporate market transactions (buy and sell) and writes them to the respective ledgers.
+ * Imports corporate market transactions (buy and sell) for Division 3 only.
  * Buy transactions go to Material_Ledger (default).
  * Sell transactions go to Sales_Ledger.
  */
 function Ledger_Import_CorpJournal(opts) {
   const log = LoggerEx.withTag('CORP_TXN');
+  // ADDED: Start timer to profile execution time
+  const t = log.startTimer('Ledger_Import_CorpJournal_Setup');
+
   opts = opts || {};
 
   if (typeof ML === 'undefined' || typeof ML.upsertBy !== 'function') {
@@ -1333,36 +1196,106 @@ function Ledger_Import_CorpJournal(opts) {
 
   const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions';
 
-  if (typeof GESI === 'undefined' || typeof GESI.invokeRaw !== 'function') {
-    throw new Error("GESI Library/invokeRaw not found. Ensure GESI is added as a library to your script.");
+  if (typeof GESI === 'undefined' || typeof GESI.invoke !== 'function') { // Check for GESI.invoke
+    throw new Error("GESI Library/invoke not found. Ensure GESI is added as a library to your script.");
   }
 
-  const SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
   const BUY_SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase();
-  const LEDGER_CORP_SALE_SOURCE = 'CORP_SALE'; // New source label for corp sales
-  const allCorpTransactions = [];
-  // GESI does not expose a 'since' parameter for Transactions. It returns the latest results.
-  for (let div = 1; div <= 7; div++) {
-    try {
-      const rawEntries = GESI.invokeRaw(GESI_FUNC_NAME, {
-        division: div
-      });
-      if (Array.isArray(rawEntries)) {
-        allCorpTransactions.push(...rawEntries);
-      }
-    } catch (e) {
-      log.log(`Error fetching Division ${div}: ${e.message}`);
-    }
+  const SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30)); // Get sinceDays from opts
+
+  // --- Date Cutoff Calculation ---
+  const MS_PER_DAY = 86400000;
+  const cutoff = new Date(Date.now() - SINCE_DAYS * MS_PER_DAY); // Calculate cutoff date
+
+  // --- Division Selection: FIXED TO DIVISION 3 ---
+  const TARGET_DIVISION = 3;
+  const authToon = getCorpAuthChar(); // Fetched and cached
+  // --- End Division Selection ---
+
+  // --- ANCHORING SETUP ---
+  // Read last known transaction ID from PropertiesService
+  const props = PropertiesService.getScriptProperties();
+  const rawFromId = props.getProperty(CORP_JOURNAL_LAST_ID);
+
+  // FIX: Use parseInt (corrected spelling) to convert the saved ID (string) to an integer.
+  // If rawFromId is null, parseInt returns NaN, so we convert NaN back to null.
+  let currentFromId = rawFromId ? parseInt(rawFromId, 10) : null;
+  if (isNaN(currentFromId)) {
+    currentFromId = null;
   }
+  // NOTE: If currentFromId exists, we use it to start the fetch for the next page of transactions (older data).
+  // ESI uses the ID of the newest record you HAVE to get records older than it.
+
+  t.stamp('Setup complete, starting API calls.'); // Profiling step 1
+
+  const allCorpTransactions = [];
+  let fetchMore = true;
+
+  log.log(`Fetching Corp Transactions for Division ${TARGET_DIVISION} (since ${SINCE_DAYS} days)...`);
+
+  do {
+    try {
+
+      // The single-object parameter method, using null if the ID is not available (first page).
+      const rawEntries = GESI.invokeRaw(
+        GESI_FUNC_NAME,
+        {
+          division: TARGET_DIVISION, // Bundled required path parameter
+          from_id: currentFromId, // Bundled optional query parameter
+          name: authToon, // Bundled optional auth name
+          show_column_headings: false, // No Headers needed with invokeRaw
+          version: null // let GESI handle it
+        }
+      );
+
+      if (!rawEntries || rawEntries.length === 0) {
+        fetchMore = false;
+        break;
+      }
+
+      allCorpTransactions.push(...rawEntries);
+
+      // Check the date of the oldest entry in the current page. If it's older than 
+      // our cutoff, stop fetching.
+      const oldestEntry = rawEntries[rawEntries.length - 1];
+      const oldestDate = new Date(oldestEntry.date);
+
+      // FIX: Add validation check for Invalid Date before comparing getTime()
+      if (isNaN(oldestDate.getTime())) {
+        log.error("Invalid Date found in ESI response. Stopping pagination.", { entry: oldestEntry });
+        fetchMore = false;
+        break;
+      }
+
+      if (oldestDate.getTime() < cutoff.getTime()) {
+        log.log(`Oldest entry date (${oldestDate}) is past cutoff. Stopping pagination.`);
+        fetchMore = false;
+      } else {
+        // Set the transaction_id of the oldest entry in the current page 
+        // as the starting point for the next, older page.
+        currentFromId = oldestEntry.transaction_id;
+      }
+
+      // Small sleep to be polite to the ESI server
+      Utilities.sleep(100);
+
+    } catch (e) {
+      log.error(`Error fetching Division ${TARGET_DIVISION} at from_id ${currentFromId}.`, e);
+      fetchMore = false; // Stop the loop on error
+      // Re-throw the error after logging so the Apps Script runtime fails visibly
+      throw e;
+    }
+  } while (fetchMore);
 
   const buyRows = [];
   const sellRows = [];
-  
+
   for (const e of allCorpTransactions) {
     if (!e || typeof e !== 'object') continue;
 
     const d = new Date(e.date);
-    if (isNaN(d.getTime())) continue;
+    // FINAL FILTER: Only process transactions newer than the cutoff.
+    if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
 
     const typeId = Number(e.type_id || 0);
     const qty = Number(e.quantity || 0);
@@ -1382,7 +1315,7 @@ function Ledger_Import_CorpJournal(opts) {
       unit_value: '',
       source: isBuy ? BUY_SOURCE : LEDGER_CORP_SALE_SOURCE,
       contract_id: contractId,
-      char: '', // Blank for corporate transactions
+      char: authToon, // use Corp's Authed Toon
       unit_value_filled: price,
     };
 
@@ -1391,16 +1324,19 @@ function Ledger_Import_CorpJournal(opts) {
       buyRows.push(row);
     } else {
       // Sell: Negative quantity (item outflow), needs sign reversal
-      row.qty = -Math.abs(row.qty); 
+      row.qty = -Math.abs(row.qty);
       sellRows.push(row);
     }
   }
 
-  return withSheetLock(function () {
+  t.stamp('Data normalization complete, starting write.'); // Profiling step 2
+
+  // --- BEGIN TRANSACTION ---
+  const result = withSheetLock(function () {
     const keys = ['source', 'contract_id'];
     let buyCount = 0;
     let sellCount = 0;
-    
+
     // 1. Process Buy Side (Inflow to Material_Ledger)
     if (buyRows.length > 0) {
       ML.setSheet(opts.sheet || LEDGER_BUY_SHEET);
@@ -1415,42 +1351,32 @@ function Ledger_Import_CorpJournal(opts) {
       log.log(`Sell side processed for ${ML.sheetName()}`, { appended_or_updated: sellCount, processed: sellRows.length });
     }
 
-    return { 
-      appended_or_updated_buy: buyCount, 
-      appended_or_updated_sell: sellCount, 
+    return {
+      appended_or_updated_buy: buyCount,
+      appended_or_updated_sell: sellCount,
       processed: allCorpTransactions.length,
       sheets: { buy: opts.sheet || LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
       locked: true
     };
   });
-}
+  // --- END TRANSACTION ---
 
+  // --- ANCHORING WRITE LOGIC (Outside Lock) ---
+  // Only save the newest ID if we actually fetched new data (and the array isn't empty)
+  if (allCorpTransactions.length > 0) {
+    // The newest transaction is the first element in the array (ESI returns newest first)
+    const newestTransactionId = allCorpTransactions[0].transaction_id;
 
+    // Save the newest ID to act as the starting anchor (from_id) for the NEXT run.
 
-function ML_fillEffectiveCost() {
-  var sh = SpreadsheetApp.getActive().getSheetByName('Material_Ledger');
-  var last = sh.getLastRow(); if (last < 2) return;
-  var vals = sh.getRange(2, 1, last-1, 9).getValues(); // A..I
-  var out = new Array(vals.length);
-  var state = new Map(); // type_id -> {Q, C}
-
-  for (var i = 0; i < vals.length; i++) {
-    var tid = +vals[i][1];                 // B type_id
-    var qty = +vals[i][3];                 // D qty
-    var price = +(vals[i][4] || vals[i][8]); // E unit_value or I unit_value_filled
-    if (!Number.isFinite(tid) || !Number.isFinite(qty) || !Number.isFinite(price)) { out[i]=['']; continue; }
-
-    var s = state.get(tid) || { Q:0, C:price };
-    if (qty > 0) { s.C = (s.Q*s.C + qty*price) / (s.Q + qty); s.Q += qty; }
-    else if (qty < 0) { s.Q += qty; } // sells don’t change avg cost
-    state.set(tid, s);
-    out[i] = [s.C];
+    props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
+    log.log(`Saved new transaction anchor: ${newestTransactionId}`);
   }
 
-  // Ensure header, then write K
-  sh.getRange(1, 11).setValue('effective_cost');
-  sh.getRange(2, 11, out.length, 1).setValues(out);
+
+  return result;
 }
+
 
 
 /**

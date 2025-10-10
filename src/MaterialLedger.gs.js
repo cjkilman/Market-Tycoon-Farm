@@ -1,20 +1,21 @@
 /** MaterialLedger API — append + upsert
  * Ledger HEAD:
  * [date, type_id, item_name, qty, unit_value, source, contract_id, char, unit_value_filled]
- * 
- * unit_value - reserved for Manual Sheet editing
+ * * unit_value - reserved for Manual Sheet editing
  * unit_value_filled - automated Pricing from sources
  * usage: Manual price overides detected price
  * if(unit_value = "")
  * return unit_value_filled
  * else
  * return unit_value
- * 
- */
+ * */
 var ML = (function () {
   // keep your defaults
   var SHEET = 'Material_Ledger';
   var HEAD  = ['date','type_id','item_name','qty','unit_value','source','contract_id','char','unit_value_filled'];
+
+  // Module-level cache for the active spreadsheet instance
+  var _SS = null; 
 
   // NEW: allow swapping the active sheet at runtime
   function setSheet(name) {
@@ -23,8 +24,15 @@ var ML = (function () {
     return SHEET;
   }
 
+  function getSS_() {
+    if (!_SS) {
+      _SS = SpreadsheetApp.getActiveSpreadsheet();
+    }
+    return _SS;
+  }
+  
   function getSheet_() {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = getSS_();
     return getOrCreateSheet(ss, SHEET, HEAD); // uses your Utility helper
   }
 
@@ -75,34 +83,69 @@ var ML = (function () {
     var sh = getSheet_();
     var H  = headerIndex_(sh);
 
-    var keyCols = (keys || []).map(function (k) {
+    var keyColNames = keys || [];
+    var keyColIndices = []; // 1-based column indices for all requested key names
+    var keyColHdrMap = {}; // Maps key name -> 0-based column index in the HEAD array
+
+    // 1. Determine 1-based indices of all key columns
+    keyColNames.forEach(function (k) {
       if (!H[k]) throw new Error('Unknown key column: ' + k);
-      return H[k]; // 1-based
+      keyColIndices.push(H[k]); // 1-based sheet column index
+    });
+    
+    // Determine the minimum range needed to read existing key data
+    var firstKeyCol = Math.min.apply(null, keyColIndices);
+    var lastKeyCol = Math.max.apply(null, keyColIndices);
+    
+    // The number of columns we actually need to read from the sheet
+    var readWidth = lastKeyCol - firstKeyCol + 1;
+
+    // The shift factor when mapping sheet index to read values array index
+    var readOffset = firstKeyCol;
+    
+    // Map of the column index in the 'read values array' to the original HEAD index
+    var sheetColToReadIndex = {};
+    keyColIndices.forEach(function(sheetCol) {
+      sheetColToReadIndex[sheetCol] = sheetCol - readOffset;
     });
 
-    var width = Math.max(HEAD.length, sh.getLastColumn());
-    var last  = sh.getLastRow();
-    var vals  = last >= 2 ? sh.getRange(2, 1, last - 1, width).getValues() : [];
 
-    // Map composite key → absolute row number
+    var last  = sh.getLastRow();
+    var vals  = [];
+    
+    // 2. Read ONLY the necessary key columns from the sheet
+    if (last >= 2) {
+      vals = sh.getRange(2, firstKeyCol, last - 1, readWidth).getValues();
+    }
+    
+    // 3. Map composite key → absolute row number (optimized read)
     var map = new Map();
     for (var r = 0; r < vals.length; r++) {
-      var key = keyCols.map(function (c) { return String(vals[r][c - 1] || ''); }).join('\u0001');
+      var row = vals[r];
+      var key = keyColIndices.map(function (sheetCol) {
+        // Get the value using the optimized read index
+        var val = row[sheetColToReadIndex[sheetCol]] || '';
+        return String(val); 
+      }).join('\u0001');
       map.set(key, r + 2); // 1-based rows, data starts at row 2
     }
 
     var appends = [];
     rows.forEach(function (obj) {
       var outRow = normalizeRow_(obj);
-      var key    = keyCols.map(function (k) {
-        var idx = HEAD.indexOf(keys[keyCols.indexOf(k)]); // resolve on HEAD
+      
+      // 4. Generate key for the incoming row
+      var key    = keyColNames.map(function (k) {
+        var idx = HEAD.indexOf(k); // 0-based index in the HEAD array
         return String(outRow[idx] || '');
       }).join('\u0001');
 
       var at = map.get(key);
       if (at) {
+        // Update existing row
         sh.getRange(at, 1, 1, HEAD.length).setValues([outRow]);
       } else {
+        // Append new row
         appends.push(outRow);
       }
     });
