@@ -475,6 +475,7 @@ function syncContracts() {
 
   // ---------------- PHASE 1: CHARACTER CONTRACTS ----------------
   var tListChar = log.startTimer('contracts:list:char');
+
   var resChar = GESI.invokeMultiple(EP_LIST_CHAR, names, { status: "all" }) || [];
   tListChar.stamp('listed');
 
@@ -1377,7 +1378,37 @@ function Ledger_Import_CorpJournal(opts) {
   return result;
 }
 
-
+/**
+ * Replaces the content of a sheet (from row 2 down) with new rows.
+ * Includes locking to prevent concurrent write issues.
+ * Assumes the sheet is already created and headers are set.
+ */
+function _rewriteData_(sh, header, rows) {
+  // We use DocumentLock here since this is writing raw, shared data.
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(5000);
+  try {
+    var needed = (rows.length || 0) + 1;
+    var lastHad = sh.getMaxRows();
+    
+    // 1. Ensure sheet has enough rows (insert if necessary)
+    if (lastHad < needed) sh.insertRowsAfter(lastHad, needed - lastHad);
+    
+    // 2. Write new data (starting at row 2)
+    if (rows.length) {
+      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    }
+    
+    // 3. Clear old excess data
+    var lastNow = rows.length + 1;
+    var extra = Math.max(0, lastHad - lastNow);
+    if (extra > 0) {
+      sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
 
 /**
  * Build a map: type_id → typeName from a Named Range.
