@@ -2,11 +2,10 @@
 // Robust, GAS-safe contract sync for EVE (GESI):
 //   • Two-phase listing: CHARACTER → CORPORATION (no mixing of scopes)
 //   • Items fetched with HEADERS (boolean; default true in GESI)
-//   • Single canonical endpoints; positional args only (no named objects)
+//   • Single canonical endpoints: positional arguments
 //   • Per-doc cache for auth names; per-user cache for items (scope-partitioned)
 //   • LoggerEx integration (marketTracker style)
 //
-// Assumes the GESI library + LoggerEx are available.
 /* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx, ML, withSheetLock, getOrCreateSheet, PT, _charIdMap */
 
 // ==========================================================================================
@@ -21,7 +20,6 @@
 var CORP_AUTH_CHARACTER = "setting_director";
 
 // Rolling lookback (days) for finished item_exchange contracts.
-// You may also define a Named Range "LOOKBACK_DAYS" or put the value in Utility!B2.
 var CONTRACT_LOOKBACK_DAYS = 30;
 
 // SHEET NAMES
@@ -62,9 +60,8 @@ GESI_TTL.items = (GESI_TTL.items != null) ? GESI_TTL.items : 900;   // 15m (user
 // ADDED: Module-level cache variable to store the authorized character name 
 // only once per script execution.
 var _cachedAuthChar = null;
-var _cachedNamedRanges = {};
-
-// ... (Your existing Utility functions: _isoDate, _toIntOrNull, _sheet, _rewrite, etc.) ...
+// ADDED: Cache for Named Ranges to avoid slow API lookups
+var _cachedNamedRanges = {}; 
 
 // ==========================================================================================
 // UTILITIES (GAS-SAFE)
@@ -82,8 +79,6 @@ function _toIntOrNull(v) {
   var n = parseInt(s, 10);
   return (Number(n) === n && isFinite(n)) ? n : null;
 }
-
-
 
 
 function _setValues(sh, startRow, rows) {
@@ -120,7 +115,7 @@ function getCharNamesFast() {
       : (typeof getAuthenticatedCharacterNames === 'function'
         ? getAuthenticatedCharacterNames
         : null);
-
+  
   if (!namesFn) throw new Error('getAuthenticatedCharacterNames not found (GESI or global).');
 
   return namesFn() || [];
@@ -132,48 +127,49 @@ function getCorpAuthChar() {
   if (_cachedAuthChar) {
     return _cachedAuthChar;
   }
-
+  
   var log = LoggerEx.withTag('GESI');
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-
+  
   var desired = "";
 
   // Helper function optimized for speed by caching Named Range lookups
   function _resolve(sh, spec) {
     if (!spec) return "";
     spec = String(spec).trim();
-    var got = null;
-
-    // 1. Named range lookup (Use internal cache if available)
+    
+    // 1. Check value cache first (eliminates I/O if already calculated this run)
     if (_cachedNamedRanges[spec] !== undefined) {
-      // Hit the cache (can be null if the range doesn't exist)
-      var nr = _cachedNamedRanges[spec];
-    } else {
-      // MISS: Do the slow lookup, then cache the result (or null)
-      try {
-        var nr = sh.getRangeByName(spec);
-        _cachedNamedRanges[spec] = nr;
-      } catch (_) {
-        _cachedNamedRanges[spec] = null;
-      }
+      const cachedValue = _cachedNamedRanges[spec];
+      return String(cachedValue).trim(); // return value (or empty string/etc)
     }
 
-    if (nr) got = nr.getValue();
-
-    // 2. Sheet!A1 reference lookup
+    var got = null;
+    
+    // 2. Named range lookup (SLOWER, caching the VALUE)
+    try {
+      var nr = sh.getRangeByName(spec);
+      if (nr) got = nr.getValue();
+    } catch (_) {
+      // Ignore
+    }
+    
+    // 3. Sheet!A1 reference lookup (SLOWER)
     if (!got && spec.indexOf('!') > 0) {
       var cut = spec.indexOf('!');
       var shn = spec.slice(0, cut);
       var a1 = spec.slice(cut + 1);
-
-      // NOTE: We rely on the caller passing the active Spreadsheet object 'sh'
+    
       if (sh) { try { got = sh.getSheetByName(shn).getRange(a1).getValue(); } catch (_) { } }
     }
-
-    if (!got) got = spec;
-    return String(got).trim();
+    
+    // 4. Cache the resulting value (if we found anything or if it's the literal spec)
+    const resultValue = got || spec;
+    _cachedNamedRanges[spec] = resultValue;
+    
+    return String(resultValue).trim();
   }
-
+  
   // 1. Try config override (fast, no GESI)
   if (typeof CORP_AUTH_CHARACTER !== 'undefined' && CORP_AUTH_CHARACTER != null) {
     desired = _resolve(ss, CORP_AUTH_CHARACTER);
@@ -190,30 +186,78 @@ function getCorpAuthChar() {
     if (!desired) desired = _resolve(ss, 'Utility!B3');
   }
 
-  // 4. Last resort: Fetch authenticated names (SLOWEST PATH)
+  // --- OPTIMIZED FALLBACK LOGIC ---
+  
+  // 4. Verification/Fallback: Only execute the slow GESI check if needed.
+  
+  // This check is the SLOW part:
+  var names = getCharNamesFast(); 
+  var fallback = names[0] || "";
+  
   if (!desired) {
-    // We only execute this expensive block if the desired name is not found in fast lookups.
-    var names = getCharNamesFast();
-    var fallback = names[0] || "";
-
-    // Check if the desired name (if one was set earlier) is valid, otherwise use fallback.
-    if (!desired || names.indexOf(desired) === -1) {
-      if (desired) log.warn('Corp auth override not in authenticated names; falling back', { wanted: desired, using: fallback, list: names });
+    // Case 1: No name found via fast methods (Steps 1-3). Use the GESI fallback.
+    desired = fallback;
+    
+  } else {
+    // Case 2: A name was found via config. 
+    // We still need to verify this name is authenticated by GESI (SLOW check).
+    
+    // If the name from the config (desired) is not in the official list, revert to default.
+    if (names.indexOf(desired) === -1) {
+      log.warn('Corp auth override not in authenticated names; falling back', { wanted: desired, using: fallback, list: names });
       desired = fallback;
     }
   }
 
 
   log.debug('corp auth character', { using: desired });
-
+  
   // ADDED: Cache the result before returning
   _cachedAuthChar = desired;
   return desired;
 }
 
 // ==========================================================================================
-// NORMALIZERS
+// CUSTOM TRIGGER FUNCTION
 // ==========================================================================================
+
+/**
+ * Runs when the spreadsheet is opened.
+ * Used to create the custom menu and prompt for authorization if needed.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Market Tools')
+      .addItem('Authorize Script (First Run)', 'forceAuthorization')
+      .addToUi();
+}
+
+/**
+ * Function to run manually to force the authorization prompt.
+ */
+function forceAuthorization() {
+    // This function runs a service that requires authorization (UrlFetchApp)
+    // and is accessible via the custom menu. Running it guarantees the prompt appears.
+    try {
+        UrlFetchApp.fetch("https://google.com");
+        SpreadsheetApp.getUi().alert('Authorization granted successfully!');
+    } catch (e) {
+        if (e.message.includes('Authorization is required')) {
+            SpreadsheetApp.getUi().alert('Authorization failed. Please follow the prompt in the editor after running this function.');
+        } else {
+            // Check if the script needs permissions beyond basic Spreadsheet access
+            const propertiesService = PropertiesService.getUserProperties();
+            propertiesService.setProperty('AUTH_CHECK', 'RUNNING');
+            propertiesService.deleteProperty('AUTH_CHECK');
+            SpreadsheetApp.getUi().alert('Authorization check failed. Please run this function again and check the console/editor for prompts.');
+        }
+    }
+}
+
+
+// ==========================================================================================
+// NORMALIZERS
+//==========================================================================================
 
 // Normalize CONTRACT LIST results → [{ ch, c }]
 function _normalizeCharContracts(res, names) {
@@ -300,7 +344,7 @@ function _normalizeCorpContracts(res, corpAuthName) {
   if (typeof res[0] === 'object') {
     for (var m = 0; m < res.length; m++) {
       var cB = res[m]; if (!cB || typeof cB !== 'object') continue;
-      tuples.push({ ch: String(corpAuthName), c: cB });
+      tuples.push({ ch: String(cB.character_name || cB.char || corpAuthName), c: cB });
     }
   }
   return tuples;
@@ -475,7 +519,6 @@ function syncContracts() {
 
   // ---------------- PHASE 1: CHARACTER CONTRACTS ----------------
   var tListChar = log.startTimer('contracts:list:char');
-
   var resChar = GESI.invokeMultiple(EP_LIST_CHAR, names, { status: "all" }) || [];
   tListChar.stamp('listed');
 
@@ -518,7 +561,7 @@ function syncContracts() {
 
     // Write contract & items under the chosen character (usually the acceptor)
     outC.push([
-      ch1, cidNum, cRow.type, cRow.status, cRow.issuer_id, cRow.acceptor_id,
+      ch1, cidNum, cRow.type, c2.status, cRow.issuer_id, cRow.acceptor_id,
       cRow.date_issued || "", cRow.date_expired || "", cRow.price || 0, cRow.reward || 0, cRow.collateral || 0,
       cRow.volume || 0, cRow.title || "", c2.start_location_id || "", cRow.end_location_id || ""
     ]);
@@ -527,13 +570,12 @@ function syncContracts() {
       var it1 = items1[j1];
       // Item contracts should only include items that were 'included' AND have a quantity
       if (!it1.is_included || !it1.quantity) continue;
-      outI.push([ch1, cidNum, it1.type_id, it1.quantity, true, !!it1.is_singleton]);
+      outI.push([ch1, cidNum, it1.type_id, it1.quantity, true, !!it2.is_singleton]);
     }
 
     seenChar['' + cidNum] = true; // so corp phase won’t re-add it
     Utilities.sleep(150);
   }
-
 
   // ---------------- PHASE 2: CORPORATION CONTRACTS ----------------
   var tListCorp = log.startTimer('contracts:list:corp');
@@ -576,6 +618,7 @@ function syncContracts() {
       outI.push([ch2, cid2, it2.type_id, it2.quantity, true, !!it2.is_singleton]);
     }
 
+    seenChar['' + cidNum] = true; // so corp phase won’t re-add it
     Utilities.sleep(150);
   }
 
@@ -585,8 +628,8 @@ function syncContracts() {
   const shI = getOrCreateSheet(ss, CONTRACT_ITEMS_RAW_SHEET, hdrI);
   
   // NOTE: Assuming _rewriteFast exists in Utility.js or globally for this usage.
-  _rewriteFast(shC, hdrC, outC);
-  _rewriteFast(shI, hdrI, outI);
+  _rewriteData_(shC, hdrC, outC);
+  _rewriteData_(shI, hdrI, outI);
 
   log.log('syncContracts done', { contracts: outC.length, items: outI.length, lookback_days: lookbackDays, lookIso: lookIso });
 }
@@ -760,7 +803,7 @@ function contractsToSalesLedger() {
 
         let unit_price_filled = 0;
         if (it.qty > 0) {
-          unit_price_filled = price / it.qty; // Simple price allocation per unit
+            unit_price_filled = price / it.qty; // Simple price allocation per unit
         }
 
         // Use a NEGATIVE quantity to denote a sale/outgoing item
@@ -968,6 +1011,38 @@ function _getData_(sheetName) {
   return { sh: sh, header: header, rows: rows, h: _hdrMap_(header) };
 }
 
+/**
+ * Replaces the content of a sheet (from row 2 down) with new rows.
+ * Includes locking to prevent concurrent write issues.
+ * Assumes the sheet is already created and headers are set.
+ */
+function _rewriteData_(sh, header, rows) {
+  // We use DocumentLock here since this is writing raw, shared data.
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(5000);
+  try {
+    var needed = (rows.length || 0) + 1;
+    var lastHad = sh.getMaxRows();
+    
+    // 1. Ensure sheet has enough rows (insert if necessary)
+    if (lastHad < needed) sh.insertRowsAfter(lastHad, needed - lastHad);
+    
+    // 2. Write new data (starting at row 2)
+    if (rows.length) {
+      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    }
+    
+    // 3. Clear old excess data
+    var lastNow = rows.length + 1;
+    var extra = Math.max(0, lastHad - lastNow);
+    if (extra > 0) {
+      sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 
 function _ensureColumn_(sh, headerRow, name) {
   var hdr = sh.getRange(headerRow, 1, 1, sh.getLastColumn()).getValues()[0];
@@ -977,6 +1052,126 @@ function _ensureColumn_(sh, headerRow, name) {
   return idx; // 0-based
 }
 // ---------------------------------------------------------------------------
+
+/**
+ * Aggregates transaction data from both Material_Ledger (Buy) and Sales_Ledger (Sell).
+ * Returns Buy and Sell stats separately.
+ * @param {number} typeId The type ID to filter for.
+ * @param {number} sinceDays How many days back to look.
+ * @returns {object} { buy: {qty: number, value: number, avg: number, count: number}, sell: {qty: number, value: number, avg: number, count: number} }
+ */
+function _aggregateLedgerStats_(typeId, sinceDays) {
+    const log = LoggerEx.withTag('MARKET_STATS');
+    const MS_PER_DAY = 86400000;
+    const cutoff = new Date(Date.now() - sinceDays * MS_PER_DAY);
+    const targetType = String(typeId);
+
+    // Prepare aggregation containers
+    const aggregates = {
+        buy: { qty: 0, value: 0, count: 0 },
+        sell: { qty: 0, value: 0, count: 0 }
+    };
+    
+    const ledgers = [
+        { sheetName: LEDGER_BUY_SHEET, isBuy: true },
+        { sheetName: LEDGER_SALE_SHEET, isBuy: false }
+    ];
+
+    ledgers.forEach(ledger => {
+        try {
+            const { rows, h } = _getData_(ledger.sheetName); 
+
+            // Column lookup indices (0-based)
+            const cTID = h['type_id'];
+            const cDATE = h['date'];
+            const cQTY = h['qty'];
+            const cUNIT_FILLED = h['unit_value_filled']; 
+            
+            if ([cTID, cDATE, cQTY, cUNIT_FILLED].some(v => v === undefined)) {
+                log.warn(`Skipping ${ledger.sheetName}: Missing critical headers.`);
+                return;
+            }
+
+            rows.forEach(row => {
+                const tid = String(row[cTID] || '');
+                const dateVal = row[cDATE];
+                let qty = Number(row[cQTY] || 0);
+                let unitPrice = Number(row[cUNIT_FILLED] || 0);
+                
+                // 1. Filter by Type ID
+                if (tid !== targetType) return;
+                
+                // 2. Filter by Date
+                const d = (dateVal instanceof Date) ? dateVal : new Date(dateVal);
+                if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) return;
+                
+                // 3. Process Transaction
+                if (unitPrice > 0 && Math.abs(qty) > 0) {
+                    const side = (ledger.isBuy) ? aggregates.buy : aggregates.sell;
+                    
+                    // Sales ledger quantities are typically negative, so we use Math.abs
+                    const absQty = Math.abs(qty); 
+                    
+                    side.qty += absQty; 
+                    side.value += absQty * unitPrice;
+                    side.count++;
+                }
+            });
+            
+        } catch (e) {
+            log.error(`Error processing ${ledger.sheetName}: ${e.message}`);
+        }
+    });
+
+    // Calculate final averages
+    const result = {
+        buy: null,
+        sell: null
+    };
+
+    if (aggregates.buy.count > 0) {
+        result.buy = {
+            qty: aggregates.buy.qty,
+            value: aggregates.buy.value,
+            avg: aggregates.buy.value / aggregates.buy.qty,
+            count: aggregates.buy.count
+        };
+    }
+    if (aggregates.sell.count > 0) {
+        result.sell = {
+            qty: aggregates.sell.qty,
+            value: aggregates.sell.value,
+            avg: aggregates.sell.value / aggregates.sell.qty,
+            count: aggregates.sell.count
+        };
+    }
+    
+    return result;
+}
+
+/**
+ * @customfunction
+ * Calculates market statistics (Quantity, Total Value, Weighted Average Price) 
+ * for a specific EVE item across both Material_Ledger (Buy) and Sales_Ledger (Sell).
+ * * @param {number} typeId The type ID of the item to analyze.
+ * @param {number} [sinceDays=30] The number of days to look back for transactions.
+ * @returns {Array<Array<any>>} A 2D array of buy/sell statistics.
+ */
+function marketStatDataBoth(typeId, sinceDays) {
+    if (!typeId) {
+        return [['typeId required']];
+    }
+    sinceDays = sinceDays || 30;
+
+    const { buy, sell } = _aggregateLedgerStats_(typeId, sinceDays);
+    
+    return [
+        ['Side', 'Total Quantity', 'Total Value (ISK)', 'Weighted Avg Price (ISK)'],
+        ['Buy', buy ? buy.qty : 0, buy ? buy.value : 0, buy ? buy.avg : 0],
+        ['Sell', sell ? sell.qty : 0, sell ? sell.value : 0, sell ? sell.avg : 0]
+    ];
+}
+
 
 // --- Raw_loot (rolling 30d total) → Material_Ledger (post deltas) ------------
 const RAW_LOOT_SHEET = 'Raw_loot';
@@ -1055,7 +1250,7 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
       if (!(unit > 0)) unit = cur.buy || 0;
 
       // Use the date and type_id as the unique identifier for loot entries
-      const contractId = dateStr;
+      const contractId = dateStr; 
 
       outRows.push({
         date: dateStr,
@@ -1064,13 +1259,12 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
         unit_value_filled: unit,
         source: source,
         // Since we are applying the delta once per day, we can use the date as the contract_id
-        contract_id: contractId,
+        contract_id: contractId, 
         char: charName
       });
     }
 
-    // Use ML.upsertBy() to update or append the rows
-    // Key: source + char + type_id + contract_id (which is the date)
+    // Use ML.upsertBy to handle the de-duplication and writing
     const keys = ['source', 'char', 'type_id', 'contract_id'];
     const count = ML.upsertBy(keys, outRows);
 
@@ -1089,7 +1283,7 @@ function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
       processed: allTids.size,
       date: dateStr,
     });
-
+    
     return count;
   });
 }
@@ -1113,7 +1307,7 @@ function Ledger_Import_Journal(opts) {
   opts = opts || {};
   var SHEET_NAME = opts.sheet || 'Material_Ledger';
   var SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
-  var SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase();
+  var SOURCE     = String(opts.sourceName || 'JOURNAL').toUpperCase();
 
   if (typeof ML === 'undefined' || typeof ML.upsertBy !== 'function') {
     throw new Error("ML API not found. Ensure MaterialLedger.gs.js is included and the ML object is global.");
@@ -1121,15 +1315,15 @@ function Ledger_Import_Journal(opts) {
 
   // NOTE: Assuming GESI_GetMarketTransactionsForAllChars or GESI_GetWalletJournalForAllChars is available
   var GESI_GET_TXN_FUNC = (typeof GESI_GetMarketTransactionsForAllChars === 'function')
-    ? GESI_GetMarketTransactionsForAllChars
-    : (typeof GESI_GetWalletJournalForAllChars === 'function' ? GESI_GetWalletJournalForAllChars : null);
-
+    ? GESI_GET_MarketTransactionsForAllChars
+    : (typeof GESI_GetWalletJournalForAllChars === 'function' ? GESI_GET_WalletJournalForAllChars : null);
+  
   if (!GESI_GET_TXN_FUNC) {
     throw new Error("Required GESI transaction helper (GetMarketTransactionsForAllChars or GetWalletJournalForAllChars) not found.");
   }
 
   // 1) Fetch/normalize entries OUTSIDE the lock (slow stuff)
-  var nowMs = Date.now();
+  var nowMs  = Date.now();
   var cutoff = new Date(nowMs - SINCE_DAYS * 86400000);
 
   var rawEntries = GESI_GET_TXN_FUNC({ since: cutoff }) || [];
@@ -1139,20 +1333,20 @@ function Ledger_Import_Journal(opts) {
   for (var i = 0; i < rawEntries.length; i++) {
     var e = rawEntries[i] || {};
     var dt = e.date || e.timestamp || e.time;
-    var d = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
+    var d  = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
     if (!(d instanceof Date) || isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue; // Apply date filter here
 
     var isBuy = (e.is_buy === true) || /buy/i.test(String(e.ref_type || ''));
     if (!isBuy) continue;
 
     var typeId = Number(e.type_id || e.typeID || 0);
-    var qty = Number(e.quantity || e.qty || 0);
-    var price = Number(e.unit_price || e.price || e.amount_per_unit || 0);
+    var qty    = Number(e.quantity || e.qty || 0);
+    var price  = Number(e.unit_price || e.price || e.amount_per_unit || 0);
     if (!(typeId > 0 && qty > 0 && price > 0)) continue;
 
     var contractId = String(e.transaction_id || e.id || e.journal_ref_id || e.context_id);
-    var charName = e.char_name || e.char || e.character || '';
-
+    var charName   = e.char_name || e.char || e.character || '';
+    
     outRows.push({
       date: d,
       type_id: typeId,
@@ -1187,15 +1381,15 @@ function Ledger_Import_Journal(opts) {
 function Ledger_Import_CorpJournal(opts) {
   const log = LoggerEx.withTag('CORP_TXN');
   // ADDED: Start timer to profile execution time
-  const t = log.startTimer('Ledger_Import_CorpJournal_Setup');
-
+  const t = log.startTimer('Ledger_Import_CorpJournal_Setup'); 
+  
   opts = opts || {};
 
   if (typeof ML === 'undefined' || typeof ML.upsertBy !== 'function') {
     throw new Error("ML API not found. Ensure MaterialLedger.gs.js is included and the ML object is global.");
   }
 
-  const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions';
+  const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions'; 
 
   if (typeof GESI === 'undefined' || typeof GESI.invoke !== 'function') { // Check for GESI.invoke
     throw new Error("GESI Library/invoke not found. Ensure GESI is added as a library to your script.");
@@ -1216,16 +1410,16 @@ function Ledger_Import_CorpJournal(opts) {
   // --- ANCHORING SETUP ---
   // Read last known transaction ID from PropertiesService
   const props = PropertiesService.getScriptProperties();
-  const rawFromId = props.getProperty(CORP_JOURNAL_LAST_ID);
-
+  const rawFromId = props.getProperty(CORP_JOURNAL_LAST_ID); 
+  
   // FIX: Use parseInt (corrected spelling) to convert the saved ID (string) to an integer.
   // If rawFromId is null, parseInt returns NaN, so we convert NaN back to null.
   let currentFromId = rawFromId ? parseInt(rawFromId, 10) : null;
   if (isNaN(currentFromId)) {
-    currentFromId = null;
+      currentFromId = null;
   }
-  // NOTE: If currentFromId exists, we use it to start the fetch for the next page of transactions (older data).
-  // ESI uses the ID of the newest record you HAVE to get records older than it.
+  // NOTE: If the ID is used in the URL, it must be the string form. ESI typically handles 
+  // conversion of large numbers passed via the options object.
 
   t.stamp('Setup complete, starting API calls.'); // Profiling step 1
 
@@ -1233,40 +1427,63 @@ function Ledger_Import_CorpJournal(opts) {
   let fetchMore = true;
 
   log.log(`Fetching Corp Transactions for Division ${TARGET_DIVISION} (since ${SINCE_DAYS} days)...`);
-
+  
   do {
     try {
-
-      // The single-object parameter method, using null if the ID is not available (first page).
+      
+      // If we have an anchor, use it to start fetching OLDER data.
+      let from_id_arg = null;
+      // Capture the from_id *before* the fetch to check against later (infinite loop prevention)
+      const previousFromId = currentFromId; 
+      
+      if (currentFromId) {
+        from_id_arg = currentFromId; 
+        log.log(`...fetching transactions before ID: ${currentFromId}`);
+      } else {
+        log.log(`...fetching most recent page (no anchor set).`);
+      }
+      
+      // FIX: Use GESI.invokeRaw (User's preferred stable method)
       const rawEntries = GESI.invokeRaw(
-        GESI_FUNC_NAME,
+        GESI_FUNC_NAME, 
         {
           division: TARGET_DIVISION, // Bundled required path parameter
-          from_id: currentFromId, // Bundled optional query parameter
+          from_id: from_id_arg, // Bundled optional query parameter (Number or null)
           name: authToon, // Bundled optional auth name
-          show_column_headings: false, // No Headers needed with invokeRaw
-          version: null // let GESI handle it
+          show_column_headings: false, // Use raw output for object parsing
+          version: null // Let GESI handle it
         }
-      );
+      ); 
 
-      if (!rawEntries || rawEntries.length === 0) {
+      if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
         fetchMore = false;
         break;
       }
-
+      
       allCorpTransactions.push(...rawEntries);
 
       // Check the date of the oldest entry in the current page. If it's older than 
       // our cutoff, stop fetching.
       const oldestEntry = rawEntries[rawEntries.length - 1];
       const oldestDate = new Date(oldestEntry.date);
+      const oldestEntryId = oldestEntry.transaction_id;
 
       // FIX: Add validation check for Invalid Date before comparing getTime()
       if (isNaN(oldestDate.getTime())) {
-        log.error("Invalid Date found in ESI response. Stopping pagination.", { entry: oldestEntry });
-        fetchMore = false;
-        break;
+          log.error("Invalid Date found in ESI response. Stopping pagination.", { entry: oldestEntry });
+          fetchMore = false;
+          break;
       }
+      
+      // FIX: INFINITE LOOP PREVENTION 
+      // If the oldest entry ID found is the same as the ID we just requested (meaning we hit the end 
+      // of the data and the server sent us the same last page again), we stop.
+      if (previousFromId && previousFromId === oldestEntryId) {
+           log.log(`Pagination exhausted: Oldest ID ${oldestEntryId} repeated. Stopping loop.`);
+           fetchMore = false;
+           break;
+      }
+
 
       if (oldestDate.getTime() < cutoff.getTime()) {
         log.log(`Oldest entry date (${oldestDate}) is past cutoff. Stopping pagination.`);
@@ -1274,29 +1491,34 @@ function Ledger_Import_CorpJournal(opts) {
       } else {
         // Set the transaction_id of the oldest entry in the current page 
         // as the starting point for the next, older page.
-        currentFromId = oldestEntry.transaction_id;
+        currentFromId = oldestEntryId;
       }
-
+      
       // Small sleep to be polite to the ESI server
-      Utilities.sleep(100);
+      Utilities.sleep(100); 
 
     } catch (e) {
       log.error(`Error fetching Division ${TARGET_DIVISION} at from_id ${currentFromId}.`, e);
       fetchMore = false; // Stop the loop on error
       // Re-throw the error after logging so the Apps Script runtime fails visibly
-      throw e;
+      throw e; 
     }
   } while (fetchMore);
+  
+  
+
+  props.deleteProperty(CORP_JOURNAL_RESUME_PROP);
+
 
   const buyRows = [];
   const sellRows = [];
-
+  
   for (const e of allCorpTransactions) {
     if (!e || typeof e !== 'object') continue;
 
     const d = new Date(e.date);
     // FINAL FILTER: Only process transactions newer than the cutoff.
-    if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
+    if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue; 
 
     const typeId = Number(e.type_id || 0);
     const qty = Number(e.quantity || 0);
@@ -1325,11 +1547,11 @@ function Ledger_Import_CorpJournal(opts) {
       buyRows.push(row);
     } else {
       // Sell: Negative quantity (item outflow), needs sign reversal
-      row.qty = -Math.abs(row.qty);
+      row.qty = -Math.abs(row.qty); 
       sellRows.push(row);
     }
   }
-
+  
   t.stamp('Data normalization complete, starting write.'); // Profiling step 2
 
   // --- BEGIN TRANSACTION ---
@@ -1337,7 +1559,7 @@ function Ledger_Import_CorpJournal(opts) {
     const keys = ['source', 'contract_id'];
     let buyCount = 0;
     let sellCount = 0;
-
+    
     // 1. Process Buy Side (Inflow to Material_Ledger)
     if (buyRows.length > 0) {
       ML.setSheet(opts.sheet || LEDGER_BUY_SHEET);
@@ -1352,9 +1574,9 @@ function Ledger_Import_CorpJournal(opts) {
       log.log(`Sell side processed for ${ML.sheetName()}`, { appended_or_updated: sellCount, processed: sellRows.length });
     }
 
-    return {
-      appended_or_updated_buy: buyCount,
-      appended_or_updated_sell: sellCount,
+    return { 
+      appended_or_updated_buy: buyCount, 
+      appended_or_updated_sell: sellCount, 
       processed: allCorpTransactions.length,
       sheets: { buy: opts.sheet || LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
       locked: true
@@ -1365,73 +1587,15 @@ function Ledger_Import_CorpJournal(opts) {
   // --- ANCHORING WRITE LOGIC (Outside Lock) ---
   // Only save the newest ID if we actually fetched new data (and the array isn't empty)
   if (allCorpTransactions.length > 0) {
-    // The newest transaction is the first element in the array (ESI returns newest first)
-    const newestTransactionId = allCorpTransactions[0].transaction_id;
-
-    // Save the newest ID to act as the starting anchor (from_id) for the NEXT run.
-
-    props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
-    log.log(`Saved new transaction anchor: ${newestTransactionId}`);
-  }
+        // The newest transaction is the first element in the array (ESI returns newest first)
+        const newestTransactionId = allCorpTransactions[0].transaction_id;
+        
+        // Save the newest ID to act as the starting anchor (from_id) for the NEXT run.
+        const props = PropertiesService.getScriptProperties();
+        props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
+        log.log(`Saved new transaction anchor: ${newestTransactionId}`);
+    }
 
 
   return result;
 }
-
-/**
- * Replaces the content of a sheet (from row 2 down) with new rows.
- * Includes locking to prevent concurrent write issues.
- * Assumes the sheet is already created and headers are set.
- */
-function _rewriteData_(sh, header, rows) {
-  // We use DocumentLock here since this is writing raw, shared data.
-  var lock = LockService.getDocumentLock();
-  lock.waitLock(5000);
-  try {
-    var needed = (rows.length || 0) + 1;
-    var lastHad = sh.getMaxRows();
-    
-    // 1. Ensure sheet has enough rows (insert if necessary)
-    if (lastHad < needed) sh.insertRowsAfter(lastHad, needed - lastHad);
-    
-    // 2. Write new data (starting at row 2)
-    if (rows.length) {
-      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    }
-    
-    // 3. Clear old excess data
-    var lastNow = rows.length + 1;
-    var extra = Math.max(0, lastHad - lastNow);
-    if (extra > 0) {
-      sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
-    }
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-/**
- * Build a map: type_id → typeName from a Named Range.
- * Expects columns: [typeID, groupID, typeName, volume].
- * Skips header/blank lines automatically.
- */
-function _typeNameMapFromSDE_(rangeName) {
-  rangeName = rangeName || 'sde_typeid_name';
-  const ss = SpreadsheetApp.getActive();
-  const rng = ss.getRangeByName(rangeName);
-  if (!rng) throw new Error('Named range not found: ' + rangeName);
-
-  const vals = rng.getValues();        // 2D array
-  const map = new Map();
-  for (let i = 0; i < vals.length; i++) {
-    const row = vals[i];
-    // Column 0: typeID, Column 2: typeName
-    const rawId = row[0];
-    const name = String(row[2] || '').trim();
-    // Parse typeID robustly (handles scientific notation)
-    const tid = Number(String(rawId).replace(/[^\d+Ee\.-]/g, ''));
-    if (Number.isFinite(tid) && name) map.set(Math.floor(tid), name);
-  }
-  return map;
-}
-

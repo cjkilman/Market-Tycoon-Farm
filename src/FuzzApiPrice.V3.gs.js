@@ -22,13 +22,13 @@ function _L_warn(tag, obj) {
   try {
     if (typeof LoggerEx !== 'undefined' && LoggerEx.warn) LoggerEx.warn(tag, obj);
     else console.warn(tag, obj);
-  } catch (_) {}
+  } catch (_) { }
 }
 function _L_info(tag, obj) {
   try {
     if (typeof LoggerEx !== 'undefined' && LoggerEx.log) LoggerEx.log(tag, obj);
     else console.log(tag, obj);
-  } catch (_) {}
+  } catch (_) { }
 }
 
 /** Run fn with simple backoff on common transient errors. */
@@ -54,22 +54,22 @@ function withScriptLock(fn, ms = 30000) {
 /** Normalize order_type/order_level. Defaults: sell/min. */
 function _normalizeOrder(order_type, order_level) {
   // FIX: Ensure type is null if not provided, preventing String(null).toLowerCase() crash.
-  let type  = (order_type != null) ? String(order_type).toLowerCase() : null;
+  let type = (order_type != null) ? String(order_type).toLowerCase() : null;
   let level = (order_level != null) ? String(order_level).toLowerCase() : null;
 
   if (type === "bid") type = "buy";
   if (type === "ask") type = "sell";
   // FIX: Allowing more aliases and including Fuzzworks camelCase fields
-  const levelAliases = { 
-    mean: "avg", 
-    average: "avg", 
-    med: "median", 
-    vol: "volume", 
-    qty: "volume", 
+  const levelAliases = {
+    mean: "avg",
+    average: "avg",
+    med: "median",
+    vol: "volume",
+    qty: "volume",
     quantity: "volume",
     // Fuzzworks specific fields (user inputs might be lowercase, but we map to camelCase output)
     weightedavg: "weightedAverage",
-    weightedavge: "weightedAverage", 
+    weightedavge: "weightedAverage",
     stddev: "stddev",
     ordercount: "orderCount",
     percentile: "percentile"
@@ -78,20 +78,20 @@ function _normalizeOrder(order_type, order_level) {
     level = levelAliases[level];
   } else if (level) {
     // If the input is not a common alias, pass it through as is (e.g., 'max', 'min', or a custom Fuzzworks field)
-    level = order_level; 
+    level = order_level;
   }
 
 
   // Final determination of type/level if they are still null
-  const validTypes  = ["buy","sell"];
+  const validTypes = ["buy", "sell"];
 
-  if (!type && !level)        { type = "sell"; level = "min"; } // Default case
-  else if (!type && level)    { type = (level === "max") ? "buy" : "sell"; } // Infer type from level
-  else if (type && !level)    { level = (type === "buy") ? "max" : "min"; } // Infer level from type
-  
+  if (!type && !level) { type = "sell"; level = "min"; } // Default case
+  else if (!type && level) { type = (level === "max") ? "buy" : "sell"; } // Infer type from level
+  else if (type && !level) { level = (type === "buy") ? "max" : "min"; } // Infer level from type
+
   // FIX: Only validate 'type' if it exists (i.e., if it wasn't null initially or was determined above)
-  if (type && !validTypes.includes(type))  throw new Error("order_type must be 'buy' or 'sell'");
-  
+  if (type && !validTypes.includes(type)) throw new Error("order_type must be 'buy' or 'sell'");
+
   return { type, level };
 }
 
@@ -108,7 +108,7 @@ function _processInputIds(input) {
 
   const rows = input.length;
   const cols = input[0] ? input[0].length : 0;
-  
+
   const uniqueIds = new Set();
   const flatIds = [];
 
@@ -117,14 +117,14 @@ function _processInputIds(input) {
       const val = (input[r] && input[r][c] !== undefined) ? input[r][c] : '';
       const n = Number(val);
       const id = Number.isFinite(n) ? n : null;
-      
+
       flatIds.push(id);
       if (id !== null) {
         uniqueIds.add(id);
       }
     }
   }
-  
+
   return {
     rows,
     cols,
@@ -146,8 +146,7 @@ function _reshape(flat, rows, cols) {
 const FUZ_CACHE_VER = 'v2';
 const MISSING_QUEUE_KEY = 'FUZ:MISSING_QUEUE';
 
-const MANUAL_REFRESH_MODE = false; 
-const FETCH_NOTICE = "Fetching...";
+const MANUAL_REFRESH_MODE = false;
 
 function cacheScope() { return CacheService.getScriptCache(); } // swap to getScriptCache() to share across bound scripts
 
@@ -156,7 +155,7 @@ function _fuzKey(location_type, location_id, type_id) {
 }
 function ttlForScope(lt) {
   // FIX: Align TTL with Fuzzworks refresh rate (30 minutes = 1800 seconds)
-  return 30 * 60; 
+  return 30 * 60;
 }
 
 /* ------------------------------ Core fetcher (Now only for background use) ------------------------------ */
@@ -170,19 +169,19 @@ function ttlForScope(lt) {
  */
 function _performFetchAndCache(type_ids, location_id, location_type = "station") {
   if (!type_ids || !type_ids.length) return {};
-  
+
   const ids = type_ids.map(Number).filter(Number.isFinite);
   if (!ids.length) return {};
 
   const uniq = Array.from(new Set(ids));
   const lt = String(location_type).toLowerCase();
-  
+
   const cache = cacheScope();
   let ttlSec = ttlForScope(lt);
 
   // FIX: Apply cache jitter (+/- 5 minutes) to avoid massive simultaneous cache expiration
   // Max jitter window is 600 seconds (10 minutes total).
-  const JITTER_SECONDS = 300; 
+  const JITTER_SECONDS = 300;
   const randomOffset = Math.floor(Math.random() * (JITTER_SECONDS * 2 + 1)) - JITTER_SECONDS;
   ttlSec = Math.max(600, ttlSec + randomOffset); // Ensure TTL is at least 10 minutes (600s)
 
@@ -219,7 +218,7 @@ function _performFetchAndCache(type_ids, location_id, location_type = "station")
   if (Object.keys(fetched).length) {
     const toPut = {};
     const allFetchedIds = Object.keys(fetched).map(Number);
-    
+
     allFetchedIds.forEach(id => {
       const row = fetched[id];
       const s = JSON.stringify(row);
@@ -232,7 +231,7 @@ function _performFetchAndCache(type_ids, location_id, location_type = "station")
     if (Object.keys(toPut).length) {
       const entries = Object.entries(toPut);
       const CHUNK = 80;
-      
+
       // Chunk writes (putAll is limited to 1000 items, and max 100kb total)
       for (let i = 0; i < entries.length; i += CHUNK) {
         cache.putAll(Object.fromEntries(entries.slice(i, i + CHUNK)), ttlSec);
@@ -243,40 +242,46 @@ function _performFetchAndCache(type_ids, location_id, location_type = "station")
 
 /**
  * Helper to delete all existing triggers pointing to fuzzworkCacheRefresh.
+ * NOTE: This is now unused as we rely on manual installation.
  */
 function _deleteExistingTriggers() {
-    const triggers = ScriptApp.getProjectTriggers();
-    triggers.forEach(trigger => {
-        if (trigger.getHandlerFunction() === "fuzzworkCacheRefresh") {
-            ScriptApp.deleteTrigger(trigger);
-        }
-    });
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => {
+    if (trigger.getHandlerFunction() === "fuzzworkCacheRefresh") {
+      ScriptApp.deleteTrigger(trigger);
+      return;
+    }
+  });
 }
 
 
 /** ----------------- ASYNCHRONOUS REFRESH FUNCTIONS ----------------------- */
 
+function processQueue() {
+  //Global Trigger to run
+  fuzzworkCacheRefresh();
+}
+
 /**
  * Public function to queue or run the cache refresh task.
- * Designed to be called by a trigger or external script runner.
+ * DESIGNED TO BE RUN BY A USER-INSTALLED TIME-DRIVEN TRIGGER.
  * @customfunction
  */
 function fuzzworkCacheRefresh() {
   // Use a ScriptLock to ensure only one instance of the refresh task runs at a time
-  return withScriptLock(function() {
-    
-    // FIX: Delete existing triggers pointing to this function before running.
-    // This prevents hitting the quota and ensures a clean start.
-    _deleteExistingTriggers();
-    
+  return withScriptLock(function () {
+
+    // NOTE: Triggers are now managed externally. We do NOT delete triggers here.
+
     const scriptCache = cacheScope();
     const queueJson = scriptCache.get(MISSING_QUEUE_KEY);
-    
+
     if (!queueJson) {
       _L_info('fuz.refresh', { status: 'Queue empty.' });
+      _deleteExistingTriggers();
       return 0;
     }
-    
+
     const queue = JSON.parse(queueJson);
     const itemsProcessed = queue.length;
 
@@ -285,10 +290,14 @@ function fuzzworkCacheRefresh() {
       return 0;
     }
 
-    // To prevent the script from hitting execution limits while fetching data,
-    // we process one task from the queue and then set a timed trigger to run the rest.
+    // Process all tasks in one execution slot (since the trigger is now time-driven)
+    // NOTE: This assumes the total fetch time for all items won't exceed 6 minutes.
+    // If it exceeds the limit, the script will crash and the trigger will run again
+    // on its next scheduled interval.
+
+    // We process only one task per trigger, and rely on the external trigger to restart.
     const task = queue.shift();
-    
+
     try {
       _L_info('fuz.refresh', { status: `Processing ${task.ids.length} items for ${task.location_id}` });
       _performFetchAndCache(task.ids, task.location_id, task.location_type);
@@ -296,26 +305,20 @@ function fuzzworkCacheRefresh() {
       _L_warn('fuz.refresh.fail', { error: e.message, task });
       queue.push(task); // Re-queue task on failure
     }
-    
+
     // Save remaining queue state
     scriptCache.put(MISSING_QUEUE_KEY, JSON.stringify(queue), 3600);
-    
+
     // Clean up if finished
     if (queue.length === 0) {
       scriptCache.remove(MISSING_QUEUE_KEY);
-    } else {
-      // CONDITIONAL TRIGGER: Only create the trigger if MANUAL_REFRESH_MODE is false
-      if (!MANUAL_REFRESH_MODE) {
-        // Set a trigger to run the next task immediately
-        ScriptApp.newTrigger("fuzzworkCacheRefresh")
-          .timeBased()
-          .at(new Date(Date.now() + 1000 * 5)) // Run in 5 seconds
-          .create();
-      } else {
-        _L_info('fuz.refresh', { status: 'Manual Mode Active: Refresh trigger creation skipped.' });
-      }
     }
-    
+    ScriptApp.newTrigger("fuzzworkCacheRefresh")
+      .timeBased()
+      .after(5)
+      .create();
+    // NOTE: No internal trigger creation, rely on the external user-installed trigger.
+
     return itemsProcessed;
   });
 }
@@ -329,27 +332,27 @@ function fuzzworkCacheRefresh() {
  */
 function _queueMissingItems(missing_ids, location_id, location_type) {
   if (!missing_ids || missing_ids.length === 0) return;
-  
+
   const scriptCache = cacheScope();
-  
+
   // Use ScriptLock to prevent two simultaneous custom function calls from corrupting the queue state
-  return withScriptLock(function() {
+  return withScriptLock(function () {
     const queueJson = scriptCache.get(MISSING_QUEUE_KEY);
     let queue = queueJson ? JSON.parse(queueJson) : [];
-    
+
     const uniqueMissingIds = Array.from(new Set(missing_ids)).filter(Number.isFinite);
     const lt = String(location_type).toLowerCase();
-    
+
     // 1. Check if a task for this location already exists in the queue
-    let existingTask = queue.find(task => 
+    let existingTask = queue.find(task =>
       task.location_id === location_id && task.location_type === lt
     );
-    
+
     if (existingTask) {
       // 2. Consolidate: Merge new missing IDs into the existing task's list
       const existingIds = new Set(existingTask.ids);
       let newIdsAdded = 0;
-      
+
       uniqueMissingIds.forEach(id => {
         if (!existingIds.has(id)) {
           existingTask.ids.push(id);
@@ -362,7 +365,7 @@ function _queueMissingItems(missing_ids, location_id, location_type) {
       } else {
         return; // No new items to fetch for this location
       }
-      
+
     } else {
       // 3. Create a new task
       queue.push({
@@ -372,27 +375,11 @@ function _queueMissingItems(missing_ids, location_id, location_type) {
       });
       _L_info('fuz.queue', { status: `Created new task for ${lt}:${location_id} with ${uniqueMissingIds.length} IDs` });
     }
-    
+
     // 4. Save updated queue state
     scriptCache.put(MISSING_QUEUE_KEY, JSON.stringify(queue), 3600);
-    
-    // 5. Ensure a refresh trigger is active if needed (only if in non-manual mode)
-    if (!MANUAL_REFRESH_MODE) {
-        // If the queue was empty before, we need to kick off the first trigger.
-        // We delete all triggers at the start of fuzzworkCacheRefresh, so no need to check here.
-        
-        // This check ensures we don't spam the Script Manager if the queue is already running
-        // (though the lock handles the actual concurrency). We check for active triggers 
-        // pointing to this function.
-        if (ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === "fuzzworkCacheRefresh").length === 0) {
-            ScriptApp.newTrigger("fuzzworkCacheRefresh")
-                .timeBased()
-                .at(new Date(Date.now() + 1000 * 5))
-                .create();
-        }
-    } else {
-         _L_info('fuz.queue', { status: 'Manual Mode Active: Refresh trigger creation skipped.' });
-    }
+
+    // 5. NOTE: No automatic trigger creation. The external trigger manages the schedule.
   });
 }
 
@@ -427,9 +414,9 @@ function _getCachedFuz(type_ids, location_id, location_type) {
  */
 function testfuzAPI() {
   const ids = [
-    16239,16243,24030,32881,17366,16273,
-    34206,34202,34203,34205,34204,34201,
-    19761,42695,42830
+    16239, 16243, 24030, 32881, 17366, 16273,
+    34206, 34202, 34203, 34205, 34204, 34201,
+    19761, 42695, 42830
   ];
   return fuzzApiPriceDataJitaSell(ids); // returns 2D aligned to input
 }
@@ -447,14 +434,14 @@ function testFuzzworksPerformance() {
 
   const results = [];
   results.push(["Test Stage", "Status", "Time (ms)", "Cache Status"]);
-  
+
   // --- TEST 1: Cache Miss Run (Queues fetch) ---
   const start1 = Date.now();
   const { flatIds: ids1, validIds: uniq1 } = _processInputIds(TEST_IDS);
   const { have: have1, missing: missing1 } = _getCachedFuz(uniq1, TEST_LOCATION, "station");
-  
+
   if (missing1.length) {
-      _queueMissingItems(missing1, TEST_LOCATION, "station");
+    _queueMissingItems(missing1, TEST_LOCATION, "station");
   }
   const status1 = missing1.length === 0 ? "CACHE HIT" : "FETCH DELEGATED";
   results.push([
@@ -474,14 +461,14 @@ function testFuzzworksPerformance() {
       Date.now() - start2,
       `Items Processed: ${itemsProcessed}`
     ]);
-    
+
     // Wait for the cache write (putAll is async but very fast)
-    Utilities.sleep(1000); 
+    Utilities.sleep(1000);
 
   } catch (e) {
     results.push(["Background Fetch Execution", "ERROR", Date.now() - start2, e.message]);
   }
-  
+
   // --- TEST 3: Cache Hit Run (Verifies data availability) ---
   const start3 = Date.now();
   const { have: have3, missing: missing3 } = _getCachedFuz(uniq1, TEST_LOCATION, "station");
@@ -492,7 +479,7 @@ function testFuzzworksPerformance() {
     Date.now() - start3,
     `${missing3.length} Missing / ${Object.keys(have3).length} Found`
   ]);
-  
+
   return results;
 }
 
@@ -519,10 +506,10 @@ function fuzzApiPriceDataJitaSell(type_ids, market_hub = 60003760, order_type = 
 
   // NOTE: This call is now non-blocking (uses _getCachedFuz only)
   const { have, missing } = _getCachedFuz(validIds, Number(market_hub), lt);
-  
+
   // Trigger background fetch for missing items
   if (missing.length) {
-      _queueMissingItems(missing, Number(market_hub), lt);
+    _queueMissingItems(missing, Number(market_hub), lt);
   }
 
   const pick = (row) => {
@@ -533,14 +520,14 @@ function fuzzApiPriceDataJitaSell(type_ids, market_hub = 60003760, order_type = 
   };
 
   const outFlat = flatIds.map(id => {
-      // Return cached value, or a placeholder if missing
-      const data = have[id];
-      if (id == null) return "";
-      if (!data) return "FETCHING..."; // Placeholder
-      
-      return (pick(data) ?? "");
+    // Return cached value, or a placeholder if missing
+    const data = have[id];
+    if (id == null) return "";
+    if (!data) return "FETCHING..."; // Placeholder
+
+    return (pick(data) ?? "");
   });
-  
+
   return _reshape(outFlat, rows, cols);
 }
 
@@ -554,12 +541,12 @@ function fuzzPriceDataByHub(type_ids, market_hub = "Jita", order_type = "sell", 
 
   let hub = String(market_hub || '').toLowerCase();
   switch (hub) {
-    case 'amarr':   hub = 60008494; break;
+    case 'amarr': hub = 60008494; break;
     case 'dodixie': hub = 60011866; break;
-    case 'rens':    hub = 60004588; break;
-    case 'hek':     hub = 60005686; break;
+    case 'rens': hub = 60004588; break;
+    case 'hek': hub = 60005686; break;
     case 'jita':
-    default:        hub = 60003760;
+    default: hub = 60003760;
   }
   // All Hub lookups are explicitly station lookups, so we pass "station"
   return fuzzApiPriceDataJitaSell(type_ids, hub, order_type, order_level, "station");
@@ -584,7 +571,7 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
 
   // location guard
   const lt = String(location_type || "").toLowerCase();
-  if (!["region","system","station"].includes(lt)) {
+  if (!["region", "system", "station"].includes(lt)) {
     throw new Error("Location Undefined (use 'region', 'system', or 'station')");
   }
 
@@ -598,7 +585,7 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
 
   // 2) Trigger background fetch for missing items
   if (missing.length) {
-      _queueMissingItems(missing, Number(location_id), lt);
+    _queueMissingItems(missing, Number(location_id), lt);
   }
 
   // 3) picker strictly for Fuzzworks fields
@@ -612,14 +599,15 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
 
   // 4) map back to original shape
   const outFlat = flatIds.map(id => {
-      // Return cached value, or a placeholder if missing
-      const data = have[id];
-      if (id == null) return "";
-      if (!data) return FETCH_NOTICE; 
-      
-      return (pick(data) ?? "");
+    // Return cached value, or a placeholder if missing
+    const data = have[id];
+    if (id == null) return "";
+    // FIX: Return blank string instead of "FETCHING..."
+    if (!data) return "Fetching...";
+
+    return (pick(data) ?? "");
   });
-  
+
   return _reshape(outFlat, rows, cols);
 }
 
@@ -635,64 +623,64 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
  * @returns {Array<Array<any>>} A 2D array aligned to the input, but with twice the columns. Outputs Buy Price and Sell Price columns.
  */
 function marketStatDataBoth(type_ids, location_type, location_id, order_level_sell = "min", order_level_buy = "max") {
-    if (!type_ids) throw new Error("type_ids is required");
+  if (!type_ids) throw new Error("type_ids is required");
 
-    const { rows, cols, flatIds, validIds } = _processInputIds(type_ids);
+  const { rows, cols, flatIds, validIds } = _processInputIds(type_ids);
 
-    // Location validation
-    const lt = String(location_type || "").toLowerCase();
-    if (!["region","system","station"].includes(lt)) {
-        throw new Error("Location Undefined (use 'region', 'system', or 'station')");
+  // Location validation
+  const lt = String(location_type || "").toLowerCase();
+  if (!["region", "system", "station"].includes(lt)) {
+    throw new Error("Location Undefined (use 'region', 'system', or 'station')");
+  }
+
+  // 1) Cache-first read (non-blocking)
+  const { have, missing } = _getCachedFuz(validIds, Number(location_id), lt);
+
+  // 2) Trigger background fetch for missing items
+  if (missing.length) {
+    _queueMissingItems(missing, Number(location_id), lt);
+  }
+
+  // 3) Picker function to extract both Buy and Sell metrics
+  function pickBoth(row) {
+    if (!row || !row.buy || !row.sell) {
+      return [null, null];
     }
 
-    // 1) Cache-first read (non-blocking)
-    const { have, missing } = _getCachedFuz(validIds, Number(location_id), lt);
+    // Normalize requested levels (using _normalizeOrder's level mapping)
+    const buyLevel = _normalizeOrder("buy", order_level_buy).level;
+    const sellLevel = _normalizeOrder("sell", order_level_sell).level;
 
-    // 2) Trigger background fetch for missing items
-    if (missing.length) {
-        _queueMissingItems(missing, Number(location_id), lt);
-    }
-    
-    // 3) Picker function to extract both Buy and Sell metrics
-    function pickBoth(row) {
-        if (!row || !row.buy || !row.sell) {
-            return [null, null];
-        }
-        
-        // Normalize requested levels (using _normalizeOrder's level mapping)
-        const buyLevel = _normalizeOrder("buy", order_level_buy).level;
-        const sellLevel = _normalizeOrder("sell", order_level_sell).level;
+    // Extract Buy value
+    const buyValue = row.buy[buyLevel];
+    const buyNum = Number(buyValue);
+    const finalBuy = Number.isFinite(buyNum) ? buyNum : null;
 
-        // Extract Buy value
-        const buyValue = row.buy[buyLevel];
-        const buyNum = Number(buyValue);
-        const finalBuy = Number.isFinite(buyNum) ? buyNum : null;
+    // Extract Sell value
+    const sellValue = row.sell[sellLevel];
+    const sellNum = Number(sellValue);
+    const finalSell = Number.isFinite(sellNum) ? sellNum : null;
 
-        // Extract Sell value
-        const sellValue = row.sell[sellLevel];
-        const sellNum = Number(sellValue);
-        const finalSell = Number.isFinite(sellNum) ? sellNum : null;
+    // FIX: Return [Sell Price, Buy Price] to match standard sheet header order.
+    return [finalSell, finalBuy];
+  }
 
-        // FIX: Return [Sell Price, Buy Price] to match standard sheet header order.
-        return [finalSell, finalBuy];
-    }
+  // 4) Map back to original shape (outputting two columns per input)
+  const outFlat = flatIds.flatMap(id => {
+    const data = have[id];
 
-    // 4) Map back to original shape (outputting two columns per input)
-    const outFlat = flatIds.flatMap(id => {
-        const data = have[id];
-        
-        if (id == null) return ["", ""];
-        
-        if (!data) return [FETCH_NOTICE, FETCH_NOTICE]; 
+    if (id == null) return ["", ""];
 
-        const [sellVal, buyVal] = pickBoth(data);
-        
-        return [
-            sellVal ?? "", // Column 1: Sell Price
-            buyVal ?? ""  // Column 2: Buy Price
-        ];
-    });
-    
-    // Reshape needs to handle the fact that we doubled the column count (cols * 2)
-    return _reshape(outFlat, rows, cols * 2); 
+    if (!data) return ["Fetching...", "Fetching..."];
+
+    const [sellVal, buyVal] = pickBoth(data);
+
+    return [
+      sellVal ?? "", // Column 1: Sell Price
+      buyVal ?? ""  // Column 2: Buy Price
+    ];
+  });
+
+  // Reshape needs to handle the fact that we doubled the column count (cols * 2)
+  return _reshape(outFlat, rows, cols * 2);
 }
