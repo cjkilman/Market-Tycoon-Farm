@@ -28,42 +28,17 @@ function _L_info(tag, obj) {
 
 
 /**
- * Public function designed to be attached to a User-Installed Time-Driven Trigger.
- * * This function orchestrates the sequential flow: 
- * 1. Executes the Fuzzworks background queue (which fetches prices).
- * 2. Bumps a cell value to force the spreadsheet to recalculate (which pulls new prices from cache).
- * * @customfunction
+ * Public function for the time-driven trigger.
+ * This version processes the data queue and then nudges the sheet to recalculate
+ * without waiting for it to finish, avoiding long execution times.
+ * @customfunction
  */
 function Full_Recalculate_Cycle() {
   const log = LoggerEx.withTag('FULL_RECALC');
   log.info('Starting full recalculation cycle...');
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const range = ss.getRangeByName(RECALC_CELL_SPEC);
-
-  if (!range) {
-    log.error(`Recalculation cell target not found: ${RECALC_CELL_SPEC}`);
-    return;
-  }
-
-
-
-  // --- Step 2: Force Sheet Recalculation ---
-  // Change the value of the designated cell (Utility!A1) to force all formulas 
-  // referencing it (like marketStatDataBoth) to re-execute and read the new cache.
-  try {
-    const currentValue = Number(range.getValue() || 0);
-    const newValue = (currentValue % 1000) + 1; // Bump value (e.g., 1 -> 2, 999 -> 1)
-    
-    range.setValue(newValue);
-    log.info(`Recalculation trigger cell (${RECALC_CELL_SPEC}) value updated to: ${newValue}`);
-  } catch (e) {
-    log.error('Failed to bump sheet recalculation trigger cell.', e.message);
-  }
-
-    // --- Step 1: Run Fuzzworks Queue ---
-  // The cache miss happens when the sheet recalculates due to volatility. 
-  // Running the cache refresh now ensures any queued prices are fetched.
+  // --- Step 1: Run Fuzzworks Queue FIRST ---
+  // This pre-fills the cache with any pending data.
   try {
     fuzzworkCacheRefresh();
     log.info('Fuzzworks queue processed.');
@@ -71,18 +46,28 @@ function Full_Recalculate_Cycle() {
     log.warn('Fuzzworks refresh failed (likely queue empty or network issue).', e.message);
   }
 
-  // --- Step 3: Integrate Other Jobs (Optional, Example) ---
-  // You can uncomment and integrate other scheduled jobs here.
-  /*
+  // --- Step 2: Trigger Asynchronous Sheet Recalculation ---
+  // We change the cell value, but critically, we DO NOT call SpreadsheetApp.flush().
+  // This allows the script to finish immediately while the sheet recalculates
+  // in the background on its own schedule.
   try {
-    Ledger_Import_CorpJournal({ division: 3, sinceDays: 30 });
-    log.info('GESI Ledger import completed.');
-  } catch (e) {
-    log.error('GESI Ledger import failed.', e.message);
-  }
-  */
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const range = ss.getRangeByName(RECALC_CELL_SPEC); // 'Utility!E3'
 
-  log.info('Full recalculate cycle finished.');
+    if (range) {
+      const currentValue = Number(range.getValue() || 0);
+      const newValue = new Date().getTime(); // Use a timestamp for a guaranteed change
+      
+      range.setValue(newValue);
+      log.info(`Recalculation trigger sent to sheet (${RECALC_CELL_SPEC}) with value: ${newValue}`);
+    } else {
+      log.error(`Recalculation cell target not found: ${RECALC_CELL_SPEC}`);
+    }
+  } catch (e) {
+    log.error('Failed to set sheet recalculation trigger cell.', e.message);
+  }
+
+  log.info('Full recalculate cycle finished. Script will now exit.');
 }
 
 

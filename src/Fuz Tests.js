@@ -28,6 +28,57 @@ function fuzDebugCacheStatus(ids, lt, lid){
   return out;
 }
 
+/**
+ * CORRECTED: Verifies cache states for Amarr and a Penirgman station.
+ * This version is compatible with the asynchronous V3 script.
+ * 1. Clears the cache for test items.
+ * 2. Queues the items using _queueMissingItems.
+ * 3. Manually runs fuzzworkCacheRefresh to process the queue.
+ * 4. Reports the final cache status.
+ */
+function verifyAmarrVsPenirgmanCache() {
+  const log = LoggerEx.withTag('VERIFY');
+  _dbgOn(); 
+
+  const itemIds = [
+    16297, 16519, 8105, 33440, 16527, 16303, 16515, 33441, 16523, 16513, 
+    33442, 16521, 16299, 16301, 11343, 11341, 11293, 12066, 5955, 35657,
+    12056, 6005, 35656, 9367, 9369, 9377, 10688, 10690, 10692
+  ];
+  
+  const amarrSystem = { id: 30002187, type: 'system', name: 'Amarr (System)' };
+  const penirgmanStation = { id: 60002179, type: 'station', name: 'Penirgman IX - Moon 11' };
+
+  log.info(`--- Starting Verification Test (V3 Compatible) ---`);
+
+  // --- 1. Test Amarr (Expected: Real Data) ---
+  log.info(`Testing ${amarrSystem.name}...`);
+  fuzDebugCacheClear(itemIds, amarrSystem.type, amarrSystem.id); // Clear cache
+  Utilities.sleep(1500); 
+  _queueMissingItems(itemIds, amarrSystem.id, amarrSystem.type); // Queue the work
+  fuzzworkCacheRefresh(); // Manually run the fetcher
+  Utilities.sleep(1500); // Allow cache to write
+  const amarrStatus = fuzDebugCacheStatus(itemIds, amarrSystem.type, amarrSystem.id);
+  log.info("--- Amarr Final Cache Status ---");
+  console.log(JSON.stringify(amarrStatus, null, 2));
+
+
+  // --- 2. Test Penirgman Station (Expected: Unlisted/Negative) ---
+  log.info(`Testing ${penirgmanStation.name}...`);
+  fuzDebugCacheClear(itemIds, penirgmanStation.type, penirgmanStation.id); // Clear cache
+  Utilities.sleep(1500);
+  _queueMissingItems(itemIds, penirgmanStation.id, penirgmanStation.type); // Queue the work
+  fuzzworkCacheRefresh(); // Manually run the fetcher
+  Utilities.sleep(1500);
+  const penirgmanStatus = fuzDebugCacheStatus(itemIds, penirgmanStation.type, penirgmanStation.id);
+  log.info("--- Penirgman Station Final Cache Status ---");
+  console.log(JSON.stringify(penirgmanStatus, null, 2));
+
+
+  log.info("--- Verification Complete ---");
+  _dbgOff();
+}
+
 /** Nuke cache for ids (surgical) */
 function fuzDebugCacheClear(ids, lt, lid){
   ids = Array.isArray(ids) ? ids.flat().map(Number).filter(Number.isFinite) : [Number(ids)];
