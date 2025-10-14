@@ -5,6 +5,7 @@ function onOpen() {
       .addItem('Refresh All Data','refreshData')
       .addItem('Update SDE Data', 'importSDE')
       .addItem('Authorize Script (First Run)', 'forceAuthorization')
+      .addItem( "Recalculate/Refresh", "Full_Recalculate_Cycle")
       .addToUi();
 }
 
@@ -66,6 +67,8 @@ function forceAuthorization() {
     // This function runs a service that requires authorization (UrlFetchApp)
     // and is accessible via the custom menu. Running it guarantees the prompt appears.
     try {
+     
+_deleteExistingTriggers();
         UrlFetchApp.fetch("https://google.com");
         SpreadsheetApp.getUi().alert('Authorization granted successfully!');
     } catch (e) {

@@ -130,17 +130,18 @@ function getCorpAuthChar() {
   
   var log = LoggerEx.withTag('GESI');
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  
+  log.info("Checking for Authized Corp Character");
   var desired = "";
 
   // Helper function optimized for speed by caching Named Range lookups
   function _resolve(sh, spec) {
     if (!spec) return "";
     spec = String(spec).trim();
-    
+    log.info("Checking spec:", spec);
     // 1. Check value cache first (eliminates I/O if already calculated this run)
     if (_cachedNamedRanges[spec] !== undefined) {
       const cachedValue = _cachedNamedRanges[spec];
+      log.info("Found cachedValue:", cachedValue);
       return String(cachedValue).trim(); // return value (or empty string/etc)
     }
 
@@ -150,6 +151,7 @@ function getCorpAuthChar() {
     try {
       var nr = sh.getRangeByName(spec);
       if (nr) got = nr.getValue();
+      log.info("Found nr :", got);
     } catch (_) {
       // Ignore
     }
@@ -160,7 +162,10 @@ function getCorpAuthChar() {
       var shn = spec.slice(0, cut);
       var a1 = spec.slice(cut + 1);
     
-      if (sh) { try { got = sh.getSheetByName(shn).getRange(a1).getValue(); } catch (_) { } }
+      if (sh) { try {
+         got = sh.getSheetByName(shn).getRange(a1).getValue();
+         log.info("Found got:", got);
+          } catch (_) { } }
     }
     
     // 4. Cache the resulting value (if we found anything or if it's the literal spec)
@@ -178,6 +183,7 @@ function getCorpAuthChar() {
   // 2. Try GESI's internal default (fast, usually a PropertyService lookup)
   if (!desired && GESI && GESI.getMainCharacter) {
     desired = String(GESI.getMainCharacter()).trim();
+     log.info("Found getMainCharacter() :", desired);
   }
 
   // 3. Try secondary config location (fast, no GESI)
@@ -1004,7 +1010,7 @@ function _getSheet_(name) { // keep if not already defined
 
 function _getData_(sheetName) {
   var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName); // Use direct SpreadsheetApp.getActiveSpreadsheet()
-  if (!sh) throw new Error('Missing sheet: ' + sheetName);
+  if (!sh) throw new Error('Missing sheet: ' + name);
   var vals = sh.getDataRange().getValues();
   var header = vals[0] || [];
   var rows = vals.slice(1);
@@ -1051,246 +1057,13 @@ function _ensureColumn_(sh, headerRow, name) {
   if (idx === -1) { idx = hdr.length; sh.getRange(headerRow, idx + 1).setValue(name); }
   return idx; // 0-based
 }
-// ---------------------------------------------------------------------------
+// ==========================================================================================
+// END UTILITIES
+// ==========================================================================================
 
-/**
- * Aggregates transaction data from both Material_Ledger (Buy) and Sales_Ledger (Sell).
- * Returns Buy and Sell stats separately.
- * @param {number} typeId The type ID to filter for.
- * @param {number} sinceDays How many days back to look.
- * @returns {object} { buy: {qty: number, value: number, avg: number, count: number}, sell: {qty: number, value: number, avg: number, count: number} }
- */
-function _aggregateLedgerStats_(typeId, sinceDays) {
-    const log = LoggerEx.withTag('MARKET_STATS');
-    const MS_PER_DAY = 86400000;
-    const cutoff = new Date(Date.now() - sinceDays * MS_PER_DAY);
-    const targetType = String(typeId);
-
-    // Prepare aggregation containers
-    const aggregates = {
-        buy: { qty: 0, value: 0, count: 0 },
-        sell: { qty: 0, value: 0, count: 0 }
-    };
-    
-    const ledgers = [
-        { sheetName: LEDGER_BUY_SHEET, isBuy: true },
-        { sheetName: LEDGER_SALE_SHEET, isBuy: false }
-    ];
-
-    ledgers.forEach(ledger => {
-        try {
-            const { rows, h } = _getData_(ledger.sheetName); 
-
-            // Column lookup indices (0-based)
-            const cTID = h['type_id'];
-            const cDATE = h['date'];
-            const cQTY = h['qty'];
-            const cUNIT_FILLED = h['unit_value_filled']; 
-            
-            if ([cTID, cDATE, cQTY, cUNIT_FILLED].some(v => v === undefined)) {
-                log.warn(`Skipping ${ledger.sheetName}: Missing critical headers.`);
-                return;
-            }
-
-            rows.forEach(row => {
-                const tid = String(row[cTID] || '');
-                const dateVal = row[cDATE];
-                let qty = Number(row[cQTY] || 0);
-                let unitPrice = Number(row[cUNIT_FILLED] || 0);
-                
-                // 1. Filter by Type ID
-                if (tid !== targetType) return;
-                
-                // 2. Filter by Date
-                const d = (dateVal instanceof Date) ? dateVal : new Date(dateVal);
-                if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) return;
-                
-                // 3. Process Transaction
-                if (unitPrice > 0 && Math.abs(qty) > 0) {
-                    const side = (ledger.isBuy) ? aggregates.buy : aggregates.sell;
-                    
-                    // Sales ledger quantities are typically negative, so we use Math.abs
-                    const absQty = Math.abs(qty); 
-                    
-                    side.qty += absQty; 
-                    side.value += absQty * unitPrice;
-                    side.count++;
-                }
-            });
-            
-        } catch (e) {
-            log.error(`Error processing ${ledger.sheetName}: ${e.message}`);
-        }
-    });
-
-    // Calculate final averages
-    const result = {
-        buy: null,
-        sell: null
-    };
-
-    if (aggregates.buy.count > 0) {
-        result.buy = {
-            qty: aggregates.buy.qty,
-            value: aggregates.buy.value,
-            avg: aggregates.buy.value / aggregates.buy.qty,
-            count: aggregates.buy.count
-        };
-    }
-    if (aggregates.sell.count > 0) {
-        result.sell = {
-            qty: aggregates.sell.qty,
-            value: aggregates.sell.value,
-            avg: aggregates.sell.value / aggregates.sell.qty,
-            count: aggregates.sell.count
-        };
-    }
-    
-    return result;
-}
-
-/**
- * @customfunction
- * Calculates market statistics (Quantity, Total Value, Weighted Average Price) 
- * for a specific EVE item across both Material_Ledger (Buy) and Sales_Ledger (Sell).
- * * @param {number} typeId The type ID of the item to analyze.
- * @param {number} [sinceDays=30] The number of days to look back for transactions.
- * @returns {Array<Array<any>>} A 2D array of buy/sell statistics.
- */
-function marketStatDataBoth(typeId, sinceDays) {
-    if (!typeId) {
-        return [['typeId required']];
-    }
-    sinceDays = sinceDays || 30;
-
-    const { buy, sell } = _aggregateLedgerStats_(typeId, sinceDays);
-    
-    return [
-        ['Side', 'Total Quantity', 'Total Value (ISK)', 'Weighted Avg Price (ISK)'],
-        ['Buy', buy ? buy.qty : 0, buy ? buy.value : 0, buy ? buy.avg : 0],
-        ['Sell', sell ? sell.qty : 0, sell ? sell.value : 0, sell ? sell.avg : 0]
-    ];
-}
-
-
-// --- Raw_loot (rolling 30d total) → Material_Ledger (post deltas) ------------
-const RAW_LOOT_SHEET = 'Raw_loot';
-const SNAP_KEY = 'raw_loot:snapshot:v2'; // doc properties key
-
-function importRawLootDeltasToLedger(asOfDate, sourceLabel, writeNegatives) {
-  const log = LoggerEx.withTag('LOOT_IMPORT');
-  const dateStr = asOfDate ? _isoDate(asOfDate) : _isoDate(Date.now());
-  const source = sourceLabel || 'LOOT';
-  const allowNeg = !!writeNegatives;
-  const charName = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar() : (GESI && GESI.name) || '';
-
-  return withSheetLock(function () {
-    // 1. Explicitly set the sheet to ensure correct target
-    ML.setSheet('Material_Ledger');
-
-    // Read Raw_loot (30-day rolling totals)
-    const loot = _getData_(RAW_LOOT_SHEET);
-    const h = loot.h;
-    const cTid = h['type_id'],
-      cQty = h['total_quantity'],
-      cBuy = h['weighted_average_buy'],
-      cVal = h['weighted_average_value'];
-    if ([cTid, cQty, cBuy, cVal].some(v => v == null)) {
-      throw new Error(`'${RAW_LOOT_SHEET}' must have headers: type_id, total_quantity, weighted_average_buy, weighted_average_value`);
-    }
-
-    // Build current snapshot map: tid → {qty,val,buy}
-    const curr = new Map();
-    for (const r of loot.rows) {
-      const tid = Number(r[cTid]) || 0;
-      if (!tid) continue;
-      // Sanitize input values robustly before using them
-      const qty = Number(String(r[cQty]).replace(/[^\d.\-]/g, '')) || 0;
-      const buy = _toNumberISK_(r[cBuy]);
-      const val = _toNumberISK_(r[cVal]);
-      curr.set(tid, {
-        qty,
-        val,
-        buy
-      });
-    }
-
-    // Load previous snapshot
-    const props = PropertiesService.getDocumentProperties();
-    const prevRaw = props.getProperty(SNAP_KEY);
-    const prev = prevRaw ? JSON.parse(prevRaw) : {}; // { tid: {qty,val} }
-
-    // UNION of tids (handles items that disappeared from loot sheet, e.g., day-31)
-    const allTids = new Set([
-      ...curr.keys(),
-      ...Object.keys(prev).map(x => Number(x) || 0).filter(Number)
-    ]);
-
-    const outRows = [];
-
-    for (const tid of allTids) {
-      const cur = curr.get(tid) || {
-        qty: 0,
-        val: 0,
-        buy: 0
-      };
-      const p = prev[String(tid)] || {
-        qty: 0,
-        val: 0
-      };
-
-      const dq = cur.qty - (Number(p.qty) || 0);
-      const dv = cur.val - (Number(p.val) || 0);
-
-      if (dq === 0) continue;
-      if (!allowNeg && dq < 0) continue; // ignore pruning drops unless allowed
-
-      // Unit for this delta: prefer dv/dq; fallback to current buy (if dv/dq results in 0 or NaN)
-      let unit = (isFinite(dv / dq) && Math.abs(dv) > 0) ? Math.abs(dv / dq) : (cur.buy || 0);
-      if (!(unit > 0)) unit = cur.buy || 0;
-
-      // Use the date and type_id as the unique identifier for loot entries
-      const contractId = dateStr; 
-
-      outRows.push({
-        date: dateStr,
-        type_id: tid,
-        qty: dq,
-        unit_value_filled: unit,
-        source: source,
-        // Since we are applying the delta once per day, we can use the date as the contract_id
-        contract_id: contractId, 
-        char: charName
-      });
-    }
-
-    // Use ML.upsertBy to handle the de-duplication and writing
-    const keys = ['source', 'char', 'type_id', 'contract_id'];
-    const count = ML.upsertBy(keys, outRows);
-
-    // Save new snapshot = current totals (present tids only)
-    const nextSnap = {};
-    for (const [tid, cur] of curr.entries()) {
-      nextSnap[String(tid)] = {
-        qty: cur.qty,
-        val: cur.val
-      };
-    }
-    props.setProperty(SNAP_KEY, JSON.stringify(nextSnap));
-
-    log.log('loot_import', {
-      appended_or_updated: count,
-      processed: allTids.size,
-      date: dateStr,
-    });
-    
-    return count;
-  });
-}
-
-function resetRawLootSnapshot() {
-  PropertiesService.getDocumentProperties().deleteProperty(SNAP_KEY);
-}
+// ==========================================================================================
+// START LEDGER FUNCTIONS
+// ==========================================================================================
 
 
 /** ===== JOURNAL → Material_Ledger (Import/Buy Side) =====================
@@ -1390,10 +1163,6 @@ function Ledger_Import_CorpJournal(opts) {
   }
 
   const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions'; 
-
-  if (typeof GESI === 'undefined' || typeof GESI.invoke !== 'function') { // Check for GESI.invoke
-    throw new Error("GESI Library/invoke not found. Ensure GESI is added as a library to your script.");
-  }
 
   const BUY_SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase();
   const SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30)); // Get sinceDays from opts
@@ -1506,53 +1275,28 @@ function Ledger_Import_CorpJournal(opts) {
   } while (fetchMore);
   
   
-
+  // Resume property is not needed and is removed/cleared.
   props.deleteProperty(CORP_JOURNAL_RESUME_PROP);
 
 
   const buyRows = [];
   const sellRows = [];
   
-  for (const e of allCorpTransactions) {
-    if (!e || typeof e !== 'object') continue;
-
-    const d = new Date(e.date);
-    // FINAL FILTER: Only process transactions newer than the cutoff.
-    if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue; 
-
-    const typeId = Number(e.type_id || 0);
-    const qty = Number(e.quantity || 0);
-    const price = Number(e.unit_price || 0);
-
-    // Skip if essential data is missing or invalid
-    if (!(typeId > 0 && qty > 0 && price > 0)) continue;
-
-    const contractId = String(e.transaction_id);
-    const isBuy = (e.is_buy === true);
-
-    const row = {
-      date: d,
-      type_id: typeId,
-      item_name: '',
-      qty: qty,
-      unit_value: '',
-      source: isBuy ? BUY_SOURCE : LEDGER_CORP_SALE_SOURCE,
-      contract_id: contractId,
-      char: authToon, // use Corp's Authed Toon
-      unit_value_filled: price,
-    };
-
-    if (isBuy) {
-      // Buy: Positive quantity (item inflow)
-      buyRows.push(row);
-    } else {
-      // Sell: Negative quantity (item outflow), needs sign reversal
-      row.qty = -Math.abs(row.qty); 
-      sellRows.push(row);
-    }
+  // FIX: Optimization Check: Skip processing/writing if no NEW transactions were found.
+  // We check if all transactions are older than the persistent anchor ID (if it exists).
+  const isNoNewData = rawFromId && allCorpTransactions.length > 0 && 
+                      (rawFromId === String(allCorpTransactions[0].transaction_id)); 
+                      
+  if (allCorpTransactions.length === 0 || isNoNewData) {
+      log.log('CORP_TXN', { status: 'Skipped ledger write: No new transactions found.' });
+      return { 
+        appended_or_updated_buy: 0, 
+        appended_or_updated_sell: 0, 
+        processed: allCorpTransactions.length,
+        sheets: { buy: opts.sheet || LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
+        locked: false
+      };
   }
-  
-  t.stamp('Data normalization complete, starting write.'); // Profiling step 2
 
   // --- BEGIN TRANSACTION ---
   const result = withSheetLock(function () {
@@ -1591,7 +1335,6 @@ function Ledger_Import_CorpJournal(opts) {
         const newestTransactionId = allCorpTransactions[0].transaction_id;
         
         // Save the newest ID to act as the starting anchor (from_id) for the NEXT run.
-        const props = PropertiesService.getScriptProperties();
         props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
         log.log(`Saved new transaction anchor: ${newestTransactionId}`);
     }
