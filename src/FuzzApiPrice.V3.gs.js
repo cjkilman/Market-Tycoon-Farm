@@ -284,7 +284,7 @@ function fuzzworkCacheRefresh() {
     if (!queueJson) {
       _L_info('fuz.refresh', { status: 'Queue empty (No JSON).' });
       // Clean up the trigger that just fired when the queue is empty
-      _deleteExistingTriggers();
+      //_deleteExistingTriggers();
       return 0; 
     }
 
@@ -293,14 +293,14 @@ function fuzzworkCacheRefresh() {
     } catch (e) {
         _L_warn('fuz.refresh.error', { status: 'Queue cache corruption. Resetting.', error: e.message });
         scriptCache.remove(MISSING_QUEUE_KEY);
-        _deleteExistingTriggers();
+       // _deleteExistingTriggers();
         return 0;
     }
     
     if (queue.length === 0) {
         _L_info('fuz.refresh', { status: 'Queue empty (Zero length).' });
         scriptCache.remove(MISSING_QUEUE_KEY);
-        _deleteExistingTriggers();
+       // _deleteExistingTriggers();
         return 0;
     }
 
@@ -334,14 +334,14 @@ function fuzzworkCacheRefresh() {
     if (queue.length > 0) {
         
         // Pulse the chain: Schedule the successor trigger
-        ScriptApp.newTrigger("fuzzworkCacheRefresh")
-          .timeBased()
-          .at(new Date(Date.now() + 1000 * 5)) // Run next pulse in 5 seconds
-          .create();
+     //   ScriptApp.newTrigger("fuzzworkCacheRefresh")
+        //  .timeBased()
+        //  .at(new Date(Date.now() + 1000 * 5)) // Run next pulse in 5 seconds
+        //  .create();
             
     } else {
         // Clean up the trigger that just fired when the queue is empty
-        _deleteExistingTriggers();
+       // _deleteExistingTriggers();
     } 
       
     _L_info('fuz.refresh', { status: `Finished processing. Items remaining: ${queue.length}` });

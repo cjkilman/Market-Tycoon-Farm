@@ -158,7 +158,7 @@ function testFuzAPIBoth() {
  */
 function testFuzAPICache() {
   const ids = [16239,16243,24030,32881,17366,16273,34206,34202,34203,34205,34204,34201,19761,42695,42830];
-  return marketStatDataCache(ids, "station", 60003760, "sell", "avg");
+  return marketStatDataCache(ids, "station", 60003760, "sell", "avg",null);
 }
 
 /**
