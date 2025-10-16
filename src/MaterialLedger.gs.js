@@ -33,10 +33,13 @@ var ML = (function () {
   
   function getSheet_() {
     var ss = getSS_();
-    return getOrCreateSheet(ss, SHEET, HEAD); // uses your Utility helper
+    // NOTE: Requires getOrCreateSheet() from Utility.js to be globally accessible
+    return getOrCreateSheet(ss, SHEET, HEAD); 
   }
 
+  // Returns 1-based index map { headerName: index }
   function headerIndex_(sh) {
+    // Read only the header row up to the maximum expected length
     var row = sh.getRange(1, 1, 1, HEAD.length).getValues()[0];
     var m = {};
     for (var i = 0; i < row.length; i++) {
@@ -48,8 +51,9 @@ var ML = (function () {
 
   // Normalize one logical row → the HEAD order, reuse your time helper
   function normalizeRow_(r) {
+    // NOTE: Assumes PT (Project Time) is globally available
     var out = {};
-    out.date  = r.date || PT.yyyymmdd(PT.now()); // reuse project Time
+    out.date  = r.date || PT.yyyymmdd(PT.now()); 
     out.type_id = r.type_id;
     out.item_name = r.item_name || '';
     out.qty   = +r.qty || 0;
@@ -73,87 +77,91 @@ var ML = (function () {
     if (!rows || !rows.length) return 0;
     var sh = getSheet_();
     var data = rows.map(normalizeRow_);
+    
+    // Single bulk write for append is already efficient
     sh.getRange(sh.getLastRow() + 1, 1, data.length, HEAD.length).setValues(data);
     return data.length;
   }
 
+  // **OPTIMIZED VERSION**
   // Upsert by one or more logical key columns (e.g. ['contract_id','source'])
+  // Reads all existing data, updates the array in memory, and writes back in one call.
   function upsertBy(keys, rows) {
     if (!rows || !rows.length) return 0;
+    
     var sh = getSheet_();
-    var H  = headerIndex_(sh);
-
+    var H = headerIndex_(sh);
     var keyColNames = keys || [];
-    var keyColIndices = []; // 1-based column indices for all requested key names
-    var keyColHdrMap = {}; // Maps key name -> 0-based column index in the HEAD array
-
-    // 1. Determine 1-based indices of all key columns
-    keyColNames.forEach(function (k) {
-      if (!H[k]) throw new Error('Unknown key column: ' + k);
-      keyColIndices.push(H[k]); // 1-based sheet column index
-    });
-    
-    // Determine the minimum range needed to read existing key data
-    var firstKeyCol = Math.min.apply(null, keyColIndices);
-    var lastKeyCol = Math.max.apply(null, keyColIndices);
-    
-    // The number of columns we actually need to read from the sheet
-    var readWidth = lastKeyCol - firstKeyCol + 1;
-
-    // The shift factor when mapping sheet index to read values array index
-    var readOffset = firstKeyCol;
-    
-    // Map of the column index in the 'read values array' to the original HEAD index
-    var sheetColToReadIndex = {};
-    keyColIndices.forEach(function(sheetCol) {
-      sheetColToReadIndex[sheetCol] = sheetCol - readOffset;
+    var keyIndices = keyColNames.map(function (k) {
+      var idx = HEAD.indexOf(k);
+      if (idx === -1) throw new Error('Unknown key column in HEAD: ' + k);
+      return idx; // 0-based index in the HEAD array (and eventual data array)
     });
 
+    var last = sh.getLastRow();
+    var allVals = []; // This will hold all existing data
 
-    var last  = sh.getLastRow();
-    var vals  = [];
-    
-    // 2. Read ONLY the necessary key columns from the sheet
+    // 1. READ EXISTING DATA (Single bulk read)
     if (last >= 2) {
-      vals = sh.getRange(2, firstKeyCol, last - 1, readWidth).getValues();
+      var range = sh.getRange(2, 1, last - 1, HEAD.length);
+      allVals = range.getValues();
     }
     
-    // 3. Map composite key → absolute row number (optimized read)
+    // 2. CREATE MAP: Composite Key (string) → 0-based index in allVals array
     var map = new Map();
-    for (var r = 0; r < vals.length; r++) {
-      var row = vals[r];
-      var key = keyColIndices.map(function (sheetCol) {
-        // Get the value using the optimized read index
-        var val = row[sheetColToReadIndex[sheetCol]] || '';
-        return String(val); 
-      }).join('\u0001');
-      map.set(key, r + 2); // 1-based rows, data starts at row 2
+    for (var r = 0; r < allVals.length; r++) {
+      var row = allVals[r];
+      // Build the composite key string from the values at the key indices
+      var key = keyIndices.map(function (headIdx) {
+        return String(row[headIdx] || '');
+      }).join('\u0001'); // Use a unique separator
+      map.set(key, r); // Store the 0-based index in the allVals array
     }
 
     var appends = [];
+    var updatedCount = 0;
+    
+    // 3. PROCESS INCOMING ROWS (In memory)
     rows.forEach(function (obj) {
       var outRow = normalizeRow_(obj);
       
-      // 4. Generate key for the incoming row
-      var key    = keyColNames.map(function (k) {
-        var idx = HEAD.indexOf(k); // 0-based index in the HEAD array
-        return String(outRow[idx] || '');
+      // Generate key for the incoming row
+      var key = keyIndices.map(function (headIdx) {
+        return String(outRow[headIdx] || '');
       }).join('\u0001');
 
-      var at = map.get(key);
-      if (at) {
-        // Update existing row
-        sh.getRange(at, 1, 1, HEAD.length).setValues([outRow]);
+      var rowIndex = map.get(key);
+      
+      if (rowIndex != null) {
+        // UPDATE: Overwrite the existing row array in allVals
+        allVals[rowIndex] = outRow;
+        updatedCount++;
       } else {
-        // Append new row
+        // APPEND: Queue as a new row
         appends.push(outRow);
       }
     });
-
-    if (appends.length) {
-      sh.getRange(sh.getLastRow() + 1, 1, appends.length, HEAD.length).setValues(appends);
+    
+    // 4. PERFORM BULK WRITE (One final bulk API call)
+    var finalData = allVals.concat(appends);
+    
+    if (finalData.length > 0) {
+      // Get range starting at row 2, covering the size of the final merged array
+      var targetRange = sh.getRange(2, 1, finalData.length, HEAD.length);
+      targetRange.setValues(finalData);
     }
-    return rows.length;
+
+    // 5. CLEAR EXCESS ROWS (if necessary, only if we deleted/updated rows resulting in a shorter final list)
+    var newLastRow = finalData.length + 1;
+    var maxRows = sh.getMaxRows();
+    
+    if (newLastRow < maxRows) {
+        sh.deleteRows(newLastRow, maxRows - newLastRow + 1);
+    }
+    
+    // NOTE: Clearing columns is typically handled by getOrCreateSheet.
+    
+    return rows.length; // Returns the total number of processed rows (updated + appended)
   }
 
   // Optional ergonomic wrapper: bind a sheet and use the same methods

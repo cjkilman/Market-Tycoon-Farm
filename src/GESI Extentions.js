@@ -5,8 +5,9 @@
 //   • Single canonical endpoints: positional arguments
 //   • Per-doc cache for auth names; per-user cache for items (scope-partitioned)
 //   • LoggerEx integration (marketTracker style)
+//   • All major functions now accept an optional 'ss' (Spreadsheet) argument.
 //
-/* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx, ML, withSheetLock, getOrCreateSheet, PT, _charIdMap */
+/* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx, ML, withSheetLock, getOrCreateSheet, PT, _charIdMap, _getData_, _toNumberISK_ */
 
 // ==========================================================================================
 // CONFIG & CONSTANTS
@@ -19,8 +20,14 @@
 // If omitted/blank/invalid, we default to GESI.name, then to first authed name.
 var CORP_AUTH_CHARACTER = "setting_director";
 
+// NEW PERSISTENT PROPERTY KEY
+const _CORP_AUTH_CHAR_PROP = 'GESI_PERSISTED_CORP_AUTH_CHAR';
+
 // Rolling lookback (days) for finished item_exchange contracts.
 var CONTRACT_LOOKBACK_DAYS = 30;
+
+// Maximum number of RAW sheet rows (excluding header) to read and process for CPU safety.
+const MAX_RAW_ROWS_TO_PROCESS = 50000;
 
 // SHEET NAMES
 var CONTRACTS_RAW_SHEET = "Contracts (RAW)";
@@ -34,6 +41,10 @@ const CORP_JOURNAL_RESUME_PROP = 'CORP_JOURNAL_DIV_RESUME'; // Property for resu
 
 // NEW: Property to store the transaction ID of the most recently fetched (newest) record.
 const CORP_JOURNAL_LAST_ID = 'CORP_JOURNAL_LAST_TRANSACTION_ID';
+
+// --- Raw_loot (rolling 30d total) → Material_Ledger (post deltas) ------------
+const RAW_LOOT_SHEET = 'Raw_loot';
+const SNAP_KEY = 'raw_loot:snapshot:v2'; // doc properties key
 
 
 // ENDPOINTS (canonical; let GESI handle versioning)
@@ -61,7 +72,11 @@ GESI_TTL.items = (GESI_TTL.items != null) ? GESI_TTL.items : 900;   // 15m (user
 // only once per script execution.
 var _cachedAuthChar = null;
 // ADDED: Cache for Named Ranges to avoid slow API lookups
-var _cachedNamedRanges = {}; 
+var _cachedNamedRanges = {};
+// NEW: Cache for authenticated GESI names (expensive call)
+var _cachedAuthNames = null;
+// NEW: Cache for character ID map
+var _cachedCharIdMap = null;
 
 // ==========================================================================================
 // UTILITIES (GAS-SAFE)
@@ -81,14 +96,9 @@ function _toIntOrNull(v) {
 }
 
 
-function _setValues(sh, startRow, rows) {
-  if (!rows || !rows.length) return;
-  sh.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
-}
-
 // Lookback days resolver (Named Range "LOOKBACK_DAYS" → Utility!B2 → default)
-function getLookbackDays() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+function getLookbackDays(ss) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet(); // Fallback to ensure 'ss' is defined
   var v = null;
   try {
     var nr = ss.getRangeByName('LOOKBACK_DAYS');
@@ -107,6 +117,11 @@ function getLookbackDays() {
 
 /* Per-DOCUMENT cache for authenticated character names */
 function getCharNamesFast() {
+  // NEW: Return cached value if available during this execution
+  if (_cachedAuthNames) {
+    return _cachedAuthNames;
+  }
+
   // Directly call the global GESI function. GESI handles its own caching 
   // via ScriptProperties or other mechanisms.
   var namesFn =
@@ -115,151 +130,137 @@ function getCharNamesFast() {
       : (typeof getAuthenticatedCharacterNames === 'function'
         ? getAuthenticatedCharacterNames
         : null);
-  
+
   if (!namesFn) throw new Error('getAuthenticatedCharacterNames not found (GESI or global).');
 
-  return namesFn() || [];
+  const names = namesFn() || [];
+  _cachedAuthNames = names; // Cache for rest of execution
+  return names;
 }
 
 // Resolve corp auth character (override → GESI.name → NamedRange/Utility → first authed)
-function getCorpAuthChar() {
-  // ADDED: Return cached value if available
+function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
+  // --- PHASE 1: FASTEST EXIT (In-Memory Cache / Persistent Property) ---
   if (_cachedAuthChar) {
     return _cachedAuthChar;
   }
-  
-  var log = LoggerEx.withTag('GESI');
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  log.info("Checking for Authized Corp Character");
-  var desired = "";
 
-  // Helper function optimized for speed by caching Named Range lookups
-  function _resolve(sh, spec) {
-    if (!spec) return "";
-    spec = String(spec).trim();
-    log.info("Checking spec:", spec);
-    // 1. Check value cache first (eliminates I/O if already calculated this run)
-    if (_cachedNamedRanges[spec] !== undefined) {
-      const cachedValue = _cachedNamedRanges[spec];
-      log.info("Found cachedValue:", cachedValue);
-      return String(cachedValue).trim(); // return value (or empty string/etc)
-    }
+  const props = PropertiesService.getScriptProperties();
+  const persistedChar = props.getProperty(_CORP_AUTH_CHAR_PROP);
 
-    var got = null;
-    
-    // 2. Named range lookup (SLOWER, caching the VALUE)
-    try {
-      var nr = sh.getRangeByName(spec);
-      if (nr) got = nr.getValue();
-      log.info("Found nr :", got);
-    } catch (_) {
-      // Ignore
-    }
-    
-    // 3. Sheet!A1 reference lookup (SLOWER)
-    if (!got && spec.indexOf('!') > 0) {
-      var cut = spec.indexOf('!');
-      var shn = spec.slice(0, cut);
-      var a1 = spec.slice(cut + 1);
-    
-      if (sh) { try {
-         got = sh.getSheetByName(shn).getRange(a1).getValue();
-         log.info("Found got:", got);
-          } catch (_) { } }
-    }
-    
-    // 4. Cache the resulting value (if we found anything or if it's the literal spec)
-    const resultValue = got || spec;
-    _cachedNamedRanges[spec] = resultValue;
-    
-    return String(resultValue).trim();
-  }
-  
-  // 1. Try config override (fast, no GESI)
-  if (typeof CORP_AUTH_CHARACTER !== 'undefined' && CORP_AUTH_CHARACTER != null) {
-    desired = _resolve(ss, CORP_AUTH_CHARACTER);
+  if (persistedChar) {
+    _cachedAuthChar = persistedChar;
+    return persistedChar;
   }
 
-  // 2. Try GESI's internal default (fast, usually a PropertyService lookup)
-  if (!desired && GESI && GESI.getMainCharacter) {
-    desired = String(GESI.getMainCharacter()).trim();
-     log.info("Found getMainCharacter() :", desired);
-  }
+  // --- PHASE 2: EXPENSIVE RESOLUTION (Sheet I/O / API Calls) ---
 
-  // 3. Try secondary config location (fast, no GESI)
-  if (!desired) {
-    desired = _resolve(ss, 'CORP_AUTH_CHAR');
-    if (!desired) desired = _resolve(ss, 'Utility!B3');
-  }
+  try {
+    var log = LoggerEx.withTag('GESI');
+    const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet(); // Fallback if ss is null/undefined
+    log.info("Checking for Authized Corp Character (SLOW PATH)");
+    var desired = "";
 
-  // --- OPTIMIZED FALLBACK LOGIC ---
-  
-  // 4. Verification/Fallback: Only execute the slow GESI check if needed.
-  
-  // This check is the SLOW part:
-  var names = getCharNamesFast(); 
-  var fallback = names[0] || "";
-  
-  if (!desired) {
-    // Case 1: No name found via fast methods (Steps 1-3). Use the GESI fallback.
-    desired = fallback;
-    
-  } else {
-    // Case 2: A name was found via config. 
-    // We still need to verify this name is authenticated by GESI (SLOW check).
-    
-    // If the name from the config (desired) is not in the official list, revert to default.
-    if (names.indexOf(desired) === -1) {
-      log.warn('Corp auth override not in authenticated names; falling back', { wanted: desired, using: fallback, list: names });
-      desired = fallback;
-    }
-  }
+    // Helper function optimized for speed by caching Named Range lookups
+    function _resolve(sh, spec) {
+      if (!spec) return null;
+      spec = String(spec).trim();
 
+      // 1. Check value cache first (Fastest)
+      if (_cachedNamedRanges[spec] !== undefined) {
+        return _cachedNamedRanges[spec] != null ? String(_cachedNamedRanges[spec]).trim() : null;
+      }
 
-  log.debug('corp auth character', { using: desired });
-  
-  // ADDED: Cache the result before returning
-  _cachedAuthChar = desired;
-  return desired;
-}
+      var got = null;
 
-// ==========================================================================================
-// CUSTOM TRIGGER FUNCTION
-// ==========================================================================================
+      // 2. Perform expensive Sheet API calls
 
-/**
- * Runs when the spreadsheet is opened.
- * Used to create the custom menu and prompt for authorization if needed.
- */
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('Market Tools')
-      .addItem('Authorize Script (First Run)', 'forceAuthorization')
-      .addToUi();
-}
+      // 2a. Try Named range lookup
+      try {
+        var nr = sh.getRangeByName(spec);
+        if (nr) got = nr.getValue();
+      } catch (_) {
+        // Ignore
+      }
 
-/**
- * Function to run manually to force the authorization prompt.
- */
-function forceAuthorization() {
-    // This function runs a service that requires authorization (UrlFetchApp)
-    // and is accessible via the custom menu. Running it guarantees the prompt appears.
-    try {
-        UrlFetchApp.fetch("https://google.com");
-        SpreadsheetApp.getUi().alert('Authorization granted successfully!');
-    } catch (e) {
-        if (e.message.includes('Authorization is required')) {
-            SpreadsheetApp.getUi().alert('Authorization failed. Please follow the prompt in the editor after running this function.');
-        } else {
-            // Check if the script needs permissions beyond basic Spreadsheet access
-            const propertiesService = PropertiesService.getUserProperties();
-            propertiesService.setProperty('AUTH_CHECK', 'RUNNING');
-            propertiesService.deleteProperty('AUTH_CHECK');
-            SpreadsheetApp.getUi().alert('Authorization check failed. Please run this function again and check the console/editor for prompts.');
+      // 2b. Try Sheet!A1 reference lookup if 2a failed
+      if (got == null && spec.indexOf('!') > 0) {
+        var cut = spec.indexOf('!');
+        var shn = spec.slice(0, cut);
+        var a1 = spec.slice(cut + 1);
+
+        if (sh) {
+          try {
+            got = sh.getSheetByName(shn).getRange(a1).getValue();
+          } catch (_) { }
         }
-    }
-}
+      }
 
+      // 3. Cache the resulting value and return
+      // Use null to indicate "not found" or "no value" explicitly in the cache
+      const resultValue = got != null && got !== "" ? got : null;
+      _cachedNamedRanges[spec] = resultValue;
+
+      return resultValue != null ? String(resultValue).trim() : null;
+    }
+
+    // 1. Try config override (fast, no GESI)
+    if (typeof CORP_AUTH_CHARACTER !== 'undefined' && CORP_AUTH_CHARACTER != null) {
+      desired = _resolve(spreadsheet, CORP_AUTH_CHARACTER);
+    }
+
+    // Convert null result from _resolve back to empty string for subsequent checks
+    if (desired === null) desired = "";
+
+    // 2. Try GESI's internal default (fast, usually a PropertyService lookup)
+    if (!desired && GESI && GESI.getMainCharacter) {
+      desired = String(GESI.getMainCharacter()).trim();
+    }
+
+    // 3. Try secondary config location (fast, no GESI)
+    if (!desired) {
+      desired = _resolve(spreadsheet, 'CORP_AUTH_CHAR');
+      if (desired === null) desired = ""; // Ensure result is not null
+    }
+
+    // --- OPTIMIZED FALLBACK LOGIC ---
+
+    // 4. Verification/Fallback: Only execute the slow GESI check if needed.
+    // This check relies on the newly optimized getCharNamesFast()
+    var names = getCharNamesFast();
+    var fallback = names[0] || "";
+
+    if (!desired) {
+      // Case 1: No name found via fast methods (Steps 1-3). Use the GESI fallback.
+      desired = fallback;
+
+    } else {
+      // Case 2: A name was found via config. 
+      // We still need to verify this name is authenticated by GESI.
+
+      // If the name from the config (desired) is not in the official list, revert to default.
+      if (names.indexOf(desired) === -1) {
+        log.warn('Corp auth override not in authenticated names; falling back', { wanted: desired, using: fallback, list: names });
+        desired = fallback;
+      }
+    }
+
+
+    log.debug('corp auth character', { using: desired });
+
+    // --- PHASE 3: CACHE AND PERSIST ---
+    if (desired) {
+      _cachedAuthChar = desired;
+      props.setProperty(_CORP_AUTH_CHAR_PROP, desired); // Persist for future fast runs
+    }
+
+    return desired;
+  } catch (e) {
+    // If an error occurs (e.g. network/GESI), rely on GESI.name fallback
+    LoggerEx.withTag('GESI').error('getCorpAuthChar failed during slow path:', e);
+    return (GESI && GESI.name) || '';
+  }
+}
 
 // ==========================================================================================
 // NORMALIZERS
@@ -510,18 +511,17 @@ function syncContracts() {
   var hdrC = ["char", "contract_id", "type", "status", "issuer_id", "acceptor_id", "date_issued", "date_expired", "price", "reward", "collateral", "volume", "title", "availability", "start_location_id", "end_location_id"];
   var hdrI = ["char", "contract_id", "type_id", "quantity", "is_included", "is_singleton"];
 
+  var ss = SpreadsheetApp.getActiveSpreadsheet(); // RETRIEVED ONCE
   var names = getCharNamesFast();
-  var corpAuth = getCorpAuthChar();
+  var corpAuth = getCorpAuthChar(ss); // PASS ss
   log.log('chars', names);
 
   var MS_PER_DAY = 86400000;
-  var lookbackDays = getLookbackDays();
+  var lookbackDays = getLookbackDays(ss); // PASS ss
   var lookIso = _isoDate(Date.now() - lookbackDays * MS_PER_DAY);
 
   var outC = [];
   var outI = [];
-  
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   // ---------------- PHASE 1: CHARACTER CONTRACTS ----------------
   var tListChar = log.startTimer('contracts:list:char');
@@ -550,7 +550,7 @@ function syncContracts() {
     byCid[cid1].push(tuplesChar[t]); // keep all sightings for this cid
   }
 
-  var idMap = (typeof _charIdMap === 'function') ? _charIdMap() : null;
+  var idMap = _charIdMap(ss) || null;
   var cids = Object.keys(byCid);
   for (var g = 0; g < cids.length; g++) {
     var cid = cids[g];
@@ -567,16 +567,16 @@ function syncContracts() {
 
     // Write contract & items under the chosen character (usually the acceptor)
     outC.push([
-      ch1, cidNum, cRow.type, c2.status, cRow.issuer_id, cRow.acceptor_id,
+      ch1, cidNum, cRow.type, cRow.status, cRow.issuer_id, cRow.acceptor_id,
       cRow.date_issued || "", cRow.date_expired || "", cRow.price || 0, cRow.reward || 0, cRow.collateral || 0,
-      cRow.volume || 0, cRow.title || "", c2.start_location_id || "", cRow.end_location_id || ""
+      cRow.volume || 0, cRow.title || "", cRow.availability || "", cRow.start_location_id || "", cRow.end_location_id || ""
     ]);
 
     for (var j1 = 0; j1 < items1.length; j1++) {
       var it1 = items1[j1];
       // Item contracts should only include items that were 'included' AND have a quantity
       if (!it1.is_included || !it1.quantity) continue;
-      outI.push([ch1, cidNum, it1.type_id, it1.quantity, true, !!it2.is_singleton]);
+      outI.push([ch1, cidNum, it1.type_id, it1.quantity, true, !!it1.is_singleton]);
     }
 
     seenChar['' + cidNum] = true; // so corp phase won’t re-add it
@@ -624,106 +624,130 @@ function syncContracts() {
       outI.push([ch2, cid2, it2.type_id, it2.quantity, true, !!it2.is_singleton]);
     }
 
-    seenChar['' + cidNum] = true; // so corp phase won’t re-add it
+    seenChar['' + cid2] = true; // so corp phase won’t re-add it
     Utilities.sleep(150);
   }
 
   // ---------------- WRITE SHEETS ----------------
-  // Replacing custom _sheetSafe with getOrCreateSheet (assuming robust implementation)
-  const shC = getOrCreateSheet(ss, CONTRACTS_RAW_SHEET, hdrC);
-  const shI = getOrCreateSheet(ss, CONTRACT_ITEMS_RAW_SHEET, hdrI);
-  
-  // NOTE: Assuming _rewriteFast exists in Utility.js or globally for this usage.
-  _rewriteData_(shC, hdrC, outC);
-  _rewriteData_(shI, hdrI, outI);
+  return withSheetLock(function () { // WRAPPED ENTIRE WRITE IN LOCK
+    // Replacing custom _sheetSafe with getOrCreateSheet (assuming robust implementation)
+    const shC = getOrCreateSheet(ss, CONTRACTS_RAW_SHEET, hdrC);
+    const shI = getOrCreateSheet(ss, CONTRACT_ITEMS_RAW_SHEET, hdrI);
 
-  log.log('syncContracts done', { contracts: outC.length, items: outI.length, lookback_days: lookbackDays, lookIso: lookIso });
+    // NOTE: Assuming _rewriteFast exists in Utility.js or globally for this usage.
+    _rewriteData_(shC, hdrC, outC); // Lock removed internally
+    _rewriteData_(shI, hdrI, outI); // Lock removed internally
+
+    log.log('syncContracts done', { contracts: outC.length, items: outI.length, lookback_days: lookbackDays, lookIso: lookIso });
+  }); // END LOCK
 }
 
 // ==========================================================================================
 // RAW → Material_Ledger (Import/Buy Side)
 // ==========================================================================================
-function contractsToMaterialLedger() {
+function contractsToMaterialLedger(ss) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('GESI');
-  // NOTE: This assumes a helper function _charIdMap() exists globally or in another module
-  const myCharId = (typeof _charIdMap === 'function') ? _charIdMap()[getCorpAuthChar()] : null;
+  const charName = getCorpAuthChar(ss); // PASS ss
+  // --- OPTIMIZED CHAR ID LOOKUP ---
+  const charIdMap = _charIdMap(ss) || {}; // Removed redundant check
+  const myCharId = charIdMap[charName] || null;
+  // --- END OPTIMIZED CHAR ID LOOKUP ---
 
-  return withSheetLock(function () {
-    // 1. Explicitly set the sheet to ensure correct target
-    ML.setSheet('Material_Ledger');
+  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET); // Instance created outside lock
 
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
-    const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
-    if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
+  // --- EARLY EXIT CHECK ---
+  // If RAW sheets are missing, we must throw error (Run syncContracts() first)
+  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
+  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
+  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
 
-    const C = shC.getDataRange().getValues();
-    const hC = C.shift();
-    const I = shI.getDataRange().getValues();
-    const hI = I.shift();
+  // Get data outside of lock
+  // Apply MAX_RAW_ROWS_TO_PROCESS cap to prevent CPU timeouts on large sheets
+  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
+  const hC = C.shift();
+  const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
+  const hI = I.shift();
 
-    const ix = (arr, name) => arr.indexOf(name);
 
-    const colC = {
-      char: ix(hC, "char"),
-      contract_id: ix(hC, "contract_id"),
-      type: ix(hC, "type"),
-      status: ix(hC, "status"),
-      acceptor_id: ix(hC, "acceptor_id"),
-      date_issued: ix(hC, "date_issued"),
-    };
-    const colI = {
-      contract_id: ix(hI, "contract_id"),
-      type_id: ix(hI, "type_id"),
-      quantity: ix(hI, "quantity"),
-      is_included: ix(hI, "is_included"),
-    };
+  // If there are no contracts/items to process, exit before locking.
+  if (C.length === 0 || I.length === 0) {
+    log.log('contracts→ledger', { status: 'Skipped: No raw contracts or items found.' });
+    return 0;
+  }
+  // --- END EARLY EXIT CHECK ---
 
-    const itemsByCid = {};
-    for (let r = 0; r < I.length; r++) {
-      const rowI = I[r];
-      const cid = rowI[colI.contract_id];
-      if (!itemsByCid[cid]) itemsByCid[cid] = [];
-      itemsByCid[cid].push({
-        type_id: rowI[colI.type_id],
-        qty: Number(rowI[colI.quantity] || 0),
-        is_included: !!rowI[colI.is_included],
+  const ix = (arr, name) => arr.indexOf(name);
+
+  const colC = {
+    char: ix(hC, "char"),
+    contract_id: ix(hC, "contract_id"),
+    type: ix(hC, "type"),
+    status: ix(hC, "status"),
+    acceptor_id: ix(hC, "acceptor_id"),
+    date_issued: ix(hC, "date_issued"),
+  };
+  const colI = {
+    contract_id: ix(hI, "contract_id"),
+    type_id: ix(hI, "type_id"),
+    quantity: ix(hI, "quantity"),
+    is_included: ix(hI, "is_included"),
+  };
+
+  const itemsByCid = {};
+  for (let r = 0; r < I.length; r++) {
+    const rowI = I[r];
+    const cid = rowI[colI.contract_id];
+    if (!itemsByCid[cid]) itemsByCid[cid] = [];
+    itemsByCid[cid].push({
+      type_id: rowI[colI.type_id],
+      qty: Number(rowI[colI.quantity] || 0),
+      is_included: !!rowI[colI.is_included],
+    });
+  }
+
+  const outRows = [];
+  for (let q = 0; q < C.length; q++) {
+    const rowC = C[q];
+    const ctype = String(rowC[colC.type] || "").toLowerCase();
+    const status = String(rowC[colC.status] || "").toLowerCase();
+    const acceptorId = rowC[colC.acceptor_id];
+    const rowCharName = rowC[colC.char] || "";
+
+    // Filter for finished contracts where the character is the acceptor (buy)
+    // Check: if charId is known AND acceptorId does not match charId OR acceptorId is known AND rowCharName does not match cached charName
+    if (ctype !== "item_exchange" || status !== "finished" || (myCharId && acceptorId !== myCharId) || (rowCharName && acceptorId && myCharId && rowCharName !== charName)) {
+      continue;
+    }
+
+    const cid2 = rowC[colC.contract_id];
+    const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+    const items = itemsByCid[cid2] || [];
+
+    for (const it of items) {
+      if (!it.is_included || it.qty <= 0) continue;
+      outRows.push({
+        date: issued,
+        type_id: it.type_id,
+        qty: it.qty,
+        source: "CONTRACT",
+        contract_id: cid2,
+        char: rowC[colC.char] || ""
       });
     }
+  }
 
-    const outRows = [];
-    for (let q = 0; q < C.length; q++) {
-      const rowC = C[q];
-      const ctype = String(rowC[colC.type] || "").toLowerCase();
-      const status = String(rowC[colC.status] || "").toLowerCase();
-      const acceptorId = rowC[colC.acceptor_id];
-      const charName = rowC[colC.char] || "";
+  // --- SECONDARY EARLY EXIT CHECK ---
+  if (outRows.length === 0) {
+    log.log('contracts→ledger', { status: 'Skipped: No qualifying contract deltas found.' });
+    return 0;
+  }
+  // --- END SECONDARY EARLY EXIT CHECK ---
 
-      // Filter for finished contracts where the character is the acceptor (buy)
-      if (ctype !== "item_exchange" || status !== "finished" || (myCharId && acceptorId !== myCharId) || (charName && acceptorId && myCharId && charName !== getCorpAuthChar())) {
-        continue;
-      }
-
-      const cid2 = rowC[colC.contract_id];
-      const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
-      const items = itemsByCid[cid2] || [];
-
-      for (const it of items) {
-        if (!it.is_included || it.qty <= 0) continue;
-        outRows.push({
-          date: issued,
-          type_id: it.type_id,
-          qty: it.qty,
-          source: "CONTRACT",
-          contract_id: cid2,
-          char: rowC[colC.char] || ""
-        });
-      }
-    }
-
-    // Use ML.upsertBy to handle the de-duplication and writing
+  return withSheetLock(function () {
+    // Use ML instance
     const keys = ['source', 'char', 'contract_id', 'type_id'];
-    const count = ML.upsertBy(keys, outRows);
+    const count = MaterialLedger.upsert(keys, outRows);
 
     log.log('contracts→ledger', {
       appended_or_updated: count,
@@ -737,97 +761,120 @@ function contractsToMaterialLedger() {
 // RAW → Sales_Ledger (Export/Sell Side)
 // ============================================================================
 
-function contractsToSalesLedger() {
+function contractsToSalesLedger(ss) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('GESI');
-  // NOTE: This assumes a helper function _charIdMap() exists globally or in another module
-  const myCharId = (typeof _charIdMap === 'function') ? _charIdMap()[getCorpAuthChar()] : null;
+  const charName = getCorpAuthChar(ss); // PASS ss
+  // --- OPTIMIZED CHAR ID LOOKUP ---
+  const charIdMap = _charIdMap(ss) || {}; // Removed redundant check
+  const myCharId = charIdMap[charName] || null;
+  // --- END OPTIMIZED CHAR ID LOOKUP ---
 
-  return withSheetLock(function () {
-    // 1. Explicitly set the sheet to ensure correct target
-    ML.setSheet('Sales_Ledger');
+  const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET); // Instance created outside lock
 
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
-    const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
-    if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
+  // --- EARLY EXIT CHECK ---
+  // If RAW sheets are missing, we must throw error (Run syncContracts() first)
+  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
+  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
+  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
 
-    const C = shC.getDataRange().getValues();
-    const hC = C.shift();
-    const I = shI.getDataRange().getValues();
-    const hI = I.shift();
+  // Get data outside of lock
+  // Apply MAX_RAW_ROWS_TO_PROCESS cap to prevent CPU timeouts on large sheets
+  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
+  const hC = C.shift();
+  const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
+  const hI = I.shift();
 
-    const ix = (arr, name) => arr.indexOf(name);
+  // If there are no contracts/items to process, exit before locking.
+  if (C.length === 0 || I.length === 0) {
+    log.log('contracts→sales_ledger', { status: 'Skipped: No raw contracts or items found.' });
+    return 0;
+  }
+  // --- END EARLY EXIT CHECK ---
 
-    const colC = {
-      char: ix(hC, "char"),
-      contract_id: ix(hC, "contract_id"),
-      type: ix(hC, "type"),
-      status: ix(hC, "status"),
-      issuer_id: ix(hC, "issuer_id"),
-      date_issued: ix(hC, "date_issued"),
-      price: ix(hC, "price"),
-    };
-    const colI = {
-      contract_id: ix(hI, "contract_id"),
-      type_id: ix(hI, "type_id"),
-      quantity: ix(hI, "quantity"),
-      is_included: ix(hI, "is_included"),
-    };
 
-    const itemsByCid = {};
-    for (let r = 0; r < I.length; r++) {
-      const rowI = I[r];
-      const cid = rowI[colI.contract_id];
-      if (!itemsByCid[cid]) itemsByCid[cid] = [];
-      itemsByCid[cid].push({
-        type_id: rowI[colI.type_id],
-        qty: Number(rowI[colI.quantity] || 0),
-        is_included: !!rowI[colI.is_included],
+  const ix = (arr, name) => arr.indexOf(name);
+
+  const colC = {
+    char: ix(hC, "char"),
+    contract_id: ix(hC, "contract_id"),
+    type: ix(hC, "type"),
+    status: ix(hC, "status"),
+    issuer_id: ix(hC, "issuer_id"),
+    date_issued: ix(hC, "date_issued"),
+    price: ix(hC, "price"),
+  };
+  const colI = {
+    contract_id: ix(hI, "contract_id"),
+    type_id: ix(hI, "type_id"),
+    quantity: ix(hI, "quantity"),
+    is_included: ix(hI, "is_included"),
+  };
+
+  const itemsByCid = {};
+  for (let r = 0; r < I.length; r++) {
+    const rowI = I[r];
+    const cid = rowI[colI.contract_id];
+    if (!itemsByCid[cid]) itemsByCid[cid] = [];
+    itemsByCid[cid].push({
+      type_id: rowI[colI.type_id],
+      qty: Number(rowI[colI.quantity] || 0),
+      is_included: !!rowI[colI.is_included],
+    });
+  }
+
+  const outRows = [];
+  for (let q = 0; q < C.length; q++) {
+    const rowC = C[q];
+    const ctype = String(rowC[colC.type] || "").toLowerCase();
+    const status = String(rowC[colC.status] || "").toLowerCase();
+    const issuerId = rowC[colC.issuer_id];
+    const rowCharName = rowC[colC.char] || "";
+    const price = Number(rowC[colC.price] || 0);
+
+    // Filter for finished contracts where the character is the issuer (sell)
+    // Check: if charId is known AND issuerId does not match charId OR issuerId is known AND rowCharName does not match cached charName
+    if (ctype !== "item_exchange" || status !== "finished" || (myCharId && issuerId !== myCharId) || (rowCharName && issuerId && myCharId && rowCharName !== charName)) {
+      continue;
+    }
+
+    const cid2 = rowC[colC.contract_id];
+    const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+    const items = itemsByCid[cid2] || [];
+
+    for (const it of items) {
+      if (!it.is_included || it.qty <= 0) continue;
+
+      let unit_price_filled = 0;
+      if (it.qty > 0) {
+        unit_price_filled = price / it.qty; // Simple price allocation per unit
+      }
+
+      // Use a NEGATIVE quantity to denote a sale/outgoing item
+      outRows.push({
+        date: issued,
+        type_id: it.type_id,
+        qty: -it.qty,
+        unit_value: '',
+        unit_value_filled: unit_price_filled,
+        source: "SALE",
+        contract_id: cid2,
+        char: rowC[colC.char] || ""
       });
     }
+  }
 
-    const outRows = [];
-    for (let q = 0; q < C.length; q++) {
-      const rowC = C[q];
-      const ctype = String(rowC[colC.type] || "").toLowerCase();
-      const status = String(rowC[colC.status] || "").toLowerCase();
-      const issuerId = rowC[colC.issuer_id];
-      const charName = rowC[colC.char] || "";
-      const price = Number(rowC[colC.price] || 0);
+  // --- SECONDARY EARLY EXIT CHECK ---
+  if (outRows.length === 0) {
+    log.log('contracts→sales_ledger', { status: 'Skipped: No qualifying contract deltas found.' });
+    return 0;
+  }
+  // --- END SECONDARY EARLY EXIT CHECK ---
 
-      // Filter for finished contracts where the character is the issuer (sell)
-      if (ctype !== "item_exchange" || status !== "finished" || (myCharId && issuerId !== myCharId) || (charName && issuerId && myCharId && charName !== getCorpAuthChar())) {
-        continue;
-      }
-
-      const cid2 = rowC[colC.contract_id];
-      const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
-      const items = itemsByCid[cid2] || [];
-
-      for (const it of items) {
-        if (!it.is_included || it.qty <= 0) continue;
-
-        let unit_price_filled = 0;
-        if (it.qty > 0) {
-            unit_price_filled = price / it.qty; // Simple price allocation per unit
-        }
-
-        // Use a NEGATIVE quantity to denote a sale/outgoing item
-        outRows.push({
-          date: issued,
-          type_id: it.type_id,
-          qty: -it.qty,
-          unit_value: '',
-          unit_value_filled: unit_price_filled,
-          source: "SALE",
-          contract_id: cid2,
-          char: charName
-        });
-      }
-    }
-
+  return withSheetLock(function () {
+    // Use ML instance
     const keys = ['source', 'char', 'contract_id', 'type_id'];
-    const count = ML.upsertBy(keys, outRows);
+    const count = SalesLedger.upsert(keys, outRows);
 
     log.log('contracts→sales_ledger', {
       appended_or_updated: count,
@@ -836,6 +883,176 @@ function contractsToSalesLedger() {
     return count;
   });
 }
+
+// ==========================================================================================
+// RAW_LOOT (rolling 30d total) → Material_Ledger (post deltas)
+// ==========================================================================================
+
+function importRawLootDeltasToLedger(ss, asOfDate, sourceLabel, writeNegatives) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const dateStr = asOfDate ? _isoDate(asOfDate) : _isoDate(Date.now());
+  const source = sourceLabel || 'LOOT';
+  const allowNeg = !!writeNegatives;
+  const charName = getCorpAuthChar(ss); // Removed redundant check
+  const log = LoggerEx.withTag('LOOT_DELTA');
+
+  return withSheetLock(function () {
+    // 1. Set up Ledger instance
+    const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
+
+    // Read Raw_loot (30-day rolling totals)
+    const loot = _getData_(ss, RAW_LOOT_SHEET); // PASS ss
+    const h = loot.h;
+    const cTid = h['type_id'],
+      cQty = h['total_quantity'],
+      cBuy = h['weighted_average_buy'],
+      cVal = h['weighted_average_value'];
+    if ([cTid, cQty, cBuy, cVal].some(v => v == null)) {
+      throw new Error(`'${RAW_LOOT_SHEET}' must have headers: type_id, total_quantity, weighted_average_buy, weighted_average_value`);
+    }
+
+    // Build current snapshot map: tid → {qty,val,buy}
+    const curr = new Map();
+    for (const r of loot.rows) {
+      const tid = Number(r[cTid]) || 0;
+      if (!tid) continue;
+      const qty = Number(String(r[cQty]).replace(/[^\d.\-]/g, '')) || 0;
+      const buy = _toNumberISK_(r[cBuy]);
+      const val = _toNumberISK_(r[cVal]);
+      curr.set(tid, {
+        qty,
+        val,
+        buy
+      });
+    }
+
+    // Load previous snapshot
+    const props = PropertiesService.getDocumentProperties();
+    const prevRaw = props.getProperty(SNAP_KEY);
+    const prev = prevRaw ? JSON.parse(prevRaw) : {};
+
+    // UNION of tids (handles day-31 disappearances)
+    const allTids = new Set([
+      ...curr.keys(),
+      ...Object.keys(prev).map(x => Number(x) || 0)
+    ]);
+
+    const outRows = [];
+
+    for (const tid of allTids) {
+      const cur = curr.get(tid) || {
+        qty: 0,
+        val: 0,
+        buy: 0
+      };
+      const p = prev[String(tid)] || {
+        qty: 0,
+        val: 0
+      };
+
+      const dq = cur.qty - (Number(p.qty) || 0);
+      const dv = cur.val - (Number(p.val) || 0);
+
+      if (dq === 0) continue;
+      if (!allowNeg && dq < 0) continue;
+
+      // Price calculation: Use absolute delta value / delta quantity, or fall back to weighted average buy price
+      let unit = (isFinite(dv / dq) && Math.abs(dv) > 0) ? Math.abs(dv / dq) : (cur.buy || 0);
+      if (!(unit > 0)) unit = cur.buy || 0;
+
+      outRows.push({
+        date: dateStr,
+        type_id: tid,
+        qty: dq,
+        unit_value_filled: unit,
+        source: source,
+        char: charName
+      });
+    }
+
+    // ** EARLY EXIT OPTIMIZATION **
+    if (outRows.length === 0) {
+      log.log('loot_import', { status: 'Skipped ledger update: No deltas found.', processed: allTids.size, date: dateStr });
+      return 0;
+    }
+
+    const keys = ['source', 'char', 'type_id', 'date'];
+    const count = MaterialLedger.upsert(keys, outRows);
+
+    const nextSnap = {};
+    for (const [tid, cur] of curr.entries()) {
+      nextSnap[String(tid)] = {
+        qty: cur.qty,
+        val: cur.val
+      };
+    }
+    props.setProperty(SNAP_KEY, JSON.stringify(nextSnap));
+
+    log.log('loot_import', {
+      appended_or_updated: count,
+      processed: allTids.size,
+      date: dateStr,
+    });
+
+    return count;
+  });
+}
+
+// NEW: Master orchestrator function to run all ledger imports
+function runAllLedgerImports() {
+  const log = LoggerEx.withTag('MASTER_SYNC');
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); // RETRIEVED ONCE HERE
+
+  log.info('--- Starting Full Ledger Import Cycle ---');
+
+  // Order is critical: Fetch RAW data first, then process dependent ledgers.
+
+  // 1. Sync RAW data (Contracts & Items)
+  try {
+    log.info('Running syncContracts (Fetch RAW data)...');
+    syncContracts(); // ss is retrieved inside syncContracts for its own needs
+  } catch (e) {
+    log.error('syncContracts FAILED', e.message);
+  }
+
+  // 2. Import Corporate Journal Transactions (Buys/Sells)
+  // This is a slow, paginated API call, so run it before the fast ledger processing.
+  try {
+    log.info('Running Ledger_Import_CorpJournal (Fetch Wallet TXNs)...');
+    Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); // PASS ss
+  } catch (e) {
+    log.error('Ledger_Import_CorpJournal FAILED', e.message);
+  }
+
+  // 3. Process Raw Contracts into Ledgers (Must run AFTER Step 1)
+  try {
+    log.info('Running contractsToMaterialLedger (Contract Buys)...');
+    contractsToMaterialLedger(ss); // PASS ss
+    log.info('Running contractsToSalesLedger (Contract Sells)...');
+    contractsToSalesLedger(ss); // PASS ss
+  } catch (e) {
+    log.error('Contract Ledger Processing FAILED', e.message);
+  }
+
+  // 4. Recalculate Unit Costs (Requires contract items/meta to be present)
+  try {
+    log.info('Running rebuildContractUnitCosts (Allocate Prices)...');
+    rebuildContractUnitCosts(ss); // PASS ss
+  } catch (e) {
+    log.error('rebuildContractUnitCosts FAILED', e.message);
+  }
+
+  // 5. Import Loot Deltas (Requires a stable Materia_Ledger state)
+  try {
+    log.info('Running importRawLootDeltasToLedger (Loot Deltas)...');
+    importRawLootDeltasToLedger(ss, null, null, true); // PASS ss
+  } catch (e) {
+    log.error('importRawLootDeltasToLedger FAILED', e.message);
+  }
+
+  log.info('--- Full Ledger Import Cycle Complete ---');
+}
+
 
 /***********************
  * Contract costing → unit_cost_alloc + Ledger fill (Original was removed; keep for reference if needed)
@@ -859,9 +1076,10 @@ function _getNamedOr_(name, fallback) {
 
 
 /** Build type_id → refPrice map from 'market price Tracker' */
-function _buildRefPriceMap_() {
+function _buildRefPriceMap_(ss) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const refSrc = String(_getNamedOr_('setting_contract_ref_source', 'MEDIAN_BUY')).toUpperCase();
-  const { rows, h } = _getData_(MARKET_PRICE_SHEET);
+  const { rows, h } = _getData_(ss, MARKET_PRICE_SHEET); // PASS ss
   const cTid = h['type_id_filtered'], cMB = h['Median Buy'], cMS = h['Median Sell'], cCB = h['Current Buy'], cCS = h['Current Sell'];
   if ([cTid, cMB, cMS, cCB, cCS].some(v => v == null)) throw new Error(`'${MARKET_PRICE_SHEET}' missing expected headers`);
   const pick = refSrc === 'CURRENT_BUY' ? cCB : refSrc === 'MEDIAN_SELL' ? cMS : refSrc === 'CURRENT_SELL' ? cCS : cMB;
@@ -878,8 +1096,9 @@ function _buildRefPriceMap_() {
 }
 
 /** contract_id → price (finished item_exchange), ignore 0-price */
-function _buildContractPriceMap_() {
-  const { rows, h } = _getData_(CONTRACTS_RAW_SHEET);
+function _buildContractPriceMap_(ss) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const { rows, h } = _getData_(ss, CONTRACTS_RAW_SHEET); // PASS ss
   const cCID = h['contract_id'], cType = h['type'], cStatus = h['status'], cPrice = h['price'];
   if ([cCID, cType, cStatus, cPrice].some(v => v == null)) throw new Error(`'${CONTRACTS_RAW_SHEET}' missing headers: contract_id,type,status,price`);
   const map = new Map();
@@ -899,19 +1118,20 @@ function _toNumberISK_(v) {
 }
 
 /** Main: compute unit_cost_alloc + fill Material_Ledger.unit_value_filled */
-function rebuildContractUnitCosts() {
+function rebuildContractUnitCosts(ss) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('GESI');
   const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase(); // 'REF' | 'QTY'
-  const refMap = _buildRefPriceMap_();
-  const priceMap = _buildContractPriceMap_();
+  const refMap = _buildRefPriceMap_(ss); // PASS ss
+  const priceMap = _buildContractPriceMap_(ss); // PASS ss
 
   // Read Contract Items (RAW)
-  const ci = _getData_(CONTRACT_ITEMS_RAW_SHEET);
+  const ci = _getData_(ss, CONTRACT_ITEMS_RAW_SHEET); // PASS ss
   const iCID = ci.h['contract_id'], iTID = ci.h['type_id'], iQ = ci.h['quantity'], iInc = ci.h['is_included'];
   if ([iCID, iTID, iQ, iInc].some(v => v == null)) throw new Error(`'${CONTRACT_ITEMS_RAW_SHEET}' missing headers: contract_id,type_id,quantity,is_included`);
 
   // Read Contracts (RAW) to get contract dates and character names
-  const c = _getData_(CONTRACTS_RAW_SHEET);
+  const c = _getData_(ss, CONTRACTS_RAW_SHEET); // PASS ss
   const cID = c.h['contract_id'], cChar = c.h['char'], cDate = c.h['date_issued'];
   if ([cID, cChar, cDate].some(v => v == null)) throw new Error(`'${CONTRACTS_RAW_SHEET}' missing headers: contract_id, char, date_issued`);
   const contractMeta = new Map();
@@ -979,10 +1199,17 @@ function rebuildContractUnitCosts() {
     }
   }
 
+  // --- EARLY EXIT CHECK ---
+  if (outRows.length === 0) {
+    log.log('rebuildContractUnitCosts', { status: 'Skipped: No contract unit cost rows to write.' });
+    return 0;
+  }
+  // --- END EARLY EXIT CHECK ---
+
   // Use ML.upsertBy() to write all rows to the ledger
-  ML.setSheet('Material_Ledger');
+  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
   const keys = ['source', 'char', 'contract_id', 'type_id'];
-  const count = ML.upsertBy(keys, outRows);
+  const count = MaterialLedger.upsert(keys, outRows);
 
   log.log('rebuildContractUnitCosts', {
     appended_or_updated: count,
@@ -993,70 +1220,112 @@ function rebuildContractUnitCosts() {
 }
 
 /** Build Char name → ID map (stub) */
-function _charIdMap() {
-  // In a real app, this would read from a dedicated sheet like 'CharIDMap'
-  // Headers: [char, character_id]
-  return {}; // Placeholder
+function _charIdMap(ss) { // ADDED ss ARGUMENT
+  // --- IMPLEMENTATION OF NAME-TO-ID MAP (Based on Corp Members) ---
+  if (_cachedCharIdMap) {
+    return _cachedCharIdMap;
+  }
+
+  const log = LoggerEx.withTag('CHAR_MAP');
+  const authToon = getCorpAuthChar(ss); // Get the authorized char name
+
+  if (!authToon) {
+    log.warn('No authorized character found for building character map.');
+    _cachedCharIdMap = {};
+    return {};
+  }
+
+  const charIdMap = {};
+
+  try {
+    // 1. Get all member IDs for the corporation tied to the authenticated character.
+    // Assumes GESI wraps this ESI call correctly and takes the authToon name.
+    // This returns an array of character IDs (numbers).
+    const memberIdsRaw = GESI.corporations_corporation_members([authToon]);
+
+    const memberIds = Array.isArray(memberIdsRaw) ? memberIdsRaw.filter(Number.isFinite) : [];
+
+    if (memberIds.length === 0) {
+      log.warn('No member IDs returned from GESI.corporations_corporation_members.');
+      _cachedCharIdMap = {};
+      return {};
+    }
+
+    // 2. Resolve those IDs to Names.
+    // Using the generic ID-to-name lookup endpoint via GESI.
+    const ID_TO_NAME_ENDPOINT = 'universe_names_id_to_name';
+
+    // GESI handles batching for GESI.invoke
+    const nameResolutions = GESI.invoke(ID_TO_NAME_ENDPOINT, memberIds, { show_column_headings: false });
+
+    // 3. Build the final Name -> ID map
+    if (Array.isArray(nameResolutions)) {
+      for (const entry of nameResolutions) {
+        // Check for required properties and filter by category 'character'
+        if (entry && entry.category === 'character' && entry.name && entry.id) {
+          // The map is NAME -> ID
+          charIdMap[entry.name] = entry.id;
+        }
+      }
+    }
+
+  } catch (e) {
+    log.error('Error building character ID map:', e);
+    _cachedCharIdMap = {}; // Fail safe
+    return {};
+  }
+
+  log.info(`Built character ID map for ${Object.keys(charIdMap).length} members.`);
+  _cachedCharIdMap = charIdMap;
+  return charIdMap;
 }
 
 // --- ADD (UTILITIES) ---------------------------------------------------------
-function _hdrMap_(arr) { var m = {}; for (var i = 0; i < arr.length; i++) m[String(arr[i]).trim()] = i; return m; }
-
-function _getSheet_(name) { // keep if not already defined
-  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
-  if (!sh) throw new Error('Missing sheet: ' + name);
-  return sh;
-}
-
-function _getData_(sheetName) {
-  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName); // Use direct SpreadsheetApp.getActiveSpreadsheet()
-  if (!sh) throw new Error('Missing sheet: ' + name);
+function _getData_(ss, sheetName) { // ADDED ss ARGUMENT
+  var sh = ss.getSheetByName(sheetName); // USE ss ARGUMENT
+  if (!sh) throw new Error('Missing sheet: ' + sheetName);
   var vals = sh.getDataRange().getValues();
+
+  // ROBUSTNESS FIX: Check for empty data before accessing header row (A1 is excluded from getDataRange if only headers exist)
+  if (vals.length < 1) {
+    return { sh: sh, header: [], rows: [], h: {} };
+  }
+
   var header = vals[0] || [];
   var rows = vals.slice(1);
-  return { sh: sh, header: header, rows: rows, h: _hdrMap_(header) };
+  var h = {};
+  for (var i = 0; i < header.length; i++) { h[String(header[i]).trim()] = i; } // 0-based index map
+
+  return { sh: sh, header: header, rows: rows, h: h };
 }
 
 /**
  * Replaces the content of a sheet (from row 2 down) with new rows.
- * Includes locking to prevent concurrent write issues.
  * Assumes the sheet is already created and headers are set.
  */
 function _rewriteData_(sh, header, rows) {
-  // We use DocumentLock here since this is writing raw, shared data.
-  var lock = LockService.getDocumentLock();
-  lock.waitLock(5000);
-  try {
-    var needed = (rows.length || 0) + 1;
-    var lastHad = sh.getMaxRows();
-    
-    // 1. Ensure sheet has enough rows (insert if necessary)
-    if (lastHad < needed) sh.insertRowsAfter(lastHad, needed - lastHad);
-    
-    // 2. Write new data (starting at row 2)
-    if (rows.length) {
-      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    }
-    
-    // 3. Clear old excess data
-    var lastNow = rows.length + 1;
-    var extra = Math.max(0, lastHad - lastNow);
-    if (extra > 0) {
-      sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
-    }
-  } finally {
-    lock.releaseLock();
+  // We rely on the caller (syncContracts) to hold the lock.
+
+  var needed = (rows.length || 0) + 1;
+  var lastHad = sh.getMaxRows();
+
+  // 1. Ensure sheet has enough rows (insert if necessary)
+  if (lastHad < needed) sh.insertRowsAfter(lastHad, needed - lastHad);
+
+  // 2. Write new data (starting at row 2)
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+  }
+
+  // 3. Clear old excess data
+  var lastNow = rows.length + 1;
+  var extra = Math.max(0, lastHad - lastNow);
+  if (extra > 0) {
+    sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
   }
 }
 
 
-function _ensureColumn_(sh, headerRow, name) {
-  var hdr = sh.getRange(headerRow, 1, 1, sh.getLastColumn()).getValues()[0];
-  var idx = -1;
-  for (var i = 0; i < hdr.length; i++) { if (String(hdr[i]).trim() === String(name)) { idx = i; break; } }
-  if (idx === -1) { idx = hdr.length; sh.getRange(headerRow, idx + 1).setValue(name); }
-  return idx; // 0-based
-}
 // ==========================================================================================
 // END UTILITIES
 // ==========================================================================================
@@ -1072,7 +1341,8 @@ function _ensureColumn_(sh, headerRow, name) {
 
 function Ledger_Import_Journal_Default() {
   // Pass opts as an object, including the necessary division and sinceDays for the corp journal import logic.
-  return Ledger_Import_CorpJournal({ division: 3, sinceDays: 30 });
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  return Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); // PASS ss
 }
 
 function Ledger_Import_Journal(opts) {
@@ -1080,25 +1350,26 @@ function Ledger_Import_Journal(opts) {
   opts = opts || {};
   var SHEET_NAME = opts.sheet || 'Material_Ledger';
   var SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
-  var SOURCE     = String(opts.sourceName || 'JOURNAL').toUpperCase();
+  var SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase();
 
   if (typeof ML === 'undefined' || typeof ML.upsertBy !== 'function') {
     throw new Error("ML API not found. Ensure MaterialLedger.gs.js is included and the ML object is global.");
   }
 
   // NOTE: Assuming GESI_GetMarketTransactionsForAllChars or GESI_GetWalletJournalForAllChars is available
-  var GESI_GET_TXN_FUNC = (typeof GESI_GetMarketTransactionsForAllChars === 'function')
+  var GESI_GET_TXN_FUNC = (GESI && typeof GESI_GetMarketTransactionsForAllChars === 'function')
     ? GESI_GET_MarketTransactionsForAllChars
-    : (typeof GESI_GetWalletJournalForAllChars === 'function' ? GESI_GET_WalletJournalForAllChars : null);
-  
+    : (GESI && typeof GESI_GetWalletJournalForAllChars === 'function' ? GESI_GET_WalletJournalForAllChars : null);
+
   if (!GESI_GET_TXN_FUNC) {
     throw new Error("Required GESI transaction helper (GetMarketTransactionsForAllChars or GetWalletJournalForAllChars) not found.");
   }
 
   // 1) Fetch/normalize entries OUTSIDE the lock (slow stuff)
-  var nowMs  = Date.now();
+  var nowMs = Date.now();
   var cutoff = new Date(nowMs - SINCE_DAYS * 86400000);
 
+  // Removed redundant function check around GESI_GET_TXN_FUNC
   var rawEntries = GESI_GET_TXN_FUNC({ since: cutoff }) || [];
 
   // Normalize to ML-compliant row objects
@@ -1106,20 +1377,20 @@ function Ledger_Import_Journal(opts) {
   for (var i = 0; i < rawEntries.length; i++) {
     var e = rawEntries[i] || {};
     var dt = e.date || e.timestamp || e.time;
-    var d  = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
+    var d = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
     if (!(d instanceof Date) || isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue; // Apply date filter here
 
     var isBuy = (e.is_buy === true) || /buy/i.test(String(e.ref_type || ''));
     if (!isBuy) continue;
 
     var typeId = Number(e.type_id || e.typeID || 0);
-    var qty    = Number(e.quantity || e.qty || 0);
-    var price  = Number(e.unit_price || e.price || e.amount_per_unit || 0);
+    var qty = Number(e.quantity || e.qty || 0);
+    var price = Number(e.unit_price || e.price || e.amount_per_unit || 0);
     if (!(typeId > 0 && qty > 0 && price > 0)) continue;
 
     var contractId = String(e.transaction_id || e.id || e.journal_ref_id || e.context_id);
-    var charName   = e.char_name || e.char || e.character || '';
-    
+    var charName = e.char_name || e.char || e.character || '';
+
     outRows.push({
       date: d,
       type_id: typeId,
@@ -1135,13 +1406,13 @@ function Ledger_Import_Journal(opts) {
 
   // 2) Lock + Sheet I/O + Write via ML API
   return withSheetLock(function () {
-    ML.setSheet(SHEET_NAME);
+    const MaterialLedger = ML.forSheet(SHEET_NAME); // Use factory pattern
 
     // Key: source + contract_id + char (transaction ID + character name is unique)
     const keys = ['source', 'contract_id', 'char'];
-    const count = ML.upsertBy(keys, outRows);
+    const count = MaterialLedger.upsert(keys, outRows); // Use factory instance
 
-    log.log('journal_import', { appended_or_updated: count, processed: outRows.length, sheet: ML.sheetName() });
+    log.log('journal_import', { appended_or_updated: count, processed: outRows.length, sheet: MaterialLedger.sheetName() });
     return count;
   });
 }
@@ -1150,19 +1421,21 @@ function Ledger_Import_Journal(opts) {
  * Imports corporate market transactions (buy and sell) for Division 3 only.
  * Buy transactions go to Material_Ledger (default).
  * Sell transactions go to Sales_Ledger.
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
  */
-function Ledger_Import_CorpJournal(opts) {
+function Ledger_Import_CorpJournal(ss, opts) { // ADDED ss ARGUMENT
   const log = LoggerEx.withTag('CORP_TXN');
   // ADDED: Start timer to profile execution time
-  const t = log.startTimer('Ledger_Import_CorpJournal_Setup'); 
-  
+  const t = log.startTimer('Ledger_Import_CorpJournal_Setup');
+
   opts = opts || {};
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
 
   if (typeof ML === 'undefined' || typeof ML.upsertBy !== 'function') {
     throw new Error("ML API not found. Ensure MaterialLedger.gs.js is included and the ML object is global.");
   }
 
-  const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions'; 
+  const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions';
 
   const BUY_SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase();
   const SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30)); // Get sinceDays from opts
@@ -1173,19 +1446,19 @@ function Ledger_Import_CorpJournal(opts) {
 
   // --- Division Selection: FIXED TO DIVISION 3 ---
   const TARGET_DIVISION = 3;
-  const authToon = getCorpAuthChar(); // Fetched and cached
+  const authToon = getCorpAuthChar(ss); // PASS ss
   // --- End Division Selection ---
 
   // --- ANCHORING SETUP ---
   // Read last known transaction ID from PropertiesService
   const props = PropertiesService.getScriptProperties();
-  const rawFromId = props.getProperty(CORP_JOURNAL_LAST_ID); 
-  
+  const rawFromId = props.getProperty(CORP_JOURNAL_LAST_ID);
+
   // FIX: Use parseInt (corrected spelling) to convert the saved ID (string) to an integer.
   // If rawFromId is null, parseInt returns NaN, so we convert NaN back to null.
   let currentFromId = rawFromId ? parseInt(rawFromId, 10) : null;
   if (isNaN(currentFromId)) {
-      currentFromId = null;
+    currentFromId = null;
   }
   // NOTE: If the ID is used in the URL, it must be the string form. ESI typically handles 
   // conversion of large numbers passed via the options object.
@@ -1196,25 +1469,25 @@ function Ledger_Import_CorpJournal(opts) {
   let fetchMore = true;
 
   log.log(`Fetching Corp Transactions for Division ${TARGET_DIVISION} (since ${SINCE_DAYS} days)...`);
-  
+
   do {
     try {
-      
+
       // If we have an anchor, use it to start fetching OLDER data.
       let from_id_arg = null;
       // Capture the from_id *before* the fetch to check against later (infinite loop prevention)
-      const previousFromId = currentFromId; 
-      
+      const previousFromId = currentFromId;
+
       if (currentFromId) {
-        from_id_arg = currentFromId; 
+        from_id_arg = currentFromId;
         log.log(`...fetching transactions before ID: ${currentFromId}`);
       } else {
         log.log(`...fetching most recent page (no anchor set).`);
       }
-      
+
       // FIX: Use GESI.invokeRaw (User's preferred stable method)
       const rawEntries = GESI.invokeRaw(
-        GESI_FUNC_NAME, 
+        GESI_FUNC_NAME,
         {
           division: TARGET_DIVISION, // Bundled required path parameter
           from_id: from_id_arg, // Bundled optional query parameter (Number or null)
@@ -1222,13 +1495,13 @@ function Ledger_Import_CorpJournal(opts) {
           show_column_headings: false, // Use raw output for object parsing
           version: null // Let GESI handle it
         }
-      ); 
+      );
 
       if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
         fetchMore = false;
         break;
       }
-      
+
       allCorpTransactions.push(...rawEntries);
 
       // Check the date of the oldest entry in the current page. If it's older than 
@@ -1239,18 +1512,18 @@ function Ledger_Import_CorpJournal(opts) {
 
       // FIX: Add validation check for Invalid Date before comparing getTime()
       if (isNaN(oldestDate.getTime())) {
-          log.error("Invalid Date found in ESI response. Stopping pagination.", { entry: oldestEntry });
-          fetchMore = false;
-          break;
+        log.error("Invalid Date found in ESI response. Stopping pagination.", { entry: oldestEntry });
+        fetchMore = false;
+        break;
       }
-      
+
       // FIX: INFINITE LOOP PREVENTION 
       // If the oldest entry ID found is the same as the ID we just requested (meaning we hit the end 
       // of the data and the server sent us the same last page again), we stop.
       if (previousFromId && previousFromId === oldestEntryId) {
-           log.log(`Pagination exhausted: Oldest ID ${oldestEntryId} repeated. Stopping loop.`);
-           fetchMore = false;
-           break;
+        log.log(`Pagination exhausted: Oldest ID ${oldestEntryId} repeated. Stopping loop.`);
+        fetchMore = false;
+        break;
       }
 
 
@@ -1262,65 +1535,105 @@ function Ledger_Import_CorpJournal(opts) {
         // as the starting point for the next, older page.
         currentFromId = oldestEntryId;
       }
-      
+
       // Small sleep to be polite to the ESI server
-      Utilities.sleep(100); 
+      Utilities.sleep(100);
 
     } catch (e) {
       log.error(`Error fetching Division ${TARGET_DIVISION} at from_id ${currentFromId}.`, e);
       fetchMore = false; // Stop the loop on error
       // Re-throw the error after logging so the Apps Script runtime fails visibly
-      throw e; 
+      throw e;
     }
   } while (fetchMore);
-  
-  
+
+
   // Resume property is not needed and is removed/cleared.
   props.deleteProperty(CORP_JOURNAL_RESUME_PROP);
 
 
+  // --- PROCESSING LOGIC: Convert Raw Transactions to Ledger Rows ---
   const buyRows = [];
   const sellRows = [];
-  
+  const charName = authToon; // Corp transactions use the auth character name
+
+  for (const e of allCorpTransactions) {
+    const dt = e.date || e.timestamp || e.time;
+    const d = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
+
+    // Check date against cutoff again, in case the server sent a slightly older first page
+    if (!(d instanceof Date) || isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
+
+    const isBuy = e.is_buy === true;
+    const typeId = Number(e.type_id || 0);
+    const qty = Number(e.quantity || 0);
+    const price = Number(e.unit_price || e.price || 0);
+    const contractId = String(e.transaction_id || e.id || 0);
+
+    if (!(typeId > 0 && qty > 0 && price > 0)) continue;
+
+    const row = {
+      date: d,
+      type_id: typeId,
+      // item_name: e.type_name || '', // ML will likely fill this later
+      qty: isBuy ? qty : -qty, // Positive for buy (inflow), negative for sell (outflow)
+      unit_value: '',
+      source: BUY_SOURCE, // Reusing BUY_SOURCE for transaction reference
+      contract_id: contractId,
+      char: charName,
+      unit_value_filled: price,
+    };
+
+    if (isBuy) {
+      buyRows.push(row);
+    } else {
+      sellRows.push(row);
+    }
+  }
+  // --- END PROCESSING LOGIC ---
+
   // FIX: Optimization Check: Skip processing/writing if no NEW transactions were found.
-  // We check if all transactions are older than the persistent anchor ID (if it exists).
-  const isNoNewData = rawFromId && allCorpTransactions.length > 0 && 
-                      (rawFromId === String(allCorpTransactions[0].transaction_id)); 
-                      
+  // This is a comprehensive check that should remain.
+  const isNoNewData = rawFromId && allCorpTransactions.length > 0 &&
+    (rawFromId === String(allCorpTransactions[0].transaction_id));
+
   if (allCorpTransactions.length === 0 || isNoNewData) {
-      log.log('CORP_TXN', { status: 'Skipped ledger write: No new transactions found.' });
-      return { 
-        appended_or_updated_buy: 0, 
-        appended_or_updated_sell: 0, 
-        processed: allCorpTransactions.length,
-        sheets: { buy: opts.sheet || LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
-        locked: false
-      };
+    log.log('CORP_TXN', { status: 'Skipped ledger write: No new transactions found.' });
+    return {
+      appended_or_updated_buy: 0,
+      appended_or_updated_sell: 0,
+      processed: allCorpTransactions.length,
+      sheets: { buy: opts.sheet || LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
+      locked: false
+    };
   }
 
   // --- BEGIN TRANSACTION ---
   const result = withSheetLock(function () {
+    // Key: source + contract_id (transaction ID is unique per transaction type)
     const keys = ['source', 'contract_id'];
     let buyCount = 0;
     let sellCount = 0;
-    
-    // 1. Process Buy Side (Inflow to Material_Ledger)
+
+    // 1. Set up Ledger instances
+    const MaterialLedger = ML.forSheet(opts.sheet || LEDGER_BUY_SHEET);
+    const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
+
+    // 2. Process Buy Side (Inflow to Material_Ledger)
     if (buyRows.length > 0) {
-      ML.setSheet(opts.sheet || LEDGER_BUY_SHEET);
-      buyCount = ML.upsertBy(keys, buyRows);
-      log.log(`Buy side processed for ${ML.sheetName()}`, { appended_or_updated: buyCount, processed: buyRows.length });
+      buyCount = MaterialLedger.upsert(keys, buyRows);
+      log.log(`Buy side processed for ${MaterialLedger.sheetName()}`, { appended_or_updated: buyCount, processed: buyRows.length });
     }
 
-    // 2. Process Sell Side (Outflow to Sales_Ledger)
+    // 3. Process Sell Side (Outflow to Sales_Ledger)
     if (sellRows.length > 0) {
-      ML.setSheet(LEDGER_SALE_SHEET);
-      sellCount = ML.upsertBy(keys, sellRows);
-      log.log(`Sell side processed for ${ML.sheetName()}`, { appended_or_updated: sellCount, processed: sellRows.length });
+      sellCount = SalesLedger.upsert(keys, sellRows);
+      log.log(`Sell side processed for ${SalesLedger.sheetName()}`, { appended_or_updated: sellCount, processed: sellRows.length });
     }
 
-    return { 
-      appended_or_updated_buy: buyCount, 
-      appended_or_updated_sell: sellCount, 
+    return {
+      appended_or_updated_buy: buyCount,
+      appended_or_updated_sell: sellCount,
       processed: allCorpTransactions.length,
       sheets: { buy: opts.sheet || LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
       locked: true
@@ -1331,13 +1644,13 @@ function Ledger_Import_CorpJournal(opts) {
   // --- ANCHORING WRITE LOGIC (Outside Lock) ---
   // Only save the newest ID if we actually fetched new data (and the array isn't empty)
   if (allCorpTransactions.length > 0) {
-        // The newest transaction is the first element in the array (ESI returns newest first)
-        const newestTransactionId = allCorpTransactions[0].transaction_id;
-        
-        // Save the newest ID to act as the starting anchor (from_id) for the NEXT run.
-        props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
-        log.log(`Saved new transaction anchor: ${newestTransactionId}`);
-    }
+    // The newest transaction is the first element in the array (ESI returns newest first)
+    const newestTransactionId = allCorpTransactions[0].transaction_id;
+
+    // Save the newest ID to act as the starting anchor (from_id) for the NEXT run.
+    props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
+    log.log(`Saved new transaction anchor: ${newestTransactionId}`);
+  }
 
 
   return result;
