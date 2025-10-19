@@ -2,19 +2,19 @@
  * Fuzzworks Price Client + Cache Helpers (Apps Script / Sheets) - V3
  * - Asynchronous, queue-based fetching to prevent spreadsheet timeouts.
  * - Shared ScriptCache for efficient data sharing between users.
- * - Chunked, concurrent POST requests with retries for reliability.
- * - Negative caching for invalid or unlisted type IDs to prevent re-queuing.
- * - De-duplication of queued tasks to minimize API calls.
+ * - FIX: Zero values for PRICE fields are now treated as blank cells.
+ * - FIX: Zero values for VOLUME and ORDERCOUNT are correctly displayed as 0.
  * ========================================================================== */
 
 /* global CacheService, LoggerEx, UrlFetchApp, Utilities, LockService, ScriptApp */
 
-/* ------------------------------ CONSTANTS --------------------------------- */
-
+// ... (All utility functions like _L_warn, withRetries, etc., are unchanged) ...
 const FUZ_CACHE_VER = 'v2';
 const MISSING_QUEUE_KEY = 'FUZ:MISSING_QUEUE';
 const MAX_ID_PER_CHUNK = 700; 
 const FETCHING_PLACEHOLDER = "Waiting on Queue";
+// --- ADDED: List of fields that represent prices ---
+const PRICE_LEVELS = ["min", "max", "avg", "median", "weightedAverage", "stddev", "percentile"];
 
 /* ------------------------------ Utilities -------------------------------- */
 
@@ -112,6 +112,7 @@ function _reshape(flat, rows, cols) {
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out[r][c] = flat[k++];
   return out;
 }
+
 
 /* ------------------------- Cache & Queue Management ---------------------- */
 
@@ -345,65 +346,6 @@ function fuzzyFetchAll(tasks) {
 /* -------------------------- Public Custom Functions ----------------------- */
 
 /**
- * Generic API to get prices for an array/range of type_ids at a station id (default Jita).
- * Preserves the input shape (rows x cols).
- * @customfunction
- */
-function fuzzApiPriceDataJitaSell(type_ids, market_hub = 60003760, order_type = null, order_level = null, location_type = "station", refresh_id = null) {
-    if (!type_ids) throw new Error('type_ids is required');
-    if (refresh_id != null) { /* no-op */ }
-
-    const { rows, cols, flatIds, validIds } = _processInputIds(type_ids);
-    const lt = String(location_type).toLowerCase();
-    const norm = _normalizeOrder(order_type, order_level);
-    const { have, missing } = _getCachedFuz(validIds, Number(market_hub), lt);
-  
-    if (missing.length) {
-        _queueMissingItems(missing, Number(market_hub), lt);
-    }
-
-    const pick = (row) => {
-        if (!row || !row[norm.type]) return null;
-        const v = row[norm.type][norm.level];
-        const num = Number(v);
-        return Number.isFinite(num) ? num : null;
-    };
-
-    const outFlat = flatIds.map(id => {
-        if (id == null) return "";
-        if (!have.hasOwnProperty(id)) {
-            return FETCHING_PLACEHOLDER;
-        }
-        const data = have[id];
-        if (!data) {
-            return ""; 
-        }
-        return (pick(data) ?? "");
-    });
-  
-    return _reshape(outFlat, rows, cols);
-}
-
-
-/**
- * Hub-name helper (Jita/Amarr/Dodixie/Rens/Hek). Defaults sell/min.
- * @customfunction
- */
-function fuzzPriceDataByHub(type_ids, market_hub = "Jita", order_type = "sell", order_level = null) {
-  if (!type_ids) throw new Error('type_ids is required');
-  let hub = String(market_hub || '').toLowerCase();
-  switch (hub) {
-    case 'amarr':   hub = 60008494; break;
-    case 'dodixie': hub = 60011866; break;
-    case 'rens':    hub = 60004588; break;
-    case 'hek':     hub = 60005686; break;
-    case 'jita':
-    default:        hub = 60003760;
-  }
-  return fuzzApiPriceDataJitaSell(type_ids, hub, order_type, order_level, "station");
-}
-
-/**
  * The primary, cache-first accessor for Fuzzworks aggregates.
  * @customfunction
  */
@@ -424,11 +366,20 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
         _queueMissingItems(missing, Number(location_id), lt);
     }
 
+    // --- CORRECTED PICKER FUNCTION ---
     function pick(row) {
         if (!row || !row[side]) return null;
         const v = row[side][lvl];
         const num = Number(v);
-        return Number.isFinite(num) ? num : null;
+
+        if (!Number.isFinite(num)) return null;
+
+        // Check if the requested level is a price field
+        if (PRICE_LEVELS.includes(lvl)) {
+            return num > 0 ? num : null; // Return null if price is 0
+        } else {
+            return num; // Return the number directly for non-price fields (like volume)
+        }
     }
 
     const outFlat = flatIds.map(id => {
@@ -463,15 +414,25 @@ function marketStatDataBoth(type_ids, location_type, location_id, order_level_se
         _queueMissingItems(missing, Number(location_id), lt);
     }
     
+    // --- CORRECTED PICKER FUNCTION ---
     function pickBoth(row) {
         if (!row) return [null, null];
         const buyLevel = _normalizeOrder("buy", order_level_buy).level;
         const sellLevel = _normalizeOrder("sell", order_level_sell).level;
+        
         const buyValue = row.buy ? row.buy[buyLevel] : null;
         const sellValue = row.sell ? row.sell[sellLevel] : null;
-        const finalBuy = Number.isFinite(Number(buyValue)) ? Number(buyValue) : null;
-        const finalSell = Number.isFinite(Number(sellValue)) ? Number(sellValue) : null;
-        return [finalSell, finalBuy];
+        
+        // Prices are blank if zero
+        const finalBuy = (Number.isFinite(Number(buyValue)) && Number(buyValue) > 0) ? Number(buyValue) : null;
+        const finalSell = (Number.isFinite(Number(sellValue)) && Number(sellValue) > 0) ? Number(sellValue) : null;
+
+        // Check if the requested levels are NOT prices (e.g., volume)
+        // If it's volume, we allow zero.
+        const finalBuyResult = PRICE_LEVELS.includes(buyLevel) ? finalBuy : buyValue;
+        const finalSellResult = PRICE_LEVELS.includes(sellLevel) ? finalSell : sellValue;
+
+        return [finalSellResult, finalBuyResult];
     }
 
     const outFlat = flatIds.flatMap(id => {
@@ -488,4 +449,24 @@ function marketStatDataBoth(type_ids, location_type, location_id, order_level_se
     });
     
     return _reshape(outFlat, rows, cols * 2); 
+}
+
+// NOTE: The other public functions like fuzzApiPriceDataJitaSell and fuzzPriceDataByHub
+// internally call marketStatData, so they will automatically inherit this corrected behavior.
+function fuzzApiPriceDataJitaSell(type_ids, market_hub = 60003760, order_type = null, order_level = null, location_type = "station", refresh_id = null) {
+    return marketStatData(type_ids, location_type, market_hub, order_type, order_level, refresh_id);
+}
+
+function fuzzPriceDataByHub(type_ids, market_hub = "Jita", order_type = "sell", order_level = null) {
+  if (!type_ids) throw new Error('type_ids is required');
+  let hub = String(market_hub || '').toLowerCase();
+  switch (hub) {
+    case 'amarr':   hub = 60008494; break;
+    case 'dodixie': hub = 60011866; break;
+    case 'rens':    hub = 60004588; break;
+    case 'hek':     hub = 60005686; break;
+    case 'jita':
+    default:        hub = 60003760;
+  }
+  return fuzzApiPriceDataJitaSell(type_ids, hub, order_type, order_level, "station");
 }

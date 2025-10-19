@@ -134,7 +134,10 @@ function _rewriteData_(sh, header, rows) {
     sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
   }
 }
-
+function resetLootSnapshot() {
+  PropertiesService.getDocumentProperties().deleteProperty('raw_loot:snapshot:v2');
+  SpreadsheetApp.getUi().alert('Loot snapshot successfully reset!');
+}
 /**
  * Reads external loot sheet, filters for non-null items, and sorts the result.
  * This completely replaces the slow QUERY(IMPORTRANGE()) formula.
@@ -754,9 +757,10 @@ function Ledger_Import_CorpJournal(ss, opts) { // ADDED ss ARGUMENT
   opts = opts || {};
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
 
-  if (typeof ML === 'undefined' || typeof ML.upsertBy !== 'function') {
+/**
+  if (typeof ML === 'undefined' || typeof ML.upsert !== 'function') {
     throw new Error("ML API not found. Ensure MaterialLedger.gs.js is included and the ML object is global.");
-  }
+  } */
 
   const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions'; 
 
@@ -932,30 +936,26 @@ function Ledger_Import_CorpJournal(ss, opts) { // ADDED ss ARGUMENT
       };
   }
 
-  // --- BEGIN TRANSACTION ---
+ // --- BEGIN TRANSACTION ---
   const result = withSheetLock(function () {
     // Key: source + contract_id (transaction ID is unique per transaction type)
     const keys = ['source', 'contract_id'];
     let buyCount = 0;
     let sellCount = 0;
     
-    const MAT_LEDGER_SHEET = opts.sheet || LEDGER_BUY_SHEET; // Capture Material Ledger name for logging
-    
-    // 1. Set up Ledger instances
-    const MaterialLedger = ML.forSheet(MAT_LEDGER_SHEET); 
+    // FIX: Create a new instance for each sheet to prevent shared state conflicts
+    const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET); 
     const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
     
     // 2. Process Buy Side (Inflow to Material_Ledger)
     if (buyRows.length > 0) {
       buyCount = MaterialLedger.upsert(keys, buyRows);
-      // FIX: Use MAT_LEDGER_SHEET string directly instead of missing MaterialLedger.sheetName() method
-      log.log(`Buy side processed for ${MAT_LEDGER_SHEET}`, { appended_or_updated: buyCount, processed: buyRows.length });
+      log.log(`Buy side processed for ${LEDGER_BUY_SHEET}`, { appended_or_updated: buyCount, processed: buyRows.length });
     }
 
     // 3. Process Sell Side (Outflow to Sales_Ledger)
     if (sellRows.length > 0) {
       sellCount = SalesLedger.upsert(keys, sellRows);
-      // FIX: Use LEDGER_SALE_SHEET string directly instead of missing SalesLedger.sheetName() method
       log.log(`Sell side processed for ${LEDGER_SALE_SHEET}`, { appended_or_updated: sellCount, processed: sellRows.length });
     }
 
@@ -963,7 +963,7 @@ function Ledger_Import_CorpJournal(ss, opts) { // ADDED ss ARGUMENT
       appended_or_updated_buy: buyCount, 
       appended_or_updated_sell: sellCount, 
       processed: allCorpTransactions.length,
-      sheets: { buy: MAT_LEDGER_SHEET, sell: LEDGER_SALE_SHEET }, // Use captured MAT_LEDGER_SHEET
+      sheets: { buy: LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
       locked: true
     };
   });
@@ -1320,7 +1320,361 @@ function syncContracts(ss, charIdMap) { // ADDED charIdMap ARGUMENT
   }); // END LOCK
 }
 
+/**
+ * New function: contractsToMaterialLedger (Full implementation defined here)
+ */
+function contractsToMaterialLedger(ss, charIdMap) { // ADDED charIdMap ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const log = LoggerEx.withTag('GESI');
+  const charName = getCorpAuthChar(ss); // PASS ss
+  // --- OPTIMIZED CHAR ID LOOKUP ---
+  // const charIdMap = _charIdMap(ss) || {}; // REMOVED redundant map creation
+  const myCharId = charIdMap[charName] || null;
+  // --- END OPTIMIZED CHAR ID LOOKUP ---
 
+  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET); // Instance created outside lock
+
+  // --- SHEET EXISTENCE CHECK ---
+  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
+  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
+  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
+  
+  // NEW: Check if sheets have data beyond headers (Row 1)
+  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) {
+      log.log('contracts→ledger', { status: 'Skipped: RAW contracts sheet is empty (headers only).' });
+      return 0;
+  }
+  // --- END SHEET EXISTENCE CHECK ---
+
+  // Get data outside of lock
+  // Apply MAX_RAW_ROWS_TO_PROCESS cap to prevent CPU timeouts on large sheets
+  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
+  const hC = C.shift();
+  const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
+  const hI = I.shift();
+
+
+  // If there are no contracts/items to process (after shifting header), exit before locking.
+  if (C.length === 0 || I.length === 0) {
+      log.log('contracts→ledger', { status: 'Skipped: No raw contracts or items found (after read).' });
+      return 0;
+  }
+  // --- END EARLY EXIT CHECK ---
+
+  const ix = (arr, name) => arr.indexOf(name);
+
+  const colC = {
+    char: ix(hC, "char"),
+    contract_id: ix(hC, "contract_id"),
+    type: ix(hC, "type"),
+    status: ix(hC, "status"),
+    acceptor_id: ix(hC, "acceptor_id"),
+    date_issued: ix(hC, "date_issued"),
+  };
+  const colI = {
+    contract_id: ix(hI, "contract_id"),
+    type_id: ix(hI, "type_id"),
+    quantity: ix(hI, "quantity"),
+    is_included: ix(hI, "is_included"),
+  };
+
+  const itemsByCid = {};
+  for (let r = 0; r < I.length; r++) {
+    const rowI = I[r];
+    const cid = rowI[colI.contract_id];
+    if (!itemsByCid[cid]) itemsByCid[cid] = [];
+    itemsByCid[cid].push({
+      type_id: rowI[colI.type_id],
+      qty: Number(rowI[colI.quantity] || 0),
+      is_included: !!rowI[colI.is_included],
+    });
+  }
+
+  const outRows = [];
+  for (let q = 0; q < C.length; q++) {
+    const rowC = C[q];
+    const ctype = String(rowC[colC.type] || "").toLowerCase();
+    const status = String(rowC[colC.status] || "").toLowerCase();
+    const acceptorId = rowC[colC.acceptor_id];
+    const rowCharName = rowC[colC.char] || "";
+
+    // Filter for finished contracts where the character is the acceptor (buy)
+    // Check: if charId is known AND acceptorId does not match charId OR acceptorId is known AND rowCharName does not match cached charName
+    if (ctype !== "item_exchange" || status !== "finished" || (myCharId && acceptorId !== myCharId) || (rowCharName && acceptorId && myCharId && rowCharName !== charName)) {
+      continue;
+    }
+
+    const cid2 = rowC[colC.contract_id];
+    const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+    const items = itemsByCid[cid2] || [];
+
+    for (const it of items) {
+      if (!it.is_included || it.qty <= 0) continue;
+      outRows.push({
+        date: issued,
+        type_id: it.type_id,
+        qty: it.qty,
+        source: "CONTRACT",
+        contract_id: cid2,
+        char: rowC[colC.char] || ""
+      });
+    }
+  }
+
+  // --- SECONDARY EARLY EXIT CHECK ---
+  if (outRows.length === 0) {
+      log.log('contracts→ledger', { status: 'Skipped: No qualifying contract deltas found.' });
+      return 0;
+  }
+  // --- END SECONDARY EARLY EXIT CHECK ---
+
+  return withSheetLock(function () {
+    // Use ML instance
+    const keys = ['source', 'char', 'contract_id', 'type_id'];
+    const count = MaterialLedger.upsert(keys, outRows);
+
+    log.log('contracts→ledger', {
+      appended_or_updated: count,
+      processed_rows: outRows.length
+    });
+    return count;
+  });
+}
+
+/**
+ * New function: contractsToSalesLedger (Full implementation defined here)
+ */
+function contractsToSalesLedger(ss, charIdMap) { // ADDED charIdMap ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const log = LoggerEx.withTag('GESI');
+  const charName = getCorpAuthChar(ss); // PASS ss
+  // --- OPTIMIZED CHAR ID LOOKUP ---
+  // const charIdMap = _charIdMap(ss) || {}; // REMOVED redundant map creation
+  const myCharId = charIdMap[charName] || null;
+  // --- END OPTIMIZED CHAR ID LOOKUP ---
+
+  const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET); // Instance created outside lock
+
+  // --- SHEET EXISTENCE CHECK ---
+  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
+  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
+  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
+
+  // NEW: Check if sheets have data beyond headers (Row 1)
+  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) {
+      log.log('contracts→sales_ledger', { status: 'Skipped: RAW contracts sheet is empty (headers only).' });
+      return 0;
+  }
+  // --- END SHEET EXISTENCE CHECK ---
+
+  // Get data outside of lock
+  // Apply MAX_RAW_ROWS_TO_PROCESS cap to prevent CPU timeouts on large sheets
+  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
+  const hC = C.shift();
+  const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
+  const hI = I.shift();
+
+  // If there are no contracts/items to process (after shifting header), exit before locking.
+  if (C.length === 0 || I.length === 0) {
+      log.log('contracts→sales_ledger', { status: 'Skipped: No raw contracts or items found (after read).' });
+      return 0;
+  }
+  // --- END EARLY EXIT CHECK ---
+
+
+  const ix = (arr, name) => arr.indexOf(name);
+
+  const colC = {
+    char: ix(hC, "char"),
+    contract_id: ix(hC, "contract_id"),
+    type: ix(hC, "type"),
+    status: ix(hC, "status"),
+    issuer_id: ix(hC, "issuer_id"),
+    date_issued: ix(hC, "date_issued"),
+    price: ix(hC, "price"),
+  };
+  const colI = {
+    contract_id: ix(hI, "contract_id"),
+    type_id: ix(hI, "type_id"),
+    quantity: ix(hI, "quantity"),
+    is_included: ix(hI, "is_included"),
+  };
+
+  const itemsByCid = {};
+  for (let r = 0; r < I.length; r++) {
+    const rowI = I[r];
+    const cid = rowI[colI.contract_id];
+    if (!itemsByCid[cid]) itemsByCid[cid] = [];
+    itemsByCid[cid].push({
+      type_id: rowI[colI.type_id],
+      qty: Number(rowI[colI.quantity] || 0),
+      is_included: !!rowI[colI.is_included],
+    });
+  }
+
+  const outRows = [];
+  for (let q = 0; q < C.length; q++) {
+    const rowC = C[q];
+    const ctype = String(rowC[colC.type] || "").toLowerCase();
+    const status = String(rowC[colC.status] || "").toLowerCase();
+    const issuerId = rowC[colC.issuer_id];
+    const rowCharName = rowC[colC.char] || "";
+    const price = Number(rowC[colC.price] || 0);
+
+    // Filter for finished contracts where the character is the issuer (sell)
+    // Check: if charId is known AND issuerId does not match charId OR issuerId is known AND rowCharName does not match cached charName
+    if (ctype !== "item_exchange" || status !== "finished" || (myCharId && issuerId !== myCharId) || (rowCharName && issuerId && myCharId && rowCharName !== charName)) {
+      continue;
+    }
+
+    const cid2 = rowC[colC.contract_id];
+    const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+    const items = itemsByCid[cid2] || [];
+
+    for (const it of items) {
+      if (!it.is_included || it.qty <= 0) continue;
+
+      let unit_price_filled = 0;
+      if (it.qty > 0) {
+          unit_price_filled = price / it.qty; // Simple price allocation per unit
+      }
+
+      // Use a NEGATIVE quantity to denote a sale/outgoing item
+      outRows.push({
+        date: issued,
+        type_id: it.type_id,
+        qty: -it.qty,
+        unit_value: '',
+        unit_value_filled: unit_price_filled,
+        source: "SALE",
+        contract_id: cid2,
+        char: rowC[colC.char] || ""
+      });
+    }
+  }
+
+  // --- SECONDARY EARLY EXIT CHECK ---
+  if (outRows.length === 0) {
+      log.log('contracts→sales_ledger', { status: 'Skipped: No qualifying contract deltas found.' });
+      return 0;
+  }
+  // --- END SECONDARY EARLY EXIT CHECK ---
+
+  return withSheetLock(function () {
+    // Use ML instance
+    const keys = ['source', 'char', 'contract_id', 'type_id'];
+    const count = SalesLedger.upsert(keys, outRows);
+
+    log.log('contracts→sales_ledger', {
+      appended_or_updated: count,
+      processed_rows: outRows.length
+    });
+    return count;
+  });
+}
+/**
+ * New function: rebuildContractUnitCosts (Full implementation defined here)
+ */
+function rebuildContractUnitCosts(ss) { // ADDED ss ARGUMENT
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const log = LoggerEx.withTag('GESI');
+  const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase(); // 'REF' | 'QTY'
+  const refMap = _buildRefPriceMap_(ss); // PASS ss
+  const priceMap = _buildContractPriceMap_(ss); // PASS ss
+
+  // Read Contract Items (RAW)
+  const ci = _getData_(ss, CONTRACT_ITEMS_RAW_SHEET); // PASS ss
+  const iCID = ci.h['contract_id'], iTID = ci.h['type_id'], iQ = ci.h['quantity'], iInc = ci.h['is_included'];
+  if ([iCID, iTID, iQ, iInc].some(v => v == null)) throw new Error(`'${CONTRACT_ITEMS_RAW_SHEET}' missing headers: contract_id,type_id,quantity,is_included`);
+
+  // Read Contracts (RAW) to get contract dates and character names
+  const c = _getData_(ss, CONTRACTS_RAW_SHEET); // PASS ss
+  const cID = c.h['contract_id'], cChar = c.h['char'], cDate = c.h['date_issued'];
+  if ([cID, cChar, cDate].some(v => v == null)) throw new Error(`'${CONTRACTS_RAW_SHEET}' missing headers: contract_id, char, date_issued`);
+  const contractMeta = new Map();
+  for (const r of c.rows) {
+    const cid = String(r[cID]);
+    contractMeta.set(cid, {
+      char: String(r[cChar]),
+      date: r[cDate] ? _isoDate(r[cDate]) : ''
+    });
+  }
+
+  const outRows = [];
+
+  // Group items by contract
+  const itemsByCid = new Map();
+  ci.rows.forEach(r => {
+    const cid = String(r[iCID]);
+    const included = String(r[iInc]).toUpperCase() === 'TRUE';
+    if (!included) return;
+    const tid = Number(r[iTID]) || 0;
+    const qty = Number(r[iQ]) || 0;
+    if (qty <= 0) return;
+    if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
+    itemsByCid.get(cid).push({
+      tid,
+      qty
+    });
+  });
+
+  // Calculate unit costs and build ledger rows
+  for (const [cid, items] of itemsByCid.entries()) {
+    const price = priceMap.get(cid) || 0;
+    const meta = contractMeta.get(cid);
+    if (price <= 0 || !meta) continue;
+
+    // Determine allocation denominator
+    let denQty = 0, denRef = 0, missingRef = false;
+    for (const { tid, qty } of items) {
+      denQty += qty;
+      const ref = refMap.get(tid) || 0;
+      if (ref > 0) denRef += qty * ref;
+      else missingRef = true;
+    }
+    const useRef = (allocMode === 'REF' && !missingRef && denRef > 0);
+
+    for (const { tid, qty } of items) {
+      let unit = 0;
+      if (useRef) {
+        const ref = refMap.get(tid) || 0;
+        unit = (denRef > 0 && ref > 0) ? (price * ref / denRef) : 0;
+      } else {
+        unit = denQty > 0 ? price / denQty : 0;
+      }
+      if (unit <= 0) continue;
+
+      outRows.push({
+        date: meta.date,
+        type_id: tid,
+        qty: qty,
+        unit_value_filled: unit,
+        source: 'CONTRACT',
+        contract_id: cid,
+        char: meta.char
+      });
+    }
+  }
+
+  // --- EARLY EXIT CHECK ---
+  if (outRows.length === 0) {
+      log.log('rebuildContractUnitCosts', { status: 'Skipped: No contract unit cost rows to write.' });
+      return 0;
+  }
+  // --- END EARLY EXIT CHECK ---
+
+  // Use ML.upsertBy() to write all rows to the ledger
+  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
+  const keys = ['source', 'char', 'contract_id', 'type_id'];
+  const count = MaterialLedger.upsert(keys, outRows);
+
+  log.log('rebuildContractUnitCosts', {
+    appended_or_updated: count,
+    processed: outRows.length
+  });
+
+  return count;
+}
 /**
  * NEW: Helper function to run all contract processing steps
  */

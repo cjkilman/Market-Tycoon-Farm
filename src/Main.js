@@ -61,6 +61,85 @@ function pull_SDE()
 }
 
 /**
+ * Rebuilds the 'Market_Control' sheet.
+ * NEW VERSION: Adds a 'last_updated' column to track the status of each item.
+ */
+function updateControlSheet() {
+    const log = LoggerEx.withTag('CONTROL_GEN');
+    log.info('Starting Market_Control sheet rebuild with last_updated column...');
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const itemMasterSheetName = 'Item List';
+    const sdeSheetName = 'SDE_invTypes';
+    const locationListSheetName = 'Location List';
+    const controlSheetName = 'Market_Control';
+
+    const itemSheet = ss.getSheetByName(itemMasterSheetName);
+    const sdeSheet = ss.getSheetByName(sdeSheetName);
+    const locationSheet = ss.getSheetByName(locationListSheetName);
+    const controlSheet = ss.getSheetByName(controlSheetName);
+
+    if (!itemSheet || !sdeSheet || !locationSheet || !controlSheet) {
+        throw new Error(`One or more required sheets are missing.`);
+    }
+
+    // 1. Create a lookup map from the SDE (typeName -> typeID)
+    const sdeData = sdeSheet.getRange('A2:C' + sdeSheet.getLastRow()).getValues();
+    const typeIdMap = new Map(sdeData.map(row => [String(row[2]).trim().toLowerCase(), row[0]]));
+
+    // 2. Read Item Names from the master 'Item List' sheet
+    const itemNamesRange = itemSheet.getRange('B2:B' + itemSheet.getLastRow());
+    const itemIds = itemNamesRange.getValues()
+        .flat()
+        .map(name => name ? typeIdMap.get(name.trim().toLowerCase()) : null)
+        .filter(id => Number.isFinite(id) && id > 0);
+    
+    const uniqueItemIds = Array.from(new Set(itemIds));
+    log.info(`Found ${uniqueItemIds.length} unique item IDs from '${itemMasterSheetName}'.`);
+    
+    // 3. Read and Deduplicate Location IDs
+    const locHeaders = locationSheet.getRange('A5:G5').getValues()[0];
+    const stationColIndex = locHeaders.indexOf('Station');
+    const systemColIndex = locHeaders.indexOf('System');
+    const regionColIndex = locHeaders.indexOf('Region');
+
+    const locData = locationSheet.getRange(6, 1, locationSheet.getLastRow() - 5, locHeaders.length).getValues();
+    const uniqueLocationStrings = new Set();
+    locData.forEach(row => {
+        if (Number(row[stationColIndex]) > 0) uniqueLocationStrings.add(`station_${row[stationColIndex]}`);
+        if (Number(row[systemColIndex]) > 0) uniqueLocationStrings.add(`system_${row[systemColIndex]}`);
+        if (Number(row[regionColIndex]) > 0) uniqueLocationStrings.add(`region_${row[regionColIndex]}`);
+    });
+
+    const locations = Array.from(uniqueLocationStrings).map(locString => {
+        const [type, id] = locString.split('_');
+        return { type, id: Number(id) };
+    });
+    log.info(`Found ${locations.length} unique market locations.`);
+
+    // 4. Generate and Write the Control Table Data
+    withSheetLock(function() {
+        controlSheet.clear();
+        const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
+        controlSheet.getRange(1, 1, 1, 4).setValues(headers);
+
+        const outputRows = [];
+        for (const item_id of uniqueItemIds) {
+            for (const loc of locations) {
+                // Add a blank placeholder for the 'last_updated' timestamp
+                outputRows.push([item_id, loc.type, loc.id, '']);
+            }
+        }
+        
+        if (outputRows.length > 0) {
+            controlSheet.getRange(2, 1, outputRows.length, 4).setValues(outputRows);
+            log.info(`Successfully wrote ${outputRows.length} control rows.`);
+        }
+    });
+    SpreadsheetApp.getUi().alert(`'${controlSheetName}' has been updated successfully.`);
+}
+
+/**
  * Function to run manually to force the authorization prompt.
  */
 function forceAuthorization() {

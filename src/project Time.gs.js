@@ -11,6 +11,7 @@ var PT = (function(){
   function tz(){
     try { return Session.getScriptTimeZone() || 'UTC'; } catch (e) { return 'UTC'; }
   }
+  
   function now(){ return new Date(); } // Date objects are local to project tz when formatted
 
   // Build a Date at project-local calendar components
