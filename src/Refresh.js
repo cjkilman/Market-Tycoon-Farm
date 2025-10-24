@@ -82,13 +82,26 @@ const A1_DYNAMIC       = "B3";
 const A1_STATIC        = "C3";
 const A1_ESI           = "D3";
 
+// Simplest implementation of refreshData without unnecessary flushing.
+// Note: You may not even need the lock if you only write data, 
+// as Google Scripts handles simultaneous writes, but keep the lock 
+// if you are worried about race conditions during the brief write operation.
 function refreshData() {
-  withLock_(function () {
-    resetFlags_();
-    nudge_(A1_DYNAMIC);
-    nudge_(A1_STATIC);
-    nudge_(A1_ESI);
-  });
+    // Keep lock if you want to ensure the 0s and 1s are set sequentially
+    withLock_(function () { 
+        const sh = sheet_();
+        
+        // 1. Reset all flags to 0 (no flush)
+        sh.getRange(A1_ALL_RESET).setValues([[0, 0, 0]]);
+        
+        // 2. Set all desired flags to 1 (no flush)
+        sh.getRange(A1_DYNAMIC).setValue(1); 
+        sh.getRange(A1_STATIC).setValue(1); 
+        sh.getRange(A1_ESI).setValue(1); 
+        
+        // Let the script exit. The spreadsheet will now pick up the changes
+        // and begin recalculating *asynchronously* on its own.
+    });
 }
 
 function refreshAllData() {
@@ -125,11 +138,12 @@ function resetFlags_() {
   SpreadsheetApp.flush();
 }
 
+// REMOVE flush() from nudge_
 function nudge_(a1) {
-  Utilities.sleep(REFRESH_DELAY_MS);
+  // Utilities.sleep(REFRESH_DELAY_MS); // <--- This sleep may not be needed anymore
   const sh = sheet_();
   sh.getRange(a1).setValue(1);
-  SpreadsheetApp.flush();
+  // SpreadsheetApp.flush(); // <--- REMOVE THIS LINE
 }
 
 function withLock_(fn) {

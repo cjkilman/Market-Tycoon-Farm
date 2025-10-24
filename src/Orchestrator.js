@@ -1,154 +1,568 @@
+
+// This global variable tracks the lock depth for a single execution.
+var EXECUTION_LOCK_DEPTH = 0;
 /**
- * Pushes cached data to the Market_Data_Raw sheet using a dynamic loop and batched writes.
- * FINAL DYNAMIC BATCHED-WRITE VERSION: This script processes the maximum number of chunks
- * in a single run and writes the collected data in safe batches for ultimate speed and reliability.
+ * Locks and executes a function, ensuring single execution.
+ * Tracks lock depth to only log messages for the outermost call.
+ * @param {function} func The function to execute.
+ * @param {string} funcName A name for logging and trigger cleanup.
+ * @returns {boolean} True if execution started, false if skipped due to lock.
  */
-function updateMarketDataSheet() {
-    const log = LoggerEx.withTag('DATA_PUSHER_DYNAMIC_BATCH');
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const props = PropertiesService.getScriptProperties();
-    const startTime = new Date();
+function executeLocked(func, funcName) {
+  const lock = LockService.getScriptLock();
+  if (lock.tryLock(30000)) { // Wait up to 30 seconds
 
-    const CONTROL_SHEET_NAME = 'Market_Control';
-    const LIVE_SHEET_NAME = 'Market_Data_Raw';
-    const TEMP_SHEET_NAME = 'Market_Data_Temp';
-    const OLD_SHEET_NAME = 'Market_Data_Old';
-    const RESUME_KEY = 'marketDataPush_lastRowProcessed';
-    const TIMESTAMP_KEY = 'marketDataPush_cycleTimestamp';
-    const CHUNK_SIZE = 2000; // The number of rows to process in each loop iteration.
-    const WRITE_BATCH_SIZE = 5000; // The number of rows to write to the sheet at a time.
-    const CALC_CONTROL_RANGE = 'Utility!B3:C3';
-    const MAX_EXECUTION_TIME_SECONDS = 270; // 5-minute safety limit.
-
-    const calcControl = ss.getRange(CALC_CONTROL_RANGE);
-    const originalCalcState = calcControl.getValues();
-    calcControl.setValues([[0, 0]]);
+    const isOuterLock = (EXECUTION_LOCK_DEPTH === 0);
+    EXECUTION_LOCK_DEPTH++; // Increment depth
 
     try {
-        log.info('Calculation pause signal sent. Starting data push cycle...');
+      // --- Only run these for the outermost call ---
+      if (isOuterLock) {
+        deleteTriggersByName(funcName);
+        console.log(`--- Starting Execution: ${funcName} ---`);
+      }
 
-        const controlSheet = ss.getSheetByName(CONTROL_SHEET_NAME);
-        if (!controlSheet) throw new Error(`Missing sheet: '${CONTROL_SHEET_NAME}'`);
+      // --- Run the code regardless of depth ---
+      func();
 
-        let startRow = parseInt(props.getProperty(RESUME_KEY) || '2');
-        if (startRow <= 1) startRow = 2;
-        const lastControlRow = controlSheet.getLastRow();
+      // --- Only log for the outermost call ---
+      if (isOuterLock) {
+        console.log(`--- Finished Execution: ${funcName} ---`);
+      }
+    } catch (e) {
+      console.error(`${funcName} failed: ${e.message}\nStack: ${e.stack}`);
+      throw e;
+    } finally {
+      EXECUTION_LOCK_DEPTH--; // Decrement depth
 
-        if (startRow > lastControlRow) {
-            log.info('All rows already processed. Resetting.');
-            props.deleteProperty(RESUME_KEY);
-            props.deleteProperty(TIMESTAMP_KEY);
-            return;
+      try {
+        lock.releaseLock();
+        if (isOuterLock) { // Only log release for the outer call
+          console.log(`Lock released for ${funcName}.`);
+        }
+      } catch (lockError) {
+        console.warn(`Failed to release lock for ${funcName}: ${lockError.message}`);
+      }
+    }
+    return true; // Execution happened
+  } else {
+    console.warn(`${funcName} was skipped because another process held the lock.`);
+    return false; // Execution was skipped
+  }
+}
+
+/**
+ * This is the single "master" function you will set on a trigger.
+ * It runs every 15 minutes and decides which 30-minute job to start.
+ */
+function masterOrchestrator() {
+  const currentMinute = new Date().getMinutes();
+
+  // --- Staggering Logic ---
+  // Window 1 (0-14 min)  -> Run Cache Refresh
+  // Window 2 (15-29 min) -> Run Market Update
+  // Window 3 (30-44 min) -> Run Cache Refresh
+  // Window 4 (45-59 min) -> Run Market Update
+
+  if (currentMinute < 15 || (currentMinute >= 30 && currentMinute < 45)) {
+    // Runs in the HH:00 and HH:30 windows
+    console.log(`Master orchestrator (min ${currentMinute}): Dispatching to fuzzworkCacheRefresh_TimeGated`);
+    fuzzworkCacheRefresh_TimeGated();
+  } else {
+    // Runs in the HH:15 and HH:45 windows (i.e., minutes 15-29 or 45-59)
+    console.log(`Master orchestrator (min ${currentMinute}): Dispatching to updateMarketDataSheet`);
+    updateMarketDataSheet();
+  }
+}
+
+/**
+ * The "Grill Captain" orchestrator. Processes the master list using a time-gated
+ * while loop to maximize work per run, ensuring the cache stays warm.
+ * Trigger this on a schedule (e.g., every 5-10 minutes).
+ */
+function fuzzworkCacheRefresh_TimeGated() {
+  const SUB_BATCH_SIZE = 250; // Process items in smaller chunks within the time limit
+  const TIME_LIMIT_MS = 270000; // 4 minutes 30 seconds
+  const PROP_KEY = 'cacheRefresh_lastIndex';
+  const properties = PropertiesService.getScriptProperties();
+
+  executeLocked(() => {
+    const START_TIME = new Date().getTime();
+
+    // 1. Get the full list from the Control Table
+    const allRequests = getMasterBatchFromControlTable();
+    if (!allRequests || allRequests.length === 0) {
+      console.log("Control Table empty. Resetting batch index.");
+      properties.deleteProperty(PROP_KEY);
+      return;
+    }
+
+    // 2. Get the starting index from the last run
+    let startIndex = parseInt(properties.getProperty(PROP_KEY) || '0', 10);
+    if (startIndex >= allRequests.length) {
+      startIndex = 0; // Reset after finishing a full cycle
+      console.log("Cache refresh: Completed full cycle. Starting over.");
+    }
+
+    let itemsProcessedThisRun = 0;
+
+    // --- Time-Gated While Loop ---
+    while (startIndex < allRequests.length) {
+      const currentTime = new Date().getTime();
+
+      // Check time BEFORE starting the next sub-batch
+      if (currentTime - START_TIME > TIME_LIMIT_MS) {
+        // Time expired, save progress and exit
+        properties.setProperty(PROP_KEY, startIndex.toString());
+        console.warn(`⚠️ Cache refresh time limit hit after processing ${itemsProcessedThisRun} items. Next run starts at index ${startIndex}.`);
+        ScriptApp.newTrigger('fuzzworkCacheRefresh_TimeGated').timeBased().after(30 * 1000).create();
+        return;
+      }
+
+      // 3. Define and process the next sub-batch
+      const endIndex = Math.min(startIndex + SUB_BATCH_SIZE, allRequests.length);
+      const currentSubBatch = allRequests.slice(startIndex, endIndex);
+
+      if (currentSubBatch.length > 0) {
+        console.log(`Processing sub-batch: ${startIndex + 1} to ${endIndex}`);
+        fuzAPI.getDataForRequests(currentSubBatch); // Process the small chunk
+        itemsProcessedThisRun += currentSubBatch.length;
+      }
+
+      // 4. Move to the next index
+      startIndex = endIndex;
+
+    } // --- End of While Loop ---
+
+    // If the loop finished naturally, we've processed everything
+    properties.setProperty(PROP_KEY, '0'); // Reset to 0 for the next full cycle
+    console.log(`Cache refresh: Finished processing all ${allRequests.length} items.`);
+
+  }, "fuzzworkCacheRefresh_TimeGated");
+}
+
+/**
+ * Processes the master list of market requests in multiple small batches within a single execution.
+ * It uses a time-gated while loop to maximize work and reschedules itself immediately if time expires.
+ * Uses a Step Property to guarantee clean state transitions.
+ */
+function updateMarketDataSheet() {
+
+  // --- LOCAL CONSTANTS ---
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const PROP_KEY_STEP = 'marketDataJobStep';
+  const PROP_KEY_REQUEST_INDEX = 'marketDataRequestIndex';
+  const PROP_KEY_SHEET_ROW = 'marketDataNextWriteRow';
+
+  const BATCH_SIZE = 1500;
+  const TIME_LIMIT_MS = 255000; // 4 minutes 15 seconds
+  const RESCHEDULE_DELAY_MS = 60 * 1000; // 1 minute
+
+  const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
+  const COLUMN_COUNT = DATA_SHEET_HEADERS.length;
+
+  // --- JOB STATES ---
+  const STEP = {
+    NEW_RUN: 'NEW_RUN',
+    PROCESSING: 'PROCESSING',
+    FINALIZING: 'FINALIZING'
+  };
+
+  executeLocked(() => {
+
+    const START_TIME = new Date().getTime();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const tempSheetName = 'Market_Data_Temp';
+    const finalSheetName = 'Market_Data_Raw';
+
+    let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STEP.NEW_RUN;
+    let sheet = ss.getSheetByName(tempSheetName);
+    const masterRequests = getMasterBatchFromControlTable();
+
+    // ----------------------------------------------------------------------
+    // --- STATE MACHINE EXECUTION ---
+    // ----------------------------------------------------------------------
+
+    // --- NEW: Handle call while FINALIZING ---
+    // If this function is called (e.g., by master orchestrator) while a
+    // previous job is waiting for finalization, just re-trigger
+    // the finalizer and exit. Do not start a new run.
+    if (currentStep === STEP.FINALIZING) {
+      console.warn(`State: ${STEP.FINALIZING}. A previous job is awaiting finalization.`);
+      console.log("Re-triggering 'finalizeMarketDataUpdate' to ensure completion and exiting current run.");
+
+      // Clean up any old finalization triggers to prevent duplicates
+      deleteTriggersByName('finalizeMarketDataUpdate');
+
+      // Schedule the finalizer
+      ScriptApp.newTrigger('finalizeMarketDataUpdate')
+        .timeBased()
+        .after(RESCHEDULE_DELAY_MS)
+        .create();
+
+      return; // Exit this execution
+    }
+
+    // --- STEP 1: NEW_RUN ---
+    if (currentStep === STEP.NEW_RUN || !sheet || !masterRequests || masterRequests.length === 0) {
+      currentStep = STEP.NEW_RUN; // Set state explicitly for logging purposes
+      console.log(`State: ${STEP.NEW_RUN}. Preparing for new cycle.`);
+
+      if (!masterRequests || masterRequests.length === 0) {
+        console.warn("Master Control Table is empty or unreadable. Cannot start job.");
+        return; // Exit if no work to do
+      }
+
+      // A. Ensure Temp Sheet exists and is clean
+      if (!sheet) {
+        console.warn(`Temporary sheet "${tempSheetName}" not found. Creating a new one.`);
+        sheet = ss.insertSheet(tempSheetName);
+      }
+
+      // B. Set Headers and Clear Data
+      sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
+      // Ensure we clear *all* data rows, even if sheet is larger than needed
+      const maxRows = sheet.getMaxRows();
+      if (maxRows > 1) {
+        sheet.getRange(2, 1, maxRows - 1, COLUMN_COUNT).clearContent();
+      }
+      const maxColumns = sheet.getMaxColumns();
+      if (maxColumns > COLUMN_COUNT) {
+        sheet.deleteColumns(COLUMN_COUNT + 1, maxColumns - COLUMN_COUNT);
+      }
+
+      // C. Initialize Indices and Transition
+      SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, '0');
+      SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, '2');
+      currentStep = STEP.PROCESSING;
+      SCRIPT_PROP.setProperty(PROP_KEY_STEP, STEP.PROCESSING);
+      console.log(`Initialization complete. Transitioning to ${STEP.PROCESSING}.`);
+    }
+
+    // --- STEP 2: PROCESSING (Core Logic) ---
+    if (currentStep === STEP.PROCESSING) {
+      console.log(`State: ${STEP.PROCESSING}. Running data fetch and write loop.`);
+
+      let requestStartIndex = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_REQUEST_INDEX));
+      let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_SHEET_ROW));
+      let batchesProcessedInThisRun = 0;
+
+      sheet = ss.getSheetByName(tempSheetName); // Re-validate sheet reference
+      if (!sheet) {
+        console.error(`Sheet "${tempSheetName}" disappeared. Resetting to NEW_RUN.`);
+        SCRIPT_PROP.setProperty(PROP_KEY_STEP, STEP.NEW_RUN);
+        ScriptApp.newTrigger('updateMarketDataSheet').timeBased().after(RESCHEDULE_DELAY_MS).create();
+        return;
+      }
+
+
+      // ⭐ CORE WHILE LOOP WITH TIME CHECK
+      while (requestStartIndex < masterRequests.length) {
+        let currentTime = new Date().getTime();
+
+        // Check time limit at the start of each potential batch
+        if (currentTime - START_TIME > TIME_LIMIT_MS) {
+          // Time expired, save current state and exit
+          SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
+          SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
+
+          // --- RESCHEDULE SELF ---
+          ScriptApp.newTrigger('updateMarketDataSheet').timeBased().after(RESCHEDULE_DELAY_MS).create();
+          console.warn(`⚠️ Time limit hit after ${batchesProcessedInThisRun} batches. Job RESCHEDULED.`);
+          return;
         }
 
-        let tempSheet = ss.getSheetByName(TEMP_SHEET_NAME);
-        let updateTimestamp;
+        // --- A. Define Current Batch & Fetch Data ---
+        const requestEndIndex = Math.min(requestStartIndex + BATCH_SIZE, masterRequests.length);
+        const requestsForThisRun = masterRequests.slice(requestStartIndex, requestEndIndex);
+        if (requestsForThisRun.length === 0) break; // Should not happen if logic is correct
 
-        if (startRow === 2) {
-            log.info('First run of cycle. Preparing temp sheet and saving timestamp.');
-            if (tempSheet) tempSheet.clear();
-            else tempSheet = ss.insertSheet(TEMP_SHEET_NAME);
-            
-            tempSheet.hideSheet();
-            const headers = [['cacheKey', 'type_id', 'location_type', 'location_id', 'sell_min', 'buy_max', 'sell_volume', 'buy_volume', 'last_updated']];
-            tempSheet.getRange(1, 1, 1, headers[0].length).setValues(headers);
+        const marketData = fuzAPI.getDataForRequests(requestsForThisRun);
+        if (!marketData || marketData.length === 0) {
+          console.warn(`API returned no data for requests ${requestStartIndex} to ${requestEndIndex}. Skipping batch.`);
+          requestStartIndex = requestEndIndex;
+          continue;
+        }
 
-            updateTimestamp = new Date();
-            props.setProperty(TIMESTAMP_KEY, updateTimestamp.getTime().toString());
+        // --- B. Flatten Data & Write Chunk ---
+        let allRowsToWrite = [];
+        const currentTimeStamp = new Date();
+        marketData.forEach(crate => {
+          crate.fuzObjects.forEach(item => {
+            allRowsToWrite.push(["", item.type_id, crate.market_type, crate.market_id, item.sell.min, item.buy.max, item.sell.volume, item.buy.volume, currentTimeStamp]);
+          });
+        });
+
+        if (allRowsToWrite.length > 0) {
+          if (allRowsToWrite[0].length !== COLUMN_COUNT) throw new Error(`Column count mismatch! Expected ${COLUMN_COUNT}, got ${allRowsToWrite[0].length}`);
+
+          if (sheet.getMaxRows() < nextWriteRow + allRowsToWrite.length) {
+            sheet.insertRowsAfter(sheet.getMaxRows(), nextWriteRow + allRowsToWrite.length - sheet.getMaxRows() + 1);
+          }
+          // --- Check #2: Before the potentially slow write operation --- ⏰
+          currentTime = new Date().getTime(); // Update current time
+          if (currentTime - START_TIME > TIME_LIMIT_MS) {
+            // Not enough time left for the write + saving state
+            SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString()); // Save index BEFORE write
+            SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString()); // Save row BEFORE write
+            ScriptApp.newTrigger('updateMarketDataSheet').timeBased().after(RESCHEDULE_DELAY_MS).create();
+            console.warn(`⚠️ Time limit hit BEFORE WRITE of batch ${batchesProcessedInThisRun + 1}. Job RESCHEDULED.`);
+            return; // Exit this execution
+          }
+
+          sheet.getRange(nextWriteRow, 1, allRowsToWrite.length, COLUMN_COUNT).setValues(allRowsToWrite);
+
+          nextWriteRow += allRowsToWrite.length;
+          requestStartIndex = requestEndIndex;
+          batchesProcessedInThisRun++;
+          console.log(`Wrote batch ${batchesProcessedInThisRun}. Next request index: ${requestStartIndex}.`);
+          SpreadsheetApp.flush();
         } else {
-            tempSheet = ss.getSheetByName(TEMP_SHEET_NAME);
-            if (!tempSheet) {
-                log.warn('Temporary sheet was missing. Resetting.');
-                props.deleteProperty(RESUME_KEY);
-                props.deleteProperty(TIMESTAMP_KEY);
-                return;
-            }
-            const savedTimestamp = props.getProperty(TIMESTAMP_KEY);
-            updateTimestamp = savedTimestamp ? new Date(parseInt(savedTimestamp)) : new Date();
+          console.log(`No data to write for batch starting at ${requestStartIndex}.`);
+          requestStartIndex = requestEndIndex;
+        }
+      } // End of WHILE loop
+
+      // --- TRANSITION TO FINALIZING ---
+      // If the loop finished naturally (didn't hit time limit and reschedule)
+      if (requestStartIndex >= masterRequests.length) {
+        console.log("All batches processed. Scheduling finalization step.");
+        // A. Set state to FINALIZING
+        SCRIPT_PROP.setProperty(PROP_KEY_STEP, STEP.FINALIZING);
+
+        // B. Clean up any old finalization triggers
+        deleteTriggersByName('finalizeMarketDataUpdate');
+
+        // C. Schedule the dedicated finalization function
+        ScriptApp.newTrigger('finalizeMarketDataUpdate') // <-- New function name
+          .timeBased()
+          .after(RESCHEDULE_DELAY_MS) // Give it a short delay
+          .create();
+        // D. Exit this execution
+        return;
+      }
+      // (If it exits due to time limit, the rescheduling logic inside the loop handles it)
+    }
+    // --- STEP 3: FINALIZING REMOVED FROM THIS FUNCTION ---
+
+  }, "updateMarketDataSheet");
+}
+/**
+ * Dedicated function for the final sheet update using Clear & Copy.
+ * Triggered by updateMarketDataSheet after all processing is complete.
+ */
+function finalizeMarketDataUpdate() {
+  // --- LOCAL CONSTANTS ---
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const PROP_KEY_STEP = 'marketDataJobStep';
+  const PROP_KEY_REQUEST_INDEX = 'marketDataRequestIndex';
+  const PROP_KEY_SHEET_ROW = 'marketDataNextWriteRow';
+  const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
+  const COLUMN_COUNT = DATA_SHEET_HEADERS.length;
+  const STEP = { FINALIZING: 'FINALIZING', NEW_RUN: 'NEW_RUN' };
+  const tempSheetName = 'Market_Data_Temp';
+  const finalSheetName = 'Market_Data_Raw';
+
+  // Note: executeLocked will call deleteTriggersByName('finalizeMarketDataUpdate') on success
+  executeLocked(() => {
+    const currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP);
+
+    // --- State Check ---
+    if (currentStep !== STEP.FINALIZING) {
+      console.warn(`finalizeMarketDataUpdate called unexpectedly in state: ${currentStep}. Aborting.`);
+      // Clean up any stray triggers just in case
+      deleteTriggersByName('finalizeMarketDataUpdate');
+      return;
+    }
+
+    console.log(`State: ${STEP.FINALIZING}. Starting final sheet update (Clear & Copy).`);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sourceSheet = ss.getSheetByName(tempSheetName);
+    let targetSheet = ss.getSheetByName(finalSheetName);
+
+    if (!sourceSheet) {
+      console.error("Cannot finalize: Temporary sheet disappeared!");
+      SCRIPT_PROP.setProperty(PROP_KEY_STEP, STEP.NEW_RUN); // Reset
+      return;
+    }
+
+    try {
+      SpreadsheetApp.flush(); // Ensure prior writes are complete
+
+      // --- 1. Prepare Target Sheet ---
+      if (!targetSheet) {
+        console.warn(`Final sheet "${finalSheetName}" not found. Creating it.`);
+        targetSheet = ss.insertSheet(finalSheetName);
+        targetSheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]); // Set headers if new
+      } else {
+        console.log(`Clearing existing data from "${finalSheetName}"...`);
+        // Clear everything except headers
+        const maxRows = targetSheet.getMaxRows();
+        if (maxRows > 1) { // Only clear if there's more than a header row
+          targetSheet.getRange(2, 1, maxRows - 1, targetSheet.getMaxColumns()).clearContent();
+        }
+        SpreadsheetApp.flush(); // Ensure clear completes
+      }
+
+      // --- 2. Copy Data ---
+      const sourceDataRange = sourceSheet.getDataRange();
+      const sourceDataHeight = sourceDataRange.getHeight();
+
+      if (sourceDataHeight > 1) { // Check if there's data beyond headers
+        const sourceValuesRange = sourceSheet.getRange(2, 1, sourceDataHeight - 1, COLUMN_COUNT);
+        console.log(`Copying ${sourceDataHeight - 1} rows from temp to final sheet...`);
+
+        // Ensure target sheet has enough rows (avoids errors if target was smaller)
+        const targetMaxRows = targetSheet.getMaxRows();
+        if (targetMaxRows < sourceDataHeight) {
+          targetSheet.insertRowsAfter(targetMaxRows, sourceDataHeight - targetMaxRows);
         }
 
-        const allOutputRowsForThisRun = [];
+        // Copy values 
+        sourceValuesRange.copyTo(targetSheet.getRange(2, 1), SpreadsheetApp.CopyPasteType.PASTE_VALUES, false);
+        SpreadsheetApp.flush(); // Ensure copy completes
+        console.log("Data copy complete.");
 
-        // --- DYNAMIC PROCESSING LOOP ---
-        while ((new Date() - startTime) / 1000 < MAX_EXECUTION_TIME_SECONDS) {
-            if (startRow > lastControlRow) break;
+      } else {
+        console.log("No data found in temp sheet to copy.");
+      }
 
-            const numRowsToProcess = Math.min(CHUNK_SIZE, lastControlRow - startRow + 1);
-            const controlData = controlSheet.getRange(startRow, 1, numRowsToProcess, 3).getValues();
 
-            const allCacheKeysInChunk = controlData.map(row => _fuzKey(String(row[1]).trim().toLowerCase(), Number(row[2]), Number(row[0]))).filter(Boolean);
-            
-            // Re-integrate the queuing logic for missing items
-            const cacheCheckResults = cacheScope().getAll(allCacheKeysInChunk);
-            const requestsToQueue = {};
-            allCacheKeysInChunk.forEach(key => {
-                if (!cacheCheckResults.hasOwnProperty(key)) {
-                    const parts = key.split(':');
-                    const locKey = `${parts[2]}:${parts[3]}`;
-                    if (!requestsToQueue[locKey]) {
-                        requestsToQueue[locKey] = { location_type: parts[2], location_id: Number(parts[3]), ids: new Set() };
-                    }
-                    requestsToQueue[locKey].ids.add(Number(parts[4]));
-                }
-            });
-            for (const key in requestsToQueue) {
-                _queueMissingItems(Array.from(requestsToQueue[key].ids), requestsToQueue[key].location_id, requestsToQueue[key].location_type);
-            }
+      // --- 3. Reset Temp Sheet for Next Run ---
+      console.log(`Resetting "${tempSheetName}" for next cycle...`);
+      const tempMaxRows = sourceSheet.getMaxRows();
+      if (tempMaxRows > 1) { // Only clear if there's more than a header row
+        sourceSheet.getRange(2, 1, tempMaxRows - 1, sourceSheet.getMaxColumns()).clearContent();
+      }
 
-            const allCachedData = cacheScope().getAll(allCacheKeysInChunk);
-            
-            for (const cacheKey of allCacheKeysInChunk) {
-                const parts = cacheKey.split(':');
-                const req = { type_id: Number(parts[4]), location_type: parts[2], location_id: Number(parts[3]) };
-                const rawValue = allCachedData[cacheKey];
-                let data = null;
-                if (rawValue && rawValue !== 'null') try { data = JSON.parse(rawValue); } catch (e) {}
+      // --- 4. Clear Properties (Job Complete) ---
+      SCRIPT_PROP.deleteProperty(PROP_KEY_STEP);
+      SCRIPT_PROP.deleteProperty(PROP_KEY_REQUEST_INDEX);
+      SCRIPT_PROP.deleteProperty(PROP_KEY_SHEET_ROW);
 
-                allOutputRowsForThisRun.push([
-                    cacheKey, req.type_id, req.location_type, req.location_id,
-                    (data?.sell?.min > 0) ? data.sell.min : '', (data?.buy?.max > 0) ? data.buy.max : '',
-                    (data?.sell?.volume != null) ? data.sell.volume : '', (data?.buy?.volume != null) ? data.buy.volume : '',
-                    updateTimestamp
-                ]);
-            }
-            startRow += numRowsToProcess;
-        }
-
-        // --- BATCHED WRITE OPERATION ---
-        if (allOutputRowsForThisRun.length > 0) {
-            log.info(`Processing complete for this run. Writing ${allOutputRowsForThisRun.length} rows in batches...`);
-            for (let i = 0; i < allOutputRowsForThisRun.length; i += WRITE_BATCH_SIZE) {
-                const batch = allOutputRowsForThisRun.slice(i, i + WRITE_BATCH_SIZE);
-                tempSheet.getRange(tempSheet.getLastRow() + 1, 1, batch.length, batch[0].length).setValues(batch);
-                log.info(`Appended batch of ${batch.length} rows to temporary sheet.`);
-            }
-        }
-
-        if (startRow > lastControlRow) {
-            log.info('Final chunk processed. Swapping sheets now.');
-            withSheetLock(function() {
-                const oldSheet = ss.getSheetByName(LIVE_SHEET_NAME);
-                if (oldSheet) oldSheet.setName(OLD_SHEET_NAME);
-                tempSheet.setName(LIVE_SHEET_NAME);
-                tempSheet.showSheet();
-                const backupSheet = ss.getSheetByName(OLD_SHEET_NAME);
-                if (backupSheet) ss.deleteSheet(backupSheet);
-            });
-            props.deleteProperty(RESUME_KEY);
-            props.deleteProperty(TIMESTAMP_KEY);
-            log.info('Full data push cycle complete.');
-        } else {
-            props.setProperty(RESUME_KEY, startRow.toString());
-            log.info(`Execution time limit reached. Next run will start at row ${startRow}.`);
-        }
+      console.log("SUCCESS: Job complete and system reset.");
 
     } catch (e) {
-        log.error("An error occurred during the update cycle:", e.stack);
-        props.deleteProperty(RESUME_KEY);
-        props.deleteProperty(TIMESTAMP_KEY);
+      console.error(`Finalization (Clear & Copy) failed: ${e.message}\nStack: ${e.stack}`);
+      SCRIPT_PROP.setProperty(PROP_KEY_STEP, STEP.NEW_RUN); // Reset state on failure
+      throw e; // Re-throw to make executeLocked aware of the failure
     } finally {
-        calcControl.setValues(originalCalcState);
-
-        log.info('Spreadsheet calculations have been resumed.');
+      // Clean up trigger *just in case* executeLocked fails
+      // (though executeLocked should handle this on its own)
+      deleteTriggersByName('finalizeMarketDataUpdate');
     }
+
+  }, "finalizeMarketDataUpdate");
 }
+
+
+/**
+ * This is the single "master" function you will set on a trigger.
+ * It runs every 15 minutes and decides which 30-minute job to start.
+ * If a job is skipped due to a lock, it schedules a one-time retry.
+ */
+function masterOrchestrator() {
+  const currentMinute = new Date().getMinutes();
+  const RETRY_DELAY_MS = 10 * 60 * 1000; // 10 minutes
+
+  // Window 1 (0-14 min)  -> Run Cache Refresh
+  // Window 2 (15-29 min) -> Run Market Update
+  // Window 3 (30-44 min) -> Run Cache Refresh
+  // Window 4 (45-59 min) -> Run Market Update
+
+  if (currentMinute < 15 || (currentMinute >= 30 && currentMinute < 45)) {
+    // --- HH:00 and HH:30 window ---
+    const funcToRun = fuzzworkCacheRefresh_TimeGated;
+    const funcName = 'fuzzworkCacheRefresh_TimeGated';
+
+    console.log(`Master orchestrator (min ${currentMinute}): Dispatching to ${funcName}`);
+    const success = executeLocked(funcToRun, funcName);
+
+    if (!success) {
+      // --- NEW LOGIC ---
+      console.warn(`Scheduling one-time retry for ${funcName}.`);
+      scheduleOneTimeTrigger(funcName, RETRY_DELAY_MS);
+    }
+
+  } else {
+    // --- HH:15 and HH:45 window ---
+    const funcToRun = updateMarketDataSheet;
+    const funcName = 'updateMarketDataSheet';
+
+    console.log(`Master orchestrator (min ${currentMinute}): Dispatching to ${funcName}`);
+    const success = executeLocked(funcToRun, funcName);
+
+    if (!success) {
+      // --- NEW LOGIC ---
+      console.warn(`Scheduling one-time retry for ${funcName}.`);
+      scheduleOneTimeTrigger(funcName, RETRY_DELAY_MS);
+    }
+  }
+}
+
+/**
+ * Helper to create a new one-time "retry" trigger.
+ * @param {string} functionName The name of the function to trigger.
+ * @param {number} delayMs The milliseconds from now to run the trigger.
+ */
+function scheduleOneTimeTrigger(functionName, delayMs) {
+  // First, delete any OTHER pending retry triggers for this same function
+  // to prevent a "retry storm". We only want one retry scheduled at a time.
+  deleteTriggersByName(functionName);
+
+  // Create the new one-time trigger
+  ScriptApp.newTrigger(functionName)
+    .timeBased()
+    .after(delayMs)
+    .create();
+  console.log(`Created one-time trigger for ${functionName} to run in ${delayMs / 60000} minutes.`);
+}
+
+/**
+ * Run this function ONCE from the editor to create
+ * the new 15-minute staggered trigger.
+ * This will also force a re-authorization, fixing permission errors.
+ */
+function setupStaggeredTriggers() {
+  // 1. Clean up ALL old triggers for the functions
+  console.log("Deleting old triggers...");
+  deleteTriggersByName('fuzzworkCacheRefresh_TimeGated');
+  deleteTriggersByName('updateMarketDataSheet');
+  deleteTriggersByName('masterOrchestrator'); // Clean up self first
+
+  // 2. Create the new 15-minute master trigger
+  ScriptApp.newTrigger('masterOrchestrator')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+
+  console.log('SUCCESS: Created 15-minute trigger for masterOrchestrator.');
+}
+
+/**
+ * Helper to delete all existing installable triggers for a given function name.
+ * @param {string} functionName The name of the function to check for triggers.
+ */
+function deleteTriggersByName(functionName) {
+  const allTriggers = ScriptApp.getProjectTriggers();
+  allTriggers.forEach(trigger => {
+    // Only delete time-based triggers
+    if (trigger.getHandlerFunction() === functionName &&
+      trigger.getEventType() === ScriptApp.EventType.CLOCK) {
+      try {
+        ScriptApp.deleteTrigger(trigger);
+        console.log(`Deleted existing clock trigger for ${functionName}.`);
+      } catch (e) {
+        console.warn(`Could not delete trigger for ${functionName}: ${e.message}`);
+      }
+    }
+  });
+}
+
+
+// NOTE: This assumes you have the 'executeLocked', 'getMasterBatchFromControlTable',
+// and 'fuzAPI' functions defined elsewhere in your script.
+
+// --- Add your other global orchestrator functions here ---
+// function fuzzPriceDataByHub() { executeLocked(() => { /* ... */ }, "fuzzPriceDataByHub"); }
+// function fuzzApiPriceDataJitaSell() { executeLocked(() => { /* ... */ }, "fuzzApiPriceDataJitaSell"); }
