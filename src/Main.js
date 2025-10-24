@@ -214,43 +214,87 @@ function getChacterNameFromID(charIds, show_column_headings = true) {
 
 
 
-
 /**
- * Enhances Google Sheets' native "query" method.  Allows you to specify column-names instead of using the column letters in the SQL statement (no spaces allowed in identifiers)
- * 
- * Sample : =query(data!A1:I,SQL("data!A1:I1","SELECT Owner-Name,Owner-Email,Type,Account-Name",false),true)
- *  
- * Params : useColNums (boolean) : false/default = generate "SELECT A, B, C" syntax 
- *                                 true = generate "SELECT Col1, Col2, Col3" syntax
- * reference: https://productforums.google.com/forum/#!topic/docs/vTgy3hgj4M4
- * by: Matthew Quinlan
+ * Replace [Header Name] tokens in a QUERY-like SQL with ColN,
+ * based on the first row (header) of the given range.
+ *
+ * This version uses CacheService to avoid re-fetching the header
+ * when called multiple times in a single formula.
+ *
+ * @param {string} rangeName    A string representing a Named Range (e.g., "myRange")
+ * OR an A1 notation range (e.g., "Sheet1!A1:G10").
+ * @param {string} queryString  SQL containing bracketed headers: [Item], [Goal], ...
+ * @param {boolean} [useColNums=true]  (This param is now ignored, defaults to ColN)
+ * @returns {string}
  */
-function sqlFromHeaderNames(rangeName, queryString, useColNums) {
-
-  let ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  let range;
-  try {
-    range = ss.getRange(rangeName);
-  }
-  catch (e) {
-    range = ss.getRangeByName(rangeName);
+function sqlFromHeaderNamesEx(rangeName, queryString, useColNums) {
+  
+  if (typeof rangeName !== 'string' || !rangeName) {
+     throw new Error(`sqlFromHeaderNamesEx: First argument must be the name of a Named Range (as a string) or an A1 notation string.`);
   }
 
-  let headers = range.getValues()[0];
+  // Get the script cache
+  const cache = CacheService.getScriptCache();
+  // The cache key is the string itself, whether it's a named range
+  // or A1 notation.
+  const cacheKey = `headerMap_${rangeName}`;
+  let map = {};
 
-  for (var i = 0; i < headers.length; i++) {
-    if (headers[i].length < 1) continue;
-    var re = new RegExp("\\b" + headers[i] + "\\b", "gm");
-    if (useColNums) {
-      var columnName = "Col" + Math.floor(i + 1);
-      queryString = queryString.replace(re, columnName);
+  // Try to get the map from cache
+  const cachedMap = cache.get(cacheKey);
+
+  if (cachedMap) {
+    // Found it in the cache, parse it and use it
+    map = JSON.parse(cachedMap);
+  } else {
+    // Not in cache, so we must build it
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let range = null;
+
+    // 1. Try to resolve as a Named Range first
+    range = ss.getRangeByName(rangeName); // This returns null if not found, doesn't throw.
+
+    // 2. If not a Named Range, try to resolve as A1 notation
+    if (!range) {
+      try {
+        range = ss.getRange(rangeName); // This *will* throw an error if invalid
+      } catch (e) {
+        // If both fail, throw a clear error.
+        throw new Error(`sqlFromHeaderNamesEx: Could not resolve range. "${rangeName}" is not a valid Named Range or A1 notation range.`);
+      }
     }
-    else {
-      var columnLetter = range.getCell(1, i + 1).getA1Notation().split(/[0-9]/)[0];
-      queryString = queryString.replace(re, columnLetter);
+    
+    // --- Build the Header Map ---
+    const headerWidth = range.getNumColumns();
+    // This is the expensive API call we want to run only once
+    const headerRow = range.offset(0, 0, 1, headerWidth).getValues()[0];
+
+    for (let i = 0; i < headerRow.length; i++) {
+      const raw = headerRow[i];
+      if (raw == null) continue;
+      const h = String(raw).trim();
+      if (!h) continue;
+
+      const replacement = `Col${i + 1}`;
+      map[h] = replacement;
     }
+    
+    // Store the newly built map in the cache for 5 minutes (300 seconds)
+    cache.put(cacheKey, JSON.stringify(map), 300);
   }
-  //Logger.log(queryString);
-  return queryString;
+  
+  // --- Replace Tokens in Query String ---
+  
+  // Find all [Header] tokens and replace them with their ColN equivalent
+  const rewritten = String(queryString).replace(/\[([^\]]+)\]/g, (m, label) => {
+    const key = String(label || "").trim();
+    if (map.hasOwnProperty(key)) return map[key];
+    
+    // Fallback to case-insensitive check
+    const found = Object.keys(map).find(k => k.toLowerCase() === key.toLowerCase());
+    return found ? map[found] : m; // leave untouched if no match
+  });
+
+  return rewritten;
 }
+

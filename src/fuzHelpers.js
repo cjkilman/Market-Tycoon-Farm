@@ -36,11 +36,18 @@ function getMasterBatchFromControlTable() {
  */
 class FuzDataObject {
   /**
-   * Private helper to safely parse numbers and provide a default.
+   * Private helper to safely parse numbers and provide a default. Volums Should return 0 for no data
    */
   _normalizeNumber(value, defaultValue = 0) {
-    const num = parseFloat(value);
+    const num = parseInt(value);
     return isNaN(num) ? defaultValue : num;
+  }
+    /**
+   * Private helper to safely parse Prices and provide a default. Prices can be Blank representing no data
+   */
+    _normalizeFloat(value, defaultValue = "") {
+    const num = parseFloat(value);
+    return isNaN(num) ? defaultValue : "";
   }
 
   /**
@@ -55,21 +62,21 @@ class FuzDataObject {
     this.last_updated = new Date();
 
     this.buy = {
-      avg: this._normalizeNumber(buyData.weightedAverage),
-      max: this._normalizeNumber(buyData.max),
-      min: this._normalizeNumber(buyData.min),
-      stddev: this._normalizeNumber(buyData.stddev),
-      median: this._normalizeNumber(buyData.median),
+      avg: this._normalizeFloat(buyData.weightedAverage),
+      max: this._normalizeFloat(buyData.max),
+      min: this._normalizeFloat(buyData.min),
+      stddev: this._normalizeFloat(buyData.stddev),
+      median: this._normalizeFloat(buyData.median),
       volume: this._normalizeNumber(buyData.volume),
       orderCount: this._normalizeNumber(buyData.orderCount, 0)
     };
 
     this.sell = {
-      avg: this._normalizeNumber(sellData.weightedAverage),
-      max: this._normalizeNumber(sellData.max),
-      min: this._normalizeNumber(sellData.min),
-      stddev: this._normalizeNumber(sellData.stddev),
-      median: this._normalizeNumber(sellData.median),
+      avg: this._normalizeFloat(sellData.weightedAverage),
+      max: this._normalizeFloat(sellData.max),
+      min: this._normalizeFloat(sellData.min),
+      stddev: this._normalizeFloat(sellData.stddev),
+      median: this._normalizeFloat(sellData.median),
       volume: this._normalizeNumber(sellData.volume),
       orderCount: this._normalizeNumber(sellData.orderCount, 0)
     };
