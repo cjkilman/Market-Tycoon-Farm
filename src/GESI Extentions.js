@@ -145,66 +145,66 @@ function resetLootSnapshot() {
  * @returns {Object|null} { header: string[], rows: any[][], h: Object } or null on failure.
  */
 function _fetchProcessedLootData() {
-    const log = LoggerEx.withTag('LOOT_SYNC');
+  const log = LoggerEx.withTag('LOOT_SYNC');
 
-    try {
-        // 1. Open external sheet
-        const externalSs = SpreadsheetApp.openById(EXTERNAL_LOOT_SHEET_ID);
-        const sourceSheetName = EXTERNAL_LOOT_RANGE.split('!')[0];
-        const sourceRange = EXTERNAL_LOOT_RANGE.split('!')[1];
+  try {
+    // 1. Open external sheet
+    const externalSs = SpreadsheetApp.openById(EXTERNAL_LOOT_SHEET_ID);
+    const sourceSheetName = EXTERNAL_LOOT_RANGE.split('!')[0];
+    const sourceRange = EXTERNAL_LOOT_RANGE.split('!')[1];
 
-        if (!externalSs) {
-            log.error('External Loot Sheet not found.', { id: EXTERNAL_LOOT_SHEET_ID });
-            return null;
-        }
-
-        // 2. Read the entire required range from the external source
-        const externalSheet = externalSs.getSheetByName(sourceSheetName);
-        if (!externalSheet) {
-            log.error('External Loot Sheet not found.', { name: sourceSheetName });
-            return null;
-        }
-
-        // Use the specified range (A:D in this case)
-        const values = externalSheet.getRange(sourceRange).getValues();
-
-        if (values.length < 2) { // Need at least header + 1 row
-            log.warn('External loot source returned insufficient data (less than 1 data row).');
-            return { sh: externalSheet, header: values[0] || [], rows: [], h: {} };
-        }
-
-        const header = values[0];
-        let rows = values.slice(1);
-
-        // Determine which column is Col1 (the first column, index 0)
-        const Col1_Index = 0;
-
-        // 3. Filter: WHERE Col1 IS NOT NULL
-        const filteredRows = rows.filter(row => row[Col1_Index] != null && row[Col1_Index] !== "");
-
-        // 4. Sort: Order By Col1 DESC
-        filteredRows.sort((a, b) => {
-            const valA = a[Col1_Index];
-            const valB = b[Col1_Index];
-
-            // Simple descending comparison (assumes sortable data type)
-            if (valA > valB) return -1;
-            if (valA < valB) return 1;
-            return 0;
-        });
-
-        log.info('Successfully fetched, filtered, and sorted external loot data.', { rows: filteredRows.length });
-
-        // 5. Return in the same structure as _getData_
-        const h = {};
-        for (let i = 0; i < header.length; i++) { h[String(header[i]).trim()] = i; } // 0-based index map
-
-        return { sh: externalSheet, header: header, rows: filteredRows, h: h };
-
-    } catch (e) {
-        log.error('Failed to fetch and process external loot data:', e);
-        return null; // Return null on any catastrophic failure (Sheet/File not found)
+    if (!externalSs) {
+      log.error('External Loot Sheet not found.', { id: EXTERNAL_LOOT_SHEET_ID });
+      return null;
     }
+
+    // 2. Read the entire required range from the external source
+    const externalSheet = externalSs.getSheetByName(sourceSheetName);
+    if (!externalSheet) {
+      log.error('External Loot Sheet not found.', { name: sourceSheetName });
+      return null;
+    }
+
+    // Use the specified range (A:D in this case)
+    const values = externalSheet.getRange(sourceRange).getValues();
+
+    if (values.length < 2) { // Need at least header + 1 row
+      log.warn('External loot source returned insufficient data (less than 1 data row).');
+      return { sh: externalSheet, header: values[0] || [], rows: [], h: {} };
+    }
+
+    const header = values[0];
+    let rows = values.slice(1);
+
+    // Determine which column is Col1 (the first column, index 0)
+    const Col1_Index = 0;
+
+    // 3. Filter: WHERE Col1 IS NOT NULL
+    const filteredRows = rows.filter(row => row[Col1_Index] != null && row[Col1_Index] !== "");
+
+    // 4. Sort: Order By Col1 DESC
+    filteredRows.sort((a, b) => {
+      const valA = a[Col1_Index];
+      const valB = b[Col1_Index];
+
+      // Simple descending comparison (assumes sortable data type)
+      if (valA > valB) return -1;
+      if (valA < valB) return 1;
+      return 0;
+    });
+
+    log.info('Successfully fetched, filtered, and sorted external loot data.', { rows: filteredRows.length });
+
+    // 5. Return in the same structure as _getData_
+    const h = {};
+    for (let i = 0; i < header.length; i++) { h[String(header[i]).trim()] = i; } // 0-based index map
+
+    return { sh: externalSheet, header: header, rows: filteredRows, h: h };
+
+  } catch (e) {
+    log.error('Failed to fetch and process external loot data:', e);
+    return null; // Return null on any catastrophic failure (Sheet/File not found)
+  }
 }
 
 
@@ -402,7 +402,7 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
 function _charIdMap(ss) { // ADDED ss ARGUMENT
   // --- IMPLEMENTATION OF NAME-TO-ID MAP (Based on Corp Members) ---
   if (_cachedCharIdMap) {
-      return _cachedCharIdMap;
+    return _cachedCharIdMap;
   }
 
   const log = LoggerEx.withTag('CHAR_MAP');
@@ -410,49 +410,49 @@ function _charIdMap(ss) { // ADDED ss ARGUMENT
   const authToon = getCorpAuthChar(ss); // Get the authorized char name
 
   if (!authToon) {
-      log.warn('No authorized character found for building character map.');
-      _cachedCharIdMap = {};
-      return {};
+    log.warn('No authorized character found for building character map.');
+    _cachedCharIdMap = {};
+    return {};
   }
 
   const charIdMap = {};
 
   try {
-      // 1. Get all member IDs for the corporation tied to the authenticated character.
-      // Assumes GESI wraps this ESI call correctly and takes the authToon name.
-      // This returns an array of character IDs (numbers).
-      const memberIdsRaw = GESI.corporations_corporation_members([authToon]);
+    // 1. Get all member IDs for the corporation tied to the authenticated character.
+    // Assumes GESI wraps this ESI call correctly and takes the authToon name.
+    // This returns an array of character IDs (numbers).
+    const memberIdsRaw = GESI.corporations_corporation_members([authToon]);
 
-      const memberIds = Array.isArray(memberIdsRaw) ? memberIdsRaw.filter(Number.isFinite) : [];
+    const memberIds = Array.isArray(memberIdsRaw) ? memberIdsRaw.filter(Number.isFinite) : [];
 
-      if (memberIds.length === 0) {
-          log.warn('No member IDs returned from GESI.corporations_corporation_members.');
-          _cachedCharIdMap = {};
-          return {};
-      }
+    if (memberIds.length === 0) {
+      log.warn('No member IDs returned from GESI.corporations_corporation_members.');
+      _cachedCharIdMap = {};
+      return {};
+    }
 
-      // 2. Resolve those IDs to Names.
-      // Using the generic ID-to-name lookup endpoint via GESI.
-      const ID_TO_NAME_ENDPOINT = 'universe_names_id_to_name';
+    // 2. Resolve those IDs to Names.
+    // Using the generic ID-to-name lookup endpoint via GESI.
+    const ID_TO_NAME_ENDPOINT = 'universe_names_id_to_name';
 
-      // GESI handles batching for GESI.invoke
-      const nameResolutions = GESI.invoke(ID_TO_NAME_ENDPOINT, memberIds, { show_column_headings: false });
+    // GESI handles batching for GESI.invoke
+    const nameResolutions = GESI.invoke(ID_TO_NAME_ENDPOINT, memberIds, { show_column_headings: false });
 
-      // 3. Build the final Name -> ID map
-      if (Array.isArray(nameResolutions)) {
-        for (const entry of nameResolutions) {
-            // Check for required properties and filter by category 'character'
-            if (entry && entry.category === 'character' && entry.name && entry.id) {
-                // The map is NAME -> ID
-                charIdMap[entry.name] = entry.id;
-            }
+    // 3. Build the final Name -> ID map
+    if (Array.isArray(nameResolutions)) {
+      for (const entry of nameResolutions) {
+        // Check for required properties and filter by category 'character'
+        if (entry && entry.category === 'character' && entry.name && entry.id) {
+          // The map is NAME -> ID
+          charIdMap[entry.name] = entry.id;
         }
       }
+    }
 
   } catch (e) {
-      log.error('Error building character ID map:', e);
-      _cachedCharIdMap = {}; // Fail safe
-      return {};
+    log.error('Error building character ID map:', e);
+    _cachedCharIdMap = {}; // Fail safe
+    return {};
   }
 
   log.info(`Built character ID map for ${Object.keys(charIdMap).length} members.`);
@@ -729,9 +729,9 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
 
   const h = loot.h;
   const cTid = h['type_id'],
-        cQty = h['total_quantity'],
-        cBuy = h['weighted_average_buy'],
-        cVal = h['weighted_average_value'];
+    cQty = h['total_quantity'],
+    cBuy = h['weighted_average_buy'],
+    cVal = h['weighted_average_value'];
   if ([cTid, cQty, cBuy, cVal].some(v => v == null)) {
     throw new Error(`'${RAW_LOOT_SHEET}' must have headers: type_id, total_quantity, weighted_average_buy, weighted_average_value`);
   }
@@ -935,9 +935,9 @@ function Ledger_Import_CorpJournal(ss, opts) {
 
   // --- ANCHORING WRITE LOGIC (now runs under main lock) ---
   if (allCorpTransactions.length > 0) {
-      const newestTransactionId = allCorpTransactions[0].transaction_id;
-      props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
-      log.log(`Saved new transaction anchor: ${newestTransactionId}`);
+    const newestTransactionId = allCorpTransactions[0].transaction_id;
+    props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
+    log.log(`Saved new transaction anchor: ${newestTransactionId}`);
   }
 
   return result; // Return actual result
@@ -1005,13 +1005,13 @@ function syncContracts(ss, charIdMap) {
   log.log('normalized char contracts', tuplesChar.length);
   var seenChar = {};
   var byCid = Object.create(null);
-  for (var t = 0; t < tuplesChar.length; t++) { /* ... filtering ... */ var cid1 = _toIntOrNull(tuplesChar[t].c.contract_id); if(cid1==null) continue; if (!byCid[cid1]) byCid[cid1] = []; byCid[cid1].push(tuplesChar[t]); }
+  for (var t = 0; t < tuplesChar.length; t++) { /* ... filtering ... */ var cid1 = _toIntOrNull(tuplesChar[t].c.contract_id); if (cid1 == null) continue; if (!byCid[cid1]) byCid[cid1] = []; byCid[cid1].push(tuplesChar[t]); }
   var cids = Object.keys(byCid);
-  for (var g = 0; g < cids.length; g++) { /* ... processing group ... */ var cidNum = _toIntOrNull(cids[g]); if(cidNum==null) continue; var ch1 = _pickCharForContract(byCid[cids[g]], byCid[cids[g]][0].c, charIdMap); var items1Raw = getContractItemsCached(ch1, cidNum, false, false) || []; var items1 = normalizeItemRows(items1Raw); outC.push([ /* ... contract data ... */ ]); for (var j1 = 0; j1 < items1.length; j1++) { /* ... push item data to outI ... */ } seenChar['' + cidNum] = true; Utilities.sleep(150); }
+  for (var g = 0; g < cids.length; g++) { /* ... processing group ... */ var cidNum = _toIntOrNull(cids[g]); if (cidNum == null) continue; var ch1 = _pickCharForContract(byCid[cids[g]], byCid[cids[g]][0].c, charIdMap); var items1Raw = getContractItemsCached(ch1, cidNum, false, false) || []; var items1 = normalizeItemRows(items1Raw); outC.push([ /* ... contract data ... */]); for (var j1 = 0; j1 < items1.length; j1++) { /* ... push item data to outI ... */ } seenChar['' + cidNum] = true; Utilities.sleep(150); }
 
   // ---------------- PHASE 2: CORPORATION CONTRACTS ----------------
   // ... (Fetching and processing logic remains the same) ...
-   var tListCorp = log.startTimer('contracts:list:corp');
+  var tListCorp = log.startTimer('contracts:list:corp');
   const corpListCacheKey = 'gesi:contract_list:corp:' + corpAuth;
   let resCorp = userCache.get(corpListCacheKey);
   if (resCorp) { resCorp = JSON.parse(resCorp); log.info('contracts:list:corp fetched from cache.'); }
@@ -1019,7 +1019,7 @@ function syncContracts(ss, charIdMap) {
   tListCorp.stamp('listed');
   var tuplesCorp = _normalizeCorpContracts(resCorp, corpAuth);
   log.log('normalized corp contracts', tuplesCorp.length);
-  for (var u = 0; u < tuplesCorp.length; u++) { /* ... filtering ... */ var cid2 = _toIntOrNull(tuplesCorp[u].c.contract_id); if(cid2==null) continue; if (seenChar['' + cid2]) continue; var ch2 = tuplesCorp[u].ch || corpAuth; var items2Raw = getContractItemsCached(ch2, cid2, false, true) || []; var items2 = normalizeItemRows(items2Raw); outC.push([ /* ... contract data ... */ ]); for (var j2 = 0; j2 < items2.length; j2++) { /* ... push item data to outI ... */ } seenChar['' + cid2] = true; Utilities.sleep(150); }
+  for (var u = 0; u < tuplesCorp.length; u++) { /* ... filtering ... */ var cid2 = _toIntOrNull(tuplesCorp[u].c.contract_id); if (cid2 == null) continue; if (seenChar['' + cid2]) continue; var ch2 = tuplesCorp[u].ch || corpAuth; var items2Raw = getContractItemsCached(ch2, cid2, false, true) || []; var items2 = normalizeItemRows(items2Raw); outC.push([ /* ... contract data ... */]); for (var j2 = 0; j2 < items2.length; j2++) { /* ... push item data to outI ... */ } seenChar['' + cid2] = true; Utilities.sleep(150); }
 
   // ---------------- WRITE SHEETS (Code previously inside lock runs directly) ----------------
   const shC = getOrCreateSheet(ss, CONTRACTS_RAW_SHEET, hdrC);
@@ -1062,7 +1062,7 @@ function contractsToMaterialLedger(ss, charIdMap) {
 
   const itemsByCid = {};
   // ... (logic to populate itemsByCid remains the same) ...
-   for (let r = 0; r < I.length; r++) { const rowI = I[r]; const cid = rowI[colI.contract_id]; if (!itemsByCid[cid]) itemsByCid[cid] = []; itemsByCid[cid].push({ type_id: rowI[colI.type_id], qty: Number(rowI[colI.quantity] || 0), is_included: !!rowI[colI.is_included] }); }
+  for (let r = 0; r < I.length; r++) { const rowI = I[r]; const cid = rowI[colI.contract_id]; if (!itemsByCid[cid]) itemsByCid[cid] = []; itemsByCid[cid].push({ type_id: rowI[colI.type_id], qty: Number(rowI[colI.quantity] || 0), is_included: !!rowI[colI.is_included] }); }
 
 
   const outRows = [];
@@ -1143,7 +1143,7 @@ function rebuildContractUnitCosts(ss) {
   // ... (header checks) ...
   const contractMeta = new Map();
   // ... (populate contractMeta) ...
-   for (const r of c.rows) { const cid = String(r[c.h['contract_id']]); contractMeta.set(cid, { char: String(r[c.h['char']]), date: r[c.h['date_issued']] ? _isoDate(r[c.h['date_issued']]) : '' }); }
+  for (const r of c.rows) { const cid = String(r[c.h['contract_id']]); contractMeta.set(cid, { char: String(r[c.h['char']]), date: r[c.h['date_issued']] ? _isoDate(r[c.h['date_issued']]) : '' }); }
 
   const outRows = [];
   const itemsByCid = new Map();
@@ -1170,52 +1170,52 @@ function rebuildContractUnitCosts(ss) {
  * Assumes lock is held by caller.
  */
 function runContractLedgerPhase(ss) {
-    const log = LoggerEx.withTag('MASTER_SYNC');
+  const log = LoggerEx.withTag('MASTER_SYNC');
 
-    // --- STEP 1: RESOLVE MAP ---
-    let charIdMap = {};
-    try {
-        charIdMap = _charIdMap(ss) || {};
-    } catch (e) {
-        log.error('Char ID Map RESOLUTION FAILED', e.message);
-    }
+  // --- STEP 1: RESOLVE MAP ---
+  let charIdMap = {};
+  try {
+    charIdMap = _charIdMap(ss) || {};
+  } catch (e) {
+    log.error('Char ID Map RESOLUTION FAILED', e.message);
+  }
 
-    // --- STEP 2: SYNC RAW CONTRACT DATA ---
-    log.info('Running syncContracts (Fetch RAW data)...');
-    let contractsWritten = 0;
-    try {
-        // Assumes syncContracts no longer uses internal lock for writing
-        contractsWritten = syncContracts(ss, charIdMap);
-    } catch (e) {
-        log.error('syncContracts FAILED', e.message);
-    }
+  // --- STEP 2: SYNC RAW CONTRACT DATA ---
+  log.info('Running syncContracts (Fetch RAW data)...');
+  let contractsWritten = 0;
+  try {
+    // Assumes syncContracts no longer uses internal lock for writing
+    contractsWritten = syncContracts(ss, charIdMap);
+  } catch (e) {
+    log.error('syncContracts FAILED', e.message);
+  }
 
-    // --- STEP 3: CONDITIONAL CHECK ---
-    if (contractsWritten === 0) {
-        log.info('Skipping contract ledger processing: No new contracts were synced.');
-        return;
-    }
+  // --- STEP 3: CONDITIONAL CHECK ---
+  if (contractsWritten === 0) {
+    log.info('Skipping contract ledger processing: No new contracts were synced.');
+    return;
+  }
 
-    // --- STEPS 4, 5, 6: PROCESSING AND COSTING ---
-    log.info(`Processing ${contractsWritten} newly synced contracts...`);
-    try {
-      log.info('Running contractsToMaterialLedger (Contract Buys)...');
-      // Assumes contractsToMaterialLedger no longer uses internal lock
-      contractsToMaterialLedger(ss, charIdMap);
-      log.info('Running contractsToSalesLedger (Contract Sells)...');
-      // Assumes contractsToSalesLedger no longer uses internal lock
-      contractsToSalesLedger(ss, charIdMap);
-    } catch (e) {
-      log.error('Contract Ledger Processing FAILED', e.message);
-    }
+  // --- STEPS 4, 5, 6: PROCESSING AND COSTING ---
+  log.info(`Processing ${contractsWritten} newly synced contracts...`);
+  try {
+    log.info('Running contractsToMaterialLedger (Contract Buys)...');
+    // Assumes contractsToMaterialLedger no longer uses internal lock
+    contractsToMaterialLedger(ss, charIdMap);
+    log.info('Running contractsToSalesLedger (Contract Sells)...');
+    // Assumes contractsToSalesLedger no longer uses internal lock
+    contractsToSalesLedger(ss, charIdMap);
+  } catch (e) {
+    log.error('Contract Ledger Processing FAILED', e.message);
+  }
 
-    try {
-      log.info('Running rebuildContractUnitCosts (Allocate Prices)...');
-      // Assumes rebuildContractUnitCosts no longer uses internal lock (it didn't before)
-      rebuildContractUnitCosts(ss);
-    } catch (e) {
-      log.error('rebuildContractUnitCosts FAILED', e.message);
-    }
+  try {
+    log.info('Running rebuildContractUnitCosts (Allocate Prices)...');
+    // Assumes rebuildContractUnitCosts no longer uses internal lock (it didn't before)
+    rebuildContractUnitCosts(ss);
+  } catch (e) {
+    log.error('rebuildContractUnitCosts FAILED', e.message);
+  }
 }
 
 /**
