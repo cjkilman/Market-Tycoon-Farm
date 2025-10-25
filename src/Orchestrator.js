@@ -1,5 +1,7 @@
-// This global variable tracks the lock depth for a single execution.
-var EXECUTION_LOCK_DEPTH = 0;
+// Global variable to track recursion depth for this lock type
+var EXECUTION_LOCK_DEPTH_TRY = 0;
+// Global variable to track recursion depth for this lock type
+var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
 // State Machine Constants (Internal steps for the Market Data job)
 const STATE_FLAGS = {
@@ -9,39 +11,43 @@ const STATE_FLAGS = {
 };
 
 /**
- * Locks and executes a function, ensuring single execution.
+ * Attempts to lock and execute a function, waiting up to 30s.
+ * If the lock is busy, it returns false (skips) without error.
+ *
  * @param {function} func The function to execute.
- * @param {string} funcName Adequate name for the lock.
- * @returns {boolean} True if execution started successfully, false if skipped due to lock.
+ * @param {string} funcName A name for logging.
+ * @returns {boolean} True if execution ran, false if it was skipped.
  */
-function executeLocked(func, funcName) {
+function executeWithTryLock(func, funcName) {
   const lock = LockService.getScriptLock();
-  if (lock.tryLock(30000)) { // Wait up to 30 seconds
-
-    const isOuterLock = (EXECUTION_LOCK_DEPTH === 0);
-    EXECUTION_LOCK_DEPTH++;
+  
+  // tryLock() waits 30s, then returns false if still locked.
+  if (lock.tryLock(30000)) { 
+    
+    const isOuterLock = (EXECUTION_LOCK_DEPTH_TRY === 0);
+    EXECUTION_LOCK_DEPTH_TRY++;
 
     try {
       if (isOuterLock) {
         deleteTriggersByName(funcName);
-        console.log(`--- Starting Execution: ${funcName} ---`);
+        console.log(`--- Starting Execution (TryLock): ${funcName} ---`);
       }
 
       func(); // Run the actual function logic
 
       if (isOuterLock) {
-        console.log(`--- Finished Execution: ${funcName} ---`);
+        console.log(`--- Finished Execution (TryLock): ${funcName} ---`);
       }
     } catch (e) {
       console.error(`${funcName} failed: ${e.message}\nStack: ${e.stack}`);
-      // Only market data functions use the specific reset handler
+      // Handle specific job resets
       if (funcName === 'updateMarketDataSheet' || funcName === 'finalizeMarketDataUpdate') {
         console.warn("Attempting to reset Market Data job state due to failure.");
         _resetMarketDataJobState(e);
       }
       throw e; // Re-throw to mark execution as failed
     } finally {
-      EXECUTION_LOCK_DEPTH--;
+      EXECUTION_LOCK_DEPTH_TRY--;
       try {
         lock.releaseLock();
         if (isOuterLock) {
@@ -53,8 +59,65 @@ function executeLocked(func, funcName) {
     }
     return true; // Execution started and ran
   } else {
+    // This is the "skip" logic
     console.warn(`${funcName} was skipped because another process held the lock.`);
     return false; // Execution was skipped
+  }
+}
+
+/**
+ * Locks and executes a function, waiting up to 30s.
+ * If the lock is busy, it THROWS AN ERROR.
+ *
+ * @param {function} func The function to execute.
+ * @param {string} funcName A name for logging.
+ */
+function executeWithWaitLock(func, funcName) {
+  const lock = LockService.getScriptLock();
+  
+  // waitLock() waits 30s, then THROWS AN ERROR if still locked.
+  // It does not return a boolean, so it cannot be in an 'if' statement.
+  try {
+    lock.waitLock(30000); 
+  } catch (e) {
+    // This error is *only* from the lock timing out
+    console.error(`Could not acquire lock for ${funcName}. Process held by another task. Error: ${e.message}`);
+    throw e; // Re-throw the lock timeout error
+  }
+  
+  // If we get here, we have the lock.
+  const isOuterLock = (EXECUTION_LOCK_DEPTH_WAIT === 0);
+  EXECUTION_LOCK_DEPTH_WAIT++;
+
+  try {
+    if (isOuterLock) {
+      deleteTriggersByName(funcName);
+      console.log(`--- Starting Execution (WaitLock): ${funcName} ---`);
+    }
+
+    func(); // Run the actual function logic
+
+    if (isOuterLock) {
+      console.log(`--- Finished Execution (WaitLock): ${funcName} ---`);
+    }
+  } catch (e) {
+    console.error(`${funcName} failed: ${e.message}\nStack: ${e.stack}`);
+    // Handle specific job resets
+    if (funcName === 'updateMarketDataSheet' || funcName === 'finalizeMarketDataUpdate') {
+      console.warn("Attempting to reset Market Data job state due to failure.");
+      _resetMarketDataJobState(e);
+    }
+    throw e; // Re-throw to mark execution as failed
+  } finally {
+    EXECUTION_LOCK_DEPTH_WAIT--;
+    try {
+      lock.releaseLock();
+      if (isOuterLock) {
+        console.log(`Lock released for ${funcName}.`);
+      }
+    } catch (lockError) {
+      console.warn(`Failed to release lock for ${funcName}: ${lockError.message}`);
+    }
   }
 }
 
@@ -73,7 +136,7 @@ function masterOrchestrator() {
     console.log(`Master orchestrator: Market data state requires cleanup/finalization.`);
 
     // 1. Attempt to delete old sheet FIRST. This is the SLOW step.
-    const cleanupSuccess = executeLocked(cleanupOldSheet, 'cleanupOldSheet');
+    const cleanupSuccess = executeWithTryLock(cleanupOldSheet, 'cleanupOldSheet');
 
     const delay = 30 * 1000; // 30 seconds wait before swapping
 
@@ -97,11 +160,11 @@ function masterOrchestrator() {
   if (currentMinute < 15 || currentMinute >= 30) { // Covers 0-14, 30-44, and 45-59
     // --- Window 1, 3, & 4: Cache Warmer (High Availability) ---
     console.log(`Master orchestrator (min ${currentMinute}): Dispatching CACHE WARMER wrapper.`);
-    executeLocked(triggerCacheWarmerWithRetry, 'triggerCacheWarmerWithRetry');
+    executeWithTryLock(triggerCacheWarmerWithRetry, 'triggerCacheWarmerWithRetry');
   } else { // currentMinute >= 15 && currentMinute < 30
     // --- Window 2: Market Data Update (High Priority) ---
     console.log(`Master orchestrator (min ${currentMinute}): Dispatching MARKET DATA UPDATE.`);
-    executeLocked(updateMarketDataSheet, 'updateMarketDataSheet');
+    executeWithTryLock(updateMarketDataSheet, 'updateMarketDataSheet');
   }
 }
 
@@ -119,7 +182,7 @@ function triggerCacheWarmerWithRetry() {
   console.log(`Wrapper ${wrapperFuncName} called. Attempting to run ${funcToRun.name}...`);
 
   // Try to execute the actual cache warmer
-  const executionStarted = executeLocked(funcToRun, funcName);
+  const executionStarted = executeWithTryLock(funcToRun, funcName);
 
   if (!executionStarted) {
     // Lock was busy (e.g., market update running)
@@ -222,18 +285,18 @@ function updateMarketDataSheet() {
     }
     if (!sheet) {
       console.warn(`Creating temp sheet: ${tempSheetName}`);
-      sheet = getOrCreateSheet(ss,tempSheetName,DATA_SHEET_HEADERS);
+      sheet = ss.insertSheet(tempSheetName);
       if (!sheet) throw new Error(`Failed to create sheet ${tempSheetName}`);
       sheet.hideSheet();
     } else {
       console.log(`Clearing temp sheet: ${tempSheetName}`);
       sheet.clearContents();
     }
-/**    sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
+    sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
     const maxRows = sheet.getMaxRows(); if (maxRows > 1) sheet.getRange(2, 1, maxRows - 1, COLUMN_COUNT).clearContent();
     const maxColumns = sheet.getMaxColumns(); if (maxColumns > COLUMN_COUNT) sheet.deleteColumns(COLUMN_COUNT + 1, maxColumns - COLUMN_COUNT);
     if (sheet.getMaxRows() > 1) { sheet.deleteRows(2, sheet.getMaxRows() - 1); } // Ensure only header
-    SpreadsheetApp.flush();*/
+    SpreadsheetApp.flush();
     SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, '0'); SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, '2');
     currentStep = STATE_FLAGS.PROCESSING; SCRIPT_PROP.setProperty(PROP_KEY_STEP, STATE_FLAGS.PROCESSING);
     console.log(`Init complete. To ${STATE_FLAGS.PROCESSING}.`);
@@ -307,7 +370,7 @@ function finalizeMarketDataUpdate() {
   const finalSheetName = 'Market_Data_Raw';
   const oldSheetName = 'Market_Data_Old';
 
-  executeLocked(() => {
+  executeWithTryLock(() => {
     const currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP);
     if (currentStep !== STATE_FLAGS.FINALIZING) {
       console.warn(`Finalizer called unexpectedly (state: ${currentStep}). Resetting.`);
@@ -363,7 +426,7 @@ function finalizeMarketDataUpdate() {
 function cleanupOldSheet() {
   const oldSheetName = 'Market_Data_Old';
   const funcName = 'cleanupOldSheet';
-  executeLocked(() => {
+  executeWithTryLock(() => {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const oldSheet = ss.getSheetByName(oldSheetName);
     if (oldSheet) {
