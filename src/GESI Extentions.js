@@ -1274,7 +1274,7 @@ function triggerLedgerImportCycle() {
   // const success = executeLocked(runAllLedgerImports, FUNC_NAME, myContractFailureHandler);
 
   // Attempt to run the main function under lock
-  const success = executeLocked(runAllLedgerImports, FUNC_NAME);
+const success = executeWithTryLock(runAllLedgerImports, FUNC_NAME);
 
   // If skipped due to lock, schedule a one-time retry
   if (!success) {
