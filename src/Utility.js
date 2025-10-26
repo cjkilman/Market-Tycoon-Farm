@@ -1,14 +1,12 @@
 /**
  * Get or create a sheet, preserving headers and adjusting dimensions.
  * For new sheets, limits the column count to the header length.
- * Optionally sets the maximum number of rows.
  * @param {SpreadsheetApp.Spreadsheet} ss - Spreadsheet object
  * @param {string} name - Sheet name
  * @param {string[]} headers - Array of header strings
- * @param {number} [maxRows] - Optional. The desired total number of data rows (excluding header). If provided, rows will be added or deleted to match this size + 1 (for header).
  * @returns {GoogleAppsScript.Spreadsheet.Sheet}
  */
-function getOrCreateSheet(ss, name, headers) {
+function getOrCreateSheet(ss, name, headers) { // <-- REMOVED maxRows parameter
   // --- Input Validation ---
   if (!ss || typeof ss.getSheetByName !== 'function') {
     // Attempt to get active spreadsheet if ss is invalid
@@ -83,11 +81,12 @@ function getOrCreateSheet(ss, name, headers) {
     }
   }
 
-  
+  // --- ADJUST ROW COUNT BLOCK (REMOVED) ---
+  // The logic that caused the timeout by inserting thousands of rows
+  // has been completely removed from here.
 
   return sheet;
 }
-
 
 function withSheetLock(fn, timeoutMs) {
   var lock = LockService.getDocumentLock();     // document-scoped: safest for Sheets
