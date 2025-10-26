@@ -99,6 +99,7 @@ function _resetMarketDataJobState(error) {
     SCRIPT_PROP.deleteProperty(PROP_KEY_STEP);
     SCRIPT_PROP.deleteProperty(PROP_KEY_REQUEST_INDEX);
     SCRIPT_PROP.deleteProperty(PROP_KEY_SHEET_ROW);
+    SCRIPT_PROP.deleteProperty('marketDataJobIsActive'); // Always clear the active flag
   } catch (propError) {
     console.error(`Error deleting script properties: ${propError.message}`);
   }
@@ -246,7 +247,7 @@ function masterOrchestrator() {
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
   const currentMinute = new Date().getMinutes();
   const NOW_MS = new Date().getTime(); // Consistent timestamp for checks
-
+const isJobActive = SCRIPT_PROP.getProperty('marketDataJobIsActive');
   // --- Priority 1: Market Data Finalization Check (MUST be run first) ---
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
     console.log(`Master orchestrator: Market data state requires cleanup/finalization.`);
@@ -267,8 +268,13 @@ function masterOrchestrator() {
 
   if (currentMinute >= 15 && currentMinute < 45) { // *** Window: Minutes 15-44 ***
     // --- Window for Market Data Update ---
-    console.log(`Master orchestrator (min ${currentMinute}): Dispatching MARKET DATA UPDATE.`);
-    executeWithTryLock(updateMarketDataSheet, 'updateMarketDataSheet');
+// --- REPLACE THE executeWithTryLock CALL WITH THIS BLOCK ---
+    if (isJobActive === 'true') {
+        console.log(`Master orchestrator: Market data job is already active. Skipping new dispatch.`);
+    } else {
+        console.log(`Master orchestrator (min ${currentMinute}): Dispatching MARKET DATA UPDATE.`);
+        executeWithTryLock(updateMarketDataSheet, 'updateMarketDataSheet');
+    }
   } else { // *** Covers 0-14 and 45-59 ***
     // --- Window for Cache Warmer ---
     console.log(`Master orchestrator (min ${currentMinute}): In cache warmer window.`);
@@ -436,10 +442,10 @@ function updateMarketDataSheet() {
   const PROP_KEY_REQUEST_INDEX = 'marketDataRequestIndex';
   const PROP_KEY_SHEET_ROW = 'marketDataNextWriteRow';
 
-  const BATCH_SIZE = 25; // Keep batch size small due to sheet calculation timeouts
-  const TIME_LIMIT_MS = 28 * 10000; // Time limit (4m 40s)
+  const BATCH_SIZE = 15; // Keep batch size small due to sheet calculation timeouts
+  const TIME_LIMIT_MS = 280000; // Time limit (4m 40s)
   const RESCHEDULE_DELAY_MS = 30 * 1000; // Reschedule delay
-  const docTryLockWaitMs = 30 * 1000; // Document Lock tryLock wait time
+  const docTryLockWaitMs = 15 * 1000; // Document Lock tryLock wait time
 
   const tempSheetName = 'Market_Data_Temp';
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
@@ -474,6 +480,8 @@ function updateMarketDataSheet() {
 
     console.log("Acquiring Document Lock for initial sheet setup...");
     try {
+      SCRIPT_PROP.setProperty('marketDataJobIsActive', 'true');
+      console.log("Job Active Flag SET.");
       // Initial setup still uses waitLock - it MUST complete or fail loudly.
       withSheetLock(() => {
         // *** PASS maxRows to getOrCreateSheet ***
@@ -561,7 +569,6 @@ function updateMarketDataSheet() {
       console.log(`Processing batch: Request indices ${requestStartIndex} to ${requestEndIndex - 1} (${requestsForThisRun.length} requests)`);
 
       let marketData;
-      let isCacheMiss = false; // Flag to track if this batch involved a cache miss
       try {
         // Get data (will use cache or fetch)
         marketData = fuzAPI.getDataForRequests(requestsForThisRun);
@@ -574,12 +581,6 @@ function updateMarketDataSheet() {
         return; // Exit
       }
 
-      // *** ADDED: Small delay *only* if it was a cache miss (i.e., putAll was called) ***
-      if (isCacheMiss && marketData && marketData.length > 0) {
-        console.log("Adding 1.5s delay after cache write to prevent service contention...");
-        Utilities.sleep(1500); // 1.5 second sleep
-      }
-      // *** END ADDED DELAY ***
 
       // Check if API returned data
       if (!marketData || !Array.isArray(marketData) || marketData.length === 0) {
