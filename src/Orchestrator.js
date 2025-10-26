@@ -436,10 +436,10 @@ function updateMarketDataSheet() {
   const PROP_KEY_REQUEST_INDEX = 'marketDataRequestIndex';
   const PROP_KEY_SHEET_ROW = 'marketDataNextWriteRow';
 
-  const BATCH_SIZE = 50; // Keep batch size small due to sheet calculation timeouts
-  const TIME_LIMIT_MS = 280000; // Time limit (4m 40s)
+  const BATCH_SIZE = 25; // Keep batch size small due to sheet calculation timeouts
+  const TIME_LIMIT_MS = 28 * 10000; // Time limit (4m 40s)
   const RESCHEDULE_DELAY_MS = 30 * 1000; // Reschedule delay
-  const docTryLockWaitMs = 10000; // Document Lock tryLock wait time
+  const docTryLockWaitMs = 30 * 1000; // Document Lock tryLock wait time
 
   const tempSheetName = 'Market_Data_Temp';
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
@@ -563,11 +563,6 @@ function updateMarketDataSheet() {
       let marketData;
       let isCacheMiss = false; // Flag to track if this batch involved a cache miss
       try {
-        // Check cache first to determine if it's a miss
-        const { cachedData, missingRequests } = fuzAPI._checkCacheForRequests(requestsForThisRun); // Assuming fuzAPI exposes this
-        if (missingRequests.length > 0) {
-          isCacheMiss = true;
-        }
         // Get data (will use cache or fetch)
         marketData = fuzAPI.getDataForRequests(requestsForThisRun);
       } catch (apiError) {
