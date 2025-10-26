@@ -1257,6 +1257,7 @@ function runAllLedgerImports() {
 
   log.info('--- Full Ledger Import Cycle Complete ---');
   // NOTE: No lock release here, executeLocked handles it.
+  return true;
 }
 
 /**

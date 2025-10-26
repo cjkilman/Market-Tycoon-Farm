@@ -55,7 +55,7 @@ function deleteTriggersByName(functionName) {
     allTriggers.forEach(trigger => {
       // Check handler function AND event type to be more specific
       if (trigger.getHandlerFunction() === functionName &&
-          trigger.getEventType() === ScriptApp.EventType.CLOCK) {
+        trigger.getEventType() === ScriptApp.EventType.CLOCK) {
         try {
           ScriptApp.deleteTrigger(trigger);
           deletedCount++;
@@ -85,7 +85,7 @@ function _resetMarketDataJobState(error) {
   // Log the error object itself for more details if available
   console.warn(`RESETTING Market Data Job State due to: ${error ? error.message : 'Manual request or completion'}.`);
   if (error && error.stack) {
-      console.warn(`Stack trace: ${error.stack}`);
+    console.warn(`Stack trace: ${error.stack}`);
   }
 
   console.log("Clearing market data job properties and triggers...");
@@ -96,11 +96,11 @@ function _resetMarketDataJobState(error) {
 
   // Use try-catch for property deletion in case of permission issues (less likely)
   try {
-      SCRIPT_PROP.deleteProperty(PROP_KEY_STEP);
-      SCRIPT_PROP.deleteProperty(PROP_KEY_REQUEST_INDEX);
-      SCRIPT_PROP.deleteProperty(PROP_KEY_SHEET_ROW);
+    SCRIPT_PROP.deleteProperty(PROP_KEY_STEP);
+    SCRIPT_PROP.deleteProperty(PROP_KEY_REQUEST_INDEX);
+    SCRIPT_PROP.deleteProperty(PROP_KEY_SHEET_ROW);
   } catch (propError) {
-      console.error(`Error deleting script properties: ${propError.message}`);
+    console.error(`Error deleting script properties: ${propError.message}`);
   }
 
   // Delete specific triggers related to the job steps
@@ -143,7 +143,7 @@ function executeWithTryLock(func, funcName) {
       if (isOuterLock) {
         console.log(`--- Finished Execution (TryLock): ${funcName} ---`);
       } else {
-         console.log(`--- Exiting nested execution (TryLock): ${funcName} ---`);
+        console.log(`--- Exiting nested execution (TryLock): ${funcName} ---`);
       }
 
     } catch (e) {
@@ -203,7 +203,7 @@ function executeWithWaitLock(func, funcName) {
       deleteTriggersByName(funcName);
       console.log(`--- Starting Execution (WaitLock): ${funcName} ---`);
     } else {
-       console.log(`--- Entering nested execution (WaitLock): ${funcName} ---`);
+      console.log(`--- Entering nested execution (WaitLock): ${funcName} ---`);
     }
 
     // Execute the function and store result
@@ -212,7 +212,7 @@ function executeWithWaitLock(func, funcName) {
     if (isOuterLock) {
       console.log(`--- Finished Execution (WaitLock): ${funcName} ---`);
     } else {
-       console.log(`--- Exiting nested execution (WaitLock): ${funcName} ---`);
+      console.log(`--- Exiting nested execution (WaitLock): ${funcName} ---`);
     }
   } catch (e) {
     console.error(`${funcName} failed during execution: ${e.message}\nStack: ${e.stack}`);
@@ -247,10 +247,6 @@ function masterOrchestrator() {
   const currentMinute = new Date().getMinutes();
   const NOW_MS = new Date().getTime(); // Consistent timestamp for checks
 
-  // Cache Warmer Cooldown Configuration
-  const PROP_KEY_COOLDOWN = 'cacheRefresh_lastFullCompletion';
-  const COOLDOWN_MINUTES = 30; // 30 Minute cooldown
-
   // --- Priority 1: Market Data Finalization Check (MUST be run first) ---
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
     console.log(`Master orchestrator: Market data state requires cleanup/finalization.`);
@@ -277,34 +273,11 @@ function masterOrchestrator() {
     // --- Window for Cache Warmer ---
     console.log(`Master orchestrator (min ${currentMinute}): In cache warmer window.`);
 
-    // Cooldown Check
-    let skipCacheWarmer = false;
-    const lastCompletionRaw = SCRIPT_PROP.getProperty(PROP_KEY_COOLDOWN);
-    if (lastCompletionRaw) {
-        const lastCompletionMs = parseInt(lastCompletionRaw, 10);
-        if (!isNaN(lastCompletionMs)) {
-            const minutesSinceCompletion = (NOW_MS - lastCompletionMs) / (60 * 1000);
-            if (minutesSinceCompletion < COOLDOWN_MINUTES) {
-                console.log(`Skipping cache warmer dispatch: Last full completion was ${minutesSinceCompletion.toFixed(1)} minutes ago (within ${COOLDOWN_MINUTES} min cooldown).`);
-                skipCacheWarmer = true;
-            } else {
-                 console.log(`Cooldown period (${COOLDOWN_MINUTES} min) has passed since last completion. Proceeding.`);
-            }
-        } else {
-            console.warn("Invalid cache warmer cooldown timestamp found. Proceeding.");
-            SCRIPT_PROP.deleteProperty(PROP_KEY_COOLDOWN); // Clean up
-        }
-    } else {
-       console.log("No previous cache warmer completion timestamp found. Proceeding.");
-    }
-
-    if (!skipCacheWarmer) {
-        console.log(`Dispatching CACHE WARMER wrapper.`);
-        executeWithTryLock(triggerCacheWarmerWithRetry, 'triggerCacheWarmerWithRetry');
-    }
-    // End Cooldown Check
+    // Cooldown logic removed.
+    console.log(`Dispatching CACHE WARMER wrapper.`);
+    executeWithTryLock(triggerCacheWarmerWithRetry, 'triggerCacheWarmerWithRetry');
   }
-   console.log(`Master orchestrator finished checks for minute ${currentMinute}.`);
+  console.log(`Master orchestrator finished checks for minute ${currentMinute}.`);
 }
 
 /**
@@ -342,14 +315,13 @@ function triggerCacheWarmerWithRetry() {
     }
     // *** End Opportunistic Cleanup ***
 
-    // Check if we are now in the market update window
+    // --- WINDOW GATE REMOVED ---
+    // This now schedules the market update immediately after a successful
+    // cache warmer run, regardless of the time window.
     const currentMinute = new Date().getMinutes();
-    if (currentMinute >= 15 && currentMinute < 45) {
-        console.log(`Cache warmer finished, now in market update window (min ${currentMinute}). Scheduling market update.`);
-        scheduleOneTimeTrigger('updateMarketDataSheet', quickUpdateDelayMs);
-    } else {
-        console.log(`Cache warmer finished, but not in market update window (min ${currentMinute}). No immediate update scheduled.`);
-    }
+    console.log(`Cache warmer finished (min ${currentMinute}). Scheduling market update immediately.`);
+    scheduleOneTimeTrigger('updateMarketDataSheet', quickUpdateDelayMs);
+    // --- END OF MODIFICATION ---
 
   } else if (result === false) {
     // --- Case 3: Ran but did NOT complete fully (hit time limit) ---
@@ -357,8 +329,8 @@ function triggerCacheWarmerWithRetry() {
     // Do nothing extra, the inner function handles its own rescheduling.
 
   } else {
-     // --- Case 4: Unexpected return value ---
-     console.warn(`${funcName} execution by ${wrapperFuncName} returned unexpected value: ${result}`);
+    // --- Case 4: Unexpected return value ---
+    console.warn(`${funcName} execution by ${wrapperFuncName} returned unexpected value: ${result}`);
   }
 }
 
@@ -403,7 +375,7 @@ function fuzzworkCacheRefresh_TimeGated() {
       console.log(`Cache refresh: Starting/Restarting from index 0.`);
       properties.deleteProperty(PROP_KEY_RESUME);
     } else {
-       console.log(`Cache refresh: Resuming from index ${startIndex}.`);
+      console.log(`Cache refresh: Resuming from index ${startIndex}.`);
     }
 
     let itemsProcessedThisRun = 0;
@@ -428,7 +400,7 @@ function fuzzworkCacheRefresh_TimeGated() {
           fuzAPI.getDataForRequests(currentSubBatch);
           itemsProcessedThisRun += currentSubBatch.length;
         } catch (apiError) {
-           console.error(`Error processing sub-batch indices ${startIndex}-${endIndex - 1}: ${apiError.message}. Skipping batch.`);
+          console.error(`Error processing sub-batch indices ${startIndex}-${endIndex - 1}: ${apiError.message}. Skipping batch.`);
         }
       }
       startIndex = endIndex;
@@ -441,8 +413,8 @@ function fuzzworkCacheRefresh_TimeGated() {
     completedFullRun = true; // <-- Set flag on full completion
 
   } catch (e) {
-      console.error(`Unhandled error during cache refresh: ${e.message}\nStack: ${e.stack}`);
-      completedFullRun = false; // Ensure flag is false on error
+    console.error(`Unhandled error during cache refresh: ${e.message}\nStack: ${e.stack}`);
+    completedFullRun = false; // Ensure flag is false on error
   } finally {
     const duration = (new Date().getTime() - START_TIME) / 1000;
     console.log(`Cache refresh execution block finished in ${duration.toFixed(2)} seconds.`);
@@ -504,28 +476,27 @@ function updateMarketDataSheet() {
     try {
       // Initial setup still uses waitLock - it MUST complete or fail loudly.
       withSheetLock(() => {
-        sheet = ss.getSheetByName(tempSheetName);
         // *** PASS maxRows to getOrCreateSheet ***
         const expectedDataRows = masterRequests.length;
         console.log(`Ensuring temp sheet '${tempSheetName}' exists with ${expectedDataRows} data rows.`);
-        sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS, expectedDataRows);
+        sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
 
         if (!sheet) throw new Error(`Failed to create or verify sheet ${tempSheetName}`);
 
         // Additional checks after getOrCreateSheet returns
-        if(sheet.getName() !== tempSheetName) {
-           throw new Error(`getOrCreateSheet returned sheet with wrong name: ${sheet.getName()}`);
+        if (sheet.getName() !== tempSheetName) {
+          throw new Error(`getOrCreateSheet returned sheet with wrong name: ${sheet.getName()}`);
         }
 
         console.log(`Sheet '${tempSheetName}' ready. Hiding sheet.`);
         sheet.hideSheet();
 
-         // Clear content below header just in case (optional, getOrCreateSheet might handle it)
-         const lastRow = sheet.getLastRow();
-         if (lastRow > 1) {
-             console.log(`Clearing content from row 2 to ${lastRow}.`);
-             sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
-         }
+        // Clear content below header just in case (optional, getOrCreateSheet might handle it)
+        const lastRow = sheet.getLastRow();
+        if (lastRow > 1) {
+          console.log(`Clearing content from row 2 to ${lastRow}.`);
+          sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
+        }
 
 
       }, 60000); // Increased lock wait time for setup
@@ -541,10 +512,10 @@ function updateMarketDataSheet() {
       console.log(`Initialization complete. Transitioning to ${STATE_FLAGS.PROCESSING}.`);
 
     } catch (setupError) {
-        console.error(`CRITICAL ERROR during NEW_RUN sheet setup: ${setupError.message}. Resetting state.`);
-         _resetMarketDataJobState(setupError);
-         // Re-throw the error to ensure the execution stops and logs failure
-         throw setupError;
+      console.error(`CRITICAL ERROR during NEW_RUN sheet setup: ${setupError.message}. Resetting state.`);
+      _resetMarketDataJobState(setupError);
+      // Re-throw the error to ensure the execution stops and logs failure
+      throw setupError;
     }
   } // --- End NEW_RUN ---
 
@@ -584,34 +555,34 @@ function updateMarketDataSheet() {
       const requestsForThisRun = masterRequests.slice(requestStartIndex, requestEndIndex);
 
       if (requestsForThisRun.length === 0) {
-         console.warn("Requests for this run is unexpectedly empty. Breaking loop.");
-         break; // Exit loop if no requests left to process
+        console.warn("Requests for this run is unexpectedly empty. Breaking loop.");
+        break; // Exit loop if no requests left to process
       }
       console.log(`Processing batch: Request indices ${requestStartIndex} to ${requestEndIndex - 1} (${requestsForThisRun.length} requests)`);
 
       let marketData;
       let isCacheMiss = false; // Flag to track if this batch involved a cache miss
       try {
-          // Check cache first to determine if it's a miss
-          const { cachedData, missingRequests } = fuzAPI._checkCacheForRequests(requestsForThisRun); // Assuming fuzAPI exposes this
-          if (missingRequests.length > 0) {
-              isCacheMiss = true;
-          }
-          // Get data (will use cache or fetch)
-          marketData = fuzAPI.getDataForRequests(requestsForThisRun);
+        // Check cache first to determine if it's a miss
+        const { cachedData, missingRequests } = fuzAPI._checkCacheForRequests(requestsForThisRun); // Assuming fuzAPI exposes this
+        if (missingRequests.length > 0) {
+          isCacheMiss = true;
+        }
+        // Get data (will use cache or fetch)
+        marketData = fuzAPI.getDataForRequests(requestsForThisRun);
       } catch (apiError) {
-          console.error(`Error calling fuzAPI.getDataForRequests for indices ${requestStartIndex}-${requestEndIndex - 1}: ${apiError.message}. Skipping batch and saving state.`);
-          // Save current state and reschedule on API error
-          SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
-          SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
-          scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2); // Longer delay on API error?
-          return; // Exit
+        console.error(`Error calling fuzAPI.getDataForRequests for indices ${requestStartIndex}-${requestEndIndex - 1}: ${apiError.message}. Skipping batch and saving state.`);
+        // Save current state and reschedule on API error
+        SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
+        SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
+        scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2); // Longer delay on API error?
+        return; // Exit
       }
 
       // *** ADDED: Small delay *only* if it was a cache miss (i.e., putAll was called) ***
       if (isCacheMiss && marketData && marketData.length > 0) {
-         console.log("Adding 1.5s delay after cache write to prevent service contention...");
-         Utilities.sleep(1500); // 1.5 second sleep
+        console.log("Adding 1.5s delay after cache write to prevent service contention...");
+        Utilities.sleep(1500); // 1.5 second sleep
       }
       // *** END ADDED DELAY ***
 
@@ -646,7 +617,7 @@ function updateMarketDataSheet() {
             }
           });
         } else {
-           console.warn(`Skipping invalid crate structure received from API.`);
+          console.warn(`Skipping invalid crate structure received from API.`);
         }
       });
 
@@ -655,10 +626,10 @@ function updateMarketDataSheet() {
       if (allRowsToWrite.length > 0) {
         // Column count validation
         if (allRowsToWrite[0].length !== COLUMN_COUNT) {
-           console.error(`CRITICAL: Column count mismatch! Expected ${COLUMN_COUNT}, got ${allRowsToWrite[0].length}. Skipping write for batch ${requestStartIndex}.`);
-           requestStartIndex = requestEndIndex; // Advance index
-           SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
-           continue; // Skip batch
+          console.error(`CRITICAL: Column count mismatch! Expected ${COLUMN_COUNT}, got ${allRowsToWrite[0].length}. Skipping write for batch ${requestStartIndex}.`);
+          requestStartIndex = requestEndIndex; // Advance index
+          SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
+          continue; // Skip batch
         }
 
         // Pre-write time check
@@ -705,17 +676,17 @@ function updateMarketDataSheet() {
         } catch (writeError) {
           // Catch errors *during* the write (e.g., service timeout)
           console.error(`Error during batch write (starting index ${requestStartIndex}): ${writeError.message}. Rescheduling.`);
-          if (writeError.stack) { console.error(`Stack: ${writeError.stack}`);}
+          if (writeError.stack) { console.error(`Stack: ${writeError.stack}`); }
           SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
           SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
           scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
           console.warn(`⚠️ Rescheduled due to write error (e.g., service timeout).`);
           return; // Exit
         } finally {
-            if (lockAcquired) {
-                try { docLock.releaseLock(); console.log("Document Lock released."); }
-                catch (rlErr) { console.error("CRITICAL: Failed to release Document Lock!", rlErr);}
-            }
+          if (lockAcquired) {
+            try { docLock.releaseLock(); console.log("Document Lock released."); }
+            catch (rlErr) { console.error("CRITICAL: Failed to release Document Lock!", rlErr); }
+          }
         }
         // --- End Document TryLock ---
 
@@ -733,15 +704,15 @@ function updateMarketDataSheet() {
       SCRIPT_PROP.setProperty(PROP_KEY_STEP, STATE_FLAGS.FINALIZING);
       // No reschedule needed, master orchestrator takes over
     } else {
-       console.warn("Processing loop finished unexpectedly. Saving state.");
-       SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
-       SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
+      console.warn("Processing loop finished unexpectedly. Saving state.");
+      SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
+      SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
     }
 
   } // --- End if PROCESSING ---
 
-   const totalDuration = (new Date().getTime() - START_TIME) / 1000;
-   console.log(`updateMarketDataSheet execution finished in ${totalDuration.toFixed(2)} seconds. Final state: ${SCRIPT_PROP.getProperty(PROP_KEY_STEP)}`);
+  const totalDuration = (new Date().getTime() - START_TIME) / 1000;
+  console.log(`updateMarketDataSheet execution finished in ${totalDuration.toFixed(2)} seconds. Final state: ${SCRIPT_PROP.getProperty(PROP_KEY_STEP)}`);
 }
 
 
@@ -783,7 +754,7 @@ function finalizeMarketDataUpdate() {
           throw new Error(`Critical: Sheet '${tempSheetName}' is missing during finalization!`);
         }
         if (tempSheet.getLastRow() <= 1) {
-           throw new Error(`Critical: Sheet '${tempSheetName}' is empty or has only headers. Cannot swap.`);
+          throw new Error(`Critical: Sheet '${tempSheetName}' is empty or has only headers. Cannot swap.`);
         }
 
         console.log("Acquired Document Lock for sheet swap (WaitLock).");
@@ -795,9 +766,9 @@ function finalizeMarketDataUpdate() {
             console.log(`Deleting existing '${oldSheetName}' sheet...`);
             ss.deleteSheet(oldSheet);
             SpreadsheetApp.flush(); // Flush after delete
-             console.log(`Sheet '${oldSheetName}' deleted.`);
+            console.log(`Sheet '${oldSheetName}' deleted.`);
           } catch (delErr) {
-             console.warn(`Could not delete existing '${oldSheetName}': ${delErr.message}. Proceeding.`);
+            console.warn(`Could not delete existing '${oldSheetName}': ${delErr.message}. Proceeding.`);
           }
         }
 
@@ -826,7 +797,7 @@ function finalizeMarketDataUpdate() {
 
     } catch (swapError) {
       console.error(`CRITICAL ERROR during finalization swap: ${swapError.message}. Resetting state.`);
-      if (swapError.stack) { console.error(`Stack: ${swapError.stack}`);}
+      if (swapError.stack) { console.error(`Stack: ${swapError.stack}`); }
       _resetMarketDataJobState(swapError); // Reset state on error
       throw swapError; // Re-throw
     }
@@ -850,37 +821,37 @@ function cleanupOldSheet() {
   const docLock = LockService.getDocumentLock();
   let lockAcquired = false;
   try {
-     lockAcquired = docLock.tryLock(docTryLockWaitMs);
+    lockAcquired = docLock.tryLock(docTryLockWaitMs);
 
-     if (lockAcquired) {
-        console.log(`Document Lock acquired for ${funcName}.`);
-        const ss = SpreadsheetApp.getActiveSpreadsheet();
-        const oldSheet = ss.getSheetByName(oldSheetName);
+    if (lockAcquired) {
+      console.log(`Document Lock acquired for ${funcName}.`);
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const oldSheet = ss.getSheetByName(oldSheetName);
 
-        if (oldSheet) {
-          console.log(`Found sheet '${oldSheetName}'. Deleting...`);
-          try {
-            ss.deleteSheet(oldSheet);
-            console.log(`Successfully deleted sheet '${oldSheetName}'.`);
-          } catch (e) {
-            console.error(`Failed to delete sheet '${oldSheetName}': ${e.message}`);
-          }
-        } else {
-          console.log(`No sheet named '${oldSheetName}' found to delete.`);
+      if (oldSheet) {
+        console.log(`Found sheet '${oldSheetName}'. Deleting...`);
+        try {
+          ss.deleteSheet(oldSheet);
+          console.log(`Successfully deleted sheet '${oldSheetName}'.`);
+        } catch (e) {
+          console.error(`Failed to delete sheet '${oldSheetName}': ${e.message}`);
         }
-     } else {
-        console.warn(`Could not acquire Document Lock for ${funcName} (TryLock). Deletion deferred.`);
-        // No error thrown, it just didn't run this time.
-     }
-  } catch (e) {
-      // Catch unexpected errors during the process
-      console.error(`Unexpected error during ${funcName}: ${e.message}`);
-      if (e.stack) { console.error(`Stack: ${e.stack}`);}
-  } finally {
-      if (lockAcquired) {
-          try { docLock.releaseLock(); console.log(`Document Lock released for ${funcName}.`);}
-          catch(rlErr) { console.error(`CRITICAL: Failed to release Document Lock for ${funcName}!`, rlErr); }
+      } else {
+        console.log(`No sheet named '${oldSheetName}' found to delete.`);
       }
+    } else {
+      console.warn(`Could not acquire Document Lock for ${funcName} (TryLock). Deletion deferred.`);
+      // No error thrown, it just didn't run this time.
+    }
+  } catch (e) {
+    // Catch unexpected errors during the process
+    console.error(`Unexpected error during ${funcName}: ${e.message}`);
+    if (e.stack) { console.error(`Stack: ${e.stack}`); }
+  } finally {
+    if (lockAcquired) {
+      try { docLock.releaseLock(); console.log(`Document Lock released for ${funcName}.`); }
+      catch (rlErr) { console.error(`CRITICAL: Failed to release Document Lock for ${funcName}!`, rlErr); }
+    }
   }
 }
 
@@ -916,9 +887,9 @@ function setupStaggeredTriggers() {
     console.log('SUCCESS: Created 15-minute trigger for masterOrchestrator.');
 
     // Add back GESI trigger if needed (assuming it runs independently)
-     ScriptApp.newTrigger('triggerLedgerImportCycle')
-       .timeBased().hourly().create(); // Or whatever frequency it needs
-     console.log('SUCCESS: Created hourly trigger for triggerLedgerImportCycle.');
+    ScriptApp.newTrigger('triggerLedgerImportCycle')
+      .timeBased().hourly().create(); // Or whatever frequency it needs
+    console.log('SUCCESS: Created hourly trigger for triggerLedgerImportCycle.');
 
   } catch (e) {
     console.error(`Failed to create new triggers: ${e.message}. Please check permissions and script validity.`);
@@ -933,8 +904,8 @@ function manualResetMarketDataJob() {
   console.log("MANUAL RESET initiated for Market Data job.");
   _resetMarketDataJobState(new Error("Manual reset requested via editor"));
   console.log("MANUAL RESET: Market Data job state has been reset.");
-   // Optional: Immediately try to run the orchestrator to kick things off
-   // try { masterOrchestrator(); } catch(e) { console.error("Error during post-reset orchestrator run:", e); }
+  // Optional: Immediately try to run the orchestrator to kick things off
+  // try { masterOrchestrator(); } catch(e) { console.error("Error during post-reset orchestrator run:", e); }
 }
 
 

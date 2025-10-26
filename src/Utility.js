@@ -8,7 +8,7 @@
  * @param {number} [maxRows] - Optional. The desired total number of data rows (excluding header). If provided, rows will be added or deleted to match this size + 1 (for header).
  * @returns {GoogleAppsScript.Spreadsheet.Sheet}
  */
-function getOrCreateSheet(ss, name, headers, maxRows = null) {
+function getOrCreateSheet(ss, name, headers) {
   // --- Input Validation ---
   if (!ss || typeof ss.getSheetByName !== 'function') {
     // Attempt to get active spreadsheet if ss is invalid
@@ -83,38 +83,7 @@ function getOrCreateSheet(ss, name, headers, maxRows = null) {
     }
   }
 
-  // --- Adjust Row Count (Optional) ---
-  if (maxRows !== null && Number.isInteger(maxRows) && maxRows >= 0) {
-    const desiredTotalRows = maxRows + 1; // +1 for the header row
-    const currentTotalRows = sheet.getMaxRows();
-
-    try {
-        if (currentTotalRows > desiredTotalRows) {
-          // Delete excess rows
-           console.log(`Deleting ${currentTotalRows - desiredTotalRows} excess rows from sheet '${sheetName}'.`);
-          sheet.deleteRows(desiredTotalRows + 1, currentTotalRows - desiredTotalRows);
-        } else if (currentTotalRows < desiredTotalRows) {
-          // Insert needed rows
-           console.log(`Inserting ${desiredTotalRows - currentTotalRows} rows into sheet '${sheetName}'.`);
-          sheet.insertRowsAfter(currentTotalRows, desiredTotalRows - currentTotalRows);
-        }
-        // If currentTotalRows === desiredTotalRows, do nothing.
-         console.log(`Sheet '${sheetName}' row count adjusted to ${desiredTotalRows}.`);
-     } catch (rowAdjustError) {
-         console.error(`Error adjusting rows for sheet '${sheetName}': ${rowAdjustError.message}`);
-         // Continue without throwing, but log the error
-     }
-  } else if (isNewSheet) {
-      // If it's a brand new sheet and no maxRows specified, delete the default extra rows
-      try {
-          const currentTotalRows = sheet.getMaxRows();
-          if (currentTotalRows > 1) { // Only delete if more than just the header exists
-              sheet.deleteRows(2, currentTotalRows - 1);
-          }
-      } catch (deleteRowsError) {
-           console.error(`Error deleting default rows for new sheet '${sheetName}': ${deleteRowsError.message}`);
-      }
-  }
+  
 
   return sheet;
 }
