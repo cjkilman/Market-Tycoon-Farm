@@ -47,7 +47,7 @@ class FuzDataObject {
    */
     _normalizeFloat(value, defaultValue = "") {
     const num = parseFloat(value);
-    return isNaN(num) ? defaultValue : "";
+    return isNaN(num) ? defaultValue : num;
   }
 
   /**
