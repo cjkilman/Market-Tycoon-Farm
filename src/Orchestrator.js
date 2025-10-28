@@ -491,6 +491,11 @@ function updateMarketDataSheet() {
     // If it executed, the result is handled by the worker's internal reschedule/state change.
 }
 
+/**
+ * Note: This file contains the corrected _updateMarketDataSheetWorker function.
+ * Other functions from the original Orchestrator.js file are omitted for brevity,
+ * but would be present in the full file.
+ */
 function _updateMarketDataSheetWorker() {
   // --- Configuration ---
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -515,9 +520,9 @@ function _updateMarketDataSheetWorker() {
 
   // --- NEW: Adaptive Throttling based on last write time ---
   const PROP_KEY_THROTTLE_DURATION = 'marketDataLastWriteDurationMs';
-  const THROTTLE_BASE_SLEEP_MS = 500;     // Min 0.5s sleep between writes (THROTTLE_MIN_SLEEP_MS)
-  const THROTTLE_LATENCY_FACTOR = 1.5;    // Sleep for 1.5x the last write duration
-  const THROTTLE_MAX_SLEEP_MS = 45000;    // Max 45s sleep
+  const THROTTLE_BASE_SLEEP_MS = 500;      // Min 0.5s sleep between writes (THROTTLE_MIN_SLEEP_MS)
+  const THROTTLE_LATENCY_FACTOR = 1.5;     // Sleep for 1.5x the last write duration
+  const THROTTLE_MAX_SLEEP_MS = 45000;     // Max 45s sleep
   const THROTTLE_FAILURE_PENALTY_MS = 10000; // Add 10s to duration on failure
   // --- END NEW ---
   
@@ -535,7 +540,7 @@ function _updateMarketDataSheetWorker() {
 
   const START_TIME = new Date().getTime();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(tempSheetName);
+  let sheet = null; // Initialize as null
   let batchesProcessedThisRun = 0; // Initialize batchesProcessedThisRun here
 
   // --- State Initialization & Validation ---
@@ -550,7 +555,8 @@ function _updateMarketDataSheetWorker() {
   const masterRequests = getMasterBatchFromControlTable();
 
   // --- Phase 1: NEW_RUN Setup ---
-  if (currentStep === STATE_FLAGS.NEW_RUN || !sheet || !masterRequests || masterRequests.length === 0) {
+  // MODIFIED: Removed !sheet check here, as it's null by default
+  if (currentStep === STATE_FLAGS.NEW_RUN || !masterRequests || masterRequests.length === 0) {
     currentStep = STATE_FLAGS.NEW_RUN;
     console.log(`State: ${STATE_FLAGS.NEW_RUN}. Preparing cycle.`);
 
@@ -563,15 +569,16 @@ function _updateMarketDataSheetWorker() {
     
     // --- FIX: Delegate to Cache Warmer on a true Cold Start ---
     // A cold start is defined by NEW_RUN and setupStep being 1 (or null)
-    let setupStep = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_SETUP_STEP) || '1', 10);
-    if (setupStep === 1) {
-        console.log(`Cold Start detected (NEW_RUN, Setup Step 1). Handing off to Cache Warmer first.`);
-        // Clear the lease so the cache warmer can run
-        SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE); 
-        // *** FIX: We must set the setupStep to 2 NOW, so the *next* run knows the handoff happened.
-        SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '2');
-        // Schedule the cache warmer to run, which will then schedule this job
-        scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', 5000); // 5 sec delay
+  let setupStep = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_SETUP_STEP) || '1', 10);
+  if (setupStep === 1) {
+      console.log(`Cold Start detected (NEW_RUN, Setup Step 1). Handing off to Cache Warmer first.`);
+      // Clear the lease so the cache warmer can run
+      SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE); 
+      // *** FIX: We must set the setupStep to 2 NOW, so the *next* run knows the handoff happened.
+      // --- MODIFICATION: Set to '3' (or any number != 1 and != 2) to signify "post-handoff" ---
+      SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '3'); // <-- CHANGED TO '3'
+      // Schedule the cache warmer to run, which will then schedule this job
+      scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', 5000); // 5 sec delay
         return; // Exit this execution completely
     }
     // --- END FIX ---
@@ -585,28 +592,30 @@ function _updateMarketDataSheetWorker() {
       SCRIPT_PROP.deleteProperty(PROP_KEY_THROTTLE_DURATION);
       
       withSheetLock(() => {
-        // --- STEP 1: Create/Get Sheet (Should be skipped if we are here) ---
+        // --- FIX: Get or create the sheet *immediately* ---
+        // This ensures the 'sheet' variable is valid for all subsequent steps.
+        sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
+        if (!sheet) throw new Error(`Failed to create or verify sheet ${tempSheetName}`);
+        // --- END FIX ---
+
+        // --- STEP 1: Handle first-time creation (setupStep <= 1) ---
         if (setupStep <= 1) {
-            // This block should now be unreachable due to the handoff above
-            // But it remains as a safety net.
-            console.log(`[Setup Step 1] Ensuring temp sheet '${tempSheetName}' exists.`);
-            const expectedDataRows = masterRequests.length;
-            sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
-            if (!sheet) throw new Error(`Failed to create or verify sheet ${tempSheetName}`);
-            
+            // This block will run on a manual reset
+            console.log(`[Setup Step 1] Ensuring temp sheet '${tempSheetName}' exists and is hidden.`);
             sheet.hideSheet();
-            SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '2');
-            setupStep = 2;
+            // We are done with setup, so delete the step property
+            SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
         
-        // --- STEP 2: Clear Content (This is now the main entry point for a warm NEW_RUN) ---
-        if (setupStep === 2) {
+        // --- STEP 2: Handle ERROR RECOVERY (setupStep === 2) ---
+        // This step will now *only* run if setupStep was explicitly set to '2' by an error handler
+        else if (setupStep === 2) { 
             // Check time before starting heavy operation
             if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
                 throw new Error("Aggressive time limit hit before Setup Step 2 (Clear Content). Rescheduling setup.");
             }
-            console.log(`[Setup Step 2] Clearing content from sheet.`);
-            const lastRow = sheet.getLastRow();
+            console.warn(`[Setup Step 2] RECOVERY: Clearing content from sheet due to previous error.`);
+            const lastRow = sheet.getLastRow(); // <-- This is now safe, sheet is not null
             if (lastRow > 1) {
               console.log(`Clearing content from row 2 to ${lastRow}.`);
               sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
@@ -615,6 +624,18 @@ function _updateMarketDataSheetWorker() {
             // Success: Clear setup state property
             SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
+        
+        // --- STEP 3: Post-Handoff (setupStep === 3) ---
+        // This is a normal run after a cold start. We just need to ensure the sheet is hidden
+        // and delete the property.
+        else if (setupStep === 3) {
+            console.log(`[Setup Step 3] Post-handoff check. Ensuring sheet is hidden.`);
+            sheet.hideSheet();
+            // We are done with setup, so delete the step property
+            SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
+        }
+
+        // If setupStep is something else, we do nothing and just proceed.
 
       }, 60000); // 60-second lock wait time for setup
 
@@ -630,7 +651,10 @@ function _updateMarketDataSheetWorker() {
     } catch (setupError) {
       console.error(`CRITICAL ERROR during NEW_RUN sheet setup (Step ${setupStep} failed): ${setupError.message}. Rescheduling.`);
       // Save the current failed step
-      SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, setupStep.toString());
+      // --- FIX: Force '2' to trigger content clear on next run ---
+      SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '2'); // <-- SET TO '2'
+      // --- END FIX ---
+      
       // Reschedule the *same function* to try the setup again
       scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
       
@@ -873,6 +897,7 @@ function _updateMarketDataSheetWorker() {
   console.log(`_updateMarketDataSheetWorker execution finished in ${totalDuration.toFixed(2)} seconds. Final state: ${SCRIPT_PROP.getProperty(PROP_KEY_STEP)}`);
 
 }
+
 
 
 /**
