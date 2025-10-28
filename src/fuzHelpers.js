@@ -26,7 +26,9 @@ function getMasterBatchFromControlTable() {
     return marketRequests;
   } catch (e) {
     console.error(`Failed to read from Control Table: ${e.message}`);
-    return []; // Return an empty array on failure
+    // --- FIX: Re-throw the error so the calling function can fail gracefully ---
+    throw e; 
+    // --- END FIX ---
   }
 }
 
