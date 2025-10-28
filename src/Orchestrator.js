@@ -568,6 +568,8 @@ function _updateMarketDataSheetWorker() {
         console.log(`Cold Start detected (NEW_RUN, Setup Step 1). Handing off to Cache Warmer first.`);
         // Clear the lease so the cache warmer can run
         SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE); 
+        // *** FIX: We must set the setupStep to 2 NOW, so the *next* run knows the handoff happened.
+        SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '2');
         // Schedule the cache warmer to run, which will then schedule this job
         scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', 5000); // 5 sec delay
         return; // Exit this execution completely
@@ -1011,7 +1013,6 @@ function finalizeMarketDataUpdate() {
 
   }, "finalizeMarketDataUpdate"); // Name for executeWithWaitLock
 }
-
 
 /**
  * Simple function to clean up the old market data sheet ('Market_Data_Old').
