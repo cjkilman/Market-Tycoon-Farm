@@ -90,6 +90,7 @@ function getOrCreateSheet(ss, name, headers) { // <-- REMOVED maxRows parameter
 
 function withSheetLock(fn, timeoutMs) {
   var lock = LockService.getDocumentLock();     // document-scoped: safest for Sheets
+
   try {
       console.log(`Attempting to acquire Document Lock (wait ${timeoutMs || 30000}ms)...`);
       lock.waitLock(timeoutMs || 30000);           // waits up to timeout
@@ -102,6 +103,7 @@ function withSheetLock(fn, timeoutMs) {
       } else {
           console.error(`Error during locked operation: ${e.message}`);
       }
+      
       throw e; // Re-throw the error
   } finally {
     try {
