@@ -925,11 +925,6 @@ function _updateMarketDataSheetWorker() {
 
 }
 
-// ... (Assume rest of Orchestrator.js functions like finalizeMarketDataUpdate follow) ...
-
-
-
-
 
 /**
  * Final sheet update using Rename Swap. Ensures atomicity.
@@ -956,6 +951,7 @@ function finalizeMarketDataUpdate() {
   console.log("Attempting to finalize market data update...");
 
   // Use executeWithWaitLock: This is a CRITICAL, short operation.
+  // Uses executeWithWaitLock from Orchestrator.js
   executeWithWaitLock(() => {
     const currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP);
     if (currentStep !== STATE_FLAGS.FINALIZING) {
@@ -965,51 +961,43 @@ function finalizeMarketDataUpdate() {
       return; // Exit
     }
 
-    console.log(`State is ${STATE_FLAGS.FINALIZING}. Starting atomic sheet swap.`);
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-
     // Determine where to start/resume
     let step = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_FINALIZER_STEP) || '1', 10);
     console.log(`Resuming finalization at step ${step}.`);
 
+    // --- NEW LOGIC: START AT STEP 1 HAND-OFF ---
+    if (step === 1) {
+      console.log("Handing off to Step 1 Deletion Worker.");
+      // The worker handles the lock, step advance to '2', and re-schedules this function.
+      _deleteOldSheetWorker(); 
+      return; // Exit here. The worker handles the lock and next schedule.
+    }
+    // --- END NEW LOGIC ---
+
+    console.log(`State is ${STATE_FLAGS.FINALIZING}. Starting atomic sheet swap (Step ${step} and up).`);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // *** NOTE: Steps 2 & 3 must remain together inside one lock ***
     try {
       // Use WaitLock for the swap - it MUST succeed or fail loudly
-      // NOTE: This lock is required for the critical structural changes.
+      // Uses withSheetLock from Utility.js
       withSheetLock(() => {
         const tempSheet = ss.getSheetByName(tempSheetName);
         const liveSheet = ss.getSheetByName(finalSheetName);
-        const oldSheet = ss.getSheetByName(oldSheetName);
 
         // --- Pre-swap Validation ---
         if (!tempSheet) {
-          // If the temporary sheet is missing, the data is lost; fail hard.
           SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
           throw new Error(`Critical: Sheet '${tempSheetName}' is missing during finalization! Data lost.`);
         }
         if (tempSheet.getLastRow() <= 1) {
-          // If temp sheet is empty, something is wrong; fail hard.
           SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
           throw new Error(`Critical: Sheet '${tempSheetName}' is empty or has only headers. Cannot swap.`);
         }
 
         console.log("Acquired Document Lock for sheet swap (WaitLock).");
 
-        // --- STEP 1: DELETE OLD_OLD SHEET ---
-        if (step <= 1) {
-          // --- FIX: Aggressive Time Check ---
-          if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
-            throw new Error("Aggressive time limit hit before Step 1 (Delete). Rescheduling finalizer.");
-          }
-          console.log(`[Step 1] Deleting existing '${oldSheetName}' sheet.`);
-          if (oldSheet) {
-            ss.deleteSheet(oldSheet);
-            console.log(`Sheet '${oldSheetName}' deleted.`);
-          } else {
-            console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
-          }
-          SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, '2');
-          step = 2;
-        }
+        // --- STEP 1 LOGIC IS REMOVED HERE ---
 
         // --- STEP 2: RENAME LIVE to OLD ---
         if (step === 2) {
@@ -1048,7 +1036,6 @@ function finalizeMarketDataUpdate() {
       }, 60000); // 60-second lock wait for critical swap
 
       // --- Post-Swap Cleanup ---
-      // NOTE: _resetMarketDataJobState clears all properties *except* the finalizer step if it was just cleared.
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete. Job state reset.");
 
@@ -1056,10 +1043,10 @@ function finalizeMarketDataUpdate() {
       console.error(`CRITICAL ERROR during finalization swap (Step ${step} failed): ${swapError.message}. Retrying...`);
 
       // Save current step (which was set at the start of the failing step)
-      // This is crucial: we save the last successful step to resume from next time
       SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, step.toString());
 
       // Reschedule itself for a retry after a delay, avoiding full job state reset
+      // Uses scheduleOneTimeTrigger from Orchestrator.js
       scheduleOneTimeTrigger('finalizeMarketDataUpdate', RETRY_DELAY_MS);
       console.log(`Finalization job scheduled to retry in ${RETRY_DELAY_MS / 1000} seconds.`);
 
@@ -1070,53 +1057,48 @@ function finalizeMarketDataUpdate() {
   }, "finalizeMarketDataUpdate"); // Name for executeWithWaitLock
 }
 
-/**
- * Simple function to clean up the old market data sheet ('Market_Data_Old').
- * Intended to be called by masterOrchestrator during the FINALIZING phase or opportunistically.
- * Uses TryLock for Document Lock - ok if skipped.
- */
-function cleanupOldSheet() {
+
+// New function for Step 1: Delete Old Sheet
+function _deleteOldSheetWorker() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
   const oldSheetName = 'Market_Data_Old';
-  const funcName = 'cleanupOldSheet';
-  const docTryLockWaitMs = 10000; // Shorter wait for non-critical cleanup
+  const RETRY_DELAY_MS = 30 * 1000;
 
-  const docLock = LockService.getDocumentLock();
-  let lockAcquired = false;
-  try {
-    lockAcquired = docLock.tryLock(docTryLockWaitMs);
+  // Ensure this function is only called when step is 1
+  if (parseInt(SCRIPT_PROP.getProperty(PROP_KEY_FINALIZER_STEP) || '1', 10) !== 1) {
+    console.warn("Skipping _deleteOldSheetWorker: Step is not 1.");
+    return;
+  }
 
-    if (lockAcquired) {
-      console.log(`Document Lock acquired for ${funcName}.`);
-      const ss = SpreadsheetApp.getActiveSpreadsheet();
+  // Use WaitLock for the critical delete operation
+  executeWithWaitLock(() => {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // Use smaller Document Lock wait time for non-critical delete
+    // Uses the 'withSheetLock' function from Utility.js
+    withSheetLock(() => { 
       const oldSheet = ss.getSheetByName(oldSheetName);
+      console.log(`[Step 1] Deleting existing '${oldSheetName}' sheet.`);
 
       if (oldSheet) {
-        console.log(`Found sheet '${oldSheetName}'. Deleting...`);
-        try {
-          ss.deleteSheet(oldSheet);
-          console.log(`Successfully deleted sheet '${oldSheetName}'.`);
-        } catch (e) {
-          console.error(`Failed to delete sheet '${oldSheetName}': ${e.message}`);
-        }
+        ss.deleteSheet(oldSheet);
+        console.log(`Sheet '${oldSheetName}' deleted.`);
+        SpreadsheetApp.flush(); // Force the delete operation to complete
       } else {
-        console.log(`No sheet named '${oldSheetName}' found to delete.`);
+        console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
       }
-    } else {
-      console.warn(`Could not acquire Document Lock for ${funcName} (TryLock). Deletion deferred.`);
-      // No error thrown, it just didn't run this time.
-    }
-  } catch (e) {
-    // Catch unexpected errors during the process
-    console.error(`Unexpected error during ${funcName}: ${e.message}`);
-    if (e.stack) { console.error(`Stack: ${e.stack}`); }
-  } finally {
-    if (lockAcquired) {
-      try { docLock.releaseLock(); console.log("Document Lock released."); }
-      catch (rlErr) { console.error("CRITICAL: Failed to release Document Lock!", rlErr); }
-    }
-  }
-}
+      
+      // Success: Advance state to Step 2 and exit
+      SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, '2');
+    }, 10000); // 10-second lock wait time for deletion
 
+  }, "_deleteOldSheetWorker"); 
+  
+  // If no error was thrown, schedule the next phase (main finalize)
+  scheduleOneTimeTrigger('finalizeMarketDataUpdate', RETRY_DELAY_MS);
+  console.log("Step 1 complete. Scheduled next phase (Step 2) for retry.");
+}
 
 /**
  * Run this function ONCE from the editor to set up triggers.
