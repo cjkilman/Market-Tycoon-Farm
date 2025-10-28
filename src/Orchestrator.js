@@ -85,9 +85,9 @@ function _resetMarketDataJobState(error) {
   const PROP_KEY_STEP = 'marketDataJobStep';
   const PROP_KEY_REQUEST_INDEX = 'marketDataRequestIndex';
   const PROP_KEY_SHEET_ROW = 'marketDataNextWriteRow';
-  
+
   // --- FIX: Add new finalizer step property to reset list ---
-  const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep'; 
+  const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
   const PROP_KEY_SETUP_STEP = 'marketDataSetupStep'; // <-- ADDED
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
 
@@ -236,13 +236,13 @@ function masterOrchestrator() {
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
   const currentMinute = new Date().getMinutes();
   const NOW_MS = new Date().getTime(); // Consistent timestamp for checks
-  
+
   // --- FIX: Switch from boolean flag to lease timestamp ---
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const leaseUntil = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_LEASE) || '0', 10);
   const isJobActive = leaseUntil > NOW_MS;
   // --------------------------------------------------------
-  
+
   // --- Priority 1: Market Data Finalization Check (MUST be run first) ---
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
     console.log(`Master orchestrator: Market data state requires cleanup/finalization.`);
@@ -263,16 +263,16 @@ function masterOrchestrator() {
     } else {
       // FIX: Check for expired lease (stuck job) and only clear the lease before dispatching
       if (leaseUntil > 0 && leaseUntil <= NOW_MS) {
-          console.warn(`Master orchestrator: Lease expired (${new Date(leaseUntil)}). Clearing lease and re-dispatching.`);
-          // *** FIX: Minimal action: only clear the lease and log the event ***
-          SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
+        console.warn(`Master orchestrator: Lease expired (${new Date(leaseUntil)}). Clearing lease and re-dispatching.`);
+        // *** FIX: Minimal action: only clear the lease and log the event ***
+        SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
       }
-      
+
       console.log(`Master orchestrator (min ${currentMinute}): Dispatching MARKET DATA UPDATE.`);
       // FIX: Set the new lease time before dispatching the job
       const NEW_LEASE = NOW_MS + 280000; // 4m 40s
       SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
-      
+
       updateMarketDataSheet(); // Calls the now-locked public wrapper
     }
   } else { // *** Covers 0-14 and 45-59 (Cache Warmer) ***
@@ -281,11 +281,11 @@ function masterOrchestrator() {
 
     // --- FIX: Check result of TryLock and schedule retry if skipped ---
     const result = executeWithTryLock(triggerCacheWarmerWithRetry, 'triggerCacheWarmerWithRetry');
-    
+
     if (result === null) {
-        const retryDelayMs = 2 * 60 * 1000; // 2 min delay
-        console.warn(`Master orchestrator: Cache warmer dispatch was skipped by lock. Scheduling retry.`);
-        scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', retryDelayMs);
+      const retryDelayMs = 2 * 60 * 1000; // 2 min delay
+      console.warn(`Master orchestrator: Cache warmer dispatch was skipped by lock. Scheduling retry.`);
+      scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', retryDelayMs);
     }
     // --- END FIX ---
   }
@@ -300,32 +300,32 @@ function masterOrchestrator() {
  */
 function triggerCacheWarmerWithRetry() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  
+
   // --- FIX: Add Finalizing Check ---
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
-      console.warn("Cache Warmer: Skipping execution, job is FINALIZING.");
-      return; // Do not run if the main job is finalizing
+    console.warn("Cache Warmer: Skipping execution, job is FINALIZING.");
+    return; // Do not run if the main job is finalizing
   }
   // --- END FIX ---
 
   const funcToRun = fuzzworkCacheRefresh_TimeGated;
   const funcName = 'fuzzworkCacheRefresh_TimeGated';
   const wrapperFuncName = 'triggerCacheWarmerWithRetry';
-  
+
   // --- FIXED CONSTANTS ---
   const FULL_RUN_RESCHEDULE_MS = 285000; // 4m 45s - Predictive reschedule
   const retryDelayMs = 2 * 60 * 1000; // 2 minutes retry delay
   const quickUpdateDelayMs = 5000; // 5 seconds delay before trying market update
   // -----------------------
-  
+
   // --- FIX: Lease Property ---
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const leaseUntil = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_LEASE) || '0', 10);
   const NOW_MS = new Date().getTime();
   const isJobActive = leaseUntil > NOW_MS;
   // ---------------------------
-  
+
   // --- FIX: Log only the function name using .name property ---
   console.log(`Wrapper ${wrapperFuncName} called. Attempting to run function ${funcToRun.name} using executeWithTryLock...`);
   // --- END FIX ---
@@ -347,14 +347,14 @@ function triggerCacheWarmerWithRetry() {
     // --- Lease Check / Job Dispatch ---
     const currentMinute = new Date().getMinutes();
     console.log(`Cache warmer finished (min ${currentMinute}). Scheduling market update immediately.`);
-    
+
     // FIX: Check for expired lease (stuck job) and only clear the lease before dispatching
     if (!isJobActive && leaseUntil > 0 && leaseUntil <= NOW_MS) {
-        console.warn(`Cache Warmer: Found expired lease (${new Date(leaseUntil)}). Clearing lease to allow immediate dispatch.`);
-        // *** FIX: Minimal action: only clear the lease and log the event ***
-        SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
+      console.warn(`Cache Warmer: Found expired lease (${new Date(leaseUntil)}). Clearing lease to allow immediate dispatch.`);
+      // *** FIX: Minimal action: only clear the lease and log the event ***
+      SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
     }
-    
+
     if (isJobActive) {
       console.log(`Cache warmer finished: Market data job is already active. Skipping new dispatch.`);
     } else {
@@ -363,7 +363,7 @@ function triggerCacheWarmerWithRetry() {
       const NOW_MS = new Date().getTime();
       const NEW_LEASE = NOW_MS + 280000; // 4m 40s
       SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
-      
+
       // *** FIX: Change synchronous call to ASYNCHRONOUS schedule ***
       scheduleOneTimeTrigger('updateMarketDataSheet', quickUpdateDelayMs);
     }
@@ -478,17 +478,17 @@ function fuzzworkCacheRefresh_TimeGated() {
  * This is the public function called by triggers and the orchestrator.
  */
 function updateMarketDataSheet() {
-    const funcName = 'updateMarketDataSheet';
-    
-    // This wrapper enforces the Script Lock check for every call, including dynamic triggers.
-    const result = executeWithTryLock(_updateMarketDataSheetWorker, funcName);
-    
-    if (result === null) {
-        // Job was skipped due to lock, so we exit silently. The orchestrator or
-        // a subsequent trigger will pick it up.
-        console.warn(`${funcName} skipped execution due to a concurrency lock. Will be picked up by next trigger.`);
-    }
-    // If it executed, the result is handled by the worker's internal reschedule/state change.
+  const funcName = 'updateMarketDataSheet';
+
+  // This wrapper enforces the Script Lock check for every call, including dynamic triggers.
+  const result = executeWithTryLock(_updateMarketDataSheetWorker, funcName);
+
+  if (result === null) {
+    // Job was skipped due to lock, so we exit silently. The orchestrator or
+    // a subsequent trigger will pick it up.
+    console.warn(`${funcName} skipped execution due to a concurrency lock. Will be picked up by next trigger.`);
+  }
+  // If it executed, the result is handled by the worker's internal reschedule/state change.
 }
 
 /**
@@ -496,6 +496,15 @@ function updateMarketDataSheet() {
  * Other functions from the original Orchestrator.js file are omitted for brevity,
  * but would be present in the full file.
  */
+/**
+ * Note: This file contains the corrected _updateMarketDataSheetWorker function.
+ * Other functions from the original Orchestrator.js file are omitted for brevity,
+ * but would be present in the full file.
+ */
+
+// --- Assume other Orchestrator.js functions exist here ---
+// ... (deleteTriggersByName, _resetMarketDataJobState, executeWithTryLock, etc.) ...
+
 function _updateMarketDataSheetWorker() {
   // --- Configuration ---
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -592,14 +601,14 @@ function _updateMarketDataSheetWorker() {
       SCRIPT_PROP.deleteProperty(PROP_KEY_THROTTLE_DURATION);
       
       withSheetLock(() => {
-        // --- FIX: Get or create the sheet *immediately* ---
-        // This ensures the 'sheet' variable is valid for all subsequent steps.
-        sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
-        if (!sheet) throw new Error(`Failed to create or verify sheet ${tempSheetName}`);
-        // --- END FIX ---
+        // --- FIX: getOrCreateSheet MOVED inside step blocks ---
 
         // --- STEP 1: Handle first-time creation (setupStep <= 1) ---
         if (setupStep <= 1) {
+            // --- FIX: Get sheet INSIDE step ---
+            sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
+            if (!sheet) throw new Error(`Failed to create/verify sheet in Step 1`);
+
             // This block will run on a manual reset
             console.log(`[Setup Step 1] Ensuring temp sheet '${tempSheetName}' exists and is hidden.`);
             sheet.hideSheet();
@@ -610,17 +619,28 @@ function _updateMarketDataSheetWorker() {
         // --- STEP 2: Handle ERROR RECOVERY (setupStep === 2) ---
         // This step will now *only* run if setupStep was explicitly set to '2' by an error handler
         else if (setupStep === 2) { 
-            // Check time before starting heavy operation
+            // Check time *before* starting heavy operation
             if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
                 throw new Error("Aggressive time limit hit before Setup Step 2 (Clear Content). Rescheduling setup.");
             }
+            
+            // --- FIX: Get sheet INSIDE step, *after* time check ---
+            sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
+            if (!sheet) throw new Error(`Failed to create/verify sheet in Step 2`);
+
             console.warn(`[Setup Step 2] RECOVERY: Clearing content from sheet due to previous error.`);
             const lastRow = sheet.getLastRow(); // <-- This is now safe, sheet is not null
             if (lastRow > 1) {
               console.log(`Clearing content from row 2 to ${lastRow}.`);
-              sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
+              sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns())
+              .clearContent();
             }
             
+            // --- ADDED BACK: Force header rewrite after clearing ---
+            console.log(`[Setup Step 2] RECOVERY: Resetting headers.`);
+            sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
+            // --- END ADDED BACK ---
+
             // Success: Clear setup state property
             SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
@@ -629,6 +649,10 @@ function _updateMarketDataSheetWorker() {
         // This is a normal run after a cold start. We just need to ensure the sheet is hidden
         // and delete the property.
         else if (setupStep === 3) {
+            // --- FIX: Get sheet INSIDE step ---
+            sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
+            if (!sheet) throw new Error(`Failed to create/verify sheet in Step 3`);
+
             console.log(`[Setup Step 3] Post-handoff check. Ensuring sheet is hidden.`);
             sheet.hideSheet();
             // We are done with setup, so delete the step property
@@ -677,8 +701,11 @@ function _updateMarketDataSheetWorker() {
     // --- END NEW ---
 
     // Re-verify sheet exists before loop
+    // This is now the *first* time this execution path tries to get the sheet
     sheet = ss.getSheetByName(tempSheetName);
     if (!sheet) {
+      // If the sheet is *still* null here, it means setup *completed* but the sheet
+      // is gone, or setup *never ran* (which shouldn't happen).
       const errMsg = `Sheet ${tempSheetName} disappeared during PROCESSING phase. Resetting state.`;
       _resetMarketDataJobState(new Error(errMsg));
       throw new Error(errMsg); // Halt execution
@@ -898,6 +925,10 @@ function _updateMarketDataSheetWorker() {
 
 }
 
+// ... (Assume rest of Orchestrator.js functions like finalizeMarketDataUpdate follow) ...
+
+
+
 
 
 /**
@@ -910,12 +941,12 @@ function finalizeMarketDataUpdate() {
   const tempSheetName = 'Market_Data_Temp';
   const finalSheetName = 'Market_Data_Raw';
   const oldSheetName = 'Market_Data_Old'; // Sheet to be deleted later by cleanupOldSheet
-  
+
   // --- FINALIZER RETRY LOGIC PROPERTIES ---
   const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
   const RETRY_DELAY_MS = 30 * 1000; // 30 seconds wait time
   // --- END FINALIZER RETRY LOGIC PROPERTIES ---
-  
+
   // --- ADDED: TIME CHECK CONSTANTS ---
   const START_TIME = new Date().getTime();
   const SOFT_LIMIT_MS = 280000; // 4m 40s
@@ -952,86 +983,86 @@ function finalizeMarketDataUpdate() {
         // --- Pre-swap Validation ---
         if (!tempSheet) {
           // If the temporary sheet is missing, the data is lost; fail hard.
-          SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP); 
+          SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
           throw new Error(`Critical: Sheet '${tempSheetName}' is missing during finalization! Data lost.`);
         }
         if (tempSheet.getLastRow() <= 1) {
-           // If temp sheet is empty, something is wrong; fail hard.
-           SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
-           throw new Error(`Critical: Sheet '${tempSheetName}' is empty or has only headers. Cannot swap.`);
+          // If temp sheet is empty, something is wrong; fail hard.
+          SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
+          throw new Error(`Critical: Sheet '${tempSheetName}' is empty or has only headers. Cannot swap.`);
         }
 
         console.log("Acquired Document Lock for sheet swap (WaitLock).");
-        
+
         // --- STEP 1: DELETE OLD_OLD SHEET ---
         if (step <= 1) {
-            // --- FIX: Aggressive Time Check ---
-            if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
-                throw new Error("Aggressive time limit hit before Step 1 (Delete). Rescheduling finalizer.");
-            }
-            console.log(`[Step 1] Deleting existing '${oldSheetName}' sheet.`);
-            if (oldSheet) {
-              ss.deleteSheet(oldSheet);
-              console.log(`Sheet '${oldSheetName}' deleted.`);
-            } else {
-                console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
-            }
-            SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, '2');
-            step = 2;
+          // --- FIX: Aggressive Time Check ---
+          if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
+            throw new Error("Aggressive time limit hit before Step 1 (Delete). Rescheduling finalizer.");
+          }
+          console.log(`[Step 1] Deleting existing '${oldSheetName}' sheet.`);
+          if (oldSheet) {
+            ss.deleteSheet(oldSheet);
+            console.log(`Sheet '${oldSheetName}' deleted.`);
+          } else {
+            console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
+          }
+          SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, '2');
+          step = 2;
         }
 
         // --- STEP 2: RENAME LIVE to OLD ---
         if (step === 2) {
-            // --- FIX: Aggressive Time Check ---
-            if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
-                throw new Error("Aggressive time limit hit before Step 2 (Rename Raw->Old). Rescheduling finalizer.");
-            }
-            console.log(`[Step 2] Renaming '${finalSheetName}' to '${oldSheetName}'.`);
-            if (liveSheet) {
-              liveSheet.setName(oldSheetName);
-              console.log(`Renamed to '${oldSheetName}'.`);
-            } else {
-              console.log(`Sheet '${finalSheetName}' not found. Skipping rename to old.`);
-            }
-            SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, '3');
-            step = 3;
+          // --- FIX: Aggressive Time Check ---
+          if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
+            throw new Error("Aggressive time limit hit before Step 2 (Rename Raw->Old). Rescheduling finalizer.");
+          }
+          console.log(`[Step 2] Renaming '${finalSheetName}' to '${oldSheetName}'.`);
+          if (liveSheet) {
+            liveSheet.setName(oldSheetName);
+            console.log(`Renamed to '${oldSheetName}'.`);
+          } else {
+            console.log(`Sheet '${finalSheetName}' not found. Skipping rename to old.`);
+          }
+          SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, '3');
+          step = 3;
         }
 
         // --- STEP 3: RENAME TEMP to LIVE ---
         if (step === 3) {
-            // --- FIX: Aggressive Time Check ---
-            if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
-                throw new Error("Aggressive time limit hit before Step 3 (Rename Temp->Raw). Rescheduling finalizer.");
-            }
-            console.log(`[Step 3] Renaming '${tempSheetName}' to '${finalSheetName}'.`);
-            tempSheet.setName(finalSheetName);
-            tempSheet.showSheet(); // Make visible
-            console.log(`Renamed to '${finalSheetName}' and shown.`);
-            
-            // Success: Clear state property for completion
-            SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
+          // --- FIX: Aggressive Time Check ---
+          if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
+            throw new Error("Aggressive time limit hit before Step 3 (Rename Temp->Raw). Rescheduling finalizer.");
+          }
+          console.log(`[Step 3] Renaming '${tempSheetName}' to '${finalSheetName}'.`);
+          tempSheet.setName(finalSheetName);
+          tempSheet.showSheet(); // Make visible
+          console.log(`Renamed to '${finalSheetName}' and shown.`);
+
+          // Success: Clear state property for completion
+          SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
         }
-        
+
         console.log("Atomic sheet swap successful.");
 
       }, 60000); // 60-second lock wait for critical swap
 
       // --- Post-Swap Cleanup ---
       // NOTE: _resetMarketDataJobState clears all properties *except* the finalizer step if it was just cleared.
-      _resetMarketDataJobState(null); 
+      _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete. Job state reset.");
 
     } catch (swapError) {
       console.error(`CRITICAL ERROR during finalization swap (Step ${step} failed): ${swapError.message}. Retrying...`);
-      
+
       // Save current step (which was set at the start of the failing step)
       // This is crucial: we save the last successful step to resume from next time
       SCRIPT_PROP.setProperty(PROP_KEY_FINALIZER_STEP, step.toString());
-      
+
       // Reschedule itself for a retry after a delay, avoiding full job state reset
       scheduleOneTimeTrigger('finalizeMarketDataUpdate', RETRY_DELAY_MS);
       console.log(`Finalization job scheduled to retry in ${RETRY_DELAY_MS / 1000} seconds.`);
-      
+
       // Rethrow to maintain executeWithWaitLock error flow
       throw swapError;
     }
