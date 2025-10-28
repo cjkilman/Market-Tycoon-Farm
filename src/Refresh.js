@@ -1,18 +1,13 @@
 /** ============================================================================
  * Refresh Script (Trigger Management)
- * - This script is designed to be run by a single, User-Installed Time-Driven 
- * trigger (e.g., every 30 minutes).
- * - It orchestrates full data synchronization: 
- * 1. Kicks off the Fuzzworks background fetch cycle.
- * 2. Forces the spreadsheet to recalculate volatile formulas (price lookups).
  * ----------------------------------------------------------------------------
- * NOTE: Assumes the following functions/constants are available in the project:
- * - LoggerEx (for logging)
- * - fuzzworkCacheRefresh() (FuzzApiPrice.V3.gs.js)
- * - GESI functions (if needed, e.g., Ledger_Import_CorpJournal)
+ * NOTE: This module contains legacy functions for manual menu use, 
+ * primarily intended to trigger asynchronous spreadsheet recalculations 
+ * and flag updates. All heavy data synchronization is now handled by 
+ * the masterOrchestrator and triggerCacheWarmerWithRetry.
  * ========================================================================== */
 
-/* global LoggerEx, SpreadsheetApp, Utilities, fuzzworkCacheRefresh */
+/* global LoggerEx, SpreadsheetApp, Utilities, fuzzworkCacheRefresh, withLock_ */
 
 // --- CONFIGURATION ---
 // The cell used in the sheet formulas (e.g., =marketStatDataBoth(..., Utility!A1)).
@@ -28,36 +23,42 @@ function _L_info(tag, obj) {
 
 
 /**
- * Public function for the time-driven trigger.
- * This version processes the data queue and then nudges the sheet to recalculate
- * without waiting for it to finish, avoiding long execution times.
- * @customfunction
+ * Public function for menu use to trigger a full recalculation cycle.
+ * This runs the cache warmer (synchronously, potentially timing out) and 
+ * nudges the sheet to re-evaluate formulas.
+ * NOTE: For robust background updates, rely on masterOrchestrator schedules.
  */
 function Full_Recalculate_Cycle() {
   const log = LoggerEx.withTag('FULL_RECALC');
   log.info('Starting full recalculation cycle...');
 
-  // --- Step 1: Run Fuzzworks Queue FIRST ---
-  // This pre-fills the cache with any pending data.
+  // --- Step 1: Run Cache Warmer (Synchronous Call) ---
+  // If the cache warmer takes > 6 minutes, this execution will fail, 
+  // but it ensures the cache is hot for the subsequent recalculation.
   try {
-    fuzzworkCacheRefresh();
+    // Assuming fuzzworkCacheRefresh is available in the global scope or another loaded file
+    if (typeof fuzzworkCacheRefresh_TimeGated === 'function') {
+        // Use the time-gated function built for the orchestrator
+        fuzzworkCacheRefresh_TimeGated();
+    } else if (typeof fuzzworkCacheRefresh === 'function') {
+        fuzzworkCacheRefresh();
+    }
     log.info('Fuzzworks queue processed.');
   } catch (e) {
     log.warn('Fuzzworks refresh failed (likely queue empty or network issue).', e.message);
   }
 
   // --- Step 2: Trigger Asynchronous Sheet Recalculation ---
-  // We change the cell value, but critically, we DO NOT call SpreadsheetApp.flush().
-  // This allows the script to finish immediately while the sheet recalculates
-  // in the background on its own schedule.
+  // Nudge a specific cell with a new timestamp to force recalculation of volatile formulas.
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const range = ss.getRangeByName(RECALC_CELL_SPEC); // 'Utility!E3'
+    // Using RangeByName is safer for dynamic sheets than A1 notation if the sheet changes name
+    const range = ss.getRangeByName(RECALC_CELL_SPEC) || ss.getRange(RECALC_CELL_SPEC);
 
     if (range) {
-      const currentValue = Number(range.getValue() || 0);
       const newValue = new Date().getTime(); // Use a timestamp for a guaranteed change
       
+      // NOTE: We rely on the sheet calculating asynchronously after the script finishes.
       range.setValue(newValue);
       log.info(`Recalculation trigger sent to sheet (${RECALC_CELL_SPEC}) with value: ${newValue}`);
     } else {
@@ -72,8 +73,7 @@ function Full_Recalculate_Cycle() {
 
 
 
-// Refresh.js (safe, minimal, same behavior)
-// Triggers: Utility!B3 (Dynamic), C3 (Static), D3 (ESI)
+// --- LEGACY FLAG MANAGEMENT (Safe for Menu Use) ---
 
 const REFRESH_DELAY_MS = 300;
 const UTILITY_SHEET    = "Utility";
@@ -82,48 +82,15 @@ const A1_DYNAMIC       = "B3";
 const A1_STATIC        = "C3";
 const A1_ESI           = "D3";
 
-// Simplest implementation of refreshData without unnecessary flushing.
-// Note: You may not even need the lock if you only write data, 
-// as Google Scripts handles simultaneous writes, but keep the lock 
-// if you are worried about race conditions during the brief write operation.
-function refreshData() {
-    // Keep lock if you want to ensure the 0s and 1s are set sequentially
-    withLock_(function () { 
-        const sh = sheet_();
-        
-        // 1. Reset all flags to 0 (no flush)
-        sh.getRange(A1_ALL_RESET).setValues([[0, 0, 0]]);
-        
-        // 2. Set all desired flags to 1 (no flush)
-        sh.getRange(A1_DYNAMIC).setValue(1); 
-        sh.getRange(A1_STATIC).setValue(1); 
-        sh.getRange(A1_ESI).setValue(1); 
-        
-        // Let the script exit. The spreadsheet will now pick up the changes
-        // and begin recalculating *asynchronously* on its own.
-    });
+/**
+ * Helper to acquire document lock
+ * FIX: Increased waitLock time to 30,000ms (30 seconds)
+ */
+function withLock_(fn) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000); // 30s wait time for document lock
+  try { fn(); } finally { lock.releaseLock(); }
 }
-
-function refreshAllData() {
-  withLock_(function () {
-    resetFlags_();
-    nudge_(A1_DYNAMIC); // keep legacy behavior: “all” implies dynamic, too
-  });
-}
-
-function refreshDynamicData() {
-  withLock_(function () { nudge_(A1_DYNAMIC); });
-}
-
-function refreshStaticData() {
-  withLock_(function () { nudge_(A1_STATIC); });
-}
-
-function refreshESI() {
-  withLock_(function () { nudge_(A1_ESI); });
-}
-
-/* ---------------- helpers ---------------- */
 
 function sheet_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -138,16 +105,50 @@ function resetFlags_() {
   SpreadsheetApp.flush();
 }
 
-// REMOVE flush() from nudge_
 function nudge_(a1) {
-  // Utilities.sleep(REFRESH_DELAY_MS); // <--- This sleep may not be needed anymore
   const sh = sheet_();
   sh.getRange(a1).setValue(1);
-  // SpreadsheetApp.flush(); // <--- REMOVE THIS LINE
 }
 
-function withLock_(fn) {
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(5000); // 5s
-  try { fn(); } finally { lock.releaseLock(); }
+
+/**
+ * Public menu function to reset all flags and set dynamic flag.
+ */
+function refreshData() {
+    withLock_(function () { 
+        const sh = sheet_();
+        
+        // 1. Reset all flags to 0 (ensures formulas re-check conditions)
+        sh.getRange(A1_ALL_RESET).setValues([[0, 0, 0]]);
+        SpreadsheetApp.flush(); // Flush immediately to force reset 
+        
+        // 2. Set all desired flags to 1
+        sh.getRange(A1_DYNAMIC).setValue(1); 
+        sh.getRange(A1_STATIC).setValue(1); 
+        sh.getRange(A1_ESI).setValue(1); 
+        
+        // The script relies on the Sheet picking up the last write (set to 1) 
+        // after the script exits to trigger formula re-evaluation.
+    });
+}
+
+function refreshAllData() {
+  withLock_(function () {
+    resetFlags_();
+    nudge_(A1_DYNAMIC);
+    nudge_(A1_STATIC); 
+    nudge_(A1_ESI); 
+  });
+}
+
+function refreshDynamicData() {
+  withLock_(function () { nudge_(A1_DYNAMIC); });
+}
+
+function refreshStaticData() {
+  withLock_(function () { nudge_(A1_STATIC); });
+}
+
+function refreshESI() {
+  withLock_(function () { nudge_(A1_ESI); });
 }

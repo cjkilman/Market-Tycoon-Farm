@@ -513,14 +513,14 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_SHEET_ROW = 'marketDataNextWriteRow';
 
   // --- FIX: BATCH_SIZE set to 800. ---
-  const BATCH_SIZE = 800; // Increased batch size
+  const BATCH_SIZE = 1500; // Increased batch size
   // ------------------------------------
 
   // --- PREDICTIVE SCHEDULING CONSTANTS ---
   const SOFT_LIMIT_MS = 280000;      // 4m 40s - Soft limit
   const RESCHEDULE_DELAY_MS = 5000;  // 5 seconds - Used for error backoff
   const FULL_RUN_RESCHEDULE_MS = 285000; // 4m 45s - Used for predictive scheduling
-  const SAFE_MARGIN_MS = 90000;      // 1m 30s margin for hard timeout
+  const SAFE_MARGIN_MS = 50000;      // 1m 30s margin for hard timeout
   // ----------------------------------------
 
   // --- FIX: REDUCE LOCK WAIT TIME ---
@@ -531,7 +531,7 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_THROTTLE_DURATION = 'marketDataLastWriteDurationMs';
   const THROTTLE_BASE_SLEEP_MS = 500;      // Min 0.5s sleep between writes (THROTTLE_MIN_SLEEP_MS)
   const THROTTLE_LATENCY_FACTOR = 1.5;     // Sleep for 1.5x the last write duration
-  const THROTTLE_MAX_SLEEP_MS = 45000;     // Max 45s sleep
+  const THROTTLE_MAX_SLEEP_MS = 5000;     // Max 45s sleep
   const THROTTLE_FAILURE_PENALTY_MS = 10000; // Add 10s to duration on failure
   // --- END NEW ---
 
@@ -605,7 +605,7 @@ function _updateMarketDataSheetWorker() {
 
         // --- STEP 1: Handle first-time creation (setupStep <= 1) ---
         if (setupStep <= 1) {
-          Utilities.sleep(45000);
+        //  Utilities.sleep(45000);
           // --- NEW FLUSH ADDED HERE ---
           SpreadsheetApp.flush();
           // --- FIX: Get sheet INSIDE step ---
@@ -906,8 +906,8 @@ function _updateMarketDataSheetWorker() {
       }
     } // End while loop
     // --- NEW: 45-second sleep added for recalculation catch-up (User Request) ---
-    console.log("Processing loop finished. Sleeping 45s for final recalculations/queuing.");
-    Utilities.sleep(45000);
+   // console.log("Processing loop finished. Sleeping 45s for final recalculations/queuing.");
+   // Utilities.sleep(45000);
     // --- END NEW ---
     // --- Post-Loop Check ---
     if (requestStartIndex >= masterRequests.length) {
@@ -1090,7 +1090,7 @@ function _deleteOldSheetWorker() {
       if (oldSheet) {
         ss.deleteSheet(oldSheet);
         console.log(`Sheet '${oldSheetName}' deleted.`);
-        Utilities.sleep(45000);
+       // Utilities.sleep(45000);
         SpreadsheetApp.flush(); // Force the delete operation to complete
       } else {
         console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
