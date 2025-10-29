@@ -111,7 +111,7 @@ class FuzDataObject {
 
     const value = this[type][level];
     const priceLevels = ["avg", "max", "min", "median"];
-    return priceLevels.includes(level) ? (value > 0 ? value : null) : value;
+    return priceLevels.includes(level) ? (value > 0 ? value : "") : value;
   }
 }
 

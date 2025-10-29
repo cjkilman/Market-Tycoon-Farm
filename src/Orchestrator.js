@@ -785,12 +785,12 @@ function _updateMarketDataSheetWorker() {
               allRowsToWrite.push([
                 "", // Placeholder
                 item.type_id,
-                crate.market_type || '',
-                crate.market_id || '',
-                item.sell?.min ?? '',
-                item.buy?.max ?? '',
-                item.sell?.volume ?? '',
-                item.buy?.volume ?? '',
+                crate.market_type,
+                crate.market_id ,
+                item.sell?.min ,
+                item.buy?.max ,
+                item.sell?.volume,
+                item.buy?.volume ,
                 currentTimeStamp
               ]);
             } else {
