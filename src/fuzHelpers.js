@@ -64,22 +64,22 @@ class FuzDataObject {
     this.last_updated = new Date();
 
     this.buy = {
-      avg: this._normalizeFloat(buyData.weightedAverage),
-      max: this._normalizeFloat(buyData.max),
-      min: this._normalizeFloat(buyData.min),
-      stddev: this._normalizeFloat(buyData.stddev),
-      median: this._normalizeFloat(buyData.median),
-      volume: this._normalizeNumber(buyData.volume),
+      avg: this._normalizeFloat(buyData.weightedAverage,""),
+      max: this._normalizeFloat(buyData.max,""),
+      min: this._normalizeFloat(buyData.min,""),
+      stddev: this._normalizeFloat(buyData.stddev,""),
+      median: this._normalizeFloat(buyData.median,""),
+      volume: this._normalizeNumber(buyData.volume,0),
       orderCount: this._normalizeNumber(buyData.orderCount, 0)
     };
 
     this.sell = {
-      avg: this._normalizeFloat(sellData.weightedAverage),
-      max: this._normalizeFloat(sellData.max),
-      min: this._normalizeFloat(sellData.min),
-      stddev: this._normalizeFloat(sellData.stddev),
-      median: this._normalizeFloat(sellData.median),
-      volume: this._normalizeNumber(sellData.volume),
+      avg: this._normalizeFloat(sellData.weightedAverage,""),
+      max: this._normalizeFloat(sellData.max,""),
+      min: this._normalizeFloat(sellData.min,""),
+      stddev: this._normalizeFloat(sellData.stddev,""),
+      median: this._normalizeFloat(sellData.median,""),
+      volume: this._normalizeNumber(sellData.volume,0),
       orderCount: this._normalizeNumber(sellData.orderCount, 0)
     };
   }
