@@ -267,6 +267,31 @@ const fuzAPI = (() => {
         // --- Negative Cache Hit ---
         // Data is confirmed not to exist. Do not add to missingRequests.
         negativeHitCount++;
+
+// Define the structure of an empty price/volume object
+        const emptyMarketData = {
+            avg: '',
+            max: '',
+            min: '',
+            stddev: '',
+            median: '',
+            volume: 0,
+            orderCount: 0
+        };
+
+        // Group the placeholder data by location
+        const locationKey = `${req.market_type}_${req.market_id}`;
+        if (!tempGroupedCache[locationKey]) {
+            tempGroupedCache[locationKey] = { market_type: req.market_type, market_id: req.market_id, fuzObjects: [] };
+        }
+        
+        // Push the full placeholder object, mimicking the FuzDataObject structure
+        tempGroupedCache[locationKey].fuzObjects.push({
+            type_id: req.type_id, 
+            last_updated: new Date(), // Required property matching FuzDataObject
+            buy: emptyMarketData,
+            sell: emptyMarketData,
+        });
         
       } else if (cacheValue) {
         // --- Positive Cache Hit ---
