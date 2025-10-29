@@ -84,7 +84,8 @@ class FuzDataObject {
     };
   }
 
-  /**
+
+ /**
    * Safely gets a specific statistic from the data object.
    */
   getStat(order_type, order_level) {
@@ -111,7 +112,17 @@ class FuzDataObject {
 
     const value = this[type][level];
     const priceLevels = ["avg", "max", "min", "median"];
-    return priceLevels.includes(level) ? (value > 0 ? value : "") : value;
+    
+    // FIX: If the value is a price and it's not positive, return "" instead of the value
+    // This ensures VLOOKUP/XLOOKUP doesn't see a 0 when data is missing.
+    if (priceLevels.includes(level)) {
+        const numValue = Number(value);
+        // If the value is not a positive number, return the clean empty string (which _normalizeFloat already defaults to)
+        // or ensure it's treated as a number > 0.
+        return (isFinite(numValue) && numValue > 0) ? value : "";
+    }
+    
+    return value;
   }
 }
 
