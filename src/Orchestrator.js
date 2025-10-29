@@ -532,7 +532,7 @@ function _updateMarketDataSheetWorker() {
   const THROTTLE_BASE_SLEEP_MS = 500;      // Min 0.5s sleep between writes (THROTTLE_MIN_SLEEP_MS)
   const THROTTLE_LATENCY_FACTOR = 1.5;     // Sleep for 1.5x the last write duration
   const THROTTLE_MAX_SLEEP_MS = 5000;     // Max 45s sleep
-  const THROTTLE_FAILURE_PENALTY_MS = 10000; // Add 10s to duration on failure
+  const THROTTLE_FAILURE_PENALTY_MS = 30000; // Add 10s to duration on failure
   // --- END NEW ---
 
   // --- FIX: Lease Property ---
@@ -605,7 +605,7 @@ function _updateMarketDataSheetWorker() {
 
         // --- STEP 1: Handle first-time creation (setupStep <= 1) ---
         if (setupStep <= 1) {
-        //  Utilities.sleep(45000);
+          //  Utilities.sleep(45000);
           // --- NEW FLUSH ADDED HERE ---
           SpreadsheetApp.flush();
           // --- FIX: Get sheet INSIDE step ---
@@ -784,7 +784,7 @@ function _updateMarketDataSheetWorker() {
             if (item && item.type_id != null) {
               allRowsToWrite.push([
                 "", // Placeholder
-crate.market_type || '', // Using || '' for robustness
+                crate.market_type || '', // Using || '' for robustness
                 crate.market_id || '', // Using || '' for robustness
                 // FIX: Replace null/undefined prices with "" (empty string)
                 item.sell?.min ?? '', // Column E (sell_min)
@@ -907,8 +907,8 @@ crate.market_type || '', // Using || '' for robustness
       }
     } // End while loop
     // --- NEW: 45-second sleep added for recalculation catch-up (User Request) ---
-   // console.log("Processing loop finished. Sleeping 45s for final recalculations/queuing.");
-   // Utilities.sleep(45000);
+    // console.log("Processing loop finished. Sleeping 45s for final recalculations/queuing.");
+    // Utilities.sleep(45000);
     // --- END NEW ---
     // --- Post-Loop Check ---
     if (requestStartIndex >= masterRequests.length) {
@@ -1091,7 +1091,7 @@ function _deleteOldSheetWorker() {
       if (oldSheet) {
         ss.deleteSheet(oldSheet);
         console.log(`Sheet '${oldSheetName}' deleted.`);
-       // Utilities.sleep(45000);
+        // Utilities.sleep(45000);
         SpreadsheetApp.flush(); // Force the delete operation to complete
       } else {
         console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
