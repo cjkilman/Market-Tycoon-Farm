@@ -784,13 +784,14 @@ function _updateMarketDataSheetWorker() {
             if (item && item.type_id != null) {
               allRowsToWrite.push([
                 "", // Placeholder
-                item.type_id,
-                crate.market_type,
-                crate.market_id ,
-                item.sell?.min ,
-                item.buy?.max ,
-                item.sell?.volume,
-                item.buy?.volume ,
+crate.market_type || '', // Using || '' for robustness
+                crate.market_id || '', // Using || '' for robustness
+                // FIX: Replace null/undefined prices with "" (empty string)
+                item.sell?.min ?? '', // Column E (sell_min)
+                item.buy?.max ?? '',  // Column F (buy_max)
+                // Volume fields are correctly handled by fuzHelpers as 0 (for volume) or '' (for price)
+                item.sell?.volume ?? 0,
+                item.buy?.volume ?? 0,
                 currentTimeStamp
               ]);
             } else {
