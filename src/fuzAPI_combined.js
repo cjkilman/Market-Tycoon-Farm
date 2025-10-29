@@ -11,6 +11,64 @@ const fuzAPI = (() => {
   const FUZ_CACHE_VER = 1; // Change this version to invalidate all old cache keys if logic changes
   const CACHE_CHUNK_SIZE = 8000; // Chunk size for putAll
 
+// In src/fuzAPI_combined.js (after CACHE_CHUNK_SIZE definition)
+
+const CIRCUIT_PROPS = {
+    STATE: 'FuzCircuitState',
+    FAIL_COUNT: 'FuzCircuitFailCount',
+    OPEN_UNTIL: 'FuzCircuitOpenUntilMs'
+};
+const CIRCUIT_THRESHOLD = 3;             // Number of consecutive failures before opening
+const CIRCUIT_COOLDOWN_MS = 60 * 60 * 1000; // 60 minutes OPEN time
+
+// Use Script Properties to manage persistent state
+const _props = PropertiesService.getScriptProperties();
+
+/** Internal helper to check the current state of the circuit. */
+function _isCircuitOpen() {
+    const state = _props.getProperty(CIRCUIT_PROPS.STATE);
+    if (state === 'OPEN') {
+        const openUntil = parseInt(_props.getProperty(CIRCUIT_PROPS.OPEN_UNTIL) || '0', 10);
+        if (Date.now() < openUntil) {
+            console.warn(`Circuit Breaker is OPEN. Blocking requests until ${new Date(openUntil).toLocaleString()}.`);
+            return true;
+        }
+        // Cooldown period expired, transition to HALF-OPEN
+        console.log("Circuit Breaker cooldown expired. Transitioning to HALF-OPEN.");
+        _props.setProperty(CIRCUIT_PROPS.STATE, 'HALF_OPEN');
+    }
+    return false;
+}
+
+/** Internal helper to trip the circuit to the OPEN state. */
+function _tripCircuit(error) {
+    const failCount = parseInt(_props.getProperty(CIRCUIT_PROPS.FAIL_COUNT) || '0', 10) + 1;
+    _props.setProperty(CIRCUIT_PROPS.FAIL_COUNT, String(failCount));
+
+    if (failCount >= CIRCUIT_THRESHOLD) {
+        const openUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
+        _props.setProperties({
+            [CIRCUIT_PROPS.STATE]: 'OPEN',
+            [CIRCUIT_PROPS.OPEN_UNTIL]: String(openUntil)
+        });
+        console.error(`Circuit Breaker TRIPPED to OPEN state. Failures exceeded threshold (${CIRCUIT_THRESHOLD}). Blocking API calls for 60 minutes.`);
+    } else {
+        console.warn(`Circuit Breaker failure count: ${failCount}/${CIRCUIT_THRESHOLD}. Error: ${error}`);
+    }
+}
+
+/** Internal helper to reset the circuit after success. */
+function _resetCircuit() {
+    const state = _props.getProperty(CIRCUIT_PROPS.STATE);
+    if (state === 'OPEN' || state === 'HALF_OPEN' || _props.getProperty(CIRCUIT_PROPS.FAIL_COUNT) !== null) {
+        console.log("Circuit Breaker reset to CLOSED state.");
+        _props.deleteProperty(CIRCUIT_PROPS.FAIL_COUNT);
+        _props.deleteProperty(CIRCUIT_PROPS.OPEN_UNTIL);
+        _props.setProperty(CIRCUIT_PROPS.STATE, 'CLOSED');
+    }
+}
+// ... rest of the IIFE ...
+
   // --- Internal State Management Helpers ---
   function _getItemKey(item) { return `${item.type_id}-${item.market_id}-${item.market_type}`; }
 
@@ -122,6 +180,9 @@ const fuzAPI = (() => {
         console.log(`Attempting to fetch data via POST for ${fetchRequests.length} requests...`);
         return UrlFetchApp.fetchAll(fetchRequests);
       });
+      // --- CIRCUIT BREAKER SUCCESS ---
+      _resetCircuit();
+      // -------------------------------
     } catch (e) {
       console.error(`_executeFetchAll failed after multiple retries: ${e.message}`);
       // On total failure, we can still negatively cache all items that were attempted
@@ -335,6 +396,13 @@ const fuzAPI = (() => {
         return [];
     }
     console.log(`fuzAPI: Received ${marketRequests.length} market requests.`);
+
+// --- CIRCUIT BREAKER CHECK (Pre-fetch) ---
+    if (_isCircuitOpen()) {
+        console.warn("getDataForRequests skipped due to OPEN Circuit Breaker.");
+        // Must return an empty set to prevent the worker from trying to write.
+        return []; 
+    }
 
     // 1. Check cache (handles positive and negative hits)
     const { cachedData, missingRequests } = _checkCacheForRequests(marketRequests);
