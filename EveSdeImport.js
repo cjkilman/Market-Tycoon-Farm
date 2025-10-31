@@ -71,68 +71,47 @@
  * Downloads and processes the CSV data for the specified SDE page.
  * @param {Object} sdePage - Object containing sheet name, CSV file name, and headers.
  */
-function buildSDEs(sdePage) {
-  if (sdePage == null) throw "sdePage is required";
-  console.time("importSDEinvTypes( sheetName:" + sdePage.sheet + ", csvFile:" + sdePage.csvFile + " )");
-
-  // Download CSV content and convert it to a 2D array.
-  const csvContent = downloadTextData(sdePage.csvFile);
-  const activeSheet = SpreadsheetApp.getActiveSpreadsheet();
-  let workSheet = activeSheet.getSheetByName(sdePage.sheet);
-  const csvData = CSVToArray(csvContent, ",", sdePage.headers,sdePage.publishedOnly);
-
+function buildSDEs(page) {
+   const urlBase = 'https://www.fuzzwork.co.uk/dump/latest/';
+  const cache = CacheService.getScriptCache();
+  const url = urlBase + page.file;
+  let raw;
+  
+  // --- REFACTORED: Added error handling for the web request ---
   try {
-
-//Bacukup Ranges
-    var backedupValues = [];
-    if (sdePage.backupRanges != null)
-    {
-      for (var i = 0; i < sdePage.backupRanges.length; i++) {
-        var backupRange = workSheet.getRange(sdePage.backupRanges[i]);
-
-        var formulas = backupRange.getFormulas();
-        var values = backupRange.getValues();
-
-        let row = [];
-        let cell = [];
-        for (var r = 0; r < formulas.length; r++) {
-          for (var c = 0; c < formulas[r].length; c++) {
-            var formula = formulas[r][c];
-            var val = values[r][c];
-            if (formula) {
-              cell.push(formula);
-            }
-            else {
-                cell.push(val);
-            }
-          }
-          row.push(cell);
-          cell = [];
-        }
-        backedupValues.push(row);
-      }
+    const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) {
+      throw new Error(`Failed to fetch ${page.file}: HTTP ${resp.getResponseCode()}`);
     }
-    // Create or clear the sheet for new data.
-    workSheet = createOrClearSdeSheet(sdePage.sheet);
-
-    // Write the CSV data to the sheet.
-    const destinationRange = workSheet.getRange(1, 1, csvData.length, csvData[0].length);
-    destinationRange.setValues(csvData);
-
-    //restore Backups
-    if (sdePage.backupRanges != null)
-      for (var i = 0; i < sdePage.backupRanges.length; i++) {
-        var backupRange = workSheet.getRange(sdePage.backupRanges[i]);
-        backupRange.setValues(backedupValues[i]);
-
-      }
-    // Remove any blank columns or rows.
-    deleteBlankColumnsAndColumns(workSheet);
+    raw = resp.getContent();
+    if (!raw || raw.length === 0) {
+      throw new Error(`Fetched empty file for ${page.file}`);
+    }
   } catch (e) {
-    throw e;
+    Logger.log(`Error in buildSDEs for ${page.name}: ${e.message}`);
+    return; // Stop processing this page
   }
+  // --- END REFACTOR ---
 
-  console.timeEnd("importSDEinvTypes( sheetName:" + sdePage.sheet + ", csvFile:" + sdePage.csvFile + " )");
+  const csv = page.file.endsWith('.bz2') ? bunzip2(raw) : raw;
+  if (!csv) {
+    Logger.log(`Failed to decompress or read ${page.file}`);
+    return;
+  }
+  
+  const rows = parseCSV(csv, page.headers, page.mode);
+
+  const hash = Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, csv));
+  const cacheKey = 'hash_' + page.name;
+  if (cache.get(cacheKey) === hash) return; // No changes
+
+  cache.put(cacheKey, hash, 21600); // store hash for 6h
+
+  let filteredRows = rows;
+  if (page.mode === 'industry') filteredRows = industryFilter(rows);
+  else if (page.mode === 'reactions') filteredRows = reactionsFilter(rows);
+
+  writeDataToSheet(page.name, filteredRows);
 }
 
 /**
@@ -329,6 +308,29 @@ function testSDE()
           // release lock
           loadingHelper.setValues(backupSettings); 
         }
+}
+
+function writeDataToSheet(sheetName, rows) {
+  // --- REFACTORED: This function now handles empty or malformed data ---
+  if (!rows || rows.length === 0 || rows[0].length === 0) {
+    Logger.log(`No data to write for ${sheetName} (rows: ${rows ? rows.length : 0}).`);
+    return; // Stop. This prevents the "number of columns" error.
+  }
+  // --- END REFACTOR ---
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  sh.clearContents();
+  
+  const numCols = rows[0].length; // Get column count *once*
+  const chunk = 5000;
+
+  for (let i = 0; i < rows.length; i += chunk) {
+    const chunkData = rows.slice(i, i + chunk);
+    // Use the stored numCols and chunkData.length
+    sh.getRange(i + 1, 1, chunkData.length, numCols)
+      .setValues(chunkData);
+  }
 }
 
 /**

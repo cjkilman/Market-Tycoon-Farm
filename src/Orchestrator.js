@@ -372,10 +372,14 @@ function triggerCacheWarmerWithRetry() {
 
   } else if (result === false) {
     // --- Case 3: Ran but did NOT complete fully (hit time limit) ---
-    console.log(`${funcName} ran but hit its time limit and rescheduled itself.`);
-    // Do nothing extra, the inner function handles its own rescheduling.
+    console.log(`${funcName} ran but hit its time limit. Rescheduling wrapper.`);
 
-  } else {
+    // --- FIX: ADD THIS LOGIC ---
+    // The inner function no longer reschedules itself. The wrapper must do it
+    // to ensure the lock is always present on every run.
+    scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
+    // You could also use FULL_RUN_RESCHEDULE_MS if you prefer a longer delay
+    // --- END FIX ---
     // --- Case 4: Unexpected return value ---
     console.warn(`${funcName} execution by ${wrapperFuncName} returned unexpected value: ${result}`);
   }
@@ -435,7 +439,7 @@ function fuzzworkCacheRefresh_TimeGated() {
       if (currentTime - START_TIME > TIME_LIMIT_MS) {
         properties.setProperty(PROP_KEY_RESUME, startIndex.toString());
         console.warn(`⚠️ Cache refresh time limit hit after ${itemsProcessedThisRun} items. Next run starts at index ${startIndex}. RESCHEDULING SELF.`);
-        scheduleOneTimeTrigger('fuzzworkCacheRefresh_TimeGated', 30 * 1000);
+        // scheduleOneTimeTrigger('fuzzworkCacheRefresh_TimeGated', 30 * 1000);
         return false; // <-- Did not complete fully
       }
 
@@ -993,8 +997,13 @@ function finalizeMarketDataUpdate() {
 
         // --- Pre-swap Validation ---
         if (!tempSheet) {
-          SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);
-          throw new Error(`Critical: Sheet '${tempSheetName}' is missing during finalization! Data lost.`);
+          const errMsg = `Critical: Sheet '${tempSheetName}' is missing during finalization! Data lost.`;
+          console.error(errMsg);
+          // This is an unrecoverable failure. Reset the entire job.
+          _resetMarketDataJobState(new Error(errMsg));
+          // Throw an error to stop the rest of this execution.
+          // The outer catch block will NOT reschedule because the state is now clear.
+          throw new Error(errMsg);
         }
         if (tempSheet.getLastRow() <= 1) {
           SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP);

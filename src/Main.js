@@ -1,12 +1,56 @@
+/**
+ * Main.js
+ * * Entry point for custom menus and trigger setup.
+ * All core logic is in other modules.
+ */
+
+/* global SpreadsheetApp, Logger, GESI, UrlFetchApp, PropertiesService, 
+   refreshData, forceAuthorization, Full_Recalculate_Cycle, 
+   sde_job_START, sde_job_FINALIZE, isSdeJobRunning, 
+   runIndustryLedgerUpdate */
+
+// --- SDE Job Control Globals ---
+// This constant MUST be declared here once for the entire project to prevent
+// the "already been declared" error in other files (like SDE_Job_Controller.gs).
+const SCRIPT_PROPS = PropertiesService.getScriptProperties();
+
+/**
+ * NEW: Helper to check the lock (Logic is in SDE_Job_Controller.gs, check uses this property)
+ */
+function isSdeJobRunning() {
+  // Checks the master lock property defined in the SDE_Job_Controller.gs file
+  return SCRIPT_PROPS.getProperty('SDE_JOB_RUNNING') === 'true';
+}
+
+
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
   // Or DocumentApp or FormApp.
   ui.createMenu('Sheet Tools')
     .addItem('Refresh All Data', 'refreshData')
-    .addItem('Update SDE Data', 'importSDE')
+    .addItem('Update SDE Data', 'sde_job_START')        // <-- NEW: Starts the robust stateful job
+    .addItem('CANCEL SDE Update', 'sde_job_FINALIZE')    // <-- NEW: Manual cleanup
     .addItem('Authorize Script (First Run)', 'forceAuthorization')
     .addItem("Recalculate/Refresh", "Full_Recalculate_Cycle")
+    .addSeparator() 
+    .addItem('Run Industry Ledger Update', '_runIndustryLedgerUpdate_MENU') 
     .addToUi();
+}
+
+/**
+ * NEW: Wrapper for menu item to run the Industry Ledger update.
+ */
+function _runIndustryLedgerUpdate_MENU() {
+  if (isSdeJobRunning()) { // <-- MASTER LOCK CHECK
+    SpreadsheetApp.getUi().alert('Cannot run: SDE Update is in progress. Please wait.');
+    return;
+  }
+  if (typeof runIndustryLedgerUpdate === 'function') {
+    runIndustryLedgerUpdate();
+    SpreadsheetApp.getUi().alert('Industry Ledger update complete. Check Material_Ledger for new entries.');
+  } else {
+    SpreadsheetApp.getUi().alert('Error: runIndustryLedgerUpdate function not found. Make sure IndustryLedger.gs.js is saved.');
+  }
 }
 
 function getStructureNames(structureIDs) {
@@ -19,52 +63,18 @@ function getStructureNames(structureIDs) {
   return output;
 }
 
-function pull_SDE() {
-  // Lock Formulas from running
-  const haltFormulas = [[0, 0]];
 
-  var thisSpreadSheet = SpreadsheetApp.getActiveSpreadsheet();
-  var loadingHelper = thisSpreadSheet.getRangeByName("'Utility'!B3:C3");
-  const backupSettings = loadingHelper.getValues();
-  loadingHelper.setValues(haltFormulas);
-
-  try {
-
-    const sdePages = [
-      new SdePage(
-        "SDE_invTypes",
-        "invTypes.csv",
-        // Optional headers,  
-        // invTypes is 100+ megabytes. Select columns needed to help it load faster. 
-        ["typeID", "groupID", "typeName", "volume"]
-      ),
-      new SdePage(
-        "SDE_staStations",
-        "staStations.csv",
-        // Optional headers,  
-        // invTypes is 100+ megabytes. Select columns needed to help it load faster. 
-        ["stationID", "security", "stationTypeID", "corporationID", "solarSystemID", "regionID", "stationName"]
-      ),
-      new SdePage(
-        "SDE_industryActivityProducts",
-        "industryActivityProducts.csv",
-        []
-      )
-    ];
-    sdePages.forEach(buildSDEs);
-  }
-  finally {
-    // release lock
-    loadingHelper.setValues(backupSettings);
-  }
-}
 
 /**
  * Rebuilds the 'Market_Control' sheet.
- * NEW VERSION: Adds a 'last_updated' column to track the status of each item.
  */
 function updateControlSheet() {
-  const log = LoggerEx.withTag('CONTROL_GEN');
+  if (isSdeJobRunning()) { 
+    Logger.log("updateControlSheet skipped: SDE Job is running.");
+    return;
+  }
+
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CONTROL_GEN') : console);
   log.info('Starting Market_Control sheet rebuild with last_updated column...');
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -117,6 +127,8 @@ function updateControlSheet() {
   log.info(`Found ${locations.length} unique market locations.`);
 
   // 4. Generate and Write the Control Table Data
+  // Assuming withSheetLock is defined elsewhere (e.g., Orchestrator.gs.js)
+  // If not, replace with: const docLock = LockService.getDocumentLock(); docLock.waitLock(30000); try { ... } finally { docLock.releaseLock(); }
   withSheetLock(function () {
     controlSheet.clear();
     const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
@@ -148,7 +160,11 @@ function forceAuthorization() {
   // and is accessible via the custom menu. Running it guarantees the prompt appears.
   try {
 
-    _deleteExistingTriggers();
+    // _deleteExistingTriggers(); // This function is in main.js from your other project, not this one.
+    // Let's call a similar function or just skip it if it's not defined.
+    if (typeof _deleteExistingTriggers === 'function') {
+      _deleteExistingTriggers();
+    }
     UrlFetchApp.fetch("https://google.com");
     SpreadsheetApp.getUi().alert('Authorization granted successfully!');
   } catch (e) {
@@ -164,31 +180,9 @@ function forceAuthorization() {
   }
 }
 
-function importSDE() {
-
-  // Display an alert box with a title, message, input field, and "Yes" and "No" buttons. The
-  // user can also close the dialog by clicking the close button in its title bar.
-  var ui = SpreadsheetApp.getUi();
-  var response = ui.alert('Updating the SDE',
-    'Updating the SDE may take a few minutes. In the meantime do not close the window otherwise you will have to restart. Continue?',
-    ui.ButtonSet.YES_NO);
-
-  // Process the user's response.
-  if (response == ui.Button.YES) {
-
-    pull_SDE();
-  } else if (response == ui.Button.NO) {
-    ui.alert('SDE unchanged.');
-  } else {
-    ui.alert('SDE unchanged.');
-  }
-}
 
 /**
  *Get Character Names from thier ID
- *
- * @param {*} charIds
- * @return {*} 
  */
 function getChacterNameFromID(charIds, show_column_headings = true) {
   if (!charIds) throw "undefined charIds";
@@ -212,31 +206,17 @@ function getChacterNameFromID(charIds, show_column_headings = true) {
   return chars;
 }
 
-
-
 /**
  * Replace [Header Name] tokens in a QUERY-like SQL with ColN,
- * based on the first row (header) of the given range.
- *
- * This version uses CacheService to avoid re-fetching the header
- * when called multiple times in a single formula.
- *
- * @param {string} rangeName    A string representing a Named Range (e.g., "myRange")
- * OR an A1 notation range (e.g., "Sheet1!A1:G10").
- * @param {string} queryString  SQL containing bracketed headers: [Item], [Goal], ...
- * @param {boolean} [useColNums=true]  (This param is now ignored, defaults to ColN)
- * @returns {string}
  */
 function sqlFromHeaderNamesEx(rangeName, queryString, useColNums) {
   
   if (typeof rangeName !== 'string' || !rangeName) {
-     throw new Error(`sqlFromHeaderNamesEx: First argument must be the name of a Named Range (as a string) or an A1 notation string.`);
+      throw new Error(`sqlFromHeaderNamesEx: First argument must be the name of a Named Range (as a string) or an A1 notation string.`);
   }
 
   // Get the script cache
   const cache = CacheService.getScriptCache();
-  // The cache key is the string itself, whether it's a named range
-  // or A1 notation.
   const cacheKey = `headerMap_${rangeName}`;
   let map = {};
 
@@ -298,3 +278,113 @@ function sqlFromHeaderNamesEx(rangeName, queryString, useColNums) {
   return rewritten;
 }
 
+function updateControlSheet() {
+    // Check master lock (assuming isSdeJobRunning is defined globally and works)
+    if (isSdeJobRunning()) { 
+        Logger.log("updateControlSheet skipped: SDE Job is running.");
+        return;
+    }
+    
+    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CONTROL_GEN') : console);
+    log.info('Starting Market_Control sheet rebuild with last_updated column...');
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // Define Sheet Names
+    const itemSourceSheetName = "MarketOverviewData"; 
+    const locationListSheetName = 'Location List';
+    const controlSheetName = 'Market_Control';
+
+    // Retrieve Sheets
+    const itemSheet = ss.getSheetByName(itemSourceSheetName); 
+    const locationSheet = ss.getSheetByName(locationListSheetName);
+    const controlSheet = ss.getSheetByName(controlSheetName);
+
+    if (!itemSheet || !locationSheet || !controlSheet) {
+        throw new Error(`One or more required sheets are missing (MarketOverviewData, Location List, Market_Control).`);
+    }
+
+    // 1. Read Item IDs directly from the new source sheet (MarketOverviewData!B4:B)
+    const itemIdsRange = itemSheet.getRange('B4:B' + itemSheet.getLastRow());
+    const uniqueItemIds = Array.from(new Set(
+        itemIdsRange.getValues()
+        .flat()
+        .map(Number) 
+        .filter(id => Number.isFinite(id) && id > 0)
+    ));
+    
+    log.info(`Found ${uniqueItemIds.length} unique item IDs from '${itemSourceSheetName}'.`);
+    
+    // 2. Read and Deduplicate Location IDs using DYNAMIC HEADERS
+    const locHeaders = locationSheet.getRange('A5:G5').getValues()[0];
+    
+    // Define the target headers (These match the sheet's column names)
+    const STATION_HEADER = 'Station';
+    const SYSTEM_HEADER = 'System';
+    const REGION_HEADER = 'Region';
+
+    const stationColIndex = locHeaders.indexOf(STATION_HEADER);
+    const systemColIndex = locHeaders.indexOf(SYSTEM_HEADER);
+    const regionColIndex = locHeaders.indexOf(REGION_HEADER);
+
+    const locData = locationSheet.getRange(6, 1, locationSheet.getLastRow() - 5, locHeaders.length).getValues();
+    const locationMap = new Map(); // Used to enforce uniqueness (type_id_number)
+    
+    // --- HIERARCHY-ENFORCED PROCESSING BLOCK (Fixed Logic) ---
+    locData.forEach(row => {
+        let type = '';
+        let id = 0;
+
+        // 1. Check for the most specific ID: STATION
+        if (stationColIndex !== -1 && Number(row[stationColIndex]) > 0) {
+            type = 'station';
+            id = Number(row[stationColIndex]);
+        
+        // 2. ONLY if no Station ID was found, check for the next most specific: SYSTEM
+        } else if (systemColIndex !== -1 && Number(row[systemColIndex]) > 0) {
+            type = 'system';
+            id = Number(row[systemColIndex]);
+        
+        // 3. ONLY if neither a Station nor a System ID was found, check for REGION
+        } else if (regionColIndex !== -1 && Number(row[regionColIndex]) > 0) {
+            type = 'region';
+            id = Number(row[regionColIndex]);
+        }
+        
+        // If a valid ID was found, store it in the Map.
+        if (id > 0) {
+            // Key is 'type_id' to guarantee uniqueness across types (e.g., station_60001 != system_60001)
+            locationMap.set(`${type}_${id}`, { type, id });
+        }
+    });
+    // --- END HIERARCHY-ENFORCED PROCESSING BLOCK ---
+
+    // Convert the Map values into the final array of objects
+    const locations = Array.from(locationMap.values());
+    log.info(`Found ${locations.length} unique market locations.`);
+
+    // 3. Generate and Write the Control Table Data
+    withSheetLock(function() {
+        controlSheet.clear();
+        const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
+        controlSheet.getRange(1, 1, 1, 4).setValues(headers);
+
+        const outputRows = [];
+        
+        // Generate all rows
+        for (const item_id of uniqueItemIds) {
+            for (const loc of locations) {
+                outputRows.push([item_id, loc.type, loc.id, '']);
+            }
+        }
+        
+        // Sort the entire outputRows array by Location ID (index 2)
+        outputRows.sort((a, b) => a[2] - b[2]);
+
+        if (outputRows.length > 0) {
+            controlSheet.getRange(2, 1, outputRows.length, 4).setValues(outputRows);
+            log.info(`Successfully wrote ${outputRows.length} control rows.`);
+        }
+    });
+    SpreadsheetApp.getUi().alert(`'${controlSheetName}' has been updated successfully.`);
+}
