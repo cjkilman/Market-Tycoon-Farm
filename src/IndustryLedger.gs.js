@@ -624,19 +624,35 @@ function _getSdeNameMap(ss) {
 }
 
 /**
- * Helper to get BPO/BPC efficiency attributes from ESI Corp Blueprints.
+ * REVISED HELPER: Pulls ME/TE attributes by calling GESI.corporation_blueprints() directly.
+ * Processes the resulting array in memory.
+ * Assumes GESI is included as a library and the corporation is authenticated.
+ * * NOTE: The 'ss' argument is removed as the function no longer needs the Spreadsheet object.
+ * * @returns {Map<number, object>} Map of blueprint_type_id -> {material_efficiency: number, time_efficiency: number}
  */
-function _getBpoAttributesMapFromEsi(ss) {
-    const sheet = ss.getSheetByName("ESI Corp Blueprints");
-    if (!sheet) { LOG_INDUSTRY.error("ESI Corp Blueprints sheet not found."); return new Map(); }
+function _getBpoAttributesMapFromEsi() {
+    // WARNING: This assumes the GESI library is correctly installed and the 
+    // corporation is fully authenticated with the 'esi-corporations.read_blueprints.v1' scope.
+    
+    // Call the GESI function directly. It returns a 2D array with headers in row 0.
+    const rawData = GESI.corporation_blueprints(); 
+    
+    if (!rawData || rawData.length <= 1) {
+        LOG_INDUSTRY.error("GESI.corporation_blueprints() returned no data or only headers.");
+        return new Map();
+    }
 
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    // Use the dynamic header function to map column names to indices
+    const headers = rawData[0]; // First row is headers
     const col = _getColIndexMap(headers, ['type_id', 'material_efficiency', 'time_efficiency']);
     
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
     const attributesMap = new Map();
 
-    for (const row of data) {
+    // Start iteration from index 1 to skip the header row
+    for (let i = 1; i < rawData.length; i++) {
+        const row = rawData[i];
+        
+        // Data is always returned as strings, so we must convert to Number
         const bp_type_id = Number(row[col.type_id]);
         const me = Number(row[col.material_efficiency]);
         const te = Number(row[col.time_efficiency]); 
@@ -648,6 +664,8 @@ function _getBpoAttributesMapFromEsi(ss) {
             });
         }
     }
+    
+    LOG_INDUSTRY.info(`Loaded attributes for ${attributesMap.size} unique blueprints directly from GESI.`);
     return attributesMap;
 }
 
