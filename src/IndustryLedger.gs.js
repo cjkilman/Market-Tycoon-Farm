@@ -479,3 +479,222 @@ function _getStationSystemMap(ss) {
     }
     return systemMap;
 }
+
+/**
+ * Utility function to dynamically find column indices by header name.
+ * @param {string[]} headers - The array of header names from the spreadsheet.
+ * @param {string[]} requiredHeaders - The list of column names needed by the function.
+ * @returns {Object<string, number>} An object mapping the required header name to its column index.
+ * @throws {Error} if any required header is missing.
+ */
+function _getColIndexMap(headers, requiredHeaders) {
+    const col = {};
+    const lowerCaseHeaders = headers.map(h => h.toLowerCase().trim());
+    
+    for (const req of requiredHeaders) {
+        const index = lowerCaseHeaders.indexOf(req.toLowerCase().trim());
+        if (index === -1) {
+            // Throw a specific error to halt execution if data is unusable
+            throw new Error(`CRITICAL HEADER ERROR: Sheet is missing required column "${req}".`);
+        }
+        // Store the index of the required header
+        col[req] = index;
+    }
+    return col;
+}
+
+/**
+ * Helper to get the current blended cost for all items (from Blended_Cost).
+ */
+function _getBlendedCostMap(ss) {
+    const sheet = ss.getSheetByName("Blended_Cost");
+    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Blended_Cost sheet is empty."); return new Map(); }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
+
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const costMap = new Map();
+    
+    for (const row of data) {
+        const type_id = Number(row[col.type_id]);
+        const cost = Number(row[col.unit_weighted_average]); 
+        
+        if (!isNaN(type_id) && !isNaN(cost) && cost > 0) {
+            costMap.set(type_id, cost);
+        }
+    }
+    return costMap;
+}
+
+/**
+ * Helper to get the Market Median price for BPO amortization fallback.
+ */
+function _getMarketMedianMap(ss) {
+    const sheet = ss.getSheetByName("Market_Data_Raw");
+    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Market_Data_Raw sheet is empty."); return new Map(); }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col = _getColIndexMap(headers, ['type_id', 'sell_median']); // Assumes 'sell_median' exists
+
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const medianMap = new Map();
+
+    for (const row of data) {
+        const type_id = Number(row[col.type_id]);
+        const median_price = Number(row[col.sell_median]);
+        
+        if (!isNaN(type_id) && median_price > 0) {
+            medianMap.set(type_id, median_price); 
+        }
+    }
+    return medianMap;
+}
+
+/**
+ * Helper to get SDE material and product definitions (Recipes).
+ */
+function _getSdeMaps(ss) {
+    const matSheet = ss.getSheetByName("SDE_industryActivityMaterials");
+    const prodSheet = ss.getSheetByName("SDE_industryActivityProducts");
+
+    if (!matSheet || !prodSheet || matSheet.getLastRow() < 2) { LOG_INDUSTRY.error("SDE sheets are missing."); return { sdeMatMap: new Map(), sdeProdMap: new Map() }; }
+
+    const matHeaders = matSheet.getRange(1, 1, 1, matSheet.getLastColumn()).getValues()[0];
+    const prodHeaders = prodSheet.getRange(1, 1, 1, prodSheet.getLastColumn()).getValues()[0];
+    
+    const matCol = _getColIndexMap(matHeaders, ['typeID', 'activityID', 'materialTypeID', 'quantity']);
+    const prodCol = _getColIndexMap(prodHeaders, ['typeID', 'activityID', 'productTypeID', 'quantity']);
+
+    const matData = matSheet.getRange(2, 1, matSheet.getLastRow() - 1, matSheet.getLastColumn()).getValues();
+    const prodData = prodSheet.getRange(2, 1, prodSheet.getLastRow() - 1, prodSheet.getLastColumn()).getValues();
+
+    const sdeMatMap = new Map();
+    const sdeProdMap = new Map();
+
+    // Process Materials
+    for (const row of matData) {
+        const activityID = Number(row[col.activityID]);
+        if (activityID !== INDUSTRY_ACTIVITY_MANUFACTURING && activityID !== INDUSTRY_ACTIVITY_INVENTION) continue; 
+        
+        const bp_type_id = Number(row[matCol.typeID]);
+        const mat_type_id = Number(row[matCol.materialTypeID]);
+        const qty = Number(row[matCol.quantity]);
+
+        if (!sdeMatMap.has(bp_type_id)) { sdeMatMap.set(bp_type_id, []); }
+        sdeMatMap.get(bp_type_id).push({ materialTypeID: mat_type_id, quantity: qty });
+    }
+
+    // Process Products
+    for (const row of prodData) {
+        const activityID = Number(row[prodCol.activityID]);
+        if (activityID !== INDUSTRY_ACTIVITY_MANUFACTURING) continue;
+        
+        const bp_type_id = Number(row[prodCol.typeID]);
+        const prod_type_id = Number(row[prodCol.productTypeID]);
+        const qty = Number(row[prodCol.quantity]);
+
+        sdeProdMap.set(bp_type_id, { productTypeID: prod_type_id, quantity: qty });
+    }
+
+    return { sdeMatMap, sdeProdMap };
+}
+
+/**
+ * Helper to get item names from SDE_invTypes.
+ */
+function _getSdeNameMap(ss) {
+    const sheet = ss.getSheetByName("SDE_invTypes");
+    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.error("SDE_invTypes sheet is missing."); return new Map(); }
+        
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col = _getColIndexMap(headers, ['typeID', 'typeName']);
+
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const nameMap = new Map();
+    
+    for (const row of data) {
+        const type_id = Number(row[col.typeID]);
+        const type_name = row[col.typeName];
+        if (!isNaN(type_id) && type_name) {
+            nameMap.set(type_id, type_name);
+        }
+    }
+    return nameMap;
+}
+
+/**
+ * Helper to get BPO/BPC efficiency attributes from ESI Corp Blueprints.
+ */
+function _getBpoAttributesMapFromEsi(ss) {
+    const sheet = ss.getSheetByName("ESI Corp Blueprints");
+    if (!sheet) { LOG_INDUSTRY.error("ESI Corp Blueprints sheet not found."); return new Map(); }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col = _getColIndexMap(headers, ['type_id', 'material_efficiency', 'time_efficiency']);
+    
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const attributesMap = new Map();
+
+    for (const row of data) {
+        const bp_type_id = Number(row[col.type_id]);
+        const me = Number(row[col.material_efficiency]);
+        const te = Number(row[col.time_efficiency]); 
+
+        if (!isNaN(bp_type_id) && bp_type_id > 0) {
+            attributesMap.set(bp_type_id, {
+                material_efficiency: me,
+                time_efficiency: te
+            });
+        }
+    }
+    return attributesMap;
+}
+
+/**
+ * Helper to map Station/Structure IDs to their containing Solar System IDs.
+ */
+function _getStationSystemMap(ss) {
+    const sheet = ss.getSheetByName("SDE_staStations");
+    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("SDE_staStations sheet is missing."); return new Map(); }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col = _getColIndexMap(headers, ['stationID', 'solarSystemID']);
+
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const systemMap = new Map();
+
+    for (const row of data) {
+        const stationID = Number(row[col.stationID]);
+        const systemID = Number(row[col.solarSystemID]);
+        
+        if (!isNaN(stationID) && !isNaN(systemID)) {
+            systemMap.set(stationID, systemID); 
+        }
+    }
+    return systemMap;
+}
+
+/**
+ * Helper to get the Copying Cost Index from ESI Cost Indexes data.
+ */
+function _getCopyingCostIndexMap(ss) {
+    const sheet = ss.getSheetByName("Cost Indexes");
+    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Cost Indexes sheet is missing."); return new Map(); }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col = _getColIndexMap(headers, ['solar_system_id', 'Copying']);
+    
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const indexMap = new Map();
+
+    for (const row of data) {
+        const system_id = Number(row[col.solar_system_id]);
+        const index_value = Number(row[col.Copying]);
+        
+        if (!isNaN(system_id) && index_value > 0) {
+            indexMap.set(system_id, index_value); 
+        }
+    }
+    return indexMap;
+}
