@@ -1235,12 +1235,17 @@ function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
  */
 function _getCorporateJobsRaw(forceRefresh) {
     // NOTE: Assumes getCorpAuthChar() is available globally
-    const authToon = getCorpAuthChar(); 
+const authToon = "Jason KIlman"; // <--- REPLACE THIS LINE 
+    // const authToon = getCorpAuthChar(); // <-- Original line commented out
+    
     const ENDPOINT = 'corporations_corporation_industry_jobs';
     const CACHE_KEY = 'CORP_JOBS_RAW_V1' + ':' + authToon;
     const CACHE_TTL = 300; // 5 minutes TTL
 
-    if (!authToon) { return null; }
+    if (!authToon || authToon === 'YOUR_AUTHORIZED_CHARACTER_NAME') { // Check for accidental use of placeholder
+         // This returns null, causing the "Data not available" error.
+         return null; 
+    }
     
     // 1. Attempt to read from cache (using de-chunking)
     if (!forceRefresh) {
