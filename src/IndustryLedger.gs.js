@@ -127,7 +127,19 @@ function runIndustryLedgerPhase(ss) {
     
     log.info('--- Starting Industry Ledger Phase (BPC Costing & Manufacturing COGS) ---');
 
-    // --- STAGE 1: Calculate WAC (Cost of BPC per run) ---
+    // ⚠️ CRITICAL STEP: The slow GESI Client call runs here (5 min timeout).
+    try {
+        log.info('Running background fetch and cache of ESI Corp Jobs...');
+        _getCorporateJobsRaw(true); // Forces a fresh GESI Client call & cache write
+        log.info('ESI Corp Jobs successfully cached.');
+    } catch (e) {
+        // If the GESI Client call fails (Authorization/Rate Limit), the script stops.
+        log.error('Background ESI Corp Jobs fetch FAILED. Check Authorization/Scopes! Skipping Ledger update.', e);
+        return; 
+    }
+    // END CRITICAL STEP
+    
+    // --- STAGE 1 & 2 will now run quickly, reading the fast cache ---
     try {
         log.info('Running BPC Creation Ledger (Stage 1: Calculate WAC)...');
         runBpcCreationLedger(ss);
@@ -135,10 +147,10 @@ function runIndustryLedgerPhase(ss) {
         log.error('BPC Creation Ledger (Stage 1) FAILED. Subsequent costing may use stale BPC data.', e);
     }
 
-    // --- STAGE 2: Process Manufacturing Jobs (Calculate final COGS) ---
     try {
         log.info('Running Manufacturing Ledger Update (Stage 2: COGS)...');
-        runIndustryLedgerUpdate(ss);
+        // This function will now read the FAST ESI Corp Jobs data from the cache.
+        runIndustryLedgerUpdate(ss); 
     } catch (e) {
         log.error('Manufacturing Ledger Update (Stage 2) FAILED', e);
     }
@@ -517,7 +529,17 @@ function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
   if (!sheet) { LOG_INDUSTRY.error("Cannot find 'ESI Corp Jobs' sheet!"); return []; }
   
   try {
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    // ⚠️ CRITICAL CHANGE: Start reading from Column C (index 2)
+    const START_COLUMN = 3; // C is the 3rd column (index 2)
+    const MAX_COLUMNS = sheet.getLastColumn();
+    const NUM_COLUMNS = MAX_COLUMNS - START_COLUMN + 1; // Number of columns to read
+    
+    // Read the Header Row (Row 1), starting from Column C
+    const rawHeaders = sheet.getRange(1, START_COLUMN, 1, NUM_COLUMNS).getValues()[0];
+    
+    // Fill in the first two columns with placeholders so the dynamic mapper still works
+    const headers = ["COL_A", "COL_B"].concat(rawHeaders); 
+    
     const requiredHeaders = ['job_id', 'activity_id', 'status', 'blueprint_type_id', 'product_type_id', 'runs', 'end_date', 'installer_id', 'cost', 'location_id'];
     const col = _getColIndexMap(headers, requiredHeaders);
     
@@ -525,15 +547,22 @@ function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
     let data = [];
     const lastRow = sheet.getLastRow();
     const numRows = lastRow - 1;
+
     if (numRows > 0) {
+        // Read ALL data (including blank columns A and B) so the column indexes are correct
         data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
     }
+    
+    // The rest of the logic remains the same, using 'col' for indexing...
     
     const newJobs = [];
     const activitySet = new Set(activityIds); 
 
     for (const row of data) {
-      const job_id = Number(row[col.job_id]);
+      // Indexing now uses the column numbers retrieved by _getColIndexMap (plus the 2 blank cols)
+      const job_id = Number(row[col.job_id]); 
+      // ... continue with the rest of your job processing logic ...
+      
       const activity_id = Number(row[col.activity_id]);
       const status = row[col.status];
 
@@ -1337,15 +1366,16 @@ function TEST_ESI_AUTH_STATUS() {
 
 // --- Create a Custom Function for the ESI Corp Jobs sheet to use this raw data ---
 
-/**
- * Custom function to populate ESI Corp Jobs sheet from cached, sharded data.
- * @customfunction
- */
+// Function GESI_CORP_JOBS_CACHED:
 function GESI_CORP_JOBS_CACHED(authCharName) {
-    const rawData = _getCorporateJobsRaw(true);
+    
+    // ⚠️ CRITICAL CHANGE: Force to ONLY read from cache (false)
+    // The live API call is now handled by the runIndustryLedgerPhase script.
+    const rawData = _getCorporateJobsRaw(false); 
     
     if (!rawData) {
-        return [['ERROR: Data not available or API failed (check logs)'],['Argument too large: value']];
+        // Change the error to tell the user what to run
+        return [['⚠️ DATA STALE: Run Ledger Script'],['Data not found in cache.']];
     }
     
     // Convert array of objects to array of arrays (compatible with Sheet output)
