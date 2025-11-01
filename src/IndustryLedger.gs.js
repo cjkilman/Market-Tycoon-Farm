@@ -357,11 +357,18 @@ function runIndustryLedgerUpdate() {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-    // 2. Get SDE Data
+    // 2. Get SDE Data (Must come first to get recipes)
     const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
     if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE sheets are empty. Skipping."); return; }
     
- // ⚠️ CRITICAL FIX: Only collect material IDs required by the specific new jobs!
+    const nameMap = _getSdeNameMap(ss);
+
+    // 3. Find new completed manufacturing jobs (MUST be defined before we iterate over them)
+    const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
+    const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
+    if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
+
+    // ⚠️ CRITICAL FIX 1: Collect ALL required material IDs from the newly defined 'newJobs'
     const allRequiredMaterialIds = new Set();
     for (const job of newJobs) {
         const materials = sdeMatMap.get(job.blueprint_type_id);
@@ -372,39 +379,33 @@ function runIndustryLedgerUpdate() {
         }
     }
     
-    // ⚠️ CRITICAL FIX: Pass the targeted material list to the cost map builder
+    // 4. Get Cost Data and Amortization/WAC
+    // ⚠️ CRITICAL FIX 2: Pass the targeted material list to the cost map builder
     const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMaterialIds));
 
     if (costMap.size === 0) { LOG_INDUSTRY.warn("Blended_Cost failed to populate any costs. Skipping."); return; }
+    
     const amortMap = _getBpoAmortizationMap(ss); 
     const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
-    const bpoAttributesMap = _getBpoAttributesMapFromEsi(); // Direct GESI call
+    const bpoAttributesMap = _getBpoAttributesMapFromEsi();
     
     const getBpcCostPerRun = (bpID) => {
       const cost = bpcWacData[bpID];
       return cost ? Number(cost) : 0;
     };
     
-    const nameMap = _getSdeNameMap(ss);
-
-    // 3. Find new completed manufacturing jobs
-    const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
-    const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
-    if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
-
-    // 4. Calculate cost and generate ledger row objects
+    // 5. Calculate cost and generate ledger row objects
     const ledgerObjects = [];
     const newlyProcessedIds = [];
-    const ledgerAPI = ML.forSheet('Material_Ledger'); // Initialize Ledger API
+    const ledgerAPI = ML.forSheet('Material_Ledger');
 
-    // ... rest of the job processing loop ...
-    
+    // --- MAIN JOB PROCESSING LOOP (Now safe to iterate over newJobs) ---
     for (const job of newJobs) {
       const materials = sdeMatMap.get(job.blueprint_type_id);
-      const product = sdeProdMap.get(job.blueprint_type_id); // Assuming sdeProdMap is globally available or returned by _getSdeMaps
+      const product = sdeProdMap.get(job.blueprint_type_id);
       
-      // ... rest of the cost calculation and ledger writing ...
-      
+      if (!materials || !product) { LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`); continue; }
+
       // A. Apply Material Efficiency (ME) Discount
       const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id); 
       const meLevel = bpoItemAttributes ? bpoItemAttributes.material_efficiency : 0; 
@@ -414,10 +415,10 @@ function runIndustryLedgerUpdate() {
       let missingCost = false;
 
       for (const mat of materials) {
-        const matCost = costMap.get(mat.materialTypeID); // This now reads from the robust costMap
+        const matCost = costMap.get(mat.materialTypeID); 
         
         if (matCost === undefined || matCost === null || matCost === 0) { 
-            // After the robust cost map is built, if cost is still 0, something is fundamentally missing/unpricable.
+            // Now, if cost is 0, it means Tiers 0, 1, 2, and 3 all failed (unpricable item).
             LOG_INDUSTRY.warn(`Missing final cost for material ${mat.materialTypeID}. Cannot price job ${job.job_id}.`); 
             missingCost = true; 
             break; 
@@ -429,29 +430,48 @@ function runIndustryLedgerUpdate() {
 
       if (missingCost) continue;
       
-      // ... (rest of the logic)
+      // B. Calculate Total Costs (Amortization + ISK Fee + Materials)
+      const totalMaterialCostForAllRuns = totalMaterialCostPerRun * job.runs;
+      const totalJobInstallationCost = job.cost;
       
+      let amortizationSurcharge = 0;
+      
+      // BPO AMORTIZATION (Capital Cost)
+      if (amortMap.has(job.blueprint_type_id)) {
+          amortizationSurcharge = amortMap.get(job.blueprint_type_id) * job.runs;
+      } 
+      // BPC AMORTIZATION (Disposable Asset Cost)
+      else {
+          const bpcCostPerRun = getBpcCostPerRun(job.blueprint_type_id);
+          amortizationSurcharge = bpcCostPerRun * job.runs;
+      }
+
+      // Define totalActualCost safely outside the if/else block
+      const totalActualCost = totalMaterialCostForAllRuns + totalJobInstallationCost + amortizationSurcharge; 
+      
+      // C. Calculate Unit Cost
       const totalUnitsProduced = product.quantity * job.runs;
       if (totalUnitsProduced === 0) continue;
       const unitManufacturingCost = totalActualCost / totalUnitsProduced;
 
-      ledgerObjects.push({
-        date: job.end_date,
-        type_id: job.product_type_id,
-        item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
-        qty: totalUnitsProduced,
-        unit_value: '', 
-        source: "INDUSTRY",
-        contract_id: job.job_id,
-        char: job.installer_id,
-        unit_value_filled: unitManufacturingCost
-      });
-      
-      newlyProcessedIds.push(job.job_id);
+      // ... (Push to ledgerObjects and newlyProcessedIds) ...
+       ledgerObjects.push({
+            date: job.end_date,
+            type_id: job.product_type_id,
+            item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
+            qty: totalUnitsProduced,
+            unit_value: '', 
+            source: "INDUSTRY",
+            contract_id: job.job_id,
+            char: job.installer_id,
+            unit_value_filled: unitManufacturingCost
+        });
+        
+        newlyProcessedIds.push(job.job_id);
     }
-    
-    // ... (Upsert and state save logic)
-    
+    // --- END MAIN JOB PROCESSING LOOP ---
+
+    // 6. Upsert and Save State
     if (ledgerObjects.length > 0) {
       const writtenCount = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
       LOG_INDUSTRY.info(`Successfully processed and wrote ${writtenCount} new manufacturing jobs to the Material_Ledger.`);
