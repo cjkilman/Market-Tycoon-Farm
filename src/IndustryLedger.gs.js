@@ -972,6 +972,7 @@ function runBpoAmortizationSetupAndCalculate() {
 /**
  * Helper to get the manual amortization surcharge for BPOs.
  * Implements a three-tiered pricing fallback: Blended > Tracker Median > Fuzzwork API.
+ * This should permanently resolve the "No market value found" warnings.
  */
 function _getBpoAmortizationMap(ss) {
     const AMORT_SHEET_NAME = "BPO_Amortization";
@@ -979,23 +980,22 @@ function _getBpoAmortizationMap(ss) {
     const amortMap = new Map();
     const log = LoggerEx.withTag('BPO_AMORT');
 
-    // 1. Retrieve essential data maps (Assuming SDE functions are available)
+    // 1. Retrieve essential data maps (Assumes SDE functions are available)
     const { sdeProdMap } = _getSdeMaps(ss);
     const blendedCostMap = _getBlendedCostMap(ss); 
-    const marketMedianMap = _getMarketMedianMap(ss);
-    
+    const marketMedianMap = _getMarketMedianMap(ss); // Reads 'market price Tracker'
+
     const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
     const lastRow = sheet ? sheet.getLastRow() : 0;
     if (lastRow < 2) { log.error(`Sheet '${AMORT_SHEET_NAME}' has no data rows. Amortization is 0.`); return amortMap; }
 
-    // --- NAMED RANGE SETTINGS FOR FUZZWORK FALLBACK (Tier 3) ---
+    // --- FUZZWORK SETTINGS (NAMED RANGES) ---
     // NOTE: Assumes _getNamedOr_ is available globally
-    const locationId = _getNamedOr_('setting_sell_loc', 60003760); // Default to Jita 4-4
-    const marketType = _getNamedOr_('setting_market_list', 'region'); 
-    // We want the highest price a buyer is offering (Max Buy Order)
+    const locationId = ss.getSheetByName('Location List').getRange('C3').getValue(); // Location List C3
+    const marketType = _getNamedOr_(ss, 'setting_market_range', 'region'); // Named Range setting_market_range
     const orderType = 'buy'; 
     const orderLevel = 'max'; 
-    // -----------------------------------------------------------
+    // -----------------------------------------
 
     const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
     try {
@@ -1036,13 +1036,12 @@ function _getBpoAmortizationMap(ss) {
         // --- PHASE 2: EXECUTE FUZZWORK API FALLBACK (Tier 3) ---
         let fuzzworkPrices = new Map();
         if (typeIdsToFetch.length > 0) {
-             // NOTE: This assumes 'fuzAPI.requestItems' is defined in FuzzApiPrice.js
-             // We use a simplified form that only requests the items and processes the price directly.
+             // Fetch prices for missing items using Fuzzwork API
              const rawFuzResults = fuzAPI.requestItems(locationId, marketType, typeIdsToFetch);
              
              // Process the raw results to get the requested metric (Max Buy)
              rawFuzResults.forEach(item => {
-                 // Assumes _extractMetric_ is available in the GESI Extentions/FuzzApiPrice file
+                 // Assumes _extractMetric_ is available globally
                  const price = _extractMetric_(item, orderType, orderLevel);
                  if (price > 0) {
                     fuzzworkPrices.set(item.type_id, price);
