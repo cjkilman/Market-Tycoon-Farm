@@ -1,14 +1,15 @@
 /**
  * IndustryLedger.gs.js
  *
- * This module is split into two stages:
+ * This module is split into two stages for complete industry cost accounting:
  * 1. Process BPC creation (Copy/Invention) jobs to calculate the cost-per-run (WAC).
  * 2. Process Manufacturing jobs, applying BPO/BPC costs and ME material savings.
+ *
+ * NOTE: This file assumes the utility functions 'getOrCreateSheet' and 
+ * 'withSheetLock' are available in the project scope (e.g., from Utility.gs).
  */
 
-/* global SpreadsheetApp, PropertiesService, LoggerEx, ScriptApp, getOrCreateSheet, deleteTriggersByName */
-
-// --- Constants ---
+// --- GLOBAL CONSTANTS ---
 const INDUSTRY_JOB_KEY = 'processedIndustryJobIds';
 const BPC_JOB_KEY = 'processedBpcJobIds';
 const BPC_WAC_KEY = 'BpcWeightedAverageCost';
@@ -17,17 +18,37 @@ const INDUSTRY_ACTIVITY_MANUFACTURING = 1;
 const INDUSTRY_ACTIVITY_COPYING = 5;
 const INDUSTRY_ACTIVITY_INVENTION = 8;
 
+// Placeholder for logging/console output
 const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('IndustryLedger') : console);
+
+
+// ----------------------------------------------------------------------
+// --- CORE UTILITY: DYNAMIC HEADER MAPPING ---
+// ----------------------------------------------------------------------
+
+/**
+ * Utility function to dynamically find column indices by header name.
+ * @throws {Error} if any required header is missing.
+ */
+function _getColIndexMap(headers, requiredHeaders) {
+    const col = {};
+    const lowerCaseHeaders = headers.map(h => h.toLowerCase().trim());
+    
+    for (const req of requiredHeaders) {
+        const index = lowerCaseHeaders.indexOf(req.toLowerCase().trim());
+        if (index === -1) {
+            throw new Error(`CRITICAL HEADER ERROR: Sheet is missing required column "${req}".`);
+        }
+        col[req] = index;
+    }
+    return col;
+}
+
 
 // ----------------------------------------------------------------------
 // --- MAIN FUNCTION STAGE 1: BPC Cost Calculation ---
 // ----------------------------------------------------------------------
 
-/**
- * Processes completed Copying and Invention jobs to calculate the cost-per-run
- * and stores the Weighted Average Cost (WAC) in PropertiesService.
- * This runs BEFORE runIndustryLedgerUpdate.
- */
 function runBpcCreationLedger() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -37,15 +58,9 @@ function runBpcCreationLedger() {
   // 1. Get Cost Data and Config
   const costMap = _getBlendedCostMap(ss);
   const presetRunsMap = _getConfigPresetRuns(ss);
-  if (presetRunsMap.size === 0) {
-    LOG_INDUSTRY.warn("Config sheet 'Config_BPC_Runs' is missing or empty. Cannot calculate BPC costs. Skipping Stage 1.");
-    return;
-  }
 
-  // 2. Get SDE/System Data (Needed for full job costing/validation)
+  // 2. Get SDE Material Requirements (Invention uses materials)
   const { sdeMatMap } = _getSdeMaps(ss);
-  // const costIndexMap = _getCopyingCostIndexMap(ss); // Optional: Cost index for validation
-  // const stationSystemMap = _getStationSystemMap(ss); // Optional: Location mapping
 
   // 3. Get previously processed BPC job IDs
   const processedJobIds = new Set(
@@ -77,8 +92,7 @@ function runBpcCreationLedger() {
             missingCost = true;
             break;
           }
-          // The invention materials are consumed ONCE per BPC
-          totalMaterialCost += (matCost * mat.quantity) * job.runs; // Total cost for all BPCs made
+          totalMaterialCost += (matCost * mat.quantity) * job.runs;
         }
       }
     }
@@ -86,10 +100,9 @@ function runBpcCreationLedger() {
     if (missingCost) continue;
 
     // B. Get Preset Runs per BPC (The standardizing variable)
-    const presetRuns = presetRunsMap.get(job.blueprint_type_id);
-    if (!presetRuns) {
-      LOG_INDUSTRY.warn(`Missing 'Preset_Runs_per_BPC' in Config for blueprint ${job.blueprint_type_id}. Skipping job ${job.job_id}.`);
-      continue;
+    const presetRuns = presetRunsMap.get(job.blueprint_type_id) || 1;
+    if (presetRuns === 1) {
+         LOG_INDUSTRY.warn(`Using 1 as Preset_Runs for BP ${job.blueprint_type_id}. Ensure this is correct in Config_BPC_Runs.`);
     }
 
     // C. Get Total Costs
@@ -116,7 +129,7 @@ function runBpcCreationLedger() {
   }
 
   // 5. Calculate WAC and Save State
-  const finalWAC = {}; 
+  const finalWAC = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
   
   for (const [bpID, data] of bpcCostMap.entries()) {
     const costPerRun = data.totalCost / data.totalRuns;
@@ -138,53 +151,35 @@ function runBpcCreationLedger() {
 // --- MAIN FUNCTION STAGE 2: MANUFACTURING LEDGER UPDATE ---
 // ----------------------------------------------------------------------
 
-/**
- * Processes completed Manufacturing jobs and writes to Material_Ledger.
- */
 function runIndustryLedgerUpdate() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  // 1. Get Cost Data
+  // 1. Get Cost Data and Amortization/WAC
   const costMap = _getBlendedCostMap(ss);
-  if (costMap.size === 0) {
-    LOG_INDUSTRY.warn("Blended_Cost sheet is empty. Skipping.");
-    return;
-  }
+  if (costMap.size === 0) { LOG_INDUSTRY.warn("Blended_Cost sheet is empty. Skipping."); return; }
   
-  // 2. Get Amortization, WAC, and ESI Attributes
   const amortMap = _getBpoAmortizationMap(ss); 
   const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
-  const bpoAttributesMap = _getBpoAttributesMapFromEsi(ss);
-
+  const bpoAttributesMap = _getBpoAttributesMapFromEsi(); // Direct GESI call
+  
   const getBpcCostPerRun = (bpID) => {
     const cost = bpcWacData[bpID];
     return cost ? Number(cost) : 0;
   };
 
-  // 3. Get SDE Material Requirements
+  // 2. Get SDE Data
   const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
-  if (sdeMatMap.size === 0) {
-    LOG_INDUSTRY.warn("SDE sheets are empty. Skipping.");
-    return;
-  }
+  if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE sheets are empty. Skipping."); return; }
   
-  // 4. Get SDE Item Names
   const nameMap = _getSdeNameMap(ss);
 
-  // 5. Get last processed job ID
-  const processedJobIds = new Set(
-    JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]')
-  );
-
-  // 6. Find new completed manufacturing jobs
+  // 3. Find new completed manufacturing jobs
+  const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
   const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
-  if (newJobs.length === 0) {
-    LOG_INDUSTRY.info("No new manufacturing jobs to process.");
-    return;
-  }
+  if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
 
-  // 7. Calculate cost and create ledger rows
+  // 4. Calculate cost and create ledger rows
   const ledgerRows = [];
   const newlyProcessedIds = [];
 
@@ -192,10 +187,7 @@ function runIndustryLedgerUpdate() {
     const materials = sdeMatMap.get(job.blueprint_type_id);
     const product = sdeProdMap.get(job.blueprint_type_id);
 
-    if (!materials || !product) {
-      LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`);
-      continue;
-    }
+    if (!materials || !product) { LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`); continue; }
 
     // A. Apply Material Efficiency (ME) Discount
     const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id); 
@@ -207,13 +199,8 @@ function runIndustryLedgerUpdate() {
 
     for (const mat of materials) {
       const matCost = costMap.get(mat.materialTypeID);
-      if (matCost === undefined || matCost === null) {
-        LOG_INDUSTRY.warn(`Missing blended cost for material ${mat.materialTypeID}. Cannot price job ${job.job_id}.`);
-        missingCost = true;
-        break;
-      }
+      if (matCost === undefined || matCost === null) { LOG_INDUSTRY.warn(`Missing blended cost for material ${mat.materialTypeID}. Cannot price job ${job.job_id}.`); missingCost = true; break; }
       
-      // Apply ME discount to required quantity
       const finalQuantity = mat.quantity * materialDiscountFactor;
       totalMaterialCostPerRun += matCost * finalQuantity;
     }
@@ -222,18 +209,16 @@ function runIndustryLedgerUpdate() {
 
     // B. Calculate Total Costs (Amortization + ISK Fee + Materials)
     const totalMaterialCostForAllRuns = totalMaterialCostPerRun * job.runs;
-    const totalJobInstallationCost = job.cost; // Already includes TE discount
+    const totalJobInstallationCost = job.cost; // Includes TE discount
     
-    // C. Apply BPC Amortization or BPO Amortization Surcharge
     let amortizationSurcharge = 0;
     
-    // Check if the BPO type ID is in the Amortization config sheet (signifying a BPO we amortize)
+    // BPO AMORTIZATION: Use Amortization Surcharge (Capital Cost)
     if (amortMap.has(job.blueprint_type_id)) {
-        // This is a BPO. Use the BPO's calculated amortization surcharge.
         amortizationSurcharge = amortMap.get(job.blueprint_type_id) * job.runs;
         LOG_INDUSTRY.info(`Job ${job.job_id}: Added BPO research amortization cost of ${amortizationSurcharge.toFixed(2)} ISK.`);
     } 
-    // Otherwise, assume it's a BPC and use the WAC calculated in Stage 1.
+    // BPC AMORTIZATION: Use WAC (Disposable Asset Cost)
     else {
         const bpcCostPerRun = getBpcCostPerRun(job.blueprint_type_id);
         amortizationSurcharge = bpcCostPerRun * job.runs;
@@ -244,7 +229,7 @@ function runIndustryLedgerUpdate() {
 
     const totalActualCost = totalMaterialCostForAllRuns + totalJobInstallationCost + amortizationSurcharge;
     
-    // D. Calculate Unit Cost
+    // C. Calculate Unit Cost
     const productQtyPerRun = product.quantity;
     const totalUnitsProduced = productQtyPerRun * job.runs;
     
@@ -252,29 +237,20 @@ function runIndustryLedgerUpdate() {
 
     const unitManufacturingCost = totalActualCost / totalUnitsProduced;
 
-    // 8. Create the row for Material_Ledger
+    // 5. Create the row for Material_Ledger
     ledgerRows.push([
-      job.end_date,
-      job.product_type_id,
-      nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
-      totalUnitsProduced,
-      unitManufacturingCost,
-      "INDUSTRY", // Source
-      job.job_id,
-      job.installer_id, // Character
-      unitManufacturingCost // unit_value_filled
+      job.end_date, job.product_type_id, nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
+      totalUnitsProduced, unitManufacturingCost, "INDUSTRY", 
+      job.job_id, job.installer_id, unitManufacturingCost
     ]);
     
     newlyProcessedIds.push(job.job_id);
   }
 
-  // 9. Append new rows and save state
+  // 6. Append new rows and save state
   if (ledgerRows.length > 0) {
     const ledgerSheet = ss.getSheetByName("Material_Ledger");
-    if (!ledgerSheet) {
-      LOG_INDUSTRY.error("Cannot find 'Material_Ledger' sheet!");
-      return;
-    }
+    if (!ledgerSheet) { LOG_INDUSTRY.error("Cannot find 'Material_Ledger' sheet!"); return; }
     const startRow = ledgerSheet.getLastRow() + 1;
     ledgerSheet.getRange(startRow, 1, ledgerRows.length, ledgerRows[0].length).setValues(ledgerRows);
     LOG_INDUSTRY.info(`Successfully added ${ledgerRows.length} manufacturing jobs to the ledger.`);
@@ -287,248 +263,8 @@ function runIndustryLedgerUpdate() {
 
 
 // ----------------------------------------------------------------------
-// --- HELPER FUNCTIONS ---
+// --- DATA HELPER FUNCTIONS ---
 // ----------------------------------------------------------------------
-
-// *** NOTE: YOUR EXISTING HELPERS (_getBlendedCostMap, _getSdeMaps, _getSdeNameMap, _getNewCompletedJobs) GO HERE ***
-// Ensure _getSdeMaps reads activity 8 (Invention) materials, and _getNewCompletedJobs accepts activityIds array.
-
-
-/**
- * Helper to get the Market Median price for a given item type ID as a fallback.
- */
-function _getMarketMedianMap(ss) {
-    const sheet = ss.getSheetByName("Market_Data_Raw");
-    const medianMap = new Map();
-
-    if (!sheet || sheet.getLastRow() < 2) {
-        LOG_INDUSTRY.warn("Sheet 'Market_Data_Raw' is empty or missing. Cannot provide price fallback.");
-        return medianMap;
-    }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = {
-        type_id: headers.indexOf('type_id'),
-        sell_median: headers.indexOf('sell_median') // ASSUMES THIS COLUMN EXISTS
-    };
-
-    if (col.type_id === -1 || col.sell_median === -1) {
-        LOG_INDUSTRY.error("Missing required columns (type_id or sell_median) in 'Market_Data_Raw'.");
-        return medianMap;
-    }
-
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-
-    for (const row of data) {
-        const type_id = Number(row[col.type_id]);
-        const median_price = Number(row[col.sell_median]);
-        
-        if (!isNaN(type_id) && median_price > 0) {
-            medianMap.set(type_id, median_price); 
-        }
-    }
-    return medianMap;
-}
-
-/**
- * Helper to get BPC preset runs from a 'Config' sheet (Needed for BPC WAC).
- */
-/**
- * Helper to get BPC preset runs from a 'Config_BPC_Runs' sheet.
- * Uses getOrCreateSheet to ensure the sheet exists.
- * @returns {Map<number, number>} Map of blueprint_type_id -> preset_runs
- */
-function _getConfigPresetRuns(ss) {
-    const CONFIG_NAME = "Config_BPC_Runs";
-    // These are the exact headers required for the WAC calculation
-    const CONFIG_HEADERS = ['bp_type_id', 'preset_runs'];
-    const presetMap = new Map();
-    
-    // 1. Use the provided getOrCreateSheet utility to ensure the sheet exists.
-    const sheet = getOrCreateSheet(ss, CONFIG_NAME, CONFIG_HEADERS); 
-    
-    // Check 2: If sheet creation/retrieval failed or sheet is empty, exit gracefully
-    const lastRow = sheet ? sheet.getLastRow() : 0;
-    if (lastRow < 2) {
-        LOG_INDUSTRY.warn(`Config sheet '${CONFIG_NAME}' created/found but has no data rows. Skipping BPC cost calculation.`);
-        return presetMap;
-    }
-
-    // Dynamic Header Lookup and data processing (rows 2 onwards)
-    const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
-    try {
-        const col = _getColIndexMap(headers, CONFIG_HEADERS);
-        
-        const numRows = lastRow - 1;
-        
-        // We read data starting from row 2 up to the last row
-        const data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
-
-        for (const row of data) {
-            const bp_type_id = Number(row[col.bp_type_id]);
-            const preset_runs = Number(row[col.preset_runs]);
-
-            if (!isNaN(bp_type_id) && !isNaN(preset_runs) && preset_runs > 0) {
-                presetMap.set(bp_type_id, preset_runs);
-            }
-        }
-    } catch (e) {
-        // Log critical header error but allow to return empty map
-        LOG_INDUSTRY.error(`Configuration Error in ${CONFIG_NAME}: ${e.message}`);
-    }
-
-    return presetMap;
-}
-
-
-/**
- * Helper to get the manual amortization surcharge for BPOs (Market Median Fallback).
- */
-function _getBpoAmortizationMap(ss) {
-    const AMORT_SHEET_NAME = "BPO_Amortization";
-    const sheet = ss.getSheetByName(AMORT_SHEET_NAME);
-    const amortMap = new Map();
-
-    if (!sheet) {
-        LOG_INDUSTRY.error(`Sheet '${AMORT_SHEET_NAME}' not found. BPO amortization will be 0.`);
-        return amortMap;
-    }
-
-    const blendedCostMap = _getBlendedCostMap(ss); 
-    const marketMedianMap = _getMarketMedianMap(ss);
-
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues(); 
-
-    for (const row of data) {
-        const bp_type_id = Number(row[0]);
-        const totalRuns = Number(row[1]); 
-        let bpoValue = 0;
-
-        if (totalRuns <= 0) continue; 
-
-        // 1. TRY PRIMARY: Blended Average (Blended_Cost sheet)
-        bpoValue = blendedCostMap.get(bp_type_id) || 0;
-
-        if (bpoValue === 0) {
-            // 2. FALLBACK: Market Median (Market_Data_Raw sheet)
-            bpoValue = marketMedianMap.get(bp_type_id) || 0;
-            if (bpoValue > 0) {
-                LOG_INDUSTRY.warn(`BPO ${bp_type_id}: Using Market Median for amortization.`);
-            }
-        }
-        
-        if (bpoValue > 0) {
-            const surchargePerRun = bpoValue / totalRuns;
-            amortMap.set(bp_type_id, surchargePerRun);
-        } else {
-            LOG_INDUSTRY.warn(`BPO ${bp_type_id}: No market value found. Amortization skipped.`);
-        }
-    }
-    return amortMap;
-}
-
-/**
- * REVISED Helper: Pulls ME/TE attributes from the ESI-populated 'ESI Corp Blueprints' sheet.
- */
-function _getBpoAttributesMapFromEsi(ss) {
-    const sheet = ss.getSheetByName("ESI Corp Blueprints");
-    const attributesMap = new Map();
-
-    if (!sheet) {
-        LOG_INDUSTRY.error("Sheet 'ESI Corp Blueprints' not found. Material efficiency savings cannot be calculated.");
-        return attributesMap;
-    }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = {
-        type_id: headers.indexOf('type_id'), 
-        me: headers.indexOf('material_efficiency'),
-        te: headers.indexOf('time_efficiency')
-    };
-    
-    if (col.type_id === -1 || col.me === -1 || col.te === -1) {
-        LOG_INDUSTRY.error("Missing required columns in 'ESI Corp Blueprints'.");
-        return attributesMap;
-    }
-
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-
-    for (const row of data) {
-        const bp_type_id = Number(row[col.type_id]);
-        const me = Number(row[col.me]);
-        // TE is optional for cost, but we'll include it.
-        // The ME value is the only one critical for the COGS calculation.
-        const te = Number(row[col.te]); 
-
-        if (!isNaN(bp_type_id) && bp_type_id > 0) {
-            attributesMap.set(bp_type_id, {
-                material_efficiency: me,
-                time_efficiency: te
-            });
-        }
-    }
-    return attributesMap;
-}
-
-/**
- * Helper to map Station/Structure IDs to their containing Solar System IDs.
- * (Included for completeness, but not strictly needed for the final COGS calculation)
- */
-function _getStationSystemMap(ss) {
-    const sheet = ss.getSheetByName("SDE_staStations");
-    const systemMap = new Map();
-
-    if (!sheet || sheet.getLastRow() < 2) {
-        LOG_INDUSTRY.warn("Sheet 'SDE_staStations' is empty or missing. Cannot map job location to system.");
-        return systemMap;
-    }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = {
-        stationID: headers.indexOf('stationID'),
-        solarSystemID: headers.indexOf('solarSystemID')
-    };
-    
-    if (col.stationID === -1 || col.solarSystemID === -1) {
-        LOG_INDUSTRY.error("Missing required columns (stationID or solarSystemID) in 'SDE_staStations'.");
-        return systemMap;
-    }
-
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-
-    for (const row of data) {
-        const stationID = Number(row[col.stationID]);
-        const systemID = Number(row[col.solarSystemID]);
-        
-        if (!isNaN(stationID) && !isNaN(systemID)) {
-            systemMap.set(stationID, systemID); 
-        }
-    }
-    return systemMap;
-}
-
-/**
- * Utility function to dynamically find column indices by header name.
- * @param {string[]} headers - The array of header names from the spreadsheet.
- * @param {string[]} requiredHeaders - The list of column names needed by the function.
- * @returns {Object<string, number>} An object mapping the required header name to its column index.
- * @throws {Error} if any required header is missing.
- */
-function _getColIndexMap(headers, requiredHeaders) {
-    const col = {};
-    const lowerCaseHeaders = headers.map(h => h.toLowerCase().trim());
-    
-    for (const req of requiredHeaders) {
-        const index = lowerCaseHeaders.indexOf(req.toLowerCase().trim());
-        if (index === -1) {
-            // Throw a specific error to halt execution if data is unusable
-            throw new Error(`CRITICAL HEADER ERROR: Sheet is missing required column "${req}".`);
-        }
-        // Store the index of the required header
-        col[req] = index;
-    }
-    return col;
-}
 
 /**
  * Helper to get the current blended cost for all items (from Blended_Cost).
@@ -538,44 +274,18 @@ function _getBlendedCostMap(ss) {
     if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Blended_Cost sheet is empty."); return new Map(); }
 
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
-
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    const costMap = new Map();
-    
-    for (const row of data) {
-        const type_id = Number(row[col.type_id]);
-        const cost = Number(row[col.unit_weighted_average]); 
-        
-        if (!isNaN(type_id) && !isNaN(cost) && cost > 0) {
-            costMap.set(type_id, cost);
-        }
-    }
-    return costMap;
-}
-
-/**
- * Helper to get the Market Median price for BPO amortization fallback.
- */
-function _getMarketMedianMap(ss) {
-    const sheet = ss.getSheetByName("Market_Data_Raw");
-    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Market_Data_Raw sheet is empty."); return new Map(); }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = _getColIndexMap(headers, ['type_id', 'sell_median']); // Assumes 'sell_median' exists
-
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    const medianMap = new Map();
-
-    for (const row of data) {
-        const type_id = Number(row[col.type_id]);
-        const median_price = Number(row[col.sell_median]);
-        
-        if (!isNaN(type_id) && median_price > 0) {
-            medianMap.set(type_id, median_price); 
-        }
-    }
-    return medianMap;
+    try {
+      const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
+      const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
+      const costMap = new Map();
+      
+      for (const row of data) {
+          const type_id = Number(row[col.type_id]);
+          const cost = Number(row[col.unit_weighted_average]); 
+          if (!isNaN(type_id) && !isNaN(cost) && cost > 0) { costMap.set(type_id, cost); }
+      }
+      return costMap;
+    } catch(e) { LOG_INDUSTRY.error(`Error reading Blended_Cost: ${e.message}`); return new Map(); }
 }
 
 /**
@@ -584,47 +294,48 @@ function _getMarketMedianMap(ss) {
 function _getSdeMaps(ss) {
     const matSheet = ss.getSheetByName("SDE_industryActivityMaterials");
     const prodSheet = ss.getSheetByName("SDE_industryActivityProducts");
-
     if (!matSheet || !prodSheet || matSheet.getLastRow() < 2) { LOG_INDUSTRY.error("SDE sheets are missing."); return { sdeMatMap: new Map(), sdeProdMap: new Map() }; }
 
     const matHeaders = matSheet.getRange(1, 1, 1, matSheet.getLastColumn()).getValues()[0];
     const prodHeaders = prodSheet.getRange(1, 1, 1, prodSheet.getLastColumn()).getValues()[0];
     
-    const matCol = _getColIndexMap(matHeaders, ['typeID', 'activityID', 'materialTypeID', 'quantity']);
-    const prodCol = _getColIndexMap(prodHeaders, ['typeID', 'activityID', 'productTypeID', 'quantity']);
+    try {
+        const matCol = _getColIndexMap(matHeaders, ['typeID', 'activityID', 'materialTypeID', 'quantity']);
+        const prodCol = _getColIndexMap(prodHeaders, ['typeID', 'activityID', 'productTypeID', 'quantity']);
 
-    const matData = matSheet.getRange(2, 1, matSheet.getLastRow() - 1, matSheet.getLastColumn()).getValues();
-    const prodData = prodSheet.getRange(2, 1, prodSheet.getLastRow() - 1, prodSheet.getLastColumn()).getValues();
+        const matData = matSheet.getRange(2, 1, matSheet.getLastRow() - 1, matSheet.getMaxColumns()).getValues();
+        const prodData = prodSheet.getRange(2, 1, prodSheet.getLastRow() - 1, prodSheet.getMaxColumns()).getValues();
 
-    const sdeMatMap = new Map();
-    const sdeProdMap = new Map();
+        const sdeMatMap = new Map();
+        const sdeProdMap = new Map();
 
-    // Process Materials
-    for (const row of matData) {
-        const activityID = Number(row[col.activityID]);
-        if (activityID !== INDUSTRY_ACTIVITY_MANUFACTURING && activityID !== INDUSTRY_ACTIVITY_INVENTION) continue; 
-        
-        const bp_type_id = Number(row[matCol.typeID]);
-        const mat_type_id = Number(row[matCol.materialTypeID]);
-        const qty = Number(row[matCol.quantity]);
+        // Process Materials (Activity 1 & 8)
+        for (const row of matData) {
+            const activityID = Number(row[matCol.activityID]);
+            if (activityID !== INDUSTRY_ACTIVITY_MANUFACTURING && activityID !== INDUSTRY_ACTIVITY_INVENTION) continue; 
+            
+            const bp_type_id = Number(row[matCol.typeID]);
+            const mat_type_id = Number(row[matCol.materialTypeID]);
+            const qty = Number(row[matCol.quantity]);
 
-        if (!sdeMatMap.has(bp_type_id)) { sdeMatMap.set(bp_type_id, []); }
-        sdeMatMap.get(bp_type_id).push({ materialTypeID: mat_type_id, quantity: qty });
-    }
+            if (!sdeMatMap.has(bp_type_id)) { sdeMatMap.set(bp_type_id, []); }
+            sdeMatMap.get(bp_type_id).push({ materialTypeID: mat_type_id, quantity: qty });
+        }
 
-    // Process Products
-    for (const row of prodData) {
-        const activityID = Number(row[prodCol.activityID]);
-        if (activityID !== INDUSTRY_ACTIVITY_MANUFACTURING) continue;
-        
-        const bp_type_id = Number(row[prodCol.typeID]);
-        const prod_type_id = Number(row[prodCol.productTypeID]);
-        const qty = Number(row[prodCol.quantity]);
+        // Process Products (Activity 1 only)
+        for (const row of prodData) {
+            const activityID = Number(row[prodCol.activityID]);
+            if (activityID !== INDUSTRY_ACTIVITY_MANUFACTURING) continue;
+            
+            const bp_type_id = Number(row[prodCol.typeID]);
+            const prod_type_id = Number(row[prodCol.productTypeID]);
+            const qty = Number(row[prodCol.quantity]);
 
-        sdeProdMap.set(bp_type_id, { productTypeID: prod_type_id, quantity: qty });
-    }
+            sdeProdMap.set(bp_type_id, { productTypeID: prod_type_id, quantity: qty });
+        }
 
-    return { sdeMatMap, sdeProdMap };
+        return { sdeMatMap, sdeProdMap };
+    } catch(e) { LOG_INDUSTRY.error(`Error reading SDE sheets: ${e.message}`); return { sdeMatMap: new Map(), sdeProdMap: new Map() }; }
 }
 
 /**
@@ -635,111 +346,215 @@ function _getSdeNameMap(ss) {
     if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.error("SDE_invTypes sheet is missing."); return new Map(); }
         
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = _getColIndexMap(headers, ['typeID', 'typeName']);
+    try {
+        const col = _getColIndexMap(headers, ['typeID', 'typeName']);
 
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    const nameMap = new Map();
-    
-    for (const row of data) {
-        const type_id = Number(row[col.typeID]);
-        const type_name = row[col.typeName];
-        if (!isNaN(type_id) && type_name) {
-            nameMap.set(type_id, type_name);
+        const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
+        const nameMap = new Map();
+        
+        for (const row of data) {
+            const type_id = Number(row[col.typeID]);
+            const type_name = row[col.typeName];
+            if (!isNaN(type_id) && type_name) {
+                nameMap.set(type_id, type_name);
+            }
         }
-    }
-    return nameMap;
+        return nameMap;
+    } catch(e) { LOG_INDUSTRY.error(`Error reading SDE_invTypes: ${e.message}`); return new Map(); }
 }
 
 /**
- * REVISED HELPER: Pulls ME/TE attributes by calling GESI.corporation_blueprints() directly.
- * Processes the resulting array in memory.
- * Assumes GESI is included as a library and the corporation is authenticated.
- * * NOTE: The 'ss' argument is removed as the function no longer needs the Spreadsheet object.
- * * @returns {Map<number, object>} Map of blueprint_type_id -> {material_efficiency: number, time_efficiency: number}
+ * Helper to find new, completed jobs by activity.
+ */
+function _getNewCompletedJobs(ss, processedJobIds, activityIds) { 
+  const sheet = ss.getSheetByName("ESI Corp Jobs");
+  if (!sheet) { LOG_INDUSTRY.error("Cannot find 'ESI Corp Jobs' sheet!"); return []; }
+  
+  try {
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const requiredHeaders = ['job_id', 'activity_id', 'status', 'blueprint_type_id', 'product_type_id', 'runs', 'end_date', 'installer_id', 'cost', 'location_id'];
+    const col = _getColIndexMap(headers, requiredHeaders);
+    
+    // Safe reading of data block
+    let data = [];
+    const lastRow = sheet.getLastRow();
+    const numRows = lastRow - 1;
+    if (numRows > 0) {
+        data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
+    }
+    
+    const newJobs = [];
+    const activitySet = new Set(activityIds); 
+
+    for (const row of data) {
+      const job_id = Number(row[col.job_id]);
+      const activity_id = Number(row[col.activity_id]);
+      const status = row[col.status];
+
+      if (status === 'delivered' && activitySet.has(activity_id) && !processedJobIds.has(job_id)) {
+        newJobs.push({
+          job_id: job_id, activity_id: activity_id,
+          blueprint_type_id: Number(row[col.blueprint_type_id]),
+          product_type_id: Number(row[col.product_type_id]),
+          runs: Number(row[col.runs]),
+          end_date: new Date(row[col.end_date]),
+          installer_id: row[col.installer_id],
+          cost: Number(row[col.cost]),
+          location_id: Number(row[col.location_id])
+        });
+      }
+    }
+    return newJobs;
+  } catch(e) { LOG_INDUSTRY.error(`Error reading ESI Corp Jobs: ${e.message}`); return []; }
+}
+
+/**
+ * Helper to get BPC preset runs from a 'Config_BPC_Runs' sheet (with defaults).
+ */
+function _getConfigPresetRuns(ss) {
+    const CONFIG_NAME = "Config_BPC_Runs";
+    const CONFIG_HEADERS = ['bp_type_id', 'preset_runs'];
+    const presetMap = new Map();
+    
+    const DEFAULT_PRESETS = [
+        { id: 237, runs: 100 }, 
+        { id: 3529, runs: 10 },
+    ];
+
+    const sheet = getOrCreateSheet(ss, CONFIG_NAME, CONFIG_HEADERS); 
+    const lastRow = sheet ? sheet.getLastRow() : 0;
+    
+    if (lastRow >= 2) {
+        const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+        try {
+            const col = _getColIndexMap(headers, CONFIG_HEADERS);
+            let data = [];
+            const numRows = lastRow - 1;
+
+            if (numRows > 0) {
+                data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
+            }
+
+            for (const row of data) {
+                const bp_type_id = Number(row[col.bp_type_id]);
+                const preset_runs = Number(row[col.preset_runs]);
+                if (!isNaN(bp_type_id) && !isNaN(preset_runs) && preset_runs > 0) { presetMap.set(bp_type_id, preset_runs); }
+            }
+        } catch (e) { LOG_INDUSTRY.error(`Configuration Error in ${CONFIG_NAME}: ${e.message}`); }
+    }
+    
+    // Apply Defaults
+    if (presetMap.size === 0) {
+        LOG_INDUSTRY.warn(`Config sheet '${CONFIG_NAME}' is empty. Applying ${DEFAULT_PRESETS.length} hardcoded defaults.`);
+        DEFAULT_PRESETS.forEach(d => { presetMap.set(d.id, d.runs); });
+    }
+
+    return presetMap;
+}
+
+/**
+ * Helper to get the Market Median price for BPO amortization fallback.
+ */
+function _getMarketMedianMap(ss) {
+    const sheet = ss.getSheetByName("Market_Data_Raw");
+    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Market_Data_Raw sheet is empty."); return new Map(); }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    try {
+        const col = _getColIndexMap(headers, ['type_id', 'sell_median']);
+        
+        let data = [];
+        const numRows = sheet.getLastRow() - 1;
+        if (numRows > 0) {
+            data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
+        }
+
+        const medianMap = new Map();
+
+        for (const row of data) {
+            const type_id = Number(row[col.type_id]);
+            const median_price = Number(row[col.sell_median]);
+            if (!isNaN(type_id) && median_price > 0) { medianMap.set(type_id, median_price); }
+        }
+        return medianMap;
+    } catch(e) { LOG_INDUSTRY.error(`Error reading Market_Data_Raw: ${e.message}`); return new Map(); }
+}
+
+/**
+ * Helper to get the manual amortization surcharge for BPOs (Market Median Fallback).
+ */
+function _getBpoAmortizationMap(ss) {
+    const AMORT_SHEET_NAME = "BPO_Amortization";
+    const AMORT_HEADERS = ['bp_type_id', 'Amortization_Runs'];
+    const amortMap = new Map();
+
+    const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
+    const lastRow = sheet ? sheet.getLastRow() : 0;
+    if (lastRow < 2) { LOG_INDUSTRY.error(`Sheet '${AMORT_SHEET_NAME}' has no data rows. Amortization is 0.`); return amortMap; }
+
+    const blendedCostMap = _getBlendedCostMap(ss); 
+    const marketMedianMap = _getMarketMedianMap(ss);
+    
+    const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+    try {
+        const col = _getColIndexMap(headers, AMORT_HEADERS);
+        const numRows = lastRow - 1;
+        
+        let data = [];
+        if (numRows > 0) { data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues(); } 
+
+        for (const row of data) {
+            const bp_type_id = Number(row[col.bp_type_id]);
+            const totalRuns = Number(row[col.Amortization_Runs]); 
+            let bpoValue = 0;
+
+            if (totalRuns <= 0) continue; 
+
+            // 1. TRY PRIMARY: Blended Average
+            bpoValue = blendedCostMap.get(bp_type_id) || 0;
+
+            if (bpoValue === 0) {
+                // 2. FALLBACK: Market Median
+                bpoValue = marketMedianMap.get(bp_type_id) || 0;
+                if (bpoValue > 0) { LOG_INDUSTRY.warn(`BPO ${bp_type_id}: Using Market Median for amortization.`); }
+            }
+            
+            if (bpoValue > 0) {
+                const surchargePerRun = bpoValue / totalRuns;
+                amortMap.set(bp_type_id, surchargePerRun);
+            } else { LOG_INDUSTRY.warn(`BPO ${bp_type_id}: No market value found. Amortization skipped.`); }
+        }
+        return amortMap;
+    } catch(e) { LOG_INDUSTRY.error(`Configuration Error in ${AMORT_SHEET_NAME}: ${e.message}`); return new Map(); }
+}
+
+/**
+ * Helper to get BPO/BPC efficiency attributes by calling GESI.corporation_blueprints() directly.
  */
 function _getBpoAttributesMapFromEsi() {
-    // WARNING: This assumes the GESI library is correctly installed and the 
-    // corporation is fully authenticated with the 'esi-corporations.read_blueprints.v1' scope.
-    
-    // Call the GESI function directly. It returns a 2D array with headers in row 0.
-    const rawData = GESI.corporation_blueprints(); 
-    
-    if (!rawData || rawData.length <= 1) {
-        LOG_INDUSTRY.error("GESI.corporation_blueprints() returned no data or only headers.");
-        return new Map();
-    }
-
-    // Use the dynamic header function to map column names to indices
-    const headers = rawData[0]; // First row is headers
-    const col = _getColIndexMap(headers, ['type_id', 'material_efficiency', 'time_efficiency']);
-    
-    const attributesMap = new Map();
-
-    // Start iteration from index 1 to skip the header row
-    for (let i = 1; i < rawData.length; i++) {
-        const row = rawData[i];
+    try {
+        const rawData = GESI.corporation_blueprints(); 
         
-        // Data is always returned as strings, so we must convert to Number
-        const bp_type_id = Number(row[col.type_id]);
-        const me = Number(row[col.material_efficiency]);
-        const te = Number(row[col.time_efficiency]); 
+        if (!rawData || rawData.length <= 1) { LOG_INDUSTRY.error("GESI.corporation_blueprints() returned no data."); return new Map(); }
 
-        if (!isNaN(bp_type_id) && bp_type_id > 0) {
-            attributesMap.set(bp_type_id, {
-                material_efficiency: me,
-                time_efficiency: te
-            });
-        }
-    }
-    
-    LOG_INDUSTRY.info(`Loaded attributes for ${attributesMap.size} unique blueprints directly from GESI.`);
-    return attributesMap;
-}
-
-/**
- * Helper to map Station/Structure IDs to their containing Solar System IDs.
- */
-function _getStationSystemMap(ss) {
-    const sheet = ss.getSheetByName("SDE_staStations");
-    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("SDE_staStations sheet is missing."); return new Map(); }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = _getColIndexMap(headers, ['stationID', 'solarSystemID']);
-
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    const systemMap = new Map();
-
-    for (const row of data) {
-        const stationID = Number(row[col.stationID]);
-        const systemID = Number(row[col.solarSystemID]);
+        const headers = rawData[0];
+        const col = _getColIndexMap(headers, ['type_id', 'material_efficiency', 'time_efficiency']);
         
-        if (!isNaN(stationID) && !isNaN(systemID)) {
-            systemMap.set(stationID, systemID); 
+        const attributesMap = new Map();
+
+        for (let i = 1; i < rawData.length; i++) {
+            const row = rawData[i];
+            const bp_type_id = Number(row[col.type_id]);
+            const me = Number(row[col.material_efficiency]);
+            const te = Number(row[col.time_efficiency]); 
+
+            if (!isNaN(bp_type_id) && bp_type_id > 0) {
+                attributesMap.set(bp_type_id, {
+                    material_efficiency: me,
+                    time_efficiency: te
+                });
+            }
         }
-    }
-    return systemMap;
-}
-
-/**
- * Helper to get the Copying Cost Index from ESI Cost Indexes data.
- */
-function _getCopyingCostIndexMap(ss) {
-    const sheet = ss.getSheetByName("Cost Indexes");
-    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Cost Indexes sheet is missing."); return new Map(); }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = _getColIndexMap(headers, ['solar_system_id', 'Copying']);
-    
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    const indexMap = new Map();
-
-    for (const row of data) {
-        const system_id = Number(row[col.solar_system_id]);
-        const index_value = Number(row[col.Copying]);
-        
-        if (!isNaN(system_id) && index_value > 0) {
-            indexMap.set(system_id, index_value); 
-        }
-    }
-    return indexMap;
+        return attributesMap;
+    } catch(e) { LOG_INDUSTRY.error(`Failed to call GESI.corporation_blueprints(): ${e.message}.`); return new Map(); }
 }
