@@ -618,18 +618,24 @@ function _getBpoAttributesMapFromEsi() {
 /**
  * Calculates the BPO's economic lifespan (Amortization_Runs) based on regional market demand.
  * Target: 10% of 30-day traded volume, projected over 12 months.
+ * * Implements the "REPLACE DATA" pattern: Clears all existing amortization values 
+ * and writes the new calculated values back.
  */
 function autofillBpoAmortizationRuns() {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const log = LoggerEx.withTag('BPO_AMORT');
     
     const AMORT_SHEET_NAME = "BPO_Amortization";
-    const MARKET_SHARE_TARGET = 0.10; // 10%
+    const AMORT_HEADERS = ['bp_type_id', 'Amortization_Runs'];
+    const MARKET_SHARE_TARGET = 0.10; 
     const PRODUCTION_WINDOW_MONTHS = 12; 
 
-    const sheet = ss.getSheetByName(AMORT_SHEET_NAME);
-    if (!sheet || sheet.getLastRow() < 2) {
-        log.error(`Sheet '${AMORT_SHEET_NAME}' not found or empty. Ensure you have added BPO Type IDs to Column A.`);
+    // NOTE: This assumes getOrCreateSheet is available and creates the sheet with AMORT_HEADERS
+    const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
+    const lastRow = sheet ? sheet.getLastRow() : 0;
+
+    if (lastRow < 2) {
+        log.error(`Sheet '${AMORT_SHEET_NAME}' found but has no data rows in Column A to process.`);
         return 0;
     }
 
@@ -641,47 +647,65 @@ function autofillBpoAmortizationRuns() {
     }
 
     // --- 2. Read BPO_Amortization Data and Headers ---
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const dataRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns());
-    const amortData = dataRange.getValues();
+    // Read only the columns necessary for calculation
+    const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+    const dataRange = sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns());
+    const existingData = dataRange.getValues();
 
     try {
-        const col = _getColIndexMap(headers, ['bp_type_id', 'Amortization_Runs']);
+        const col = _getColIndexMap(headers, AMORT_HEADERS);
         const typeIdColIndex = col.bp_type_id; 
         const runsColIndex = col.Amortization_Runs;
 
-        const updatedRuns = []; // Array to store the new runs value
+        const newRowsToWrite = []; 
 
         // --- 3. Calculate New Runs ---
-        for (const row of amortData) {
+        for (const row of existingData) {
             const bp_type_id = Number(row[typeIdColIndex]);
-            
-            // Note: The BPO Type ID is usually the product Type ID for T1 items.
+            if (!(bp_type_id > 0)) continue; 
+
             const product_type_id = bp_type_id; 
-            
             const demandVolume = demandMap.get(product_type_id) || 0;
 
+            let newRuns = row[runsColIndex] || 0; // Default to existing if no demand is found
+            
             if (demandVolume > 0) {
                 // Calculation: 30-Day Volume * (12 months) * (10% share)
-                const newRuns = Math.round(
+                const calculatedRuns = Math.round(
                     demandVolume * PRODUCTION_WINDOW_MONTHS * MARKET_SHARE_TARGET
                 );
-                
-                // Keep the original data intact, only changing the calculated column
-                row[runsColIndex] = newRuns;
+                newRuns = calculatedRuns;
                 log.debug(`BP ${bp_type_id}: Demand ${demandVolume.toLocaleString()} -> Runs ${newRuns.toLocaleString()}`);
-            } else {
-                // If no demand data, keep the existing value (or blank it out)
-                row[runsColIndex] = row[runsColIndex] || ''; 
             }
-            updatedRuns.push(row);
+
+            // Only push rows that have a valid ID and a calculated run count
+            if (newRuns > 0) {
+                 // Create a new, clean row [bp_type_id, newRuns]
+                 newRowsToWrite.push([bp_type_id, newRuns]); 
+            }
         }
 
-        // --- 4. Write Back to Sheet ---
-        if (updatedRuns.length > 0) {
-            dataRange.setValues(updatedRuns);
-            log.info(`Successfully updated Amortization_Runs for ${updatedRuns.length} BPOs based on market demand.`);
-            return updatedRuns.length;
+        // --- 4. CLEAR AND REWRITE (The Replace Data on Each Run Logic) ---
+        const lastDataRow = sheet.getLastRow();
+
+        if (newRowsToWrite.length > 0) {
+            // Clear all data below the header
+            if (lastDataRow > 1) {
+                sheet.getRange(2, 1, lastDataRow - 1, sheet.getMaxColumns()).clearContent();
+            }
+
+            // Write the new, calculated data
+            sheet.getRange(2, 1, newRowsToWrite.length, 2).setValues(newRowsToWrite);
+            
+            log.info(`Successfully cleared and REPLACED Amortization_Runs with ${newRowsToWrite.length} rows based on market demand.`);
+            return newRowsToWrite.length;
+        } else {
+            log.warn("No valid BPO Type IDs were found or demand was zero. Amortization sheet content was cleared.");
+            // Clear content if a previous valid run existed but this run found no data
+            if (lastDataRow > 1) {
+                sheet.getRange(2, 1, lastDataRow - 1, sheet.getMaxColumns()).clearContent();
+            }
+            return 0;
         }
         
     } catch (e) {
