@@ -869,3 +869,101 @@ function autofillBpoAmortizationInventory() {
         throw e;
     }
 }
+
+/**
+ * FINALIZED MASTER FUNCTION: Executes the complete BPO Amortization setup.
+ * 1. Synchronizes BPO list (Inventory).
+ * 2. Calculates economic lifespan (Market Demand) and overwrites Column B.
+ */
+function runBpoAmortizationSetupAndCalculate() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const log = LoggerEx.withTag('BPO_AMORT');
+    
+    const AMORT_SHEET_NAME = "BPO_Amortization";
+    const AMORT_HEADERS = ['bp_type_id', 'Amortization_Runs'];
+    const MARKET_SHARE_TARGET = 0.10; 
+    const PRODUCTION_WINDOW_MONTHS = 12; 
+
+    log.info('--- Starting BPO Amortization Setup (One-Step Sync) ---');
+
+    // --- PHASE 1: INVENTORY SYNCHRONIZATION (Initializes Column A) ---
+    const allBlueprints = _getCorporateBlueprintsRaw(true); 
+    if (!allBlueprints || allBlueprints.length === 0) {
+        log.error("Failed to fetch blueprint data. Aborting.");
+        return 0;
+    }
+
+    const uniqueBpoTypeIds = new Set();
+    for (const bp of allBlueprints) {
+        if (Number(bp.runs) === -1) { 
+            uniqueBpoTypeIds.add(Number(bp.type_id));
+        }
+    }
+    const bpoTypeIds = Array.from(uniqueBpoTypeIds).filter(id => id > 0).sort((a, b) => a - b);
+    const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
+    const lastRow = sheet.getLastRow();
+    
+    // Preserve existing data for column B values
+    const existingRunsMap = new Map();
+    if (lastRow > 1) {
+        const existingValues = sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).getValues();
+        existingValues.forEach(row => {
+            const existingId = Number(row[0]);
+            if (existingId > 0 && row[1] != null && row[1] !== "") { 
+                existingRunsMap.set(existingId, row[1]);
+            }
+        });
+    }
+    
+    // Build Initial Data (IDs + Preserved/Zero Runs)
+    const syncedData = bpoTypeIds.map(id => [
+        id,
+        existingRunsMap.get(id) || 0 // Initializing to 0 if no value found
+    ]);
+
+    // Write back the clean, synchronized list (Column A updated)
+    if (lastRow > 1) { sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent(); }
+    if (syncedData.length === 0) {
+         log.warn("No BPOs found to synchronize. Setup complete (but empty).");
+         return 0;
+    }
+    sheet.getRange(2, 1, syncedData.length, 2).setValues(syncedData);
+    log.info(`Synchronized ${syncedData.length} BPO Type IDs. Now calculating lifespan...`);
+
+
+    // --- PHASE 2: ECONOMIC LIFESPAN CALCULATION (OVERWRITES COLUMN B) ---
+    const demandMap = _getMarketDemandMap(ss);
+    if (demandMap.size === 0) {
+        log.error("Could not retrieve market demand volume. Cannot calculate Amortization Runs.");
+        return 0;
+    }
+
+    const finalData = [];
+    for (const row of syncedData) { // Use the freshly synchronized data
+        const bp_type_id = Number(row[0]);
+        const demandVolume = demandMap.get(bp_type_id) || 0;
+        let newRuns = 0;
+        
+        if (demandVolume > 0) {
+            // Calculation: (30-Day Volume / 30 days) * 365 days * 10% market share
+            const calculatedRuns = Math.round(
+                (demandVolume / 30) * 365 * MARKET_SHARE_TARGET
+            );
+            
+            // Set a minimum floor of 100 runs if calculated value is tiny
+            newRuns = Math.max(100, calculatedRuns); 
+        } else {
+            // If market data is missing, we use the existing value (which may be 0) or set the floor to 100
+            newRuns = row[1] > 0 ? row[1] : 100; 
+        }
+
+        finalData.push([bp_type_id, newRuns]); 
+    }
+
+    // --- PHASE 3: FINAL WRITE (Atomic Update) ---
+    // Overwrite the synchronized data with the final calculated runs
+    sheet.getRange(2, 1, finalData.length, 2).setValues(finalData);
+    log.info(`Amortization setup complete. Calculated and wrote economic lifespan for ${finalData.length} BPOs.`);
+    
+    return finalData.length;
+}
