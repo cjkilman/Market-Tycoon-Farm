@@ -486,96 +486,105 @@ function runIndustryLedgerUpdate() {
  * 3. Fuzzwork API (Tier 3)
  */
 function _getBlendedCostMap(ss) {
-    const sheet = ss.getSheetByName("Blended_Cost");
-    const log = LoggerEx.withTag('BLENDED_COST_FALLBACK');
-    
-    // --- 1. Setup Tier 2/3 Settings ---
-    const marketMedianMap = _getMarketMedianMap(ss); // Tier 2: Local Tracker
-    
-    // Fuzzwork Settings (Tier 3)
+  const sheet = ss.getSheetByName("Blended_Cost");
+  const log = LoggerEx.withTag('BLENDED_COST_FALLBACK');
+
+  // --- 1. Setup Tier 2/3 Settings ---
+  const marketMedianMap = _getMarketMedianMap(ss); // Tier 2: Local Tracker
+
+  // Fuzzwork Settings (Tier 3)
+
+
+
+
+  const orderType = 'buy';
+  const orderLevel = 'median';
+
+  const allItemCosts = new Map(); // Final map of type_id -> cost
+  const tier3FetchList = new Set(); // List of items requiring API call
+
+  // --- 2. PHASE 1: Read Tier 1 (Blended Cost) and Tier 2 (Local Tracker) ---
+
+  // Read Tier 1 into the final map, applying Tier 2 fallback immediately
+  if (sheet && sheet.getLastRow() >= 2) {
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    try {
+      const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
+      const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
+
+      for (const row of data) {
+        const type_id = Number(row[col.type_id]);
+        let cost = Number(row[col.unit_weighted_average]);
+
+        // Tier 1 Check: If missing, check Tier 2
+        if (cost === 0 || isNaN(cost) || cost === null) {
+          cost = marketMedianMap.get(type_id) || 0; // Tier 2 Cost
+        }
+
+        if (!isNaN(type_id)) {
+          if (cost > 0) {
+            allItemCosts.set(type_id, cost); // Tier 1 or Tier 2 cost found
+          } else {
+            tier3FetchList.add(type_id); // No internal cost found, needs API call
+          }
+        }
+      }
+    } catch (e) { log.error(`Error reading Blended_Cost: ${e.message}`); }
+  } else {
+    log.warn("Blended_Cost sheet is empty or missing. Relying entirely on Market Tracker and Fuzzwork.");
+  }
+
+  // 3. PHASE 2: Check items found ONLY in Tier 2 (marketMedianMap)
+  // If a Datacore is missing from Blended_Cost but is in the Tracker, Tier 2 is used.
+  for (const [type_id, cost] of marketMedianMap.entries()) {
+    if (!allItemCosts.has(type_id)) {
+      if (cost > 0) {
+        allItemCosts.set(type_id, cost);
+      } else {
+        tier3FetchList.add(type_id);
+      }
+    }
+  }
+
+  // --- 4. PHASE 3: Execute Fuzzwork API Fallback (Tier 3) ---
+  if (tier3FetchList.size > 0) {
     // NOTE: Assuming these settings are read correctly by other functions
-    const locationId = ss.getSheetByName('Location List').getRange('C3').getValue();
-    const marketType = _getNamedOr_(ss, 'setting_market_range', 'region'); 
-    const orderType = 'buy'; 
-    const orderLevel = 'median'; 
-    
-    const allItemCosts = new Map(); // Final map of type_id -> cost
-    const tier3FetchList = new Set(); // List of items requiring API call
+    const locationIdRange = ss.getSheetByName('Location List').getRange('C3').getValue();
 
-    // --- 2. PHASE 1: Read Tier 1 (Blended Cost) and Tier 2 (Local Tracker) ---
-    
-    // Read Tier 1 into the final map, applying Tier 2 fallback immediately
-    if (sheet && sheet.getLastRow() >= 2) {
-        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-        try {
-            const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
-            const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
-            
-            for (const row of data) {
-                const type_id = Number(row[col.type_id]);
-                let cost = Number(row[col.unit_weighted_average]); 
-                
-                // Tier 1 Check: If missing, check Tier 2
-                if (cost === 0 || isNaN(cost) || cost === null) {
-                    cost = marketMedianMap.get(type_id) || 0; // Tier 2 Cost
-                }
-                
-                if (!isNaN(type_id)) {
-                    if (cost > 0) {
-                        allItemCosts.set(type_id, cost); // Tier 1 or Tier 2 cost found
-                    } else {
-                        tier3FetchList.add(type_id); // No internal cost found, needs API call
-                    }
-                }
-            }
-        } catch(e) { log.error(`Error reading Blended_Cost: ${e.message}`); }
-    } else {
-        log.warn("Blended_Cost sheet is empty or missing. Relying entirely on Market Tracker and Fuzzwork.");
-    }
-    
-    // 3. PHASE 2: Check items found ONLY in Tier 2 (marketMedianMap)
-    // If a Datacore is missing from Blended_Cost but is in the Tracker, Tier 2 is used.
-    for (const [type_id, cost] of marketMedianMap.entries()) {
-        if (!allItemCosts.has(type_id)) {
-             if (cost > 0) {
-                 allItemCosts.set(type_id, cost);
-             } else {
-                 tier3FetchList.add(type_id);
-             }
+    const marketTypeRange = ss.getSheetByName('setting_market_range').getValue();
+    if (!locationIdRange || !marketTypeRange)
+      throw (new Error("Invalid Named Ranges for Fuz"));
+    const locationId = String(locationIdRange.getValue()).trim();
+    const marketType = String(marketTypeRange.getv()).trim();
+    const idsArray = Array.from(tier3FetchList);
+    log.info(`Attempting Tier 3 fallback for ${idsArray.length} items via Fuzzwork API.`);
+
+    try {
+      // NOTE: Assumes fuzAPI.requestItems and _extractMetric_ are available globally
+      const rawFuzResults = fuzAPI.requestItems(locationId, marketType, idsArray);
+
+      rawFuzResults.forEach(item => {
+        const cost = _extractMetric_(item, orderType, orderLevel);
+        if (cost > 0) {
+          allItemCosts.set(item.type_id, cost);
+          log.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3): ${cost}`);
+        } else {
+          log.warn(`Fuzzwork returned zero cost for material ${item.type_id}. Final cost is 0.`);
         }
+      });
+    } catch (e) {
+      log.error(`Fuzzwork Tier 3 API call failed: ${e.message}`);
     }
-    
-    // --- 4. PHASE 3: Execute Fuzzwork API Fallback (Tier 3) ---
-    if (tier3FetchList.size > 0) {
-        const idsArray = Array.from(tier3FetchList);
-        log.info(`Attempting Tier 3 fallback for ${idsArray.length} items via Fuzzwork API.`);
-        
-        try {
-             // NOTE: Assumes fuzAPI.requestItems and _extractMetric_ are available globally
-            const rawFuzResults = fuzAPI.requestItems(locationId, marketType, idsArray);
-            
-            rawFuzResults.forEach(item => {
-                const cost = _extractMetric_(item, orderType, orderLevel);
-                if (cost > 0) {
-                    allItemCosts.set(item.type_id, cost);
-                    log.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3): ${cost}`);
-                } else {
-                    log.warn(`Fuzzwork returned zero cost for material ${item.type_id}. Final cost is 0.`);
-                }
-            });
-        } catch(e) {
-            log.error(`Fuzzwork Tier 3 API call failed: ${e.message}`);
-        }
-    }
+  }
 
-    // 5. Final filter: return only items with a positive cost
-    const finalCostMap = new Map();
-    for (const [type_id, cost] of allItemCosts.entries()) {
-        if (cost > 0) { finalCostMap.set(type_id, cost); }
-    }
+  // 5. Final filter: return only items with a positive cost
+  const finalCostMap = new Map();
+  for (const [type_id, cost] of allItemCosts.entries()) {
+    if (cost > 0) { finalCostMap.set(type_id, cost); }
+  }
 
-    // This map now contains the most accurate cost for every item required.
-    return finalCostMap;
+  // This map now contains the most accurate cost for every item required.
+  return finalCostMap;
 }
 
 // NOTE: Since the ultimate goal is to fix the missing Datacore costs, and your
