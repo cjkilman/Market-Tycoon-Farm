@@ -361,9 +361,10 @@ function runIndustryLedgerUpdate() {
     const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
     if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE sheets are empty. Skipping."); return; }
     
-    // ⚠️ CRITICAL FIX: Collect ALL unique material IDs required by ALL jobs
+ // ⚠️ CRITICAL FIX: Only collect material IDs required by the specific new jobs!
     const allRequiredMaterialIds = new Set();
-    for (const [bp_type_id, materials] of sdeMatMap.entries()) {
+    for (const job of newJobs) {
+        const materials = sdeMatMap.get(job.blueprint_type_id);
         if (materials) {
             for (const mat of materials) {
                 allRequiredMaterialIds.add(mat.materialTypeID);
@@ -371,12 +372,10 @@ function runIndustryLedgerUpdate() {
         }
     }
     
-    // 1. Get Cost Data and Amortization/WAC
-    // ⚠️ CRITICAL FIX: Pass the full list of required IDs to the cost map builder
+    // ⚠️ CRITICAL FIX: Pass the targeted material list to the cost map builder
     const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMaterialIds));
 
     if (costMap.size === 0) { LOG_INDUSTRY.warn("Blended_Cost failed to populate any costs. Skipping."); return; }
-    
     const amortMap = _getBpoAmortizationMap(ss); 
     const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
     const bpoAttributesMap = _getBpoAttributesMapFromEsi(); // Direct GESI call
