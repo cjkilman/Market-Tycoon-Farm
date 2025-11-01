@@ -573,3 +573,26 @@ function _getBpoAttributesMapFromEsi() {
         return attributesMap;
     } catch(e) { LOG_INDUSTRY.error(`Failed to call GESI.corporation_blueprints(): ${e.message}.`); return new Map(); }
 }
+
+/**
+ * Utility function to dynamically find column indices by header name.
+ * @param {string[]} headers - The array of header names from the spreadsheet.
+ * @param {string[]} requiredHeaders - The list of column names needed by the function.
+ * @returns {Object<string, number>} An object mapping the required header name to its column index.
+ * @throws {Error} if any required header is missing.
+ */
+function _getColIndexMap(headers, requiredHeaders) {
+    const col = {};
+    const lowerCaseHeaders = headers.map(h => h.toLowerCase().trim());
+    
+    for (const req of requiredHeaders) {
+        const index = lowerCaseHeaders.indexOf(req.toLowerCase().trim());
+        if (index === -1) {
+            // Throw a specific error to halt execution if data is unusable
+            throw new Error(`CRITICAL HEADER ERROR: Sheet is missing required column "${req}".`);
+        }
+        // Store the index of the required header
+        col[req] = index;
+    }
+    return col;
+}
