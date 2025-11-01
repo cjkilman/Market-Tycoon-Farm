@@ -30,6 +30,60 @@ const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Indust
 // ----------------------------------------------------------------------
 
 /**
+ * TEST FUNCTION: Calls the core job-fetching function, bypassing the 
+ * spreadsheet cell lookup, to diagnose the character name/auth token issue.
+ * * INSTRUCTIONS: 
+ * 1. Replace "YOUR_AUTHORIZED_CHARACTER_NAME" below with the name you think is correct.
+ * 2. Select this function (TEST_CORP_JOBS_AUTH) and click the Run button (▶️).
+ * 3. Check the Logger (View -> Logs) for the result.
+ */
+function TEST_CORP_JOBS_AUTH() {
+  
+  // ⚠️ MANDATORY: REPLACE THIS PLACEHOLDER WITH THE NAME YOU ARE TESTING ⚠️
+  // Example: const testToonName = "Jason Kilman";
+  const testToonName = "Jason Kilman"; 
+  
+  const LOG = Logger;
+  LOG.log(`--- Starting ESI Job Raw Data Test for: ${testToonName} ---`);
+  
+  // ----------------------------------------------------------------------------------
+  // ⚠️ WARNING: This function relies on a temporary override of the global
+  // getCorpAuthChar() function to force the script to use the test name. 
+  // ----------------------------------------------------------------------------------
+  
+  // Temporarily define the problematic function to return the test name
+  // This bypasses the spreadsheet lookup (e.g., 'Market Overview'!B10)
+  const originalGetCorpAuthChar = (typeof getCorpAuthChar !== 'undefined') ? getCorpAuthChar : null;
+  getCorpAuthChar = function() { return testToonName; };
+
+  try {
+    // Call the original helper function, forcing a live ESI fetch (true)
+    const jobData = _getCorporateJobsRaw(true);
+
+    if (jobData === null) {
+        LOG.log("❌ TEST FAILED: _getCorporateJobsRaw returned NULL.");
+        LOG.log("Reason: Check if GESI returned an error (403/420) or no data. The character name is likely misspelled, or the token is expired/missing scopes.");
+    } else if (Array.isArray(jobData)) {
+        LOG.log(`✅ TEST SUCCESS: ESI Client authorization worked! Fetched ${jobData.length} job records.`);
+        if (jobData.length > 0) {
+            LOG.log(`First Job Status: ${jobData[0].status}, Job ID: ${jobData[0].job_id}`);
+        }
+    } else {
+        LOG.log("❌ TEST FAILED: Unexpected return type.");
+    }
+
+  } catch (e) {
+    LOG.log(`❌ TEST FAILED with Script Error: ${e.message}`);
+    LOG.log("ACTION: This is a coding/environment error, not an auth error. Check that all supporting functions (like _getAndDechunk) are in scope.");
+  } finally {
+    // Restore the original function definition
+    if (originalGetCorpAuthChar) {
+      getCorpAuthChar = originalGetCorpAuthChar;
+    }
+  }
+}
+
+/**
  * Stores a string of arbitrary length into the User Cache using multiple keys (sharding).
  */
 function _chunkAndPut(key, largeString, ttl) {
@@ -1266,7 +1320,7 @@ function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
  */
 function _getCorporateJobsRaw(forceRefresh) {
     // NOTE: Assumes getCorpAuthChar() is available globally
-const authToon = "Jason KIlman"; // <--- REPLACE THIS LINE 
+const authToon = getCorpAuthChar(); // <--- REPLACE THIS LINE 
     // const authToon = getCorpAuthChar(); // <-- Original line commented out
     
     const ENDPOINT = 'corporations_corporation_industry_jobs';
@@ -1290,10 +1344,10 @@ const authToon = "Jason KIlman"; // <--- REPLACE THIS LINE
     const rawObjects = GESI.invokeRaw(
         ENDPOINT,
         {
-          include_completed: true,
-            name: authToon,
-            show_column_headings: false,
-            version: null
+include_completed: true, 
+ name: authToon, 
+ show_column_headings: false,
+  version: null
         }
     );
 
