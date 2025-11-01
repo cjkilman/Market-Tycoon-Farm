@@ -1,10 +1,8 @@
 /**
  * IndustryLedger.gs.js
  *
- * This module is the Industry Ledger Add-on. It executes in two stages:
- * 1. Process BPC creation (Copy/Invention) jobs to calculate the cost-per-run (WAC).
- * 2. Process Manufacturing jobs, applying BPO/BPC costs and ME material savings,
- * and writes final COGS data to the Material_Ledger via the ML API.
+ * This module is the Industry Ledger Add-on, built for robust COGS accounting.
+ * It includes sharding utilities to bypass the Google Apps Script Cache limit.
  *
  * NOTE: This file assumes 'getOrCreateSheet', 'ML.forSheet', 'getCorpAuthChar', and 'LoggerEx' are in scope.
  */
@@ -28,7 +26,7 @@ const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Indust
 
 
 // ----------------------------------------------------------------------
-// --- CORE UTILITY: CACHE SHARDING FUNCTIONS ---
+// --- CORE UTILITY: CACHE SHARDING FUNCTIONS (FIXES ARGUMENT TOO LARGE) ---
 // ----------------------------------------------------------------------
 
 /**
@@ -94,8 +92,9 @@ function _getAndDechunk(key) {
     return result.join('');
 }
 
+
 // ----------------------------------------------------------------------
-// --- CORE UTILITY: DYNAMIC HEADER MAPPING ---
+// --- CORE UTILITY: DYNAMIC HEADER MAPPING (FIXES SCOPE/REFERENCE) ---
 // ----------------------------------------------------------------------
 
 /**
@@ -289,7 +288,7 @@ function runIndustryLedgerUpdate() {
 
   for (const job of newJobs) {
     const materials = sdeMatMap.get(job.blueprint_type_id);
-    const product = sdeProdMap.get(job.blueprint_type_id);
+    const product = prodMap.get(job.blueprint_type_id);
 
     if (!materials || !product) { LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`); continue; }
 
@@ -562,8 +561,7 @@ function _getConfigPresetRuns(ss) {
 
 /**
  * Helper to get the Market Median price for BPO amortization fallback.
- * FIX: Reads the calculated 'Median Sell' price from the 'market price Tracker' sheet.
- * @returns {Map<number, number>} Map of type_id -> Median Sell value
+ * FIX: Reads from 'market price Tracker' using 'Median Sell'.
  */
 function _getMarketMedianMap(ss) {
     const TRACKER_SHEET_NAME = "market price Tracker";
@@ -588,20 +586,14 @@ function _getMarketMedianMap(ss) {
 
         for (const row of data) {
             const type_id = Number(row[col[ID_HEADER]]);
-            // Price often has ISK appended and commas, requiring a cleanup before Number() conversion
+            // Price cleanup: Remove ISK and commas
             const priceStr = String(row[col[MEDIAN_HEADER]]).replace(/ISK/gi, '').replace(/,/g, '').trim(); 
             const median_price = Number(priceStr);
 
-            if (!isNaN(type_id) && median_price > 0) {
-                medianMap.set(type_id, median_price); 
-            }
+            if (!isNaN(type_id) && median_price > 0) { medianMap.set(type_id, median_price); }
         }
         return medianMap;
-    } catch(e) { 
-        // Log the error but return empty map so the Blended Cost (primary) can run
-        LOG_INDUSTRY.error(`Error reading ${TRACKER_SHEET_NAME}: ${e.message}`); 
-        return new Map(); 
-    }
+    } catch(e) { LOG_INDUSTRY.error(`Error reading ${TRACKER_SHEET_NAME}: ${e.message}`); return new Map(); }
 }
 
 /**
@@ -752,10 +744,9 @@ function autofillBpoAmortizationInventory() {
 
     try {
         // 1. Get ALL Blueprints using the shared, cached function (FORCING refresh)
-        // NOTE: This call automatically uses the caching logic defined in _getCorporateBlueprintsRaw
         const allBlueprints = _getCorporateBlueprintsRaw(true); 
 
-        if (!allBlueplans) {
+        if (!allBlueprints || allBlueprints.length === 0) {
             log.error("Failed to fetch blueprint data for inventory sync. Aborting.");
             return 0;
         }
@@ -779,7 +770,6 @@ function autofillBpoAmortizationInventory() {
         }
 
         // 3. Prepare data for sheet rewrite (Preserve existing runs)
-        // NOTE: Assumes getOrCreateSheet is available in global scope.
         const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
         const lastRow = sheet.getLastRow();
         const existingValues = sheet.getRange(2, 1, Math.max(1, lastRow - 1), sheet.getMaxColumns()).getValues();
