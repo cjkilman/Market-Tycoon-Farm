@@ -33,6 +33,7 @@ function onOpen() {
     .addItem('Authorize Script (First Run)', 'forceAuthorization')
     .addItem("Recalculate/Refresh", "Full_Recalculate_Cycle")
     .addSeparator() 
+    .addItem('Reset All Job History', 'resetIndustryLedgerProperties')
     .addItem('Run Industry Ledger Update', '_runIndustryLedgerUpdate_MENU') 
     .addToUi();
 }
