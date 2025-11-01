@@ -251,12 +251,11 @@ function runBpcCreationLedger() {
 /**
  * Resets the script properties that track processed Industry Jobs and 
  * calculated BPC Weighted Average Costs (WAC).
- * * This effectively forces the Industry Ledger to re-process all 'delivered'
- * jobs in the 'ESI Corp Jobs' sheet and recalculate all BPC WACs.
+ * This forces the Ledger to re-process all 'delivered' jobs and recalculate BPC costs.
  */
 function resetIndustryLedgerProperties() {
   
-  // --- Keys defined in IndustryLedger.gs.js ---
+  // Keys defined in IndustryLedger.gs.js
   const INDUSTRY_JOB_KEY = 'processedIndustryJobIds';
   const BPC_JOB_KEY = 'processedBpcJobIds';
   const BPC_WAC_KEY = 'BpcWeightedAverageCost';
@@ -268,6 +267,7 @@ function resetIndustryLedgerProperties() {
   const ui = SpreadsheetApp.getUi();
 
   try {
+    // Deletes the tracking keys
     for (const key of keysToDelete) {
       if (props.getProperty(key) !== null) {
         props.deleteProperty(key);
@@ -275,7 +275,7 @@ function resetIndustryLedgerProperties() {
       }
     }
     
-    // Provide user feedback
+    // Success message for the user
     const message = `✅ Success! Deleted ${deletedCount} Industry Ledger properties. 
     The script will now re-process all delivered jobs and recalculate BPC costs on the next run.`;
     
