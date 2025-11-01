@@ -94,7 +94,6 @@ function _getAndDechunk(key) {
     return result.join('');
 }
 
-
 // ----------------------------------------------------------------------
 // --- CORE UTILITY: DYNAMIC HEADER MAPPING ---
 // ----------------------------------------------------------------------
@@ -563,14 +562,23 @@ function _getConfigPresetRuns(ss) {
 
 /**
  * Helper to get the Market Median price for BPO amortization fallback.
+ * FIX: Reads the calculated 'Median Sell' price from the 'market price Tracker' sheet.
+ * @returns {Map<number, number>} Map of type_id -> Median Sell value
  */
 function _getMarketMedianMap(ss) {
-    const sheet = ss.getSheetByName("Market_Data_Raw");
-    if (!sheet || sheet.getLastRow() < 2) { LOG_INDUSTRY.warn("Market_Data_Raw sheet is empty."); return new Map(); }
+    const TRACKER_SHEET_NAME = "market price Tracker";
+    const MEDIAN_HEADER = 'Median Sell';
+    const ID_HEADER = 'type_id_filtered';
+    
+    const sheet = ss.getSheetByName(TRACKER_SHEET_NAME);
+    if (!sheet || sheet.getLastRow() < 2) { 
+        LOG_INDUSTRY.warn(`Sheet '${TRACKER_SHEET_NAME}' is empty or missing. Cannot provide median price fallback.`);
+        return new Map(); 
+    }
 
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     try {
-        const col = _getColIndexMap(headers, ['type_id', 'sell_median']);
+        const col = _getColIndexMap(headers, [ID_HEADER, MEDIAN_HEADER]);
         
         let data = [];
         const numRows = sheet.getLastRow() - 1;
@@ -579,12 +587,21 @@ function _getMarketMedianMap(ss) {
         const medianMap = new Map();
 
         for (const row of data) {
-            const type_id = Number(row[col.type_id]);
-            const median_price = Number(row[col.sell_median]);
-            if (!isNaN(type_id) && median_price > 0) { medianMap.set(type_id, median_price); }
+            const type_id = Number(row[col[ID_HEADER]]);
+            // Price often has ISK appended and commas, requiring a cleanup before Number() conversion
+            const priceStr = String(row[col[MEDIAN_HEADER]]).replace(/ISK/gi, '').replace(/,/g, '').trim(); 
+            const median_price = Number(priceStr);
+
+            if (!isNaN(type_id) && median_price > 0) {
+                medianMap.set(type_id, median_price); 
+            }
         }
         return medianMap;
-    } catch(e) { LOG_INDUSTRY.error(`Error reading Market_Data_Raw: ${e.message}`); return new Map(); }
+    } catch(e) { 
+        // Log the error but return empty map so the Blended Cost (primary) can run
+        LOG_INDUSTRY.error(`Error reading ${TRACKER_SHEET_NAME}: ${e.message}`); 
+        return new Map(); 
+    }
 }
 
 /**
@@ -633,4 +650,171 @@ function _getBpoAmortizationMap(ss) {
         }
         return amortMap;
     } catch(e) { LOG_INDUSTRY.error(`Configuration Error in ${AMORT_SHEET_NAME}: ${e.message}`); return new Map(); }
+}
+
+/**
+ * Helper to get BPO/BPC efficiency attributes by calling GESI.corporation_blueprints() directly.
+ * * Uses the shared, cached data source.
+ */
+function _getBpoAttributesMapFromEsi() {
+    const rawObjects = _getCorporateBlueprintsRaw(); 
+    
+    if (!rawObjects) { 
+        LOG_INDUSTRY.error("Blueprint Raw Data Fetch failed. Cannot calculate attributes."); 
+        return new Map(); 
+    }
+
+    const attributesMap = new Map();
+
+    for (const bpObj of rawObjects) {
+        const bp_type_id = Number(bpObj.type_id);
+        const me = Number(bpObj.material_efficiency);
+        const te = Number(bpObj.time_efficiency); 
+
+        if (!isNaN(bp_type_id) && bp_type_id > 0) {
+            attributesMap.set(bp_type_id, {
+                material_efficiency: me,
+                time_efficiency: te
+            });
+        }
+    }
+    
+    LOG_INDUSTRY.info(`Loaded attributes for ${attributesMap.size} unique blueprints.`);
+    return attributesMap;
+}
+
+/**
+ * SHARED FUNCTION: Fetches and Caches the raw array of corporate blueprints (BPOs/BPCs) 
+ * using sharding to bypass the "Argument too large" limitation.
+ */
+function _getCorporateBlueprintsRaw(forceRefresh) {
+    const log = LoggerEx.withTag('BPO_DATA');
+    const authToon = getCorpAuthChar(); 
+    const ENDPOINT = 'corporations_corporation_blueprints';
+    const userCache = CacheService.getUserCache();
+
+    if (!authToon) {
+        log.error("Cannot resolve authorized corporation character.");
+        return null;
+    }
+
+    const cacheKey = BPO_RAW_CACHE_KEY + ':' + authToon;
+    
+    // 1. Attempt to read from cache (using de-chunking)
+    if (!forceRefresh) {
+        const cachedJson = _getAndDechunk(cacheKey);
+        if (cachedJson) {
+            log.info("Blueprints fetched from User Cache (De-chunked).");
+            return JSON.parse(cachedJson);
+        }
+    }
+
+    // 2. Live API Call (If not in cache or forced)
+    try {
+        log.info("Fetching corporate blueprints via GESI.invokeRaw (Live API call).");
+        
+        const rawObjects = GESI.invokeRaw(
+            ENDPOINT,
+            {
+                name: authToon,
+                show_column_headings: false,
+                version: null
+            }
+        );
+
+        if (!Array.isArray(rawObjects) || rawObjects.length === 0) {
+            log.error(`GESI.invokeRaw(${ENDPOINT}) returned no usable data.`);
+            return null;
+        }
+
+        // 3. Store in cache (using chunking)
+        const rawJsonString = JSON.stringify(rawObjects);
+        _chunkAndPut(cacheKey, rawJsonString, BPO_RAW_CACHE_TTL);
+        
+        return rawObjects;
+
+    } catch (e) {
+        log.error(`Failed to invoke GESI endpoint ${ENDPOINT} (Final Attempt): ${e.message}.`);
+        throw e;
+    }
+}
+
+/**
+ * Automatically populates Column A (bp_type_id) of the BPO_Amortization sheet 
+ * with all Blueprint Originals (BPOs) owned by the corporation.
+ */
+function autofillBpoAmortizationInventory() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const log = LoggerEx.withTag('BPO_AMORT');
+    
+    const AMORT_SHEET_NAME = "BPO_Amortization";
+    const AMORT_HEADERS = ['bp_type_id', 'Amortization_Runs'];
+
+    try {
+        // 1. Get ALL Blueprints using the shared, cached function (FORCING refresh)
+        // NOTE: This call automatically uses the caching logic defined in _getCorporateBlueprintsRaw
+        const allBlueprints = _getCorporateBlueprintsRaw(true); 
+
+        if (!allBlueplans) {
+            log.error("Failed to fetch blueprint data for inventory sync. Aborting.");
+            return 0;
+        }
+
+        // 2. Filter for Blueprint Originals (BPOs)
+        const uniqueBpoTypeIds = new Set();
+        for (const bp of allBlueprints) {
+            if (Number(bp.runs) === -1) { 
+                const typeId = Number(bp.type_id);
+                if (typeId > 0) {
+                    uniqueBpoTypeIds.add(typeId);
+                }
+            }
+        }
+        
+        const bpoTypeIds = Array.from(uniqueBpoTypeIds).sort((a, b) => a - b);
+        
+        if (bpoTypeIds.length === 0) {
+            log.warn("Found no Blueprint Originals (BPOs) in the corporation inventory.");
+            return 0;
+        }
+
+        // 3. Prepare data for sheet rewrite (Preserve existing runs)
+        // NOTE: Assumes getOrCreateSheet is available in global scope.
+        const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
+        const lastRow = sheet.getLastRow();
+        const existingValues = sheet.getRange(2, 1, Math.max(1, lastRow - 1), sheet.getMaxColumns()).getValues();
+        
+        const existingRunsMap = new Map();
+        if (lastRow > 1) {
+            existingValues.forEach(row => {
+                const existingId = Number(row[0]);
+                if (existingId > 0 && row[1] != null && row[1] !== "") { 
+                    existingRunsMap.set(existingId, row[1]);
+                }
+            });
+        }
+        
+        // 4. Build Final Data (ID + Preserve existing Runs or set to 0)
+        const finalData = bpoTypeIds.map(id => [
+            id,
+            existingRunsMap.get(id) || 0 
+        ]);
+
+        // 5. Clear and Rewrite
+        if (lastRow > 1) {
+            sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
+        }
+        
+        if (finalData.length > 0) {
+            sheet.getRange(2, 1, finalData.length, 2).setValues(finalData);
+            log.info(`Successfully synchronized ${finalData.length} BPO Type IDs from inventory to ${AMORT_SHEET_NAME}.`);
+            return finalData.length;
+        } else {
+            return 0;
+        }
+
+    } catch (e) {
+        log.error(`autofillBpoAmortizationInventory FAILED: ${e.message}`);
+        throw e;
+    }
 }
