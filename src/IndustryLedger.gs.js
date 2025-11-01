@@ -1279,7 +1279,7 @@ function _getCorporateJobsRaw(forceRefresh) {
  * @customfunction
  */
 function GESI_CORP_JOBS_CACHED(authCharName) {
-    const rawData = _getCorporateJobsRaw(false);
+    const rawData = _getCorporateJobsRaw(true);
     
     if (!rawData) {
         return [['ERROR: Data not available or API failed (check logs)'],['Argument too large: value']];
