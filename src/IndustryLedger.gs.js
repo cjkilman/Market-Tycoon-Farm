@@ -538,10 +538,12 @@ function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
     const rawHeaders = sheet.getRange(1, START_COLUMN, 1, NUM_COLUMNS).getValues()[0];
     
     // Fill in the first two columns with placeholders so the dynamic mapper still works
-    const headers = ["COL_A", "COL_B"].concat(rawHeaders); 
+// 1. Read the entire header row. Columns A and B will be empty strings.
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     
+    // 2. Map the required headers. The mapper will find them in column 2 (C) and onwards.
     const requiredHeaders = ['job_id', 'activity_id', 'status', 'blueprint_type_id', 'product_type_id', 'runs', 'end_date', 'installer_id', 'cost', 'location_id'];
-    const col = _getColIndexMap(headers, requiredHeaders);
+    const col = _getColIndexMap(headers, requiredHeaders); // This should work, even with leading blanks.
     
     // Safe reading of data block
     let data = [];
