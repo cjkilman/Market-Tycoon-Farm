@@ -566,14 +566,39 @@ function _getBpoAmortizationMap(ss) {
 }
 
 /**
- * Helper to get BPO/BPC efficiency attributes by calling GESI.corporation_blueprints() directly.
+ * REVISED HELPER: Pulls ME/TE attributes by directly invoking the ESI endpoint.
+ * Uses the style GESI.invokeRaw(ENDPOINT, { options }).
+ * @returns {Map<number, object>} Map of blueprint_type_id -> {material_efficiency, time_efficiency}
  */
 function _getBpoAttributesMapFromEsi() {
-    try {
-        const rawData = GESI.corporation_blueprints(); 
-        
-        if (!rawData || rawData.length <= 1) { LOG_INDUSTRY.error("GESI.corporation_blueprints() returned no data."); return new Map(); }
+    const authToon = getCorpAuthChar(); 
+    const ENDPOINT = 'corporations_corporation_blueprints'; 
 
+    if (!authToon) {
+        LOG_INDUSTRY.error("Cannot resolve authorized corporation character for GESI call.");
+        return new Map();
+    }
+    
+    try {
+        // Applying the requested raw invoke style:
+        const rawData = GESI.invokeRaw(
+            ENDPOINT,
+            {
+                // The name of the authenticated character needed for corporate scope
+                name: authToon, 
+                // Explicitly request headers for dynamic mapping
+                show_column_headings: true, 
+                // Placeholder for consistency, ESI doesn't use version here
+                version: null 
+            }
+        );
+        
+        if (!rawData || rawData.length <= 1) { 
+            LOG_INDUSTRY.error(`GESI.invokeRaw(${ENDPOINT}) returned no data for ${authToon}.`); 
+            return new Map(); 
+        }
+
+        // --- Processing the Raw Data (Remains the same) ---
         const headers = rawData[0];
         const col = _getColIndexMap(headers, ['type_id', 'material_efficiency', 'time_efficiency']);
         
@@ -592,7 +617,12 @@ function _getBpoAttributesMapFromEsi() {
                 });
             }
         }
+        
+        LOG_INDUSTRY.info(`Loaded attributes for ${attributesMap.size} unique blueprints via Raw Invoke.`);
         return attributesMap;
-    } catch(e) { LOG_INDUSTRY.error(`Failed to call GESI.corporation_blueprints(): ${e.message}.`); return new Map(); }
+    } catch(e) { 
+        LOG_INDUSTRY.error(`Failed to invoke GESI endpoint ${ENDPOINT}: ${e.message}.`); 
+        throw e;
+    }
 }
 
