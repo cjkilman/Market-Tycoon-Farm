@@ -980,7 +980,7 @@ function _getBpoAmortizationMap(ss) {
     const amortMap = new Map();
     const log = LoggerEx.withTag('BPO_AMORT');
 
-    // 1. Retrieve essential data maps (Assumes SDE functions are available)
+    // 1. Retrieve essential data maps (local prices)
     const { sdeProdMap } = _getSdeMaps(ss);
     const blendedCostMap = _getBlendedCostMap(ss); 
     const marketMedianMap = _getMarketMedianMap(ss); // Reads 'market price Tracker'
@@ -989,13 +989,14 @@ function _getBpoAmortizationMap(ss) {
     const lastRow = sheet ? sheet.getLastRow() : 0;
     if (lastRow < 2) { log.error(`Sheet '${AMORT_SHEET_NAME}' has no data rows. Amortization is 0.`); return amortMap; }
 
-    // --- FUZZWORK SETTINGS (NAMED RANGES) ---
-    // NOTE: Assumes _getNamedOr_ is available globally
-    const locationId = ss.getSheetByName('Location List').getRange('C3').getValue(); // Location List C3
-    const marketType = _getNamedOr_(ss, 'setting_market_range', 'region'); // Named Range setting_market_range
-    const orderType = 'buy'; 
+    // --- FUZZWORK SETTINGS (TIER 3) ---
+    // Location ID is explicitly read from Location List, cell C3
+    const locationId = ss.getSheetByName('Location List').getRange('C3').getValue(); 
+    // Market Type is read from the Named Range 'setting_market_range' (assuming _getNamedOr_ is available)
+    const marketType = _getNamedOr_(ss, 'setting_market_range', 'region'); 
+    const orderType = 'buy'; // Max Buy Order (highest realizable asset value)
     const orderLevel = 'max'; 
-    // -----------------------------------------
+    // ---------------------------------
 
     const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
     try {
@@ -1022,6 +1023,7 @@ function _getBpoAmortizationMap(ss) {
             }
             const product_id = productObj.productTypeID;
             
+            // Check Tier 1 & 2 local caches
             const localValue = blendedCostMap.get(product_id) || marketMedianMap.get(product_id) || 0;
             
             // Collect data needed for final calculation pass
@@ -1037,11 +1039,10 @@ function _getBpoAmortizationMap(ss) {
         let fuzzworkPrices = new Map();
         if (typeIdsToFetch.length > 0) {
              // Fetch prices for missing items using Fuzzwork API
+             // NOTE: Assumes fuzAPI.requestItems and _extractMetric_ are available globally
              const rawFuzResults = fuzAPI.requestItems(locationId, marketType, typeIdsToFetch);
              
-             // Process the raw results to get the requested metric (Max Buy)
              rawFuzResults.forEach(item => {
-                 // Assumes _extractMetric_ is available globally
                  const price = _extractMetric_(item, orderType, orderLevel);
                  if (price > 0) {
                     fuzzworkPrices.set(item.type_id, price);
