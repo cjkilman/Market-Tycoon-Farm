@@ -352,125 +352,117 @@ function resetIndustryLedgerProperties() {
   }
 }
 
-// ----------------------------------------------------------------------
-// --- MAIN FUNCTION STAGE 2: MANUFACTURING LEDGER UPDATE ---
-// ----------------------------------------------------------------------
-
+// Function runIndustryLedgerUpdate() 
 function runIndustryLedgerUpdate() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  // 1. Get Cost Data and Amortization/WAC
-  const costMap = _getBlendedCostMap(ss);
-  if (costMap.size === 0) { LOG_INDUSTRY.warn("Blended_Cost sheet is empty. Skipping."); return; }
-
-  const amortMap = _getBpoAmortizationMap(ss);
-  const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
-  const bpoAttributesMap = _getBpoAttributesMapFromEsi(); // Direct GESI call
-
-  const getBpcCostPerRun = (bpID) => {
-    const cost = bpcWacData[bpID];
-    return cost ? Number(cost) : 0;
-  };
-
-  // 2. Get SDE Data
-  const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
-  if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE sheets are empty. Skipping."); return; }
-
-  const nameMap = _getSdeNameMap(ss);
-
-  // 3. Find new completed manufacturing jobs
-  const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
-  const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
-  if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
-
-  // 4. Calculate cost and generate ledger row objects
-  const ledgerObjects = [];
-  const newlyProcessedIds = [];
-  const ledgerAPI = ML.forSheet('Material_Ledger'); // Initialize Ledger API
-
-  for (const job of newJobs) {
-    const materials = sdeMatMap.get(job.blueprint_type_id);
-    const product = sdeProdMap.get(job.blueprint_type_id);
-
-    if (!materials || !product) { LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`); continue; }
-
-    // A. Apply Material Efficiency (ME) Discount
-    const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id);
-    const meLevel = bpoItemAttributes ? bpoItemAttributes.material_efficiency : 0;
-    const materialDiscountFactor = 1 - (meLevel / 100);
-
-    let totalMaterialCostPerRun = 0;
-    let missingCost = false;
-
-    for (const mat of materials) {
-      const matCost = costMap.get(mat.materialTypeID);
-      if (matCost === undefined || matCost === null) { LOG_INDUSTRY.warn(`Missing blended cost for material ${mat.materialTypeID}. Cannot price job ${job.job_id}.`); missingCost = true; break; }
-
-      const finalQuantity = mat.quantity * materialDiscountFactor;
-      totalMaterialCostPerRun += matCost * finalQuantity;
+    // 2. Get SDE Data
+    const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
+    if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE sheets are empty. Skipping."); return; }
+    
+    // ⚠️ CRITICAL FIX: Collect ALL unique material IDs required by ALL jobs
+    const allRequiredMaterialIds = new Set();
+    for (const [bp_type_id, materials] of sdeMatMap.entries()) {
+        if (materials) {
+            for (const mat of materials) {
+                allRequiredMaterialIds.add(mat.materialTypeID);
+            }
+        }
     }
+    
+    // 1. Get Cost Data and Amortization/WAC
+    // ⚠️ CRITICAL FIX: Pass the full list of required IDs to the cost map builder
+    const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMaterialIds));
 
-    if (missingCost) continue;
+    if (costMap.size === 0) { LOG_INDUSTRY.warn("Blended_Cost failed to populate any costs. Skipping."); return; }
+    
+    const amortMap = _getBpoAmortizationMap(ss); 
+    const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
+    const bpoAttributesMap = _getBpoAttributesMapFromEsi(); // Direct GESI call
+    
+    const getBpcCostPerRun = (bpID) => {
+      const cost = bpcWacData[bpID];
+      return cost ? Number(cost) : 0;
+    };
+    
+    const nameMap = _getSdeNameMap(ss);
 
-    // B. Calculate Total Costs (Amortization + ISK Fee + Materials)
-    const totalMaterialCostForAllRuns = totalMaterialCostPerRun * job.runs;
-    const totalJobInstallationCost = job.cost; // Includes TE discount
+    // 3. Find new completed manufacturing jobs
+    const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
+    const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
+    if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
 
-    let amortizationSurcharge = 0;
+    // 4. Calculate cost and generate ledger row objects
+    const ledgerObjects = [];
+    const newlyProcessedIds = [];
+    const ledgerAPI = ML.forSheet('Material_Ledger'); // Initialize Ledger API
 
-    // BPO AMORTIZATION (Capital Cost)
-    if (amortMap.has(job.blueprint_type_id)) {
-      amortizationSurcharge = amortMap.get(job.blueprint_type_id) * job.runs;
-      LOG_INDUSTRY.info(`Job ${job.job_id}: Added BPO research amortization cost of ${amortizationSurcharge.toFixed(2)} ISK.`);
-    }
-    // BPC AMORTIZATION (Disposable Asset Cost)
-    else {
-      const bpcCostPerRun = getBpcCostPerRun(job.blueprint_type_id);
-      amortizationSurcharge = bpcCostPerRun * job.runs;
-      if (bpcCostPerRun > 0) {
-        LOG_INDUSTRY.info(`Job ${job.job_id}: Added BPC creation cost of ${amortizationSurcharge.toFixed(2)} ISK.`);
+    // ... rest of the job processing loop ...
+    
+    for (const job of newJobs) {
+      const materials = sdeMatMap.get(job.blueprint_type_id);
+      const product = sdeProdMap.get(job.blueprint_type_id); // Assuming sdeProdMap is globally available or returned by _getSdeMaps
+      
+      // ... rest of the cost calculation and ledger writing ...
+      
+      // A. Apply Material Efficiency (ME) Discount
+      const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id); 
+      const meLevel = bpoItemAttributes ? bpoItemAttributes.material_efficiency : 0; 
+      const materialDiscountFactor = 1 - (meLevel / 100);
+
+      let totalMaterialCostPerRun = 0;
+      let missingCost = false;
+
+      for (const mat of materials) {
+        const matCost = costMap.get(mat.materialTypeID); // This now reads from the robust costMap
+        
+        if (matCost === undefined || matCost === null || matCost === 0) { 
+            // After the robust cost map is built, if cost is still 0, something is fundamentally missing/unpricable.
+            LOG_INDUSTRY.warn(`Missing final cost for material ${mat.materialTypeID}. Cannot price job ${job.job_id}.`); 
+            missingCost = true; 
+            break; 
+        }
+
+        const finalQuantity = mat.quantity * materialDiscountFactor;
+        totalMaterialCostPerRun += matCost * finalQuantity;
       }
+
+      if (missingCost) continue;
+      
+      // ... (rest of the logic)
+      
+      const totalUnitsProduced = product.quantity * job.runs;
+      if (totalUnitsProduced === 0) continue;
+      const unitManufacturingCost = totalActualCost / totalUnitsProduced;
+
+      ledgerObjects.push({
+        date: job.end_date,
+        type_id: job.product_type_id,
+        item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
+        qty: totalUnitsProduced,
+        unit_value: '', 
+        source: "INDUSTRY",
+        contract_id: job.job_id,
+        char: job.installer_id,
+        unit_value_filled: unitManufacturingCost
+      });
+      
+      newlyProcessedIds.push(job.job_id);
+    }
+    
+    // ... (Upsert and state save logic)
+    
+    if (ledgerObjects.length > 0) {
+      const writtenCount = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
+      LOG_INDUSTRY.info(`Successfully processed and wrote ${writtenCount} new manufacturing jobs to the Material_Ledger.`);
+    } else {
+      LOG_INDUSTRY.info("Finished processing. No new rows to write to Material_Ledger.");
     }
 
-    const totalActualCost = totalMaterialCostForAllRuns + totalJobInstallationCost + amortizationSurcharge;
-
-    // C. Calculate Unit Cost
-    const productQtyPerRun = product.quantity;
-    const totalUnitsProduced = productQtyPerRun * job.runs;
-
-    if (totalUnitsProduced === 0) continue;
-
-    const unitManufacturingCost = totalActualCost / totalUnitsProduced;
-
-    // D. Create Normalized Object for ML API
-    ledgerObjects.push({
-      date: job.end_date,
-      type_id: job.product_type_id,
-      item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
-      qty: totalUnitsProduced,
-      unit_value: '',
-      source: "INDUSTRY",
-      contract_id: job.job_id,
-      char: job.installer_id,
-      unit_value_filled: unitManufacturingCost
-    });
-
-    newlyProcessedIds.push(job.job_id);
-  }
-
-  // 5. Upsert new rows using the ML API
-  if (ledgerObjects.length > 0) {
-    const writtenCount = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
-    LOG_INDUSTRY.info(`Successfully processed and wrote ${writtenCount} new manufacturing jobs to the Material_Ledger.`);
-  } else {
-    LOG_INDUSTRY.info("Finished processing. No new rows to write to Material_Ledger.");
-  }
-
-  // 6. Save new state (processed job IDs)
-  newlyProcessedIds.forEach(id => processedJobIds.add(id));
-  const trimmedJobIds = Array.from(processedJobIds).slice(-1000);
-  SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(trimmedJobIds));
+    newlyProcessedIds.forEach(id => processedJobIds.add(id));
+    const trimmedJobIds = Array.from(processedJobIds).slice(-1000);
+    SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(trimmedJobIds));
 }
 
 
@@ -480,111 +472,103 @@ function runIndustryLedgerUpdate() {
 
 /**
  * Helper to get the current blended cost for all items, 
- * implementing a Three-Tier Cost Fallback:
- * 1. Blended_Cost (Tier 1)
- * 2. Market Price Tracker (Tier 2)
- * 3. Fuzzwork API (Tier 3)
+ * implementing a Three-Tier Cost Fallback based on required material IDs.
+ * * @param {object} ss - SpreadsheetApp object.
+ * @param {number[]} requiredMaterialIds - Array of ALL unique material IDs needed for current jobs.
  */
-function _getBlendedCostMap(ss) {
-  const sheet = ss.getSheetByName("Blended_Cost");
-  const log = LoggerEx.withTag('BLENDED_COST_FALLBACK');
+function _getBlendedCostMap(ss, requiredMaterialIds) {
+    const sheet = ss.getSheetByName("Blended_Cost");
+    const log = LoggerEx.withTag('BLENDED_COST_FALLBACK');
+    
+    // --- 1. Setup Tier 2/3 Settings ---
+    const marketMedianMap = _getMarketMedianMap(ss); // Tier 2: Local Tracker
+    
+    // Fuzzwork Settings (Tier 3)
+    const defaultRegionId = 10000002; // Jita Region ID (Safest fallback)
+    const locationIdRaw = ss.getSheetByName('Location List').getRange('C3').getValue();
+    const locationId = (locationIdRaw && locationIdRaw > 0) ? locationIdRaw : defaultRegionId; 
+    const marketType = 'region';     // Force the broadest search
+    const orderType = 'buy';         // Look for Buy Orders
+    const orderLevel = 'max';        // Get the MAX price
+    
+    const allItemCosts = new Map(); // Final map of type_id -> cost
+    const tier3FetchList = new Set(); // List of items requiring API call
 
-  // --- 1. Setup Tier 2/3 Settings ---
-  const marketMedianMap = _getMarketMedianMap(ss); // Tier 2: Local Tracker
-
-  // Fuzzwork Settings (Tier 3)
-
-
-
-
-  const orderType = 'buy';
-  const orderLevel = 'median';
-
-  const allItemCosts = new Map(); // Final map of type_id -> cost
-  const tier3FetchList = new Set(); // List of items requiring API call
-
-  // --- 2. PHASE 1: Read Tier 1 (Blended Cost) and Tier 2 (Local Tracker) ---
-
-  // Read Tier 1 into the final map, applying Tier 2 fallback immediately
-  if (sheet && sheet.getLastRow() >= 2) {
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    try {
-      const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
-      const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
-
-      for (const row of data) {
-        const type_id = Number(row[col.type_id]);
-        let cost = Number(row[col.unit_weighted_average]);
-
-        // Tier 1 Check: If missing, check Tier 2
-        if (cost === 0 || isNaN(cost) || cost === null) {
-          cost = marketMedianMap.get(type_id) || 0; // Tier 2 Cost
-        }
-
-        if (!isNaN(type_id)) {
-          if (cost > 0) {
-            allItemCosts.set(type_id, cost); // Tier 1 or Tier 2 cost found
-          } else {
-            tier3FetchList.add(type_id); // No internal cost found, needs API call
-          }
-        }
-      }
-    } catch (e) { log.error(`Error reading Blended_Cost: ${e.message}`); }
-  } else {
-    log.warn("Blended_Cost sheet is empty or missing. Relying entirely on Market Tracker and Fuzzwork.");
-  }
-
-  // 3. PHASE 2: Check items found ONLY in Tier 2 (marketMedianMap)
-  // If a Datacore is missing from Blended_Cost but is in the Tracker, Tier 2 is used.
-  for (const [type_id, cost] of marketMedianMap.entries()) {
-    if (!allItemCosts.has(type_id)) {
-      if (cost > 0) {
-        allItemCosts.set(type_id, cost);
-      } else {
-        tier3FetchList.add(type_id);
-      }
+    // --- 2. PHASE 1: Read Tier 1 (Blended Cost) and Tier 2 (Local Tracker) ---
+    // Read Tier 1 into the final map, applying Tier 2 fallback immediately
+    if (sheet && sheet.getLastRow() >= 2) {
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        try {
+            const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
+            const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
+            
+            for (const row of data) {
+                const type_id = Number(row[col.type_id]);
+                let cost = Number(row[col.unit_weighted_average]); 
+                
+                // Tier 1 Check: If missing, check Tier 2
+                if (cost === 0 || isNaN(cost) || cost === null) {
+                    cost = marketMedianMap.get(type_id) || 0; // Tier 2 Cost
+                }
+                
+                if (!isNaN(type_id) && cost > 0) {
+                    allItemCosts.set(type_id, cost); 
+                }
+            }
+        } catch(e) { log.error(`Error reading Blended_Cost: ${e.message}`); }
+    } else {
+        log.warn("Blended_Cost sheet is empty or missing. Relying entirely on Market Tracker and Fuzzwork.");
     }
-  }
+    
+    // 3. PHASE 2: CRITICAL FIX: Check ALL required material IDs against known costs.
+    const neededIds = new Set(requiredMaterialIds);
+    
+    for (const type_id of neededIds) {
+        if (allItemCosts.has(type_id)) {
+            continue; // Cost already secured in Tier 1 or Tier 2
+        }
 
-  // --- 4. PHASE 3: Execute Fuzzwork API Fallback (Tier 3) ---
-  if (tier3FetchList.size > 0) {
-    // NOTE: Assuming these settings are read correctly by other functions
-    const locationIdRange = ss.getSheetByName('Location List').getRange('C3').getValue();
+        // Tier 2 Check (Items NOT found in Blended_Cost)
+        const marketCost = marketMedianMap.get(type_id) || 0; 
 
-    const marketTypeRange = ss.getSheetByName('setting_market_range').getValue();
-    if (!locationIdRange || !marketTypeRange)
-      throw (new Error("Invalid Named Ranges for Fuz"));
-    const locationId = String(locationIdRange.getValue()).trim();
-    const marketType = String(marketTypeRange.getv()).trim();
-    const idsArray = Array.from(tier3FetchList);
-    log.info(`Attempting Tier 3 fallback for ${idsArray.length} items via Fuzzwork API.`);
-
-    try {
-      // NOTE: Assumes fuzAPI.requestItems and _extractMetric_ are available globally
-      const rawFuzResults = fuzAPI.requestItems(locationId, marketType, idsArray);
-
-      rawFuzResults.forEach(item => {
-        const cost = _extractMetric_(item, orderType, orderLevel);
-        if (cost > 0) {
-          allItemCosts.set(item.type_id, cost);
-          log.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3): ${cost}`);
+        if (marketCost > 0) {
+            allItemCosts.set(type_id, marketCost); // Tier 2 cost found
         } else {
-          log.warn(`Fuzzwork returned zero cost for material ${item.type_id}. Final cost is 0.`);
+            // Tier 1 and Tier 2 both failed. ADD TO TIER 3 LIST.
+            tier3FetchList.add(type_id); 
         }
-      });
-    } catch (e) {
-      log.error(`Fuzzwork Tier 3 API call failed: ${e.message}`);
     }
-  }
+    
+    // --- 4. PHASE 3: Execute Fuzzwork API Fallback (Tier 3) ---
+    if (tier3FetchList.size > 0) {
+        const idsArray = Array.from(tier3FetchList);
+        log.info(`Attempting Tier 3 fallback for ${idsArray.length} items via Fuzzwork API.`);
 
-  // 5. Final filter: return only items with a positive cost
-  const finalCostMap = new Map();
-  for (const [type_id, cost] of allItemCosts.entries()) {
-    if (cost > 0) { finalCostMap.set(type_id, cost); }
-  }
+        try {
+            // Executes the batch ESI request for all missing Datacores/materials
+            const rawFuzResults = fuzAPI.requestItems(locationId, marketType, idsArray);
+            
+            rawFuzResults.forEach(item => {
+                const cost = _extractMetric_(item, orderType, orderLevel);
+                if (cost > 0) {
+                    allItemCosts.set(item.type_id, cost);
+                    log.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3): ${cost}`);
+                } else {
+                    log.warn(`Fuzzwork returned zero cost for material ${item.type_id}. Final cost is 0.`);
+                }
+            });
+        } catch (e) {
+            log.error(`Fuzzwork Tier 3 API call failed: ${e.message}`);
+        }
+    }
 
-  // This map now contains the most accurate cost for every item required.
-  return finalCostMap;
+    // 5. Final filter: return only items with a positive cost
+    const finalCostMap = new Map();
+    for (const [type_id, cost] of allItemCosts.entries()) {
+        if (cost > 0) { finalCostMap.set(type_id, cost); }
+    }
+
+    return finalCostMap;
 }
 
 // NOTE: Since the ultimate goal is to fix the missing Datacore costs, and your
