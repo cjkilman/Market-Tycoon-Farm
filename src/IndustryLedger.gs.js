@@ -967,3 +967,113 @@ function runBpoAmortizationSetupAndCalculate() {
     
     return finalData.length;
 }
+
+
+/**
+ * Helper to get the manual amortization surcharge for BPOs.
+ * Implements a three-tiered pricing fallback: Blended > Tracker Median > Fuzzwork API.
+ */
+function _getBpoAmortizationMap(ss) {
+    const AMORT_SHEET_NAME = "BPO_Amortization";
+    const AMORT_HEADERS = ['bp_type_id', 'Amortization_Runs'];
+    const amortMap = new Map();
+    const log = LoggerEx.withTag('BPO_AMORT');
+
+    // 1. Retrieve essential data maps (Assuming SDE functions are available)
+    const { sdeProdMap } = _getSdeMaps(ss);
+    const blendedCostMap = _getBlendedCostMap(ss); 
+    const marketMedianMap = _getMarketMedianMap(ss);
+    
+    const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
+    const lastRow = sheet ? sheet.getLastRow() : 0;
+    if (lastRow < 2) { log.error(`Sheet '${AMORT_SHEET_NAME}' has no data rows. Amortization is 0.`); return amortMap; }
+
+    // --- NAMED RANGE SETTINGS FOR FUZZWORK FALLBACK (Tier 3) ---
+    // NOTE: Assumes _getNamedOr_ is available globally
+    const locationId = _getNamedOr_('setting_sell_loc', 60003760); // Default to Jita 4-4
+    const marketType = _getNamedOr_('setting_market_list', 'region'); 
+    // We want the highest price a buyer is offering (Max Buy Order)
+    const orderType = 'buy'; 
+    const orderLevel = 'max'; 
+    // -----------------------------------------------------------
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+    try {
+        const col = _getColIndexMap(headers, AMORT_HEADERS);
+        const numRows = lastRow - 1;
+        
+        let data = [];
+        if (numRows > 0) { data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues(); } 
+
+        const typeIdsToFetch = [];
+        const amortizationData = [];
+
+        // --- PHASE 1: IDENTIFY MISSING PRICES & BUILD DATA STRUCTURE ---
+        for (const row of data) {
+            const bp_type_id = Number(row[col.bp_type_id]);
+            const totalRuns = Number(row[col.Amortization_Runs]); 
+            if (totalRuns <= 0) continue; 
+            
+            // Map BPO Asset ID to final Product Item ID
+            const productObj = sdeProdMap.get(bp_type_id);
+            if (!productObj) {
+                log.warn(`BPO ${bp_type_id}: Cannot find manufactured product in SDE. Skipping.`);
+                continue;
+            }
+            const product_id = productObj.productTypeID;
+            
+            const localValue = blendedCostMap.get(product_id) || marketMedianMap.get(product_id) || 0;
+            
+            // Collect data needed for final calculation pass
+            amortizationData.push({ bpId: bp_type_id, productId: product_id, runs: totalRuns, localValue: localValue });
+            
+            // If local value is zero (Tier 1 & 2 failed), add to the Fuzzwork fetch list
+            if (localValue === 0) {
+                typeIdsToFetch.push(product_id);
+            }
+        }
+        
+        // --- PHASE 2: EXECUTE FUZZWORK API FALLBACK (Tier 3) ---
+        let fuzzworkPrices = new Map();
+        if (typeIdsToFetch.length > 0) {
+             // NOTE: This assumes 'fuzAPI.requestItems' is defined in FuzzApiPrice.js
+             // We use a simplified form that only requests the items and processes the price directly.
+             const rawFuzResults = fuzAPI.requestItems(locationId, marketType, typeIdsToFetch);
+             
+             // Process the raw results to get the requested metric (Max Buy)
+             rawFuzResults.forEach(item => {
+                 // Assumes _extractMetric_ is available in the GESI Extentions/FuzzApiPrice file
+                 const price = _extractMetric_(item, orderType, orderLevel);
+                 if (price > 0) {
+                    fuzzworkPrices.set(item.type_id, price);
+                 }
+             });
+             log.info(`Fetched ${fuzzworkPrices.size} fallback prices from Fuzzwork API (Tier 3).`);
+        }
+
+        // --- PHASE 3: FINAL CALCULATION PASS ---
+        for (const item of amortizationData) {
+            let bpoValue = item.localValue;
+            
+            // Check Tier 3: External Fuzzwork API (Only runs if localValue was 0)
+            if (bpoValue === 0) {
+                bpoValue = fuzzworkPrices.get(item.productId) || 0;
+                if (bpoValue > 0) {
+                    log.warn(`BPO ${item.bpId}: Using external Fuzzwork API fallback price.`);
+                }
+            }
+            
+            // Final Amortization Assignment
+            if (bpoValue > 0) {
+                const surchargePerRun = bpoValue / item.runs;
+                amortMap.set(item.bpId, surchargePerRun);
+            } else { 
+                log.warn(`BPO ${item.bpId}: No market value found (All sources failed). Amortization skipped.`); 
+            }
+        }
+        return amortMap;
+    } catch(e) { 
+        log.error(`Configuration Error in ${AMORT_SHEET_NAME}: ${e.message}`); 
+        throw e;
+    }
+}
