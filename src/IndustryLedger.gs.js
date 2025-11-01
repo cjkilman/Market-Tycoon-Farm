@@ -1189,3 +1189,69 @@ function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
     return [['ERROR', e.message]];
   }
 }
+
+// --- Add a new function similar to _getCorporateBlueprintsRaw ---
+
+/**
+ * Fetches and Caches the raw array of corporate industry jobs,
+ * using sharding to bypass the "Argument too large" limitation.
+ */
+function _getCorporateJobsRaw(forceRefresh) {
+    // NOTE: Assumes getCorpAuthChar() is available globally
+    const authToon = getCorpAuthChar(); 
+    const ENDPOINT = 'corporations_corporation_industry_jobs';
+    const CACHE_KEY = 'CORP_JOBS_RAW_V1' + ':' + authToon;
+    const CACHE_TTL = 300; // 5 minutes TTL
+
+    if (!authToon) { return null; }
+    
+    // 1. Attempt to read from cache (using de-chunking)
+    if (!forceRefresh) {
+        const cachedJson = _getAndDechunk(CACHE_KEY); 
+        if (cachedJson) { return JSON.parse(cachedJson); }
+    }
+
+    // 2. Live API Call
+    try {
+        // NOTE: This assumes a globally accessible GESI object
+        const rawObjects = GESI.invokeRaw(
+            ENDPOINT,
+            { name: authToon, show_column_headings: false, version: null }
+        );
+
+        if (!Array.isArray(rawObjects) || rawObjects.length === 0) { return null; }
+
+        // 3. Store in cache (using chunking, resolves Argument too large)
+        const rawJsonString = JSON.stringify(rawObjects);
+        // NOTE: Uses the _chunkAndPut function already in IndustryLedger.gs.js
+        _chunkAndPut(CACHE_KEY, rawJsonString, CACHE_TTL);
+        
+        return rawObjects;
+
+    } catch (e) {
+        // Add robust error logging
+        Logger.log(`Failed to invoke GESI endpoint ${ENDPOINT} (Final Attempt): ${e.message}.`);
+        return null;
+    }
+}
+
+// --- Create a Custom Function for the ESI Corp Jobs sheet to use this raw data ---
+
+/**
+ * Custom function to populate ESI Corp Jobs sheet from cached, sharded data.
+ * @customfunction
+ */
+function GESI_CORP_JOBS_CACHED(authCharName) {
+    const rawData = _getCorporateJobsRaw(false);
+    
+    if (!rawData) {
+        return [['ERROR: Data not available or API failed (check logs)'],['Argument too large: value']];
+    }
+    
+    // Convert array of objects to array of arrays (compatible with Sheet output)
+    const headerRow = Object.keys(rawData[0] || {});
+    const values = rawData.map(obj => headerRow.map(key => obj[key]));
+    
+    // Return the headers and the values
+    return [headerRow, ...values];
+}
