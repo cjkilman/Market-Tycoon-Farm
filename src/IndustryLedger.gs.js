@@ -1,8 +1,12 @@
 /**
  * IndustryLedger.gs.js
  *
- * This module is the Industry Ledger Add-on, built for robust COGS accounting.
- * It includes sharding utilities to bypass the Google Apps Script Cache limit.
+ * This module is the Industry Ledger Add-on. It executes in two stages:
+ * 1. Process BPC creation (Copy/Invention) jobs to calculate the cost-per-run (WAC).
+ * 2. Process Manufacturing jobs, applying BPO/BPC costs and ME material savings,
+ * and writes final COGS data to the Material_Ledger via the ML API.
+ *
+ * NOTE: This file assumes 'getOrCreateSheet', 'ML.forSheet', 'getCorpAuthChar', and 'LoggerEx' are in scope.
  */
 
 // --- GLOBAL CONSTANTS ---
@@ -92,7 +96,7 @@ function _getAndDechunk(key) {
 
 
 // ----------------------------------------------------------------------
-// --- CORE UTILITY: DYNAMIC HEADER MAPPING (FIXES SCOPE ISSUES) ---
+// --- CORE UTILITY: DYNAMIC HEADER MAPPING ---
 // ----------------------------------------------------------------------
 
 /**
@@ -111,6 +115,7 @@ function _getColIndexMap(headers, requiredHeaders) {
     }
     return col;
 }
+
 
 // ----------------------------------------------------------------------
 // --- MASTER ADD-ON INTEGRATION ---
@@ -341,7 +346,7 @@ function runIndustryLedgerUpdate() {
     ledgerObjects.push({
       date: job.end_date,
       type_id: job.product_type_id,
-      item_name: nameMap.get(job.product_type_id) || `Product ${job.product_id}`,
+      item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
       qty: totalUnitsProduced,
       unit_value: '', 
       source: "INDUSTRY",
@@ -371,93 +376,6 @@ function runIndustryLedgerUpdate() {
 // ----------------------------------------------------------------------
 // --- DATA HELPER FUNCTIONS (Consolidated) ---
 // ----------------------------------------------------------------------
-
-/**
- * SHARED FUNCTION: Fetches and Caches the raw array of corporate blueprints (BPOs/BPCs) 
- * using sharding to bypass the "Argument too large" limitation.
- */
-function _getCorporateBlueprintsRaw(forceRefresh) {
-    const log = LoggerEx.withTag('BPO_DATA');
-    const authToon = getCorpAuthChar(); 
-    const ENDPOINT = 'corporations_corporation_blueprints';
-    const userCache = CacheService.getUserCache();
-
-    if (!authToon) {
-        log.error("Cannot resolve authorized corporation character.");
-        return null;
-    }
-
-    const cacheKey = BPO_RAW_CACHE_KEY + ':' + authToon;
-    
-    // 1. Attempt to read from cache (using de-chunking)
-    if (!forceRefresh) {
-        const cachedJson = _getAndDechunk(cacheKey);
-        if (cachedJson) {
-            log.info("Blueprints fetched from User Cache (De-chunked).");
-            return JSON.parse(cachedJson);
-        }
-    }
-
-    // 2. Live API Call (If not in cache or forced)
-    try {
-        log.info("Fetching corporate blueprints via GESI.invokeRaw (Live API call).");
-        
-        const rawObjects = GESI.invokeRaw(
-            ENDPOINT,
-            {
-                name: authToon,
-                show_column_headings: false,
-                version: null
-            }
-        );
-
-        if (!Array.isArray(rawObjects) || rawObjects.length === 0) {
-            log.error(`GESI.invokeRaw(${ENDPOINT}) returned no usable data.`);
-            return null;
-        }
-
-        // 3. Store in cache (using chunking)
-        const rawJsonString = JSON.stringify(rawObjects);
-        _chunkAndPut(cacheKey, rawJsonString, BPO_RAW_CACHE_TTL);
-        
-        return rawObjects;
-
-    } catch (e) {
-        log.error(`Failed to invoke GESI endpoint ${ENDPOINT} (Final Attempt): ${e.message}.`);
-        throw e;
-    }
-}
-
-/**
- * Helper to get BPO/BPC efficiency attributes by calling GESI.corporation_blueprints() directly.
- * * Uses the shared, cached data source.
- */
-function _getBpoAttributesMapFromEsi() {
-    const rawObjects = _getCorporateBlueprintsRaw(); 
-    
-    if (!rawObjects) { 
-        LOG_INDUSTRY.error("Blueprint Raw Data Fetch failed. Cannot calculate attributes."); 
-        return new Map(); 
-    }
-
-    const attributesMap = new Map();
-
-    for (const bpObj of rawObjects) {
-        const bp_type_id = Number(bpObj.type_id);
-        const me = Number(bpObj.material_efficiency);
-        const te = Number(bpObj.time_efficiency); 
-
-        if (!isNaN(bp_type_id) && bp_type_id > 0) {
-            attributesMap.set(bp_type_id, {
-                material_efficiency: me,
-                time_efficiency: te
-            });
-        }
-    }
-    
-    LOG_INDUSTRY.info(`Loaded attributes for ${attributesMap.size} unique blueprints.`);
-    return attributesMap;
-}
 
 /**
  * Helper to get the current blended cost for all items (from Blended_Cost).
