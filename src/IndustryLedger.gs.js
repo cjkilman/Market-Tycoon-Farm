@@ -1079,6 +1079,26 @@ function _getBpoAmortizationMap(ss) {
 }
 
 /**
+ * Utility to extract the price metric (min, max, median, etc.) 
+ * from a single Fuzzwork aggregate object.
+ * This function resolves the ReferenceError in the amortization loop.
+ * * @param {Object} row - The full Fuzzwork aggregate object for one item ID.
+ * @param {string} side - 'buy' or 'sell'.
+ * @param {string} level - 'min', 'max', 'avg', 'median', 'volume'.
+ * @returns {number} The numeric price, or 0 if not found.
+ */
+function _extractMetric_(row, side, level) {
+    if (!row || !row[side]) return 0;
+
+    const node = row[side];
+    const v = node[level];
+    const num = Number(v);
+    
+    // Return numeric price, or 0 if not found/invalid
+    return Number.isFinite(num) ? num : 0;
+}
+
+/**
  * Helper to retrieve 30-day traded volume from the Publish_ESI_Region_market_orders sheet.
  * @returns {Map<number, number>} Map of type_id -> vol30_region (30-day traded volume)
  */
@@ -1117,4 +1137,55 @@ function _getMarketDemandMap(ss) {
         LOG_INDUSTRY.error(`Error reading market demand sheet: ${e.message}`); 
         return demandMap;
     }
+}
+
+
+/**
+ * Custom function to fetch Corporation Industry Jobs with caching (Memoization + CacheService).
+ * Prevents continuous API calls during sheet recalculations.
+ * * @param {string} name Character name with ESI Corp Jobs scope.
+ * @param {boolean} [include_completed=false] Whether to include completed jobs.
+ * @returns {any[][]} Raw data from GESI call.
+ * @customfunction
+ */
+function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
+  // Use a short, unique key for the ESI endpoint
+  const CACHE_KEY_BASE = 'CorpIndJobsRaw';
+  const CACHE_TTL = 300; // 5 minutes
+
+  if (!name) return [['Error: Auth name required']];
+
+  // 1. Determine Cache Key
+  const key = CACHE_KEY_BASE + ':' + name + ':' + (include_completed ? 'C' : 'A');
+  
+  // 2. Try in-memory memoization (optional, but faster for immediate reuse)
+  // NOTE: You would need to define a global map (e.g., _cijMemo) for this, 
+  // but for simplicity, we focus on the script-level CacheService.
+  const cache = CacheService.getUserCache();
+
+  // 3. Check CacheService
+  let jsonText = cache.get(key);
+  if (jsonText) {
+    // Return cached data
+    return JSON.parse(jsonText);
+  }
+
+  // 4. Live API Call (Cache Miss)
+  try {
+    // NOTE: This assumes a globally accessible GESI object
+    const rawData = GESI.corporations_corporation_industry_jobs(name, include_completed);
+
+    // 5. Store in CacheService
+    if (Array.isArray(rawData) && rawData.length > 0) {
+      jsonText = JSON.stringify(rawData);
+      cache.put(key, jsonText, CACHE_TTL);
+    }
+    
+    return rawData;
+
+  } catch (e) {
+    // Log error and return a message to prevent the whole sheet from failing
+    Logger.log(`ESI Corp Jobs GESI call failed: ${e.message}`);
+    return [['ERROR', e.message]];
+  }
 }
