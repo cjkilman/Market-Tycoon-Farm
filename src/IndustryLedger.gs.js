@@ -1287,10 +1287,15 @@ const authToon = "Jason KIlman"; // <--- REPLACE THIS LINE
     // 2. Live API Call
     try {
         // NOTE: This assumes a globally accessible GESI object
-        const rawObjects = GESI.invokeRaw(
-            ENDPOINT,
-            {include_completed: true,  name: authToon, show_column_headings: false, version: null }
-        );
+    const rawObjects = GESI.invokeRaw(
+        ENDPOINT,
+        {
+          include_completed: true,
+            name: authToon,
+            show_column_headings: false,
+            version: null
+        }
+    );
 
         if (!Array.isArray(rawObjects) || rawObjects.length === 0) { return null; }
 
