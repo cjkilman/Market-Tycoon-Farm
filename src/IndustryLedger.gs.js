@@ -1,12 +1,15 @@
 /**
  * IndustryLedger.gs.js
  *
- * This module is split into two stages for complete industry cost accounting:
+ * This module is the Industry Ledger Add-on. It executes in two stages:
  * 1. Process BPC creation (Copy/Invention) jobs to calculate the cost-per-run (WAC).
- * 2. Process Manufacturing jobs, applying BPO/BPC costs and ME material savings.
+ * 2. Process Manufacturing jobs, applying BPO/BPC costs and ME material savings,
+ * and writes final COGS data to the Material_Ledger via the ML API.
  *
- * NOTE: This file assumes the utility functions 'getOrCreateSheet' and 
- * 'withSheetLock' are available in the project scope (e.g., from Utility.gs).
+ * NOTE: This file assumes the following functions are available in the project scope:
+ * - getOrCreateSheet, withSheetLock (from Utility.gs)
+ * - GESI.corporation_blueprints(), GESI.invoke()
+ * - ML.forSheet, LoggerEx (from ML.gs and Logger.gs)
  */
 
 // --- GLOBAL CONSTANTS ---
@@ -18,35 +21,44 @@ const INDUSTRY_ACTIVITY_MANUFACTURING = 1;
 const INDUSTRY_ACTIVITY_COPYING = 5;
 const INDUSTRY_ACTIVITY_INVENTION = 8;
 
-// Placeholder for logging/console output
 const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('IndustryLedger') : console);
 
 
 // ----------------------------------------------------------------------
-// --- CORE UTILITY: DYNAMIC HEADER MAPPING ---
+// --- MASTER ADD-ON INTEGRATION ---
 // ----------------------------------------------------------------------
 
 /**
- * Utility function to dynamically find column indices by header name.
- * @throws {Error} if any required header is missing.
+ * Executes the full two-stage Industry Ledger process under the main system lock.
+ * This is the function that should be called by the 'runAllLedgerImports' master loop.
  */
-function _getColIndexMap(headers, requiredHeaders) {
-    const col = {};
-    const lowerCaseHeaders = headers.map(h => h.toLowerCase().trim());
+function runIndustryLedgerPhase(ss) {
+    const log = LoggerEx.withTag('MASTER_SYNC');
     
-    for (const req of requiredHeaders) {
-        const index = lowerCaseHeaders.indexOf(req.toLowerCase().trim());
-        if (index === -1) {
-            throw new Error(`CRITICAL HEADER ERROR: Sheet is missing required column "${req}".`);
-        }
-        col[req] = index;
+    log.info('--- Starting Industry Ledger Phase (BPC Costing & Manufacturing COGS) ---');
+
+    // --- STAGE 1: Calculate WAC (Cost of BPC per run) ---
+    try {
+        log.info('Running BPC Creation Ledger (Stage 1: Calculate WAC)...');
+        runBpcCreationLedger(ss);
+    } catch (e) {
+        log.error('BPC Creation Ledger (Stage 1) FAILED. Subsequent costing may use stale BPC data.', e);
     }
-    return col;
+
+    // --- STAGE 2: Process Manufacturing Jobs (Calculate final COGS) ---
+    try {
+        log.info('Running Manufacturing Ledger Update (Stage 2: COGS)...');
+        runIndustryLedgerUpdate(ss);
+    } catch (e) {
+        log.error('Manufacturing Ledger Update (Stage 2) FAILED', e);
+    }
+    
+    log.info('--- Industry Ledger Phase Complete ---');
 }
 
 
 // ----------------------------------------------------------------------
-// --- MAIN FUNCTION STAGE 1: BPC Cost Calculation ---
+// --- MAIN FUNCTION STAGE 1: BPC Cost Calculation (WAC) ---
 // ----------------------------------------------------------------------
 
 function runBpcCreationLedger() {
@@ -99,10 +111,10 @@ function runBpcCreationLedger() {
 
     if (missingCost) continue;
 
-    // B. Get Preset Runs per BPC (The standardizing variable)
+    // B. Get Preset Runs per BPC (Standardizing variable)
     const presetRuns = presetRunsMap.get(job.blueprint_type_id) || 1;
-    if (presetRuns === 1) {
-         LOG_INDUSTRY.warn(`Using 1 as Preset_Runs for BP ${job.blueprint_type_id}. Ensure this is correct in Config_BPC_Runs.`);
+    if (presetRuns === 1 && job.activity_id === INDUSTRY_ACTIVITY_COPYING) {
+         LOG_INDUSTRY.warn(`Using 1 as Preset_Runs for BP ${job.blueprint_type_id}. Copying BPCs may have inaccurate cost-per-run.`);
     }
 
     // C. Get Total Costs
@@ -179,13 +191,14 @@ function runIndustryLedgerUpdate() {
   const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
   if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
 
-  // 4. Calculate cost and create ledger rows
-  const ledgerRows = [];
+  // 4. Calculate cost and generate ledger row objects
+  const ledgerObjects = [];
   const newlyProcessedIds = [];
+  const ledgerAPI = ML.forSheet('Material_Ledger'); // Initialize Ledger API
 
   for (const job of newJobs) {
     const materials = sdeMatMap.get(job.blueprint_type_id);
-    const product = sdeProdMap.get(job.blueprint_type_id);
+    const product = prodMap.get(job.blueprint_type_id);
 
     if (!materials || !product) { LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`); continue; }
 
@@ -213,12 +226,12 @@ function runIndustryLedgerUpdate() {
     
     let amortizationSurcharge = 0;
     
-    // BPO AMORTIZATION: Use Amortization Surcharge (Capital Cost)
+    // BPO AMORTIZATION (Capital Cost)
     if (amortMap.has(job.blueprint_type_id)) {
         amortizationSurcharge = amortMap.get(job.blueprint_type_id) * job.runs;
         LOG_INDUSTRY.info(`Job ${job.job_id}: Added BPO research amortization cost of ${amortizationSurcharge.toFixed(2)} ISK.`);
     } 
-    // BPC AMORTIZATION: Use WAC (Disposable Asset Cost)
+    // BPC AMORTIZATION (Disposable Asset Cost)
     else {
         const bpcCostPerRun = getBpcCostPerRun(job.blueprint_type_id);
         amortizationSurcharge = bpcCostPerRun * job.runs;
@@ -237,25 +250,31 @@ function runIndustryLedgerUpdate() {
 
     const unitManufacturingCost = totalActualCost / totalUnitsProduced;
 
-    // 5. Create the row for Material_Ledger
-    ledgerRows.push([
-      job.end_date, job.product_type_id, nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
-      totalUnitsProduced, unitManufacturingCost, "INDUSTRY", 
-      job.job_id, job.installer_id, unitManufacturingCost
-    ]);
+    // D. Create Normalized Object for ML API
+    ledgerObjects.push({
+      date: job.end_date,
+      type_id: job.product_type_id,
+      item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
+      qty: totalUnitsProduced,
+      unit_value: '', 
+      source: "INDUSTRY",
+      contract_id: job.job_id,
+      char: job.installer_id,
+      unit_value_filled: unitManufacturingCost
+    });
     
     newlyProcessedIds.push(job.job_id);
   }
 
-  // 6. Append new rows and save state
-  if (ledgerRows.length > 0) {
-    const ledgerSheet = ss.getSheetByName("Material_Ledger");
-    if (!ledgerSheet) { LOG_INDUSTRY.error("Cannot find 'Material_Ledger' sheet!"); return; }
-    const startRow = ledgerSheet.getLastRow() + 1;
-    ledgerSheet.getRange(startRow, 1, ledgerRows.length, ledgerRows[0].length).setValues(ledgerRows);
-    LOG_INDUSTRY.info(`Successfully added ${ledgerRows.length} manufacturing jobs to the ledger.`);
+  // 5. Upsert new rows using the ML API
+  if (ledgerObjects.length > 0) {
+    const writtenCount = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
+    LOG_INDUSTRY.info(`Successfully processed and wrote ${writtenCount} new manufacturing jobs to the Material_Ledger.`);
+  } else {
+    LOG_INDUSTRY.info("Finished processing. No new rows to write to Material_Ledger.");
   }
 
+  // 6. Save new state (processed job IDs)
   newlyProcessedIds.forEach(id => processedJobIds.add(id));
   const trimmedJobIds = Array.from(processedJobIds).slice(-1000);
   SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(trimmedJobIds));
@@ -263,7 +282,7 @@ function runIndustryLedgerUpdate() {
 
 
 // ----------------------------------------------------------------------
-// --- DATA HELPER FUNCTIONS ---
+// --- DATA HELPER FUNCTIONS (Consolidated) ---
 // ----------------------------------------------------------------------
 
 /**
@@ -417,8 +436,8 @@ function _getConfigPresetRuns(ss) {
     const presetMap = new Map();
     
     const DEFAULT_PRESETS = [
-        { id: 237, runs: 100 }, 
-        { id: 3529, runs: 10 },
+        { id: 237, runs: 100 }, // Example T1 BPC
+        { id: 3529, runs: 10 }, // Example T2 BPC
     ];
 
     const sheet = getOrCreateSheet(ss, CONFIG_NAME, CONFIG_HEADERS); 
@@ -431,9 +450,7 @@ function _getConfigPresetRuns(ss) {
             let data = [];
             const numRows = lastRow - 1;
 
-            if (numRows > 0) {
-                data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
-            }
+            if (numRows > 0) { data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues(); }
 
             for (const row of data) {
                 const bp_type_id = Number(row[col.bp_type_id]);
@@ -465,9 +482,7 @@ function _getMarketMedianMap(ss) {
         
         let data = [];
         const numRows = sheet.getLastRow() - 1;
-        if (numRows > 0) {
-            data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
-        }
+        if (numRows > 0) { data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues(); }
 
         const medianMap = new Map();
 
