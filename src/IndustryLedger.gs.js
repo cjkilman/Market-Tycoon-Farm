@@ -333,23 +333,50 @@ function _getMarketMedianMap(ss) {
 /**
  * Helper to get BPC preset runs from a 'Config' sheet (Needed for BPC WAC).
  */
+/**
+ * Helper to get BPC preset runs from a 'Config_BPC_Runs' sheet.
+ * Uses getOrCreateSheet to ensure the sheet exists.
+ * @returns {Map<number, number>} Map of blueprint_type_id -> preset_runs
+ */
 function _getConfigPresetRuns(ss) {
-    const sheet = ss.getSheetByName("Config_BPC_Runs");
+    const CONFIG_NAME = "Config_BPC_Runs";
+    // These are the exact headers required for the WAC calculation
+    const CONFIG_HEADERS = ['bp_type_id', 'preset_runs'];
     const presetMap = new Map();
     
-    if (!sheet) {
-        LOG_INDUSTRY.warn("Sheet 'Config_BPC_Runs' not found. BPC WAC calculation will fail.");
+    // 1. Use the provided getOrCreateSheet utility to ensure the sheet exists.
+    const sheet = getOrCreateSheet(ss, CONFIG_NAME, CONFIG_HEADERS); 
+    
+    // Check 2: If sheet creation/retrieval failed or sheet is empty, exit gracefully
+    const lastRow = sheet ? sheet.getLastRow() : 0;
+    if (lastRow < 2) {
+        LOG_INDUSTRY.warn(`Config sheet '${CONFIG_NAME}' created/found but has no data rows. Skipping BPC cost calculation.`);
         return presetMap;
     }
 
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
-    for (const row of data) {
-      const bp_type_id = Number(row[0]);
-      const preset_runs = Number(row[1]);
-      if (!isNaN(bp_type_id) && !isNaN(preset_runs) && preset_runs > 0) {
-        presetMap.set(bp_type_id, preset_runs);
-      }
+    // Dynamic Header Lookup and data processing (rows 2 onwards)
+    const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+    try {
+        const col = _getColIndexMap(headers, CONFIG_HEADERS);
+        
+        const numRows = lastRow - 1;
+        
+        // We read data starting from row 2 up to the last row
+        const data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
+
+        for (const row of data) {
+            const bp_type_id = Number(row[col.bp_type_id]);
+            const preset_runs = Number(row[col.preset_runs]);
+
+            if (!isNaN(bp_type_id) && !isNaN(preset_runs) && preset_runs > 0) {
+                presetMap.set(bp_type_id, preset_runs);
+            }
+        }
+    } catch (e) {
+        // Log critical header error but allow to return empty map
+        LOG_INDUSTRY.error(`Configuration Error in ${CONFIG_NAME}: ${e.message}`);
     }
+
     return presetMap;
 }
 
