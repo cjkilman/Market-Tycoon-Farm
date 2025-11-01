@@ -1077,3 +1077,44 @@ function _getBpoAmortizationMap(ss) {
         throw e;
     }
 }
+
+/**
+ * Helper to retrieve 30-day traded volume from the Publish_ESI_Region_market_orders sheet.
+ * @returns {Map<number, number>} Map of type_id -> vol30_region (30-day traded volume)
+ */
+function _getMarketDemandMap(ss) {
+    const TRACKER_SHEET_NAME = "Publish_ESI_Region_market_orders";
+    const VOLUME_HEADER = 'vol30_region'; // Column header for 30-day volume
+    
+    const sheet = ss.getSheetByName(TRACKER_SHEET_NAME);
+    const demandMap = new Map();
+    
+    if (!sheet || sheet.getLastRow() < 2) { 
+        LOG_INDUSTRY.error(`Sheet '${TRACKER_SHEET_NAME}' is missing or empty. Cannot calculate amortization runs.`);
+        return demandMap;
+    }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    try {
+        const col = _getColIndexMap(headers, ['type_id', VOLUME_HEADER]);
+        
+        let data = [];
+        const numRows = sheet.getLastRow() - 1;
+        if (numRows > 0) { data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues(); }
+
+        for (const row of data) {
+            const type_id = Number(row[col.type_id]);
+            // Clean volume string (removes commas) before converting to number
+            const volumeStr = String(row[col[VOLUME_HEADER]]).replace(/,/g, '').trim(); 
+            const volume = Number(volumeStr);
+            
+            if (!isNaN(type_id) && volume > 0) {
+                demandMap.set(type_id, volume);
+            }
+        }
+        return demandMap;
+    } catch(e) { 
+        LOG_INDUSTRY.error(`Error reading market demand sheet: ${e.message}`); 
+        return demandMap;
+    }
+}
