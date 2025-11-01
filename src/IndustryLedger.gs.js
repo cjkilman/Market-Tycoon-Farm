@@ -1,12 +1,8 @@
 /**
  * IndustryLedger.gs.js
  *
- * This module is the Industry Ledger Add-on. It executes in two stages:
- * 1. Process BPC creation (Copy/Invention) jobs to calculate the cost-per-run (WAC).
- * 2. Process Manufacturing jobs, applying BPO/BPC costs and ME material savings,
- * and writes final COGS data to the Material_Ledger via the ML API.
- *
- * NOTE: This file assumes 'getOrCreateSheet', 'ML.forSheet', and 'LoggerEx' are in scope.
+ * This module is the Industry Ledger Add-on, built for robust COGS accounting.
+ * It includes sharding utilities to bypass the Google Apps Script Cache limit.
  */
 
 // --- GLOBAL CONSTANTS ---
@@ -18,16 +14,89 @@ const INDUSTRY_ACTIVITY_MANUFACTURING = 1;
 const INDUSTRY_ACTIVITY_COPYING = 5;
 const INDUSTRY_ACTIVITY_INVENTION = 8;
 
+// --- CACHE SHARDING CONSTANTS ---
+const BPO_RAW_CACHE_KEY = 'BPO_RAW_INVENTORY_V1';
+const BPO_RAW_CACHE_TTL = 3600; // 1 hour TTL
+const MAX_CACHE_CHUNK_SIZE = 90000; // Max chars per chunk (staying below 100KB limit)
+const CHUNK_INDEX_SUFFIX = ':IDX';
+
 const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('IndustryLedger') : console);
 
 
 // ----------------------------------------------------------------------
-// --- CORE UTILITY: DYNAMIC HEADER MAPPING (MOVED TO TOP FOR SCOPE FIX) ---
+// --- CORE UTILITY: CACHE SHARDING FUNCTIONS ---
+// ----------------------------------------------------------------------
+
+/**
+ * Stores a string of arbitrary length into the User Cache using multiple keys (sharding).
+ */
+function _chunkAndPut(key, largeString, ttl) {
+    const cache = CacheService.getUserCache();
+    const chunks = [];
+    const numChunks = Math.ceil(largeString.length / MAX_CACHE_CHUNK_SIZE);
+    
+    // 1. Split the string into chunks
+    for (let i = 0; i < numChunks; i++) {
+        const start = i * MAX_CACHE_CHUNK_SIZE;
+        const end = start + MAX_CACHE_CHUNK_SIZE;
+        chunks.push(largeString.substring(start, end));
+    }
+    
+    // 2. Build the map of keys to write (baseKey:0, baseKey:1, etc.)
+    const keysToWrite = {};
+    for (let i = 0; i < chunks.length; i++) {
+        keysToWrite[key + ':' + i] = chunks[i];
+    }
+    // 3. Write a master index key containing the number of chunks
+    keysToWrite[key + CHUNK_INDEX_SUFFIX] = String(numChunks);
+
+    // 4. Put all chunks and the index key into the cache
+    cache.putAll(keysToWrite, ttl);
+}
+
+/**
+ * Retrieves a large sharded string from the User Cache and reconstructs it.
+ */
+function _getAndDechunk(key) {
+    const cache = CacheService.getUserCache();
+    
+    // 1. Get the index key to find the number of chunks
+    const numChunksRaw = cache.get(key + CHUNK_INDEX_SUFFIX);
+    if (!numChunksRaw) {
+        return null;
+    }
+    const numChunks = parseInt(numChunksRaw, 10);
+
+    // 2. Build the list of keys to retrieve
+    const keysToGet = [];
+    for (let i = 0; i < numChunks; i++) {
+        keysToGet.push(key + ':' + i);
+    }
+
+    // 3. Get all chunks
+    const chunks = cache.getAll(keysToGet);
+
+    // 4. Reconstruct the string
+    const result = [];
+    for (let i = 0; i < numChunks; i++) {
+        const chunk = chunks[key + ':' + i];
+        if (chunk == null) {
+            // If any chunk is missing, the data is corrupt/expired
+            return null; 
+        }
+        result.push(chunk);
+    }
+
+    return result.join('');
+}
+
+
+// ----------------------------------------------------------------------
+// --- CORE UTILITY: DYNAMIC HEADER MAPPING (FIXES SCOPE ISSUES) ---
 // ----------------------------------------------------------------------
 
 /**
  * Utility function to dynamically find column indices by header name.
- * @throws {Error} if any required header is missing.
  */
 function _getColIndexMap(headers, requiredHeaders) {
     const col = {};
@@ -42,7 +111,6 @@ function _getColIndexMap(headers, requiredHeaders) {
     }
     return col;
 }
-
 
 // ----------------------------------------------------------------------
 // --- MASTER ADD-ON INTEGRATION ---
@@ -273,7 +341,7 @@ function runIndustryLedgerUpdate() {
     ledgerObjects.push({
       date: job.end_date,
       type_id: job.product_type_id,
-      item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
+      item_name: nameMap.get(job.product_type_id) || `Product ${job.product_id}`,
       qty: totalUnitsProduced,
       unit_value: '', 
       source: "INDUSTRY",
@@ -303,6 +371,93 @@ function runIndustryLedgerUpdate() {
 // ----------------------------------------------------------------------
 // --- DATA HELPER FUNCTIONS (Consolidated) ---
 // ----------------------------------------------------------------------
+
+/**
+ * SHARED FUNCTION: Fetches and Caches the raw array of corporate blueprints (BPOs/BPCs) 
+ * using sharding to bypass the "Argument too large" limitation.
+ */
+function _getCorporateBlueprintsRaw(forceRefresh) {
+    const log = LoggerEx.withTag('BPO_DATA');
+    const authToon = getCorpAuthChar(); 
+    const ENDPOINT = 'corporations_corporation_blueprints';
+    const userCache = CacheService.getUserCache();
+
+    if (!authToon) {
+        log.error("Cannot resolve authorized corporation character.");
+        return null;
+    }
+
+    const cacheKey = BPO_RAW_CACHE_KEY + ':' + authToon;
+    
+    // 1. Attempt to read from cache (using de-chunking)
+    if (!forceRefresh) {
+        const cachedJson = _getAndDechunk(cacheKey);
+        if (cachedJson) {
+            log.info("Blueprints fetched from User Cache (De-chunked).");
+            return JSON.parse(cachedJson);
+        }
+    }
+
+    // 2. Live API Call (If not in cache or forced)
+    try {
+        log.info("Fetching corporate blueprints via GESI.invokeRaw (Live API call).");
+        
+        const rawObjects = GESI.invokeRaw(
+            ENDPOINT,
+            {
+                name: authToon,
+                show_column_headings: false,
+                version: null
+            }
+        );
+
+        if (!Array.isArray(rawObjects) || rawObjects.length === 0) {
+            log.error(`GESI.invokeRaw(${ENDPOINT}) returned no usable data.`);
+            return null;
+        }
+
+        // 3. Store in cache (using chunking)
+        const rawJsonString = JSON.stringify(rawObjects);
+        _chunkAndPut(cacheKey, rawJsonString, BPO_RAW_CACHE_TTL);
+        
+        return rawObjects;
+
+    } catch (e) {
+        log.error(`Failed to invoke GESI endpoint ${ENDPOINT} (Final Attempt): ${e.message}.`);
+        throw e;
+    }
+}
+
+/**
+ * Helper to get BPO/BPC efficiency attributes by calling GESI.corporation_blueprints() directly.
+ * * Uses the shared, cached data source.
+ */
+function _getBpoAttributesMapFromEsi() {
+    const rawObjects = _getCorporateBlueprintsRaw(); 
+    
+    if (!rawObjects) { 
+        LOG_INDUSTRY.error("Blueprint Raw Data Fetch failed. Cannot calculate attributes."); 
+        return new Map(); 
+    }
+
+    const attributesMap = new Map();
+
+    for (const bpObj of rawObjects) {
+        const bp_type_id = Number(bpObj.type_id);
+        const me = Number(bpObj.material_efficiency);
+        const te = Number(bpObj.time_efficiency); 
+
+        if (!isNaN(bp_type_id) && bp_type_id > 0) {
+            attributesMap.set(bp_type_id, {
+                material_efficiency: me,
+                time_efficiency: te
+            });
+        }
+    }
+    
+    LOG_INDUSTRY.info(`Loaded attributes for ${attributesMap.size} unique blueprints.`);
+    return attributesMap;
+}
 
 /**
  * Helper to get the current blended cost for all items (from Blended_Cost).
@@ -560,214 +715,4 @@ function _getBpoAmortizationMap(ss) {
         }
         return amortMap;
     } catch(e) { LOG_INDUSTRY.error(`Configuration Error in ${AMORT_SHEET_NAME}: ${e.message}`); return new Map(); }
-}
-
-// --- NEW SHARED CONSTANTS ---
-const BPO_RAW_CACHE_KEY = 'BPO_RAW_INVENTORY_V1';
-const BPO_RAW_CACHE_TTL = 3600; // 1 hour TTL for ESI data
-
-/**
- * SHARED FUNCTION: Fetches and Caches the raw array of corporate blueprints (BPOs/BPCs).
- * This function hits the GESI endpoint once per hour/execution unless forced.
- * @param {boolean} [forceRefresh=false] - Skips cache read and forces a live API call.
- * @returns {Array<Object>|null} Array of blueprint objects, or null on failure.
- */
-function _getCorporateBlueprintsRaw(forceRefresh) {
-    const log = LoggerEx.withTag('BPO_DATA');
-    // NOTE: Assumes getCorpAuthChar() is defined and available.
-    const authToon = getCorpAuthChar(); 
-    const ENDPOINT = 'corporations_corporation_blueprints';
-    const userCache = CacheService.getUserCache();
-
-    if (!authToon) {
-        log.error("Cannot resolve authorized corporation character.");
-        return null;
-    }
-
-    const cacheKey = BPO_RAW_CACHE_KEY + ':' + authToon;
-    
-    if (!forceRefresh) {
-        const cached = userCache.get(cacheKey);
-        if (cached) {
-            log.info("Blueprints fetched from User Cache.");
-            return JSON.parse(cached);
-        }
-    }
-
-    try {
-        log.info("Fetching corporate blueprints via GESI.invokeRaw (Live API call).");
-        
-        const rawObjects = GESI.invokeRaw(
-            ENDPOINT,
-            {
-                name: authToon,
-                show_column_headings: false,
-                version: null
-            }
-        );
-
-        if (!Array.isArray(rawObjects) || rawObjects.length === 0) {
-            log.error(`GESI.invokeRaw(${ENDPOINT}) returned no usable data.`);
-            return null;
-        }
-
-        userCache.put(cacheKey, JSON.stringify(rawObjects), BPO_RAW_CACHE_TTL);
-        return rawObjects;
-
-    } catch (e) {
-        log.error(`Failed to invoke GESI endpoint ${ENDPOINT}: ${e.message}.`);
-        throw e; // Fail loud if the API call itself throws an error
-    }
-}
-
-
-/**
- * REFACTORED: Reads blueprint inventory via shared cache and maps ME/TE attributes.
- */
-function _getBpoAttributesMapFromEsi() {
-    // Calls shared function without forcing a refresh
-    const rawObjects = _getCorporateBlueprintsRaw(); 
-    
-    if (!rawObjects) { 
-        LOG_INDUSTRY.error("Blueprint Raw Data Fetch failed. Cannot calculate attributes."); 
-        return new Map(); 
-    }
-
-    const attributesMap = new Map();
-
-    for (const bpObj of rawObjects) {
-        const bp_type_id = Number(bpObj.type_id);
-        const me = Number(bpObj.material_efficiency);
-        const te = Number(bpObj.time_efficiency); 
-
-        if (!isNaN(bp_type_id) && bp_type_id > 0) {
-            attributesMap.set(bp_type_id, {
-                material_efficiency: me,
-                time_efficiency: te
-            });
-        }
-    }
-    
-    LOG_INDUSTRY.info(`Loaded attributes for ${attributesMap.size} unique blueprints.`);
-    return attributesMap;
-}
-
-
-/**
- * REFACTORED: Populates BPO_Amortization sheet using the shared inventory fetcher.
- * Uses forceRefresh=true to ensure the inventory list is current.
- */
-function autofillBpoAmortizationInventory() {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const log = LoggerEx.withTag('BPO_AMORT');
-    
-    const AMORT_SHEET_NAME = "BPO_Amortization";
-    const AMORT_HEADERS = ['bp_type_id', 'Amortization_Runs'];
-
-    try {
-        // 1. Get ALL Blueprints using the shared, cached function (FORCING refresh)
-        const allBlueprints = _getCorporateBlueprintsRaw(true); 
-
-        if (!allBlueprints) {
-            log.error("Failed to fetch blueprint data for inventory sync. Aborting.");
-            return 0;
-        }
-
-        // 2. Filter for Blueprint Originals (BPOs)
-        const uniqueBpoTypeIds = new Set();
-        for (const bp of allBlueprints) {
-            if (Number(bp.runs) === -1) { 
-                const typeId = Number(bp.type_id);
-                if (typeId > 0) {
-                    uniqueBpoTypeIds.add(typeId);
-                }
-            }
-        }
-        
-        const bpoTypeIds = Array.from(uniqueBpoTypeIds).sort((a, b) => a - b);
-        
-        if (bpoTypeIds.length === 0) {
-            log.warn("Found no Blueprint Originals (BPOs) in the corporation inventory.");
-            return 0;
-        }
-
-        // 3. Prepare data for sheet rewrite (Preserve existing runs)
-        const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
-        const lastRow = sheet.getLastRow();
-        const existingValues = sheet.getRange(2, 1, Math.max(1, lastRow - 1), sheet.getMaxColumns()).getValues();
-        
-        const existingRunsMap = new Map();
-        if (lastRow > 1) {
-            existingValues.forEach(row => {
-                const existingId = Number(row[0]);
-                // Ensure a non-zero, non-blank value is present before caching
-                if (existingId > 0 && row[1] != null && row[1] !== "") { 
-                    existingRunsMap.set(existingId, row[1]);
-                }
-            });
-        }
-        
-        // 4. Build Final Data (ID + Preserve existing Runs or set to 0)
-        const finalData = bpoTypeIds.map(id => [
-            id,
-            existingRunsMap.get(id) || 0 // Preserve existing run value, otherwise 0
-        ]);
-
-        // 5. Clear and Rewrite
-        if (lastRow > 1) {
-            sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
-        }
-        
-        if (finalData.length > 0) {
-            sheet.getRange(2, 1, finalData.length, 2).setValues(finalData);
-            log.info(`Successfully synchronized ${finalData.length} BPO Type IDs from inventory to ${AMORT_SHEET_NAME}.`);
-            return finalData.length;
-        } else {
-            return 0;
-        }
-
-    } catch (e) {
-        log.error(`autofillBpoAmortizationInventory FAILED: ${e.message}`);
-        throw e;
-    }
-}
-
-/**
- * Helper to retrieve 30-day traded volume from the Publish_ESI_Region_market_orders sheet.
- * @returns {Map<number, number>} Map of type_id -> vol30_region (30-day traded volume)
- */
-function _getMarketDemandMap(ss) {
-    const sheet = ss.getSheetByName("Publish_ESI_Region_market_orders");
-    const demandMap = new Map();
-    
-    if (!sheet || sheet.getLastRow() < 2) { 
-        LOG_INDUSTRY.error("Sheet 'Publish_ESI_Region_market_orders' is missing or empty.");
-        return demandMap;
-    }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    try {
-        const col = _getColIndexMap(headers, ['type_id', 'vol30_region']);
-        
-        let data = [];
-        const numRows = sheet.getLastRow() - 1;
-        if (numRows > 0) { 
-            data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
-        }
-
-        for (const row of data) {
-            const type_id = Number(row[col.type_id]);
-            // The volume comes as a string and needs cleaning (e.g., "1,234,567" -> 1234567)
-            const volumeStr = String(row[col.vol30_region]).replace(/,/g, '').trim(); 
-            const volume = Number(volumeStr);
-            
-            if (!isNaN(type_id) && volume > 0) {
-                demandMap.set(type_id, volume);
-            }
-        }
-        return demandMap;
-    } catch(e) { 
-        LOG_INDUSTRY.error(`Error reading market demand sheet: ${e.message}`); 
-        return demandMap;
-    }
 }
