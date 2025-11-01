@@ -614,3 +614,118 @@ function _getBpoAttributesMapFromEsi() {
         throw e;
     }
 }
+
+/**
+ * Calculates the BPO's economic lifespan (Amortization_Runs) based on regional market demand.
+ * Target: 10% of 30-day traded volume, projected over 12 months.
+ */
+function autofillBpoAmortizationRuns() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const log = LoggerEx.withTag('BPO_AMORT');
+    
+    const AMORT_SHEET_NAME = "BPO_Amortization";
+    const MARKET_SHARE_TARGET = 0.10; // 10%
+    const PRODUCTION_WINDOW_MONTHS = 12; 
+
+    const sheet = ss.getSheetByName(AMORT_SHEET_NAME);
+    if (!sheet || sheet.getLastRow() < 2) {
+        log.error(`Sheet '${AMORT_SHEET_NAME}' not found or empty. Ensure you have added BPO Type IDs to Column A.`);
+        return 0;
+    }
+
+    // --- 1. Get Market Demand Data (Volume) ---
+    const demandMap = _getMarketDemandMap(ss);
+    if (demandMap.size === 0) {
+        log.error("Could not retrieve market demand volume. Aborting amortization run calculation.");
+        return 0;
+    }
+
+    // --- 2. Read BPO_Amortization Data and Headers ---
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const dataRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns());
+    const amortData = dataRange.getValues();
+
+    try {
+        const col = _getColIndexMap(headers, ['bp_type_id', 'Amortization_Runs']);
+        const typeIdColIndex = col.bp_type_id; 
+        const runsColIndex = col.Amortization_Runs;
+
+        const updatedRuns = []; // Array to store the new runs value
+
+        // --- 3. Calculate New Runs ---
+        for (const row of amortData) {
+            const bp_type_id = Number(row[typeIdColIndex]);
+            
+            // Note: The BPO Type ID is usually the product Type ID for T1 items.
+            const product_type_id = bp_type_id; 
+            
+            const demandVolume = demandMap.get(product_type_id) || 0;
+
+            if (demandVolume > 0) {
+                // Calculation: 30-Day Volume * (12 months) * (10% share)
+                const newRuns = Math.round(
+                    demandVolume * PRODUCTION_WINDOW_MONTHS * MARKET_SHARE_TARGET
+                );
+                
+                // Keep the original data intact, only changing the calculated column
+                row[runsColIndex] = newRuns;
+                log.debug(`BP ${bp_type_id}: Demand ${demandVolume.toLocaleString()} -> Runs ${newRuns.toLocaleString()}`);
+            } else {
+                // If no demand data, keep the existing value (or blank it out)
+                row[runsColIndex] = row[runsColIndex] || ''; 
+            }
+            updatedRuns.push(row);
+        }
+
+        // --- 4. Write Back to Sheet ---
+        if (updatedRuns.length > 0) {
+            dataRange.setValues(updatedRuns);
+            log.info(`Successfully updated Amortization_Runs for ${updatedRuns.length} BPOs based on market demand.`);
+            return updatedRuns.length;
+        }
+        
+    } catch (e) {
+        log.error(`Amortization Runs Calculation FAILED: ${e.message}`);
+        return 0;
+    }
+}
+
+/**
+ * Helper to retrieve 30-day traded volume from the Publish_ESI_Region_market_orders sheet.
+ * @returns {Map<number, number>} Map of type_id -> vol30_region (30-day traded volume)
+ */
+function _getMarketDemandMap(ss) {
+    const sheet = ss.getSheetByName("Publish_ESI_Region_market_orders");
+    const demandMap = new Map();
+    
+    if (!sheet || sheet.getLastRow() < 2) { 
+        LOG_INDUSTRY.error("Sheet 'Publish_ESI_Region_market_orders' is missing or empty.");
+        return demandMap;
+    }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    try {
+        const col = _getColIndexMap(headers, ['type_id', 'vol30_region']);
+        
+        let data = [];
+        const numRows = sheet.getLastRow() - 1;
+        if (numRows > 0) { 
+            data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
+        }
+
+        for (const row of data) {
+            const type_id = Number(row[col.type_id]);
+            // The volume comes as a string and needs cleaning (e.g., "1,234,567" -> 1234567)
+            const volumeStr = String(row[col.vol30_region]).replace(/,/g, '').trim(); 
+            const volume = Number(volumeStr);
+            
+            if (!isNaN(type_id) && volume > 0) {
+                demandMap.set(type_id, volume);
+            }
+        }
+        return demandMap;
+    } catch(e) { 
+        LOG_INDUSTRY.error(`Error reading market demand sheet: ${e.message}`); 
+        return demandMap;
+    }
+}
