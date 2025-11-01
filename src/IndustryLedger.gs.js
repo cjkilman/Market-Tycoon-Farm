@@ -248,6 +248,43 @@ function runBpcCreationLedger() {
   SCRIPT_PROP.setProperty(BPC_JOB_KEY, JSON.stringify(trimmedJobIds));
 }
 
+/**
+ * Resets the script properties that track processed Industry Jobs and 
+ * calculated BPC Weighted Average Costs (WAC).
+ * * This effectively forces the Industry Ledger to re-process all 'delivered'
+ * jobs in the 'ESI Corp Jobs' sheet and recalculate all BPC WACs.
+ */
+function resetIndustryLedgerProperties() {
+  
+  // --- Keys defined in IndustryLedger.gs.js ---
+  const INDUSTRY_JOB_KEY = 'processedIndustryJobIds';
+  const BPC_JOB_KEY = 'processedBpcJobIds';
+  const BPC_WAC_KEY = 'BpcWeightedAverageCost';
+
+  const props = PropertiesService.getScriptProperties();
+  const keysToDelete = [INDUSTRY_JOB_KEY, BPC_JOB_KEY, BPC_WAC_KEY];
+  let deletedCount = 0;
+  
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    for (const key of keysToDelete) {
+      if (props.getProperty(key) !== null) {
+        props.deleteProperty(key);
+        deletedCount++;
+      }
+    }
+    
+    // Provide user feedback
+    const message = `✅ Success! Deleted ${deletedCount} Industry Ledger properties. 
+    The script will now re-process all delivered jobs and recalculate BPC costs on the next run.`;
+    
+    ui.alert('Ledger Reset Complete', message, ui.ButtonSet.OK);
+    
+  } catch (e) {
+    ui.alert('Reset Failed', `An error occurred while deleting properties: ${e.message}`, ui.ButtonSet.OK);
+  }
+}
 
 // ----------------------------------------------------------------------
 // --- MAIN FUNCTION STAGE 2: MANUFACTURING LEDGER UPDATE ---
