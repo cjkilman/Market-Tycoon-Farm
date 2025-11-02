@@ -330,14 +330,43 @@ function sde_job_START() {
   try {
     SCRIPT_PROPS.setProperty(KEY_JOB_RUNNING, 'true');
     
-    // Halt Formulas & Pause Orchestrator
+    // Halt Formulas
     const ss = getSS();
     const loadingHelper = ss.getRangeByName("'Utility'!B3:C3");
     const backupSettings = loadingHelper.getValues();
     loadingHelper.setValues([[0, 0]]);
     SCRIPT_PROPS.setProperty(KEY_BACKUP_SETTINGS, JSON.stringify(backupSettings));
-    _deleteTriggersFor('masterOrchestrator'); 
-    Logger.log('START: Orchestrator trigger deleted. Formulas halted.');
+    
+    // --- START: MODIFICATION TO HALT ALL BACKGROUND JOBS ---
+    Logger.log('START: Halting all conflicting background jobs and triggers...');
+    
+    // 1. Delete all triggers for the orchestrator AND self-chaining jobs
+    _deleteTriggersFor('masterOrchestrator');
+    _deleteTriggersFor('updateMarketDataSheet');
+    _deleteTriggersFor('finalizeMarketDataUpdate');
+    _deleteTriggersFor('triggerCacheWarmerWithRetry');
+    _deleteTriggersFor('triggerLedgerImportCycle');
+    _deleteTriggersFor('runAllLedgerImports'); // As seen in logs
+
+    Logger.log('START: All conflicting triggers deleted.');
+
+    // 2. Reset the state properties for those jobs (based on Orchestrator.js)
+    SCRIPT_PROPS.deleteProperty('marketDataJobStep');
+    SCRIPT_PROPS.deleteProperty('marketDataRequestIndex');
+    SCRIPT_PROPS.deleteProperty('marketDataNextWriteRow');
+    SCRIPT_PROPS.deleteProperty('marketDataJobLeaseUntil');
+    SCRIPT_PROPS.deleteProperty('marketDataFinalizeStep');
+    SCRIPT_PROPS.deleteProperty('marketDataSetupStep');
+    SCRIPT_PROPS.deleteProperty('marketDataLastWriteDurationMs');
+    
+    SCRIPT_PROPS.deleteProperty('cacheRefresh_lastIndex');
+    SCRIPT_PROPS.deleteProperty('cacheRefresh_lastFullCompletion');
+    
+    // (Add any other known job states here)
+    SCRIPT_PROPS.deleteProperty('ledgerImportJobStep'); // Assuming this exists
+
+    Logger.log('START: All background job states have been reset.');
+    // --- END: MODIFICATION ---
 
     // Define the Job List using sdeLib
     const SDE = sdeLib(); 
