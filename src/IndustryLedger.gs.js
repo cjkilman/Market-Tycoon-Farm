@@ -1304,6 +1304,16 @@ function _getMarketDemandMap(ss) {
  * @customfunction
  */
 function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
+  // --- NEW: MAINTENANCE MODE CHECK ---
+  // Check if globals are defined before trying to access them
+  if (typeof SCRIPT_PROPS !== 'undefined' && typeof GLOBAL_STATE_KEY !== 'undefined') {
+    const systemState = SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+    if (systemState === 'MAINTENANCE') {
+      return; // Return blank immediately
+    }
+  }
+  // --- END: MAINTENANCE MODE CHECK ---
+
   // Use a short, unique key for the ESI endpoint
   const CACHE_KEY_BASE = 'CorpIndJobsRaw';
   const CACHE_TTL = 300; // 5 minutes

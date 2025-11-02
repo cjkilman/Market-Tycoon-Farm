@@ -3,6 +3,21 @@ var EXECUTION_LOCK_DEPTH_TRY = 0;
 // Global variable to track recursion depth for this lock type
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
+
+const LOCK_TIMEOUT_MS = 5000;
+const LOCK_WAIT_TIMEOUT_MS = 30000; // Default wait
+
+/**
+ * Global property key for system-wide maintenance mode.
+ */
+if (typeof GLOBAL_STATE_KEY === 'undefined') {
+  /**
+   * Global property key for system-wide maintenance mode.
+   */
+  var  GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
+}
+
+
 // State Machine Constants (Internal steps for the Market Data job)
 const STATE_FLAGS = {
   NEW_RUN: 'NEW_RUN',
@@ -13,6 +28,10 @@ const STATE_FLAGS = {
 /**
  * Helper to create a new one-time "retry" trigger.
  */
+/**
+ * Helper to create a new one-time "retry" trigger.
+ * --- FIX: Now checks for Maintenance Mode ---
+ */
 function scheduleOneTimeTrigger(functionName, delayMs) {
   // --- FIX: CRITICAL ERROR CHECK (Fail Fast) ---
   if (typeof functionName !== 'string' || functionName.trim() === '') {
@@ -20,11 +39,21 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
     // immediately upon a critical input validation failure.
     throw new Error(`CRITICAL SCHEDULER ERROR: Invalid function name provided. Must be a non-empty string. Got: ${functionName}`);
   }
-  // --- END FIX ---
+  
+  // --- NEW: MAINTENANCE MODE CHECK ---
+  // SCRIPT_PROPS must be globally defined
+  const systemState = SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+
+  // --- END: MAINTENANCE MODE CHECK ---
+
   try {
     // Attempt to delete existing triggers first to prevent duplicates
     deleteTriggersByName(functionName);
-
+  if (systemState === 'MAINTENANCE') {
+    console.warn(`Blocking one-time trigger for ${functionName}: System is in MAINTENANCE mode.`);
+    Logger.log(`Blocking one-time trigger for ${functionName}: System is in MAINTENANCE mode.`);
+    return; // Do not schedule the trigger
+  }
     // Create the new trigger
     ScriptApp.newTrigger(functionName)
       .timeBased()
@@ -112,118 +141,94 @@ function _resetMarketDataJobState(error) {
 }
 
 
+
+
+
+
 /**
- * Attempts to lock and execute a function, waiting up to 30s.
- * If the lock is busy, it returns null (skips) without error.
- * If the function executes, returns the function's return value.
- * Uses Script Lock.
+ * Wraps a function in a ScriptLock tryLock().
+ * If lock is acquired, executes the function.
+ * If not, logs a skip message.
+ *
+ * MODIFIED: Now checks for GLOBAL_STATE_KEY
+ *
+ * @param {function} funcToRun - The function to execute.
+ * @param {string} functionName - The name of the function being called (for logging).
+ * @param {number} [timeoutMs=LOCK_TIMEOUT_MS] - Optional lock timeout.
+ * @returns {*} The result of funcToRun, or null if skipped.
  */
-function executeWithTryLock(func, funcName) {
+function executeWithTryLock(funcToRun, functionName, timeoutMs = LOCK_TIMEOUT_MS) {
   const lock = LockService.getScriptLock();
-  let functionResult = null; // Variable to store the function's result
-
-  if (lock.tryLock(30000)) {
-    const isOuterLock = (EXECUTION_LOCK_DEPTH_TRY === 0);
-    EXECUTION_LOCK_DEPTH_TRY++;
-
+  if (lock.tryLock(timeoutMs)) {
     try {
-      if (isOuterLock) {
-        deleteTriggersByName(funcName);
-        console.log(`--- Starting Execution (TryLock): ${funcName} ---`);
-      } else {
-        console.log(`--- Entering nested execution (TryLock): ${funcName} ---`);
+      
+      // --- START: MAINTENANCE MODE CHECK ---
+      const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+      if (systemState === 'MAINTENANCE') {
+        console.warn(`Skipping execution of ${functionName}: System is in MAINTENANCE mode.`);
+        Logger.log(`Skipping execution of ${functionName}: System is in MAINTENANCE mode.`);
+        return null; // Do not run, and do not reschedule.
       }
+      // --- END: MAINTENANCE MODE CHECK ---
 
-      // Execute the function and store its result
-      functionResult = func(); // <-- STORE RESULT
-
-      if (isOuterLock) {
-        console.log(`--- Finished Execution (TryLock): ${funcName} ---`);
-      } else {
-        console.log(`--- Exiting nested execution (TryLock): ${funcName} ---`);
-      }
-
+      console.log(`--- Starting Execution (TryLock): ${functionName} ---`);
+      return funcToRun();
     } catch (e) {
-      console.error(`${funcName} failed: ${e.message}\nStack: ${e.stack}`);
-      // --- FIX: REMOVED ALL RESET LOGIC ---
-      // The worker functions are now responsible for their own stateful retries.
-      // --- END FIX ---
-      throw e; // Re-throw error
+      console.error(`Unhandled exception in ${functionName}: ${e.message} \nStack: ${e.stack}`);
+      Logger.log(`Unhandled exception in ${functionName}: ${e.message}`);
+      throw e; // Re-throw to be caught by GAS
     } finally {
-      EXECUTION_LOCK_DEPTH_TRY--;
-      try {
-        lock.releaseLock();
-        if (isOuterLock) {
-          console.log(`Script Lock released for ${funcName}.`);
-        }
-      } catch (lockError) {
-        console.error(`CRITICAL: Failed to release Script Lock for ${funcName}: ${lockError.message}`);
-      }
+      lock.releaseLock();
+      console.log(`Script Lock released for ${functionName}.`);
     }
-    // Return the result from the executed function
-    return functionResult; // <-- RETURN RESULT
   } else {
-    console.warn(`${funcName} was skipped because another process held the Script Lock.`);
-    // Return null to indicate it was skipped
-    return null; // <-- RETURN NULL ON SKIP
+    console.warn(`Skipping execution of ${functionName}: Script Lock was busy.`);
+    Logger.log(`Skipping execution of ${functionName}: Script Lock was busy.`);
+    return null;
   }
 }
 
 /**
- * Locks and executes a function, waiting up to 30s.
- * If the lock is busy after waiting, it THROWS AN ERROR.
- * Uses Script Lock.
+ * Wraps a function in a ScriptLock waitLock().
+ * This will pause execution until the lock is acquired.
+ *
+ * MODIFIED: Now checks for GLOBAL_STATE_KEY
+ *
+ * @param {function} funcToRun - The function to execute.
+ * @param {string} functionName - The name of the function being called (for logging).
+ * @param {number} [timeoutMs=LOCK_WAIT_TIMEOUT_MS] - Optional lock timeout.
+ * @returns {*} The result of funcToRun.
  */
-function executeWithWaitLock(func, funcName) {
+function executeWithWaitLock(funcToRun, functionName, timeoutMs = LOCK_WAIT_TIMEOUT_MS) {
   const lock = LockService.getScriptLock();
-  let functionResult = undefined; // Use undefined initially
-
   try {
-    lock.waitLock(30000);
-    console.log(`Script Lock acquired for ${funcName} (WaitLock).`);
+    lock.waitLock(timeoutMs);
   } catch (e) {
-    console.error(`Could not acquire Script Lock for ${funcName} after waiting. Error: ${e.message}`);
+    console.error(`Could not acquire Script Lock for ${functionName} after waiting. Error: ${e.message}`);
     throw e;
   }
-
-  const isOuterLock = (EXECUTION_LOCK_DEPTH_WAIT === 0);
-  EXECUTION_LOCK_DEPTH_WAIT++;
-
+  
   try {
-    if (isOuterLock) {
-      deleteTriggersByName(funcName);
-      console.log(`--- Starting Execution (WaitLock): ${funcName} ---`);
-    } else {
-      console.log(`--- Entering nested execution (WaitLock): ${funcName} ---`);
+    
+    // --- START: MAINTENANCE MODE CHECK ---
+    const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+    if (systemState === 'MAINTENANCE') {
+      console.warn(`Skipping execution of ${functionName}: System is in MAINTENANCE mode.`);
+      Logger.log(`Skipping execution of ${functionName}: System is in MAINTENANCE mode.`);
+      return null; // Do not run.
     }
+    // --- END: MAINTENANCE MODE CHECK ---
 
-    // Execute the function and store result
-    functionResult = func(); // <-- STORE RESULT
-
-    if (isOuterLock) {
-      console.log(`--- Finished Execution (WaitLock): ${funcName} ---`);
-    } else {
-      console.log(`--- Exiting nested execution (WaitLock): ${funcName} ---`);
-    }
+    console.log(`--- Starting Execution (WaitLock): ${functionName} ---`);
+    return funcToRun();
   } catch (e) {
-    console.error(`${funcName} failed during execution: ${e.message}\nStack: ${e.stack}`);
-    // --- FIX: REMOVED ALL RESET LOGIC ---
-    // The worker functions are now responsible for their own stateful retries.
-    // --- END FIX ---
-    throw e; // Re-throw error
+    console.error(`Unhandled exception in ${functionName}: ${e.message} \nStack: ${e.stack}`);
+    Logger.log(`Unhandled exception in ${functionName}: ${e.message}`);
+    throw e; // Re-throw to be caught by GAS
   } finally {
-    EXECUTION_LOCK_DEPTH_WAIT--;
-    try {
-      lock.releaseLock();
-      if (isOuterLock) {
-        console.log(`Script Lock released for ${funcName}.`);
-      }
-    } catch (lockError) {
-      console.error(`CRITICAL: Failed to release Script Lock for ${funcName}: ${lockError.message}`);
-    }
+    lock.releaseLock();
+    console.log(`Script Lock released for ${functionName}.`);
   }
-  // Return the result from the executed function
-  return functionResult; // <-- RETURN RESULT
 }
 
 /**

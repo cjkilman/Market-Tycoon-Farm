@@ -10,9 +10,6 @@
    runIndustryLedgerUpdate */
 
 // --- SDE Job Control Globals ---
-// This constant MUST be declared here once for the entire project to prevent
-// the "already been declared" error in other files (like SDE_Job_Controller.gs).
-const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 
 /**
  * NEW: Helper to check the lock (Logic is in SDE_Job_Controller.gs, check uses this property)
@@ -210,8 +207,21 @@ function getChacterNameFromID(charIds, show_column_headings = true) {
 /**
  * Replace [Header Name] tokens in a QUERY-like SQL with ColN,
  */
+/**
+ * Replace [Header Name] tokens in a QUERY-like SQL with ColN,
+ */
 function sqlFromHeaderNamesEx(rangeName, queryString, useColNums) {
   
+  // --- NEW: MAINTENANCE MODE CHECK ---
+  // SCRIPT_PROPS must be globally defined in Main.js
+  if (typeof SCRIPT_PROPS !== 'undefined' && typeof GLOBAL_STATE_KEY !== 'undefined') {
+    const systemState = SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+    if (systemState === 'MAINTENANCE') {
+      return; // Return blank immediately
+    }
+  }
+  // --- END: MAINTENANCE MODE CHECK ---
+
   if (typeof rangeName !== 'string' || !rangeName) {
       throw new Error(`sqlFromHeaderNamesEx: First argument must be the name of a Named Range (as a string) or an A1 notation string.`);
   }
@@ -263,6 +273,10 @@ function sqlFromHeaderNamesEx(rangeName, queryString, useColNums) {
     // Store the newly built map in the cache for 5 minutes (300 seconds)
     cache.put(cacheKey, JSON.stringify(map), 300);
   }
+
+  // --- Header Replacement Logic ---
+  // (This part is unchanged)
+  // ...
   
   // --- Replace Tokens in Query String ---
   
