@@ -1306,12 +1306,13 @@ function _getMarketDemandMap(ss) {
 function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
   // --- NEW: MAINTENANCE MODE CHECK ---
   // Check if globals are defined before trying to access them
-  if (typeof SCRIPT_PROPS !== 'undefined' && typeof GLOBAL_STATE_KEY !== 'undefined') {
+  if (!SCRIPT_PROPS) {
     const systemState = SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+  }
     if (systemState === 'MAINTENANCE') {
       return; // Return blank immediately
     }
-  }
+  
   // --- END: MAINTENANCE MODE CHECK ---
 
   // Use a short, unique key for the ESI endpoint
