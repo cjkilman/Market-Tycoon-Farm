@@ -218,7 +218,7 @@ const sdeLib = () => {
     console.time("buildSDEs( sheetName:" + sdePage.sheet + ")");
     
     // --- Your Design Parameters ---
-    const CHUNK_SIZE = 5000; // Write 5000 rows at a time
+    const CHUNK_SIZE = 4000; // Write 5000 rows at a time
     const DOC_LOCK_TIMEOUT = 30000; // 30 second wait for DocumentLock
     const SCRIPT_TIME_LIMIT = 240000; // 4 minutes (240,000 ms)
     
