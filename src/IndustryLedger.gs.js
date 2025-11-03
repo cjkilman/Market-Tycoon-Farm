@@ -354,134 +354,134 @@ function resetIndustryLedgerProperties() {
 
 // Function runIndustryLedgerUpdate() 
 function runIndustryLedgerUpdate() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  // 2. Get SDE Data (Must come first to get recipes)
-  const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
-  if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE sheets are empty. Skipping."); return; }
+    // 1. Get SDE Data (Recipes/Material Requirements)
+    const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
+    if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE sheets are empty. Skipping."); return; }
+    
+    const nameMap = _getSdeNameMap(ss);
 
-  const nameMap = _getSdeNameMap(ss);
+    // 2. Find new completed manufacturing jobs (DEFINES 'newJobs')
+    const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
+    const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
+    if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
 
-  // 3. Find new completed manufacturing jobs (MUST be defined before we iterate over them)
-  const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
-  const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
-  if (newJobs.length === 0) { LOG_INDUSTRY.info("No new manufacturing jobs to process."); return; }
+    // 3. CRITICAL: Collect ALL unique material IDs from the newly defined 'newJobs'
+    //    (This block is now correctly placed *after* newJobs is defined)
+    const allRequiredMaterialIds = new Set();
+    for (const job of newJobs) {
+        const materials = sdeMatMap.get(job.blueprint_type_id);
+        if (materials) {
+            for (const mat of materials) {
+                allRequiredMaterialIds.add(mat.materialTypeID);
+            }
+        }
+    }
+    
+    // 4. Get Cost Data (Tier 0-3 costMap built here)
+    const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMaterialIds));
 
-  // ⚠️ CRITICAL FIX 1: Collect ALL required material IDs from the newly defined 'newJobs'
-  const allRequiredMaterialIds = new Set();
-  for (const job of newJobs) {
-    const materials = sdeMatMap.get(job.blueprint_type_id);
-    if (materials) {
+    if (costMap.size === 0) { LOG_INDUSTRY.warn("Blended_Cost failed to populate any costs. Skipping."); return; }
+    
+    // 5. Setup Amortization/BPO Data (Needs costMap defined)
+    const amortMap = _getBpoAmortizationMap(ss); 
+    const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
+    const bpoAttributesMap = _getBpoAttributesMapFromEsi();
+    
+    const getBpcCostPerRun = (bpID) => {
+      const cost = bpcWacData[bpID];
+      return cost ? Number(cost) : 0;
+    };
+    
+    // 6. Start Processing Jobs
+    const ledgerObjects = [];
+    const newlyProcessedIds = [];
+    const ledgerAPI = ML.forSheet('Material_Ledger');
+
+    // --- MAIN JOB PROCESSING LOOP ---
+    for (const job of newJobs) {
+      const materials = sdeMatMap.get(job.blueprint_type_id);
+      const product = sdeProdMap.get(job.blueprint_type_id);
+      
+      if (!materials || !product) { LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`); continue; }
+
+      // A. Apply Material Efficiency (ME) Discount
+      const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id); 
+      const meLevel = bpoItemAttributes ? bpoItemAttributes.material_efficiency : 0; 
+      const materialDiscountFactor = 1 - (meLevel / 100);
+
+      let totalMaterialCostPerRun = 0;
+      let missingCost = false;
+
       for (const mat of materials) {
-        allRequiredMaterialIds.add(mat.materialTypeID);
-      }
-    }
-  }
+        const matCost = costMap.get(mat.materialTypeID); 
+        
+        if (matCost === undefined || matCost === null || matCost === 0) { 
+            LOG_INDUSTRY.warn(`Missing final cost for material ${mat.materialTypeID}. Cannot price job ${job.job_id}.`); 
+            missingCost = true; 
+            break; 
+        }
 
-  // 4. Get Cost Data and Amortization/WAC
-  // ⚠️ CRITICAL FIX 2: Pass the targeted material list to the cost map builder
-  const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMaterialIds));
-
-  if (costMap.size === 0) { LOG_INDUSTRY.warn("Blended_Cost failed to populate any costs. Skipping."); return; }
-
-  const amortMap = _getBpoAmortizationMap(ss);
-  const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
-  const bpoAttributesMap = _getBpoAttributesMapFromEsi();
-
-  const getBpcCostPerRun = (bpID) => {
-    const cost = bpcWacData[bpID];
-    return cost ? Number(cost) : 0;
-  };
-
-  // 5. Calculate cost and generate ledger row objects
-  const ledgerObjects = [];
-  const newlyProcessedIds = [];
-  const ledgerAPI = ML.forSheet('Material_Ledger');
-
-  // --- MAIN JOB PROCESSING LOOP (Now safe to iterate over newJobs) ---
-  for (const job of newJobs) {
-    const materials = sdeMatMap.get(job.blueprint_type_id);
-    const product = sdeProdMap.get(job.blueprint_type_id);
-
-    if (!materials || !product) { LOG_INDUSTRY.warn(`Missing SDE data for job ${job.job_id} (BP ${job.blueprint_type_id}). Skipping.`); continue; }
-
-    // A. Apply Material Efficiency (ME) Discount
-    const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id);
-    const meLevel = bpoItemAttributes ? bpoItemAttributes.material_efficiency : 0;
-    const materialDiscountFactor = 1 - (meLevel / 100);
-
-    let totalMaterialCostPerRun = 0;
-    let missingCost = false;
-
-    for (const mat of materials) {
-      const matCost = costMap.get(mat.materialTypeID);
-
-      if (matCost === undefined || matCost === null || matCost === 0) {
-        // Now, if cost is 0, it means Tiers 0, 1, 2, and 3 all failed (unpricable item).
-        LOG_INDUSTRY.warn(`Missing final cost for material ${mat.materialTypeID}. Cannot price job ${job.job_id}.`);
-        missingCost = true;
-        break;
+        const finalQuantity = mat.quantity * materialDiscountFactor;
+        totalMaterialCostPerRun += matCost * finalQuantity;
       }
 
-      const finalQuantity = mat.quantity * materialDiscountFactor;
-      totalMaterialCostPerRun += matCost * finalQuantity;
+      if (missingCost) continue;
+      
+      // B. Calculate Total Costs (Amortization + ISK Fee + Materials)
+      const totalMaterialCostForAllRuns = totalMaterialCostPerRun * job.runs;
+      const totalJobInstallationCost = job.cost;
+      
+      let amortizationSurcharge = 0;
+      
+      // BPO AMORTIZATION (Capital Cost)
+      if (amortMap.has(job.blueprint_type_id)) {
+          amortizationSurcharge = amortMap.get(job.blueprint_type_id) * job.runs;
+      } 
+      // BPC AMORTIZATION (Disposable Asset Cost)
+      else {
+          const bpcCostPerRun = getBpcCostPerRun(job.blueprint_type_id);
+          amortizationSurcharge = bpcCostPerRun * job.runs;
+      }
+
+      // Define totalActualCost safely outside the if/else block
+      const totalActualCost = totalMaterialCostForAllRuns + totalJobInstallationCost + amortizationSurcharge; 
+      
+      // C. Calculate Unit Cost
+      const totalUnitsProduced = product.quantity * job.runs;
+      if (totalUnitsProduced === 0) continue;
+      const unitManufacturingCost = totalActualCost / totalUnitsProduced;
+
+      // D. Write to Ledger
+       ledgerObjects.push({
+            date: job.end_date,
+            type_id: job.product_type_id,
+            item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
+            qty: totalUnitsProduced,
+            unit_value: '', 
+            source: "INDUSTRY",
+            contract_id: job.job_id,
+            char: job.installer_id,
+            unit_value_filled: unitManufacturingCost
+        });
+        
+        newlyProcessedIds.push(job.job_id);
+    }
+    // --- END MAIN JOB PROCESSING LOOP ---
+
+    // 7. Upsert and Save State
+    if (ledgerObjects.length > 0) {
+      const writtenCount = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
+      LOG_INDUSTRY.info(`Successfully processed and wrote ${writtenCount} new manufacturing jobs to the Material_Ledger.`);
+    } else {
+      LOG_INDUSTRY.info("Finished processing. No new rows to write to Material_Ledger.");
     }
 
-    if (missingCost) continue;
-
-    // B. Calculate Total Costs (Amortization + ISK Fee + Materials)
-    const totalMaterialCostForAllRuns = totalMaterialCostPerRun * job.runs;
-    const totalJobInstallationCost = job.cost;
-
-    let amortizationSurcharge = 0;
-
-    // BPO AMORTIZATION (Capital Cost)
-    if (amortMap.has(job.blueprint_type_id)) {
-      amortizationSurcharge = amortMap.get(job.blueprint_type_id) * job.runs;
-    }
-    // BPC AMORTIZATION (Disposable Asset Cost)
-    else {
-      const bpcCostPerRun = getBpcCostPerRun(job.blueprint_type_id);
-      amortizationSurcharge = bpcCostPerRun * job.runs;
-    }
-
-    // Define totalActualCost safely outside the if/else block
-    const totalActualCost = totalMaterialCostForAllRuns + totalJobInstallationCost + amortizationSurcharge;
-
-    // C. Calculate Unit Cost
-    const totalUnitsProduced = product.quantity * job.runs;
-    if (totalUnitsProduced === 0) continue;
-    const unitManufacturingCost = totalActualCost / totalUnitsProduced;
-
-    // ... (Push to ledgerObjects and newlyProcessedIds) ...
-    ledgerObjects.push({
-      date: job.end_date,
-      type_id: job.product_type_id,
-      item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
-      qty: totalUnitsProduced,
-      unit_value: '',
-      source: "INDUSTRY",
-      contract_id: job.job_id,
-      char: job.installer_id,
-      unit_value_filled: unitManufacturingCost
-    });
-
-    newlyProcessedIds.push(job.job_id);
-  }
-  // --- END MAIN JOB PROCESSING LOOP ---
-
-  // 6. Upsert and Save State
-  if (ledgerObjects.length > 0) {
-    const writtenCount = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
-    LOG_INDUSTRY.info(`Successfully processed and wrote ${writtenCount} new manufacturing jobs to the Material_Ledger.`);
-  } else {
-    LOG_INDUSTRY.info("Finished processing. No new rows to write to Material_Ledger.");
-  }
-
-  newlyProcessedIds.forEach(id => processedJobIds.add(id));
-  const trimmedJobIds = Array.from(processedJobIds).slice(-1000);
-  SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(trimmedJobIds));
+    newlyProcessedIds.forEach(id => processedJobIds.add(id));
+    const trimmedJobIds = Array.from(processedJobIds).slice(-1000);
+    SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(trimmedJobIds));
 }
 
 
@@ -490,41 +490,111 @@ function runIndustryLedgerUpdate() {
 // ----------------------------------------------------------------------
 
 // Function _getBlendedCostMap(ss, requiredMaterialIds) 
+/**
+ * Helper to get the current blended cost for all items, 
+ * implementing a Three-Tier Cost Fallback based on required material IDs.
+ * * @param {object} ss - SpreadsheetApp object.
+ * @param {number[]} requiredMaterialIds - Array of ALL unique material IDs needed for current jobs.
+ */
 function _getBlendedCostMap(ss, requiredMaterialIds) {
-  const sheet = ss.getSheetByName("Blended_Cost");
-  const log = LoggerEx.withTag('BLENDED_COST_FALLBACK');
+    const sheet = ss.getSheetByName("Blended_Cost");
+    const log = LoggerEx.withTag('BLENDED_COST_FALLBACK');
+    
+    // --- 1. Setup Tier 2/3 Settings & Acquisition Fee ---
+    const marketMedianMap = _getMarketMedianMap(ss); // Tier 2: Local Tracker
+    
+    // ⚠️ CRITICAL ACQUISITION FEE LOGIC: (Based on 0 Standings, No Skills)
+    const BROKER_FEE_RATE = Number(_getNamedOr_('FEE_RATE', 0.03)); // Default to 3.0%
+    const TRANSACTION_TAX_RATE = Number(_getNamedOr_('TAX_RATE', 0.075)); // Default to 7.5%
+    const TOTAL_ACQUISITION_FEE = BROKER_FEE_RATE + TRANSACTION_TAX_RATE;
+    const ACQUISITION_MULTIPLIER = 1 + TOTAL_ACQUISITION_FEE;
+    log.info(`Using ACQUISITION_MULTIPLIER: ${ACQUISITION_MULTIPLIER} (Broker: ${BROKER_FEE_RATE}, Tax: ${TRANSACTION_TAX_RATE})`);
+    
+    // Fuzzwork Settings (Tier 3)
+    const defaultRegionId = 10000002; // Jita Region ID
+    const locationIdRaw = ss.getSheetByName('Location List').getRange('C3').getValue();
+    const locationId = (locationIdRaw && locationIdRaw > 0) ? locationIdRaw : defaultRegionId; 
+    const marketType = 'region';     // Force the broadest search
+    const orderType = 'buy';         // Look for Buy Orders
+    const orderLevel = 'max';        // Get the MAX price
+    
+    const allItemCosts = new Map(); // Final map of type_id -> cost
+    const tier3FetchList = new Set(); // List of items requiring API call
 
-  // --- 1. Setup Tier 2/3 Settings & Acquisition Fee ---
-  const marketMedianMap = _getMarketMedianMap(ss); // Tier 2: Local Tracker
+    // --- 2. PHASE 1: Read Tier 1 (Blended Cost) ---
+    if (sheet && sheet.getLastRow() >= 2) {
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        try {
+            const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
+            const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
+            
+            for (const row of data) {
+                const type_id = Number(row[col.type_id]);
+                let cost = Number(row[col.unit_weighted_average]); 
+                
+                if (!isNaN(type_id) && cost > 0) {
+                    allItemCosts.set(type_id, cost); // Tier 1 cost found, NO tax applied
+                }
+            }
+        } catch(e) { log.error(`Error reading Blended_Cost: ${e.message}`); }
+    } else {
+        log.warn("Blended_Cost sheet is empty or missing. Bypassing Tier 1.");
+    }
+    
+    // --- 3. PHASE 2: Check ALL required material IDs against known costs ---
+    const neededIds = new Set(requiredMaterialIds);
+    
+    for (const type_id of neededIds) {
+        if (allItemCosts.has(type_id)) {
+            continue; // Tier 1 cost is already set
+        }
 
-  // ⚠️ CRITICAL ACQUISITION FEE LOGIC: (Based on 0 Standings, No Skills)
-  // Broker Fee Base: 3.0% (Applies to Buy Orders)
-  // Tax Rate Base: 7.5% (Applied here only because it is combined by user)
-  const BROKER_FEE_RATE = _getNamedOr_('FEE_RATE', 0.03); // Default to 3.0%
-  const TRANSACTION_TAX_RATE = _getNamedOr_('TAX_RATE', 0.075); // Default to 7.5%
+        // Tier 2 Check (Items NOT found in Blended_Cost)
+        const marketCost = marketMedianMap.get(type_id) || 0; 
 
-  // Total Fee applied to acquisition cost (COGS)
-  const TOTAL_ACQUISITION_FEE = BROKER_FEE_RATE + TRANSACTION_TAX_RATE;
-  const ACQUISITION_MULTIPLIER = 1 + TOTAL_ACQUISITION_FEE;
+        if (marketCost > 0) {
+            // TIER 2 FALLBACK: Market Tracker cost found. APPLY ACQUISITION FEE.
+            const costWithFee = marketCost * ACQUISITION_MULTIPLIER;
+            allItemCosts.set(type_id, costWithFee); 
+            log.info(`Applied Broker Fee to Tier 2 cost for ${type_id}.`);
+        } else {
+            // Tier 1 and Tier 2 both failed. ADD TO TIER 3 LIST.
+            tier3FetchList.add(type_id); 
+        }
+    }
+    
+    // --- 4. PHASE 3: Execute Fuzzwork API Fallback (Tier 3) ---
+    if (tier3FetchList.size > 0) {
+        const idsArray = Array.from(tier3FetchList);
+        log.info(`Attempting Tier 3 fallback for ${idsArray.length} items via Fuzzwork API.`);
 
-  // ... (rest of the function remains the same) ...
+        try {
+            const rawFuzResults = fuzAPI.requestItems(locationId, marketType, idsArray);
+            
+            rawFuzResults.forEach(item => {
+                const rawCost = _extractMetric_(item, orderType, orderLevel);
+                
+                if (rawCost > 0) {
+                    // ⚠️ CRITICAL FIX: APPLY ACQUISITION FEE TO FUZZWORK PRICE
+                    const finalCost = rawCost * ACQUISITION_MULTIPLIER; 
+                    allItemCosts.set(item.type_id, finalCost);
+                    log.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3) + Fee: ${finalCost}`);
+                } else {
+                    log.warn(`Fuzzwork returned zero cost for material ${item.type_id}. Final cost is 0.`);
+                }
+            });
+        } catch (e) {
+            log.error(`Fuzzwork Tier 3 API call failed: ${e.message}`);
+        }
+    }
 
-  // --- EXECUTION POINT FOR TIER 2 FALLBACK ---
-  // (Inside Phase 2 loops)
-  if (marketCost > 0) {
-    // APPLY COMBINED FEE to external cost data
-    cost = marketCost * ACQUISITION_MULTIPLIER;
-    // ...
-  }
+    // 5. Final filter: return only items with a positive cost
+    const finalCostMap = new Map();
+    for (const [type_id, cost] of allItemCosts.entries()) {
+        if (cost > 0) { finalCostMap.set(type_id, cost); }
+    }
 
-  // --- EXECUTION POINT FOR TIER 3 FALLBACK ---
-  // (Inside Phase 3 loops)
-  if (rawCost > 0) {
-    // APPLY COMBINED FEE TO FUZZWORK PRICE
-    const finalCost = rawCost * ACQUISITION_MULTIPLIER;
-    // ...
-  }
-  // ... (rest of the function continues)
+    return finalCostMap;
 }
 
 // NOTE: Since the ultimate goal is to fix the missing Datacore costs, and your
@@ -1306,25 +1376,14 @@ function _getMarketDemandMap(ss) {
 function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
   // --- NEW: MAINTENANCE MODE CHECK ---
   // Check if globals are defined before trying to access them
-  // Check for the Apps Script environment ONCE
-  const isAppsScript = (typeof SCRIPT_PROPS !== 'undefined');
-
-  // 1. Set up logger based on environment
-  const LOG_INDUSTRY = isAppsScript
-    ? LoggerEx.withTag('IndustryLedger')
-    : console;
-
-  // 2. Safely get system state based on environment
-  const systemState = isAppsScript
-    ? SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING'
-    : 'RUNNING'; // Default to 'RUNNING' if not in Apps Script
-
-  // 3. Perform the maintenance check
-  if (systemState === 'MAINTENANCE') {
-    LOG_INDUSTRY.log('System is in MAINTENANCE mode. Exiting.');
-    return;
+  
+  if (!SCRIPT_PROPS) {
+    const systemState = SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
   }
-
+    if (systemState === 'MAINTENANCE') {
+      return; // Return blank immediately
+    }
+  
   // --- END: MAINTENANCE MODE CHECK ---
 
   // Use a short, unique key for the ESI endpoint

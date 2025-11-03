@@ -6,10 +6,9 @@
  * @param {string[]} headers - Array of header strings
  * @returns {GoogleAppsScript.Spreadsheet.Sheet}
  */
-function getOrCreateSheet(ss, name, headers) { // <-- REMOVED maxRows parameter
-  // --- Input Validation ---
+function getOrCreateSheet(ss, name, headers) { 
+  // --- Input Validation (Retained) ---
   if (!ss || typeof ss.getSheetByName !== 'function') {
-    // Attempt to get active spreadsheet if ss is invalid
     ss = SpreadsheetApp.getActiveSpreadsheet();
     if (!ss) {
         throw new Error("getOrCreateSheet: Could not get active spreadsheet.");
@@ -23,68 +22,52 @@ function getOrCreateSheet(ss, name, headers) { // <-- REMOVED maxRows parameter
   }
   // --- End Input Validation ---
 
-  const sheetName = name.trim(); // Use trimmed name
+  const sheetName = name.trim(); 
   const headerCount = headers.length;
   let sheet = ss.getSheetByName(sheetName);
   let isNewSheet = false;
 
   if (!sheet) {
-    // Create new sheet
+    // 1. CREATE NEW SHEET (Expensive but necessary once)
     console.log(`Creating new sheet: '${sheetName}'`);
     sheet = ss.insertSheet(sheetName);
     isNewSheet = true;
 
-    // Adjust columns to match headers exactly
+    // 2. SET HEADERS AND MINIMALLY ADJUST COLUMNS
+    // We only perform heavy pruning/adjusting when NEW, not when existing.
     const maxCols = sheet.getMaxColumns();
     if (maxCols > headerCount) {
+      // Delete excess columns added by default (26 -> 9)
       sheet.deleteColumns(headerCount + 1, maxCols - headerCount);
     } else if (maxCols < headerCount) {
       sheet.insertColumnsAfter(maxCols, headerCount - maxCols);
     }
 
-    // Append headers to the new sheet
-    sheet.appendRow(headers);
-    console.log(`Headers appended to new sheet '${sheetName}'.`);
+    sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
+    console.log(`Headers set for new sheet '${sheetName}'.`);
 
   } else {
-    // Existing sheet: check and potentially prune/add columns
-    const maxCols = sheet.getMaxColumns();
-     if (maxCols > headerCount) {
-      console.log(`Pruning columns in existing sheet '${sheetName}' from ${maxCols} to ${headerCount}`);
-      sheet.deleteColumns(headerCount + 1, maxCols - headerCount);
-    } else if (maxCols < headerCount) {
-       console.log(`Adding columns in existing sheet '${sheetName}' from ${maxCols} to ${headerCount}`);
-      sheet.insertColumnsAfter(maxCols, headerCount - maxCols);
-    }
+    // EXISTING SHEET: Perform no expensive column/header manipulation.
+    // The sheet worker (Orchestrator.js) will handle clearing contents (clearContent) 
+    // and resetting headers only if needed, or rely on the final swap logic.
+    console.log(`Sheet '${sheetName}' exists. Skipping column/header cleanup.`);
 
-    // Check headers, clear and reset if they don't match
+    // --- CRITICAL RE-INSERTION FOR ERROR RECOVERY (Step 2) ---
+    // If we're here, it means we are in the ERROR RECOVERY path of Orchestrator (Setup Step 2)
+    // The recovery path in Orchestrator *must* succeed, but its sheet manipulation
+    // caused the timeout. The only thing we absolutely must ensure is the header is present.
     try {
-        const currentHeaders = sheet.getRange(1, 1, 1, headerCount).getValues()[0];
-        const same = currentHeaders.every((h, i) => String(h).trim() === String(headers[i]).trim()); // Trim headers for comparison
-        if (!same) {
-          console.warn(`Headers mismatch in sheet '${sheetName}'. Clearing content below header and resetting headers.`);
-          // Clear content below header row
-          const lastRow = sheet.getLastRow();
-          if (lastRow > 1) {
-              sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
-          }
-          // Set new headers
-          sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
-          isNewSheet = true; // Treat as new for row adjustment logic below
-          console.log(`Headers reset for sheet '${sheetName}'.`);
-        }
-    } catch (headerError) {
-        console.error(`Error reading headers for sheet '${sheetName}': ${headerError.message}. Clearing and resetting.`);
-        sheet.clearContents(); // Clear everything if header read fails
-        sheet.getRange(1, 1, 1, headerCount).setValues([headers]); // Set new headers
-        isNewSheet = true;
+        // Attempt to just set the headers, ignoring what's already there (fast overwrite)
+        sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
+        console.log(`Headers overwritten/verified for existing sheet.`);
+    } catch (e) {
+        // If even this fails, rethrow.
+        throw new Error(`Failed during minimal header set on existing sheet: ${e.message}`);
     }
   }
 
-  // --- ADJUST ROW COUNT BLOCK (REMOVED) ---
-  // The logic that caused the timeout by inserting thousands of rows
-  // has been completely removed from here.
-
+  // NOTE: Clearing contents is now left entirely to Orchestrator._updateMarketDataSheetWorker
+  
   return sheet;
 }
 
