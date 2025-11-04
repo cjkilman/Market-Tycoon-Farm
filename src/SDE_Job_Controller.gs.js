@@ -270,7 +270,7 @@ const sdeLib = () => {
         const MIN_CHUNK_SIZE = 500;        // Min rows to write at once
         const TARGET_WRITE_TIME_MS = 3000; // Target time for setValues() to take (3 seconds)
         const DOC_LOCK_TIMEOUT = 30000;    // 30 second wait for DocumentLock (used only for initial clear)
-        const SCRIPT_TIME_LIMIT = 240000;  // 4 minutes (240,000 ms)
+        const SCRIPT_TIME_LIMIT = 285000; // 4m 45s - Predictive reschedule
 
         // --- DYNAMIC STATE ---
         // Initialize currentChunkSize to the maximum safe size
