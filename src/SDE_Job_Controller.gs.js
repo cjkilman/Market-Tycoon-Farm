@@ -271,13 +271,13 @@ const sdeLib = () => {
         // --- Your Design Parameters ---
         const CHUNK_SIZE = 4000; // Write 4000 rows at a time
         const DOC_LOCK_TIMEOUT = 30000; // 30 second wait for DocumentLock (used only for initial clear)
-        const SCRIPT_TIME_LIMIT = 240000; // 4 minutes (240,000 ms)
+        const SCRIPT_TIME_LIMIT = 285000; // 4 minutes (240,000 ms)
 
         // --- Your Adaptive Throttle Parameters ---
-        const THROTTLE_BASE_SLEEP_MS = 250;      // Min 0.25s sleep between writes
-        const THROTTLE_LATENCY_FACTOR = 1.2;     // Sleep for 1.2x the last write duration
-        const THROTTLE_MAX_SLEEP_MS = 5000;      // Max 5s sleep
-        let lastWriteDurationMs = 500;           // Default for first loop
+        const THROTTLE_BASE_SLEEP_MS = 250;      // Min 0.25s sleep between writes
+        const THROTTLE_LATENCY_FACTOR = 1.2;     // Sleep for 1.2x the last write duration
+        const THROTTLE_MAX_SLEEP_MS = 5000;      // Max 5s sleep
+        let lastWriteDurationMs = 500;           // Default for first loop
         // --- End Parameters ---
 
         const activeSpreadsheet = getSS();
