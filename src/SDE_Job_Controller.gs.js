@@ -8,10 +8,9 @@
  *
  * NOTE: This file assumes the constant SCRIPT_PROPS is declared once in Main.js.
  *
- * --- FIX v4.4 (Refactored Sheet Setup) ---
- * - Moved header writing logic into createOrClearSdeSheet.
- * - Removed redundant header writing from buildSDEs.
- * - Removed slow autoResizeColumns to prevent execution time limit errors.
+ * --- FIX v4.6 (Dynamic Chunking) ---
+ * - Replaced fixed CHUNK_SIZE with dynamic calculation based on TARGET_WRITE_TIME_MS (3s).
+ * - Aggressively reduces chunk size on Document Lock contention or slow write times.
  */
 
 // --- FIX: Safely define global constants with 'var' ---
@@ -192,7 +191,7 @@ const sdeLib = () => {
     };
 
     const autoResizeColumns = (sheet) => {
-        // --- FIX: This function remains, but is commented out in buildSDEs ---
+        // This function is present but commented out in buildSDEs for stability
         if (!sheet) return;
         const lastColumn = sheet.getLastColumn();
         if (lastColumn > 0) {
@@ -202,8 +201,6 @@ const sdeLib = () => {
     
     /**
      * NEW: Non-blocking Document Lock helper function.
-     * Records duration including lock release time.
-     * STRICTLY uses memory cache; throws error on cache miss.
      */
     function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
         const chunkStartTime = new Date().getTime();
@@ -269,15 +266,21 @@ const sdeLib = () => {
         console.time("buildSDEs( sheetName:" + sdePage.sheet + ")");
 
         // --- Your Design Parameters ---
-        const CHUNK_SIZE = 4000; // Write 4000 rows at a time
-        const DOC_LOCK_TIMEOUT = 30000; // 30 second wait for DocumentLock (used only for initial clear)
-        const SCRIPT_TIME_LIMIT = 285000; // 4 minutes (240,000 ms)
+        const MAX_CHUNK_SIZE = 5000;       // Max rows to write at once
+        const MIN_CHUNK_SIZE = 500;        // Min rows to write at once
+        const TARGET_WRITE_TIME_MS = 3000; // Target time for setValues() to take (3 seconds)
+        const DOC_LOCK_TIMEOUT = 30000;    // 30 second wait for DocumentLock (used only for initial clear)
+        const SCRIPT_TIME_LIMIT = 240000;  // 4 minutes (240,000 ms)
+
+        // --- DYNAMIC STATE ---
+        // Initialize currentChunkSize to the maximum safe size
+        let currentChunkSize = MAX_CHUNK_SIZE; 
 
         // --- Your Adaptive Throttle Parameters ---
-        const THROTTLE_BASE_SLEEP_MS = 250;      // Min 0.25s sleep between writes
-        const THROTTLE_LATENCY_FACTOR = 1.2;     // Sleep for 1.2x the last write duration
-        const THROTTLE_MAX_SLEEP_MS = 5000;      // Max 5s sleep
-        let lastWriteDurationMs = 500;           // Default for first loop
+        const THROTTLE_BASE_SLEEP_MS = 250;      // Min 0.25s sleep between writes
+        const THROTTLE_LATENCY_FACTOR = 1.2;     // Sleep for 1.2x the last write duration
+        const THROTTLE_MAX_SLEEP_MS = 5000;      // Max 5s sleep
+        let lastWriteDurationMs = 500;           // Default for first loop
         // --- End Parameters ---
 
         const activeSpreadsheet = getSS();
@@ -324,7 +327,6 @@ const sdeLib = () => {
                 try {
                     // createOrClearSdeSheet now handles clearing AND writing headers
                     finalSheetReference = createOrClearSdeSheet(activeSpreadsheet, sdePage.sheet, headers);
-                    // The line to write headers is REMOVED from here
                 } finally {
                     docLock.releaseLock();
                 }
@@ -345,7 +347,6 @@ const sdeLib = () => {
             while (currentRow < dataRows.length) {
                 
                 // --- Adaptive Throttle Logic (Sleep only if last write was successful) ---
-                // lastWriteDurationMs is 0 on contention failure, skipping sleep for immediate retry
                 if (lastWriteDurationMs > 0) { 
                     let sleepMs = Math.max(THROTTLE_BASE_SLEEP_MS, lastWriteDurationMs * THROTTLE_LATENCY_FACTOR);
                     sleepMs = Math.min(THROTTLE_MAX_SLEEP_MS, sleepMs); // Cap at max
@@ -365,7 +366,7 @@ const sdeLib = () => {
                 }
                 // --- End Timeout Check ---
                 
-                const chunkEnd = Math.min(currentRow + CHUNK_SIZE, dataRows.length);
+                const chunkEnd = Math.min(currentRow + currentChunkSize, dataRows.length); // Use DYNAMIC SIZE
                 const chunk = dataRows.slice(currentRow, chunkEnd);
                 const writeRow = currentRow + 2; // +1 for 1-based index, +1 for header row (which is now written by createOrClearSdeSheet)
 
@@ -384,13 +385,31 @@ const sdeLib = () => {
                     if (result.success === true) {
                         // Success: Update duration and advance row
                         lastWriteDurationMs = result.duration;
+                        
+                        // --- DYNAMIC CHUNK SIZE ADJUSTMENT ---
+                        // Calculate the ratio: If it took 10s (slow), ratio is 3000/10000 = 0.3
+                        const adjustmentFactor = TARGET_WRITE_TIME_MS / lastWriteDurationMs;
+                        
+                        // Adjust the size for the NEXT chunk
+                        currentChunkSize = Math.round(currentChunkSize * adjustmentFactor);
+                        
+                        // Enforce Min/Max bounds
+                        currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, currentChunkSize));
+                        
+                        console.log(`buildSDEs: Chunk write successful. Rows written: ${chunk.length}. Duration: ${lastWriteDurationMs}ms. Next chunk size adjusted to ${currentChunkSize}.`);
+                        // --- END DYNAMIC ADJUSTMENT ---
+                        
                         currentRow = chunkEnd; 
-                        console.log(`buildSDEs: Chunk write successful. Rows written: ${chunk.length}. Took ${lastWriteDurationMs}ms.`);
+                        
                     } else {
-                        // Failure: Lock contention (tryLock failed). Do not advance row.
-                        // Set duration to 0 to skip throttling in the next loop iteration (immediate retry)
+                        // Failure: Lock contention (tryLock failed). Aggressive reduction.
                         lastWriteDurationMs = 0; 
-                        console.warn(`buildSDEs: Document Lock contention hit. Retrying chunk immediately.`);
+                        
+                        // --- AGGRESSIVE HALVING ---
+                        currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+                        console.warn(`buildSDEs: Document Lock contention hit. Halving chunk size aggressively to ${currentChunkSize}. Retrying chunk immediately.`);
+                        // --- END AGGRESSIVE HALVING ---
+
                         continue; // Immediately start next iteration of while loop
                     }
                 } else {
@@ -401,8 +420,7 @@ const sdeLib = () => {
             console.log(`buildSDEs: Finished writing all ${dataRows.length} data rows.`);
 
             // Use the final reference acquired during Stage 2
-            // --- FINAL FIX: autoResizeColumns is commented out for stability ---
-            // autoResizeColumns(finalSheetReference);
+            // autoResizeColumns(finalSheetReference); // Commented out for stability
 
         } catch (e) {
             // Ensure lock is released on error if it was held (only needed for initial clear, but safe to check)
@@ -483,7 +501,7 @@ function sde_job_START() {
 
         // Halt Formulas
         const ss = getSS();
-        const loadingHelper = ss.getRangeByName("'Utility'!B3:D3");
+        const loadingHelper = ss.getRange("'Utility'!B3:D3");
         const backupSettings = loadingHelper.getValues();
         loadingHelper.setValues([[0, 0,0]]);
         SCRIPT_PROPS.setProperty(KEY_BACKUP_SETTINGS, JSON.stringify(backupSettings));
@@ -640,7 +658,8 @@ function sde_job_FINALIZE() {
         if (backupSettingsJSON) {
             const backupSettings = JSON.parse(backupSettingsJSON);
             const ss = getSS(); // Optimization
-            const loadingHelper = ss.getRangeByName("'Utility'!B3:C3");
+            // FIX: Changed range from B3:C3 (2 cols) to B3:D3 (3 cols)
+            const loadingHelper = ss.getRange("'Utility'!B3:D3"); 
             loadingHelper.setValues(backupSettings);
             Logger.log('FINALIZE: Restored formula settings.');
         }
@@ -666,6 +685,7 @@ function sde_job_FINALIZE() {
         if (!lockAcquired) {
             Logger.log('FINALIZE: Lock unavailable. Aborting.');
         } else {
+            // The fatal error from the mismatch is caught here
             Logger.log(`ERROR in sde_job_FINALIZE: ${e.message} at line ${e.lineNumber}`);
         }
     } finally {
