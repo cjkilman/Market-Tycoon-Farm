@@ -483,9 +483,9 @@ function sde_job_START() {
 
         // Halt Formulas
         const ss = getSS();
-        const loadingHelper = ss.getRangeByName("'Utility'!B3:C3");
+        const loadingHelper = ss.getRangeByName("'Utility'!B3:D3");
         const backupSettings = loadingHelper.getValues();
-        loadingHelper.setValues([[0, 0]]);
+        loadingHelper.setValues([[0, 0,0]]);
         SCRIPT_PROPS.setProperty(KEY_BACKUP_SETTINGS, JSON.stringify(backupSettings));
 
         // --- Setting MAINTENANCE FLAG ---
