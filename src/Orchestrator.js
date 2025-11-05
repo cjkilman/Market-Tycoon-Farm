@@ -521,28 +521,23 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_REQUEST_INDEX = 'marketDataRequestIndex';
   const PROP_KEY_SHEET_ROW = 'marketDataNextWriteRow';
 
-  // --- FIX: BATCH_SIZE set to 800. ---
-  const BATCH_SIZE = 1500; // Increased batch size
-  // ------------------------------------
+  // --- START: DYNAMIC CHUNKING LOGIC (from SDE script) ---
+  const MAX_CHUNK_SIZE = 5000;     // Max rows to fetch at once
+  const MIN_CHUNK_SIZE = 500;      // Min rows to fetch at once
+  const TARGET_WRITE_TIME_MS = 3000; // Target time for setValues() to take (3 seconds)
+  const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize'; // Property to store chunk size
+  // --- END: DYNAMIC CHUNKING LOGIC ---
 
   // --- PREDICTIVE SCHEDULING CONSTANTS ---
   const SOFT_LIMIT_MS = 280000;      // 4m 40s - Soft limit
   const RESCHEDULE_DELAY_MS = 5000;  // 5 seconds - Used for error backoff
   const FULL_RUN_RESCHEDULE_MS = 285000; // 4m 45s - Used for predictive scheduling
-  const SAFE_MARGIN_MS = 50000;      // 1m 30s margin for hard timeout
-  // ----------------------------------------
+  const SAFE_MARGIN_MS = 50000;      // 50s margin for hard timeout
 
-  // --- FIX: REDUCE LOCK WAIT TIME ---
-  const docTryLockWaitMs = 5 * 1000; // Document Lock tryLock wait time (reduced from 15s)
-  // ----------------------------------
+  // --- LOCK WAIT TIME ---
+  const docTryLockWaitMs = 5 * 1000; // Document Lock tryLock wait time
 
-  // --- NEW: Adaptive Throttling based on last write time ---
-  const PROP_KEY_THROTTLE_DURATION = 'marketDataLastWriteDurationMs';
-  const THROTTLE_BASE_SLEEP_MS = 500;      // Min 0.5s sleep between writes (THROTTLE_MIN_SLEEP_MS)
-  const THROTTLE_LATENCY_FACTOR = 1.5;     // Sleep for 1.5x the last write duration
-  const THROTTLE_MAX_SLEEP_MS = 5000;     // Max 45s sleep
-  const THROTTLE_FAILURE_PENALTY_MS = 30000; // Add 10s to duration on failure
-  // --- END NEW ---
+  // --- REMOVED DYNAMIC THROTTLING ---
 
   // --- FIX: Lease Property ---
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
@@ -570,36 +565,27 @@ function _updateMarketDataSheetWorker() {
     return;
   }
 
-  const masterRequests = getMasterBatchFromControlTable();
+  const masterRequests = getMasterBatchFromControlTable(ss);
 
   // --- Phase 1: NEW_RUN Setup ---
-  // MODIFIED: Removed !sheet check here, as it's null by default
   if (currentStep === STATE_FLAGS.NEW_RUN || !masterRequests || masterRequests.length === 0) {
     currentStep = STATE_FLAGS.NEW_RUN;
     console.log(`State: ${STATE_FLAGS.NEW_RUN}. Preparing cycle.`);
 
     if (!masterRequests || masterRequests.length === 0) {
       console.warn("Control Table empty. Resetting state and exiting.");
-      // FIX: Resetting state on empty control table is still necessary to clear old properties
       _resetMarketDataJobState(new Error("Control Table empty during NEW_RUN"));
       return;
     }
 
-    // --- FIX: Delegate to Cache Warmer on a true Cold Start ---
-    // A cold start is defined by NEW_RUN and setupStep being 1 (or null)
     let setupStep = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_SETUP_STEP) || '1', 10);
     if (setupStep === 1) {
       console.log(`Cold Start detected (NEW_RUN, Setup Step 1). Handing off to Cache Warmer first.`);
-      // Clear the lease so the cache warmer can run
       SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
-      // *** FIX: We must set the setupStep to '3' NOW, so the *next* run knows the handoff happened.
-      // --- MODIFICATION: Set to '3' (or any number != 1 and != 2) to signify "post-handoff" ---
-      SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '3'); // <-- CHANGED TO '3'
-      // Schedule the cache warmer to run, which will then schedule this job
+      SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '3'); 
       scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', 5000); // 5 sec delay
       return; // Exit this execution completely
     }
-    // --- END FIX ---
 
     console.log("Acquiring Document Lock for initial sheet setup...");
     console.log(`Resuming setup at step ${setupStep}.`);
@@ -607,72 +593,46 @@ function _updateMarketDataSheetWorker() {
     try {
       // Lease is already set by the masterOrchestrator
       SCRIPT_PROP.deleteProperty('marketDataJobIsActive');
-      SCRIPT_PROP.deleteProperty(PROP_KEY_THROTTLE_DURATION);
+      // --- REMOVED THROTTLE DURATION RESET ---
+      // --- ADDED CHUNK SIZE RESET ---
+      SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE); 
 
       withSheetLock(() => {
-        // --- FIX: getOrCreateSheet MOVED inside step blocks ---
-
         // --- STEP 1: Handle first-time creation (setupStep <= 1) ---
         if (setupStep <= 1) {
-          //  Utilities.sleep(45000);
-          // --- NEW FLUSH ADDED HERE ---
           SpreadsheetApp.flush();
-          // --- FIX: Get sheet INSIDE step ---
           sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
           if (!sheet) throw new Error(`Failed to create/verify sheet in Step 1`);
-
-          // This block will run on a manual reset
           console.log(`[Setup Step 1] Ensuring temp sheet '${tempSheetName}' exists and is hidden.`);
           sheet.hideSheet();
-          // We are done with setup, so delete the step property
           SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
-
         // --- STEP 2: Handle ERROR RECOVERY (setupStep === 2) ---
-        // This step will now *only* run if setupStep was explicitly set to '2' by an error handler
         else if (setupStep === 2) {
-          // Check time *before* starting heavy operation
           if (new Date().getTime() - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
             throw new Error("Aggressive time limit hit before Setup Step 2 (Clear Content). Rescheduling setup.");
           }
-
-          // --- FIX: Get sheet INSIDE step, *after* time check ---
           sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
           if (!sheet) throw new Error(`Failed to create/verify sheet in Step 2`);
-
           console.warn(`[Setup Step 2] RECOVERY: Clearing content from sheet due to previous error.`);
-          const lastRow = sheet.getLastRow(); // <-- This is now safe, sheet is not null
+          const lastRow = sheet.getLastRow(); 
           if (lastRow > 1) {
             console.log(`Clearing content from row 2 to ${lastRow}.`);
             sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns())
               .clearContent();
           }
-
-          // --- ADDED BACK: Force header rewrite after clearing ---
           console.log(`[Setup Step 2] RECOVERY: Resetting headers.`);
           sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
-          // --- END ADDED BACK ---
-
-          // Success: Clear setup state property
           SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
-
         // --- STEP 3: Post-Handoff (setupStep === 3) ---
-        // This is a normal run after a cold start. We just need to ensure the sheet is hidden
-        // and delete the property.
         else if (setupStep === 3) {
-          // --- FIX: Get sheet INSIDE step ---
           sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
           if (!sheet) throw new Error(`Failed to create/verify sheet in Step 3`);
-
           console.log(`[Setup Step 3] Post-handoff check. Ensuring sheet is hidden.`);
           sheet.hideSheet();
-          // We are done with setup, so delete the step property
           SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
-
-        // If setupStep is something else, we do nothing and just proceed.
-
       }, 60000); // 60-second lock wait time for setup
 
       console.log("Initial sheet setup complete.");
@@ -686,16 +646,8 @@ function _updateMarketDataSheetWorker() {
 
     } catch (setupError) {
       console.error(`CRITICAL ERROR during NEW_RUN sheet setup (Step ${setupStep} failed): ${setupError.message}. Rescheduling.`);
-      // Save the current failed step
-      // --- FIX: Force '2' to trigger content clear on next run ---
-      SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '2'); // <-- SET TO '2'
-      // --- END FIX ---
-
-      // Reschedule the *same function* to try the setup again
+      SCRIPT_PROP.setProperty(PROP_KEY_SETUP_STEP, '2'); // Force '2' to clear
       scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
-
-      // We do NOT reset the whole job, just retry the setup.
-      // We re-throw the error to stop this execution.
       throw setupError;
     }
   } // --- End NEW_RUN ---
@@ -708,21 +660,17 @@ function _updateMarketDataSheetWorker() {
     let requestStartIndex = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_REQUEST_INDEX) || '0');
     let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_SHEET_ROW) || '2');
 
-    // --- NEW: Read throttle state once ---
-    let lastDurationMs = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_THROTTLE_DURATION) || '0');
+    // --- NEW: Read chunk size state once ---
+    let currentChunkSize = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || MAX_CHUNK_SIZE.toString());
     // --- END NEW ---
 
-    // Re-verify sheet exists before loop
-    // This is now the *first* time this execution path tries to get the sheet
     sheet = ss.getSheetByName(tempSheetName);
     if (!sheet) {
-      // If the sheet is *still* null here, it means setup *completed* but the sheet
-      // is gone, or setup *never ran* (which shouldn't happen).
       const errMsg = `Sheet ${tempSheetName} disappeared during PROCESSING phase. Resetting state.`;
       _resetMarketDataJobState(new Error(errMsg));
       throw new Error(errMsg); // Halt execution
     }
-    console.log(`Resuming from request index: ${requestStartIndex}, next write row: ${nextWriteRow}`);
+    console.log(`Resuming from request index: ${requestStartIndex}, next write row: ${nextWriteRow}, chunk size: ${currentChunkSize}`);
 
     // --- Main Processing Loop ---
     while (requestStartIndex < masterRequests.length) {
@@ -730,30 +678,21 @@ function _updateMarketDataSheetWorker() {
 
       // --- Time Limit Check (Soft Limit) ---
       if (currentTime - START_TIME > SOFT_LIMIT_MS) {
-        // Save current state before rescheduling
         SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
         SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
-        // (Throttle state is already saved on each loop)
-
-        // FIX: Predictive reschedule using FULL_RUN_RESCHEDULE_MS
+        // --- NEW: Save current chunk size ---
+        SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
+        
         scheduleOneTimeTrigger('updateMarketDataSheet', FULL_RUN_RESCHEDULE_MS);
-        console.warn(`⚠️ Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULE_MS / 60000} minutes.`);
+        console.warn(`WARNING: Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULE_MS / 60000} minutes.`);
         return; // Exit current execution
       }
 
-      // --- NEW: ADAPTIVE THROTTLE ---
-      // Calculate sleep time based on the *last* batch's performance
-      let sleepMs = Math.max(THROTTLE_BASE_SLEEP_MS, lastDurationMs * THROTTLE_LATENCY_FACTOR);
-      sleepMs = Math.min(THROTTLE_MAX_SLEEP_MS, sleepMs); // Cap at max
-
-      console.log(`Throttling for ${sleepMs.toFixed(0)}ms (based on last write of ${lastDurationMs}ms)`);
-      if (sleepMs > 0) {
-        Utilities.sleep(sleepMs);
-      }
-      // --- END NEW ---
+      // --- REMOVED ADAPTIVE THROTTLE ---
 
       // --- Prepare Batch & Fetch Data ---
-      const requestEndIndex = Math.min(requestStartIndex + BATCH_SIZE, masterRequests.length);
+      // --- MODIFIED: Use dynamic chunk size ---
+      const requestEndIndex = Math.min(requestStartIndex + currentChunkSize, masterRequests.length);
       const requestsForThisRun = masterRequests.slice(requestStartIndex, requestEndIndex);
 
       if (requestsForThisRun.length === 0) {
@@ -764,19 +703,17 @@ function _updateMarketDataSheetWorker() {
 
       let marketData;
       try {
-        // Get data (will use cache or fetch)
         marketData = fuzAPI.getDataForRequests(requestsForThisRun);
       } catch (apiError) {
         console.error(`Error calling fuzAPI.getDataForRequests for indices ${requestStartIndex}-${requestEndIndex - 1}: ${apiError.message}. Skipping batch and saving state.`);
-        // Save current state and reschedule on API error
         SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
         SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
-        scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2); // Longer delay on API error?
+        // --- NEW: Save current chunk size ---
+        SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
+        scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2);
         return; // Exit
       }
 
-
-      // Check if API returned data
       if (!marketData || !Array.isArray(marketData) || marketData.length === 0) {
         console.warn(`API returned no data for requests ${requestStartIndex + 1}-${requestEndIndex}. Advancing index.`);
         requestStartIndex = requestEndIndex; // Advance index even if no data
@@ -794,10 +731,10 @@ function _updateMarketDataSheetWorker() {
               allRowsToWrite.push([
                 "", // Placeholder
                 item.type_id,
-                crate.market_type || '', // Using || '' for robustness
-                crate.market_id || '', // Using || '' for robustness
-                item.sell?.min ?? '', // Column E (sell_min)
-                item.buy?.max ?? '',  // Column F (buy_max)
+                crate.market_type || '', 
+                crate.market_id || '', 
+                item.sell?.min ?? '', 
+                item.buy?.max ?? '',  
                 item.sell?.volume ?? 0,
                 item.buy?.volume ?? 0,
                 currentTimeStamp
@@ -814,7 +751,6 @@ function _updateMarketDataSheetWorker() {
 
       // --- Write Batch (Document Lock) ---
       if (allRowsToWrite.length > 0) {
-        // Column count validation
         if (allRowsToWrite[0].length !== COLUMN_COUNT) {
           console.error(`CRITICAL: Column count mismatch! Expected ${COLUMN_COUNT}, got ${allRowsToWrite[0].length}. Skipping write for batch ${requestStartIndex}.`);
           requestStartIndex = requestEndIndex; // Advance index
@@ -822,18 +758,16 @@ function _updateMarketDataSheetWorker() {
           continue; // Skip batch
         }
 
-        // --- Aggressive Time Check: Reschedule if less than SAFE_MARGIN_MS remains ---
         const timeBeforeWrite = new Date().getTime();
         if (timeBeforeWrite - START_TIME > (SOFT_LIMIT_MS - SAFE_MARGIN_MS)) {
-          // Log that we are stopping work to avoid hard timeout
           SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
           SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
+          // --- NEW: Save current chunk size ---
+          SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
           scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
-          console.warn(`⚠️ Aggressive time limit hit (less than ${SAFE_MARGIN_MS}ms remaining). Saved state. RESCHEDULED to avoid hard timeout.`);
+          console.warn(`WARNING: Aggressive time limit hit (less than ${SAFE_MARGIN_MS}ms remaining). Saved state. RESCHEDULED to avoid hard timeout.`);
           return; // Exit current execution
         }
-        // --- End Aggressive Time Check ---
-
 
         // --- Use Document TryLock ---
         const docLock = LockService.getDocumentLock();
@@ -843,14 +777,12 @@ function _updateMarketDataSheetWorker() {
           lockAcquired = docLock.tryLock(docTryLockWaitMs);
 
           if (lockAcquired) {
-            const writeStartTime = new Date().getTime(); // --- NEW ---
+            const writeStartTime = new Date().getTime(); 
             console.log(`Document Lock acquired. Attempting sheet.getRange(${nextWriteRow}, 1, ${allRowsToWrite.length}, ${COLUMN_COUNT}).setValues(...)`);
             const range = sheet.getRange(nextWriteRow, 1, allRowsToWrite.length, COLUMN_COUNT);
-
             range.setValues(allRowsToWrite);
-
             console.log(`Write successful.`);
-            const currentWriteDurationMs = new Date().getTime() - writeStartTime; // --- NEW ---
+            const currentWriteDurationMs = new Date().getTime() - writeStartTime; 
 
             // --- Update State ONLY if Write Succeeded ---
             nextWriteRow += allRowsToWrite.length;
@@ -859,13 +791,13 @@ function _updateMarketDataSheetWorker() {
             SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
             SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
 
-            // --- NEW: ADAPTIVE THROTTLING (SAVE DURATION) ---
-            lastDurationMs = currentWriteDurationMs; // Update duration for *this* execution's next loop
-            SCRIPT_PROP.setProperty(PROP_KEY_THROTTLE_DURATION, lastDurationMs.toString()); // Save for *next* execution
+            // --- NEW: DYNAMIC CHUNK SIZE ADJUSTMENT ---
+            const adjustmentFactor = TARGET_WRITE_TIME_MS / currentWriteDurationMs;
+            currentChunkSize = Math.round(currentChunkSize * adjustmentFactor);
+            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, currentChunkSize));
+            SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString()); // Save for next run
+            console.log(`Batch ${batchesProcessedThisRun} written successfully (${(currentWriteDurationMs / 1000).toFixed(2)}s). State saved. Next index: ${requestStartIndex}. Next row: ${nextWriteRow}. Next chunk size: ${currentChunkSize}`);
             // --- END NEW ---
-
-            console.log(`Batch ${batchesProcessedThisRun} written successfully (${(currentWriteDurationMs / 1000).toFixed(2)}s). State saved. Next index: ${requestStartIndex}. Next row: ${nextWriteRow}`);
-
 
           } else {
             // --- Lock NOT Acquired ---
@@ -873,31 +805,30 @@ function _updateMarketDataSheetWorker() {
             SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
             SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
 
-            // --- NEW: ADAPTIVE THROTTLING (BACK-OFF PENALTY) ---
-            const penaltyDuration = Math.min(THROTTLE_MAX_SLEEP_MS, lastDurationMs + THROTTLE_FAILURE_PENALTY_MS);
-            SCRIPT_PROP.setProperty(PROP_KEY_THROTTLE_DURATION, penaltyDuration.toString());
-            console.warn(`Backing off: new base sleep duration is ${penaltyDuration}ms`);
+            // --- NEW: AGGRESSIVE HALVING ---
+            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+            SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
+            console.warn(`Backing off: new chunk size is ${currentChunkSize}`);
             // --- END NEW ---
 
             scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
-            console.warn(`⚠️ Rescheduled due to Document Lock conflict.`);
+            console.warn(`WARNING: Rescheduled due to Document Lock conflict.`);
             return; // Exit
           }
         } catch (writeError) {
-          // Catch errors *during* the write (e.g., service timeout)
           console.error(`Error during batch write (starting index ${requestStartIndex}): ${writeError.message}. Rescheduling.`);
           if (writeError.stack) { console.error(`Stack: ${writeError.stack}`); }
           SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
           SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
 
-          // --- NEW: ADAPTIVE THROTTLING (BACK-OFF PENALTY) ---
-          const penaltyDuration = Math.min(THROTTLE_MAX_SLEEP_MS, lastDurationMs + THROTTLE_FAILURE_PENALTY_MS);
-          SCRIPT_PROP.setProperty(PROP_KEY_THROTTLE_DURATION, penaltyDuration.toString());
-          console.warn(`Backing off: new base sleep duration is ${penaltyDuration}ms`);
+          // --- NEW: AGGRESSIVE HALVING ON ERROR ---
+          currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+          SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
+          console.warn(`Backing off on error: new chunk size is ${currentChunkSize}`);
           // --- END NEW ---
 
           scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
-          console.warn(`⚠️ Rescheduled due to write error (e.g., service timeout).`);
+          console.warn(`WARNING: Rescheduled due to write error (e.g., service timeout).`);
           return; // Exit
         } finally {
           if (lockAcquired) {
@@ -908,36 +839,34 @@ function _updateMarketDataSheetWorker() {
         // --- End Document TryLock ---
 
       } else {
-        // No valid rows prepared (e.g., all negative cache hits for this batch)
+        // No valid rows prepared
         console.log(`No valid rows to write for batch starting index ${requestStartIndex}. Advancing index.`);
         requestStartIndex = requestEndIndex; // Advance index
         SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
       }
     } // End while loop
-    // --- NEW: 45-second sleep added for recalculation catch-up (User Request) ---
-    // console.log("Processing loop finished. Sleeping 45s for final recalculations/queuing.");
-    // Utilities.sleep(45000);
-    // --- END NEW ---
+
     // --- Post-Loop Check ---
     if (requestStartIndex >= masterRequests.length) {
       console.log("All batches processed successfully. Setting state to FINALIZING.");
       SCRIPT_PROP.setProperty(PROP_KEY_STEP, STATE_FLAGS.FINALIZING);
-      // FIX: Delete the lease on success
       SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
-
-      // *** FIX: Force the finalization schedule immediately ***
+      // --- NEW: Clear chunk size on success ---
+      SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
+      
       scheduleOneTimeTrigger('finalizeMarketDataUpdate', RESCHEDULE_DELAY_MS);
     } else {
       console.warn("Processing loop finished unexpectedly. Saving state.");
       SCRIPT_PROP.setProperty(PROP_KEY_REQUEST_INDEX, requestStartIndex.toString());
       SCRIPT_PROP.setProperty(PROP_KEY_SHEET_ROW, nextWriteRow.toString());
+      // --- NEW: Save current chunk size ---
+      SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
     }
 
   } // --- End if PROCESSING ---
 
   const totalDuration = (new Date().getTime() - START_TIME) / 1000;
   console.log(`_updateMarketDataSheetWorker execution finished in ${totalDuration.toFixed(2)} seconds. Final state: ${SCRIPT_PROP.getProperty(PROP_KEY_STEP)}`);
-
 }
 
 

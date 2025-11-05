@@ -3,9 +3,9 @@
  * This is the single source of truth for what to process.
  * @returns {Array<Object>} An array of objects, e.g., [{type_id: 34, market_id: 60003760, market_type: 'station'}]
  */
-function getMasterBatchFromControlTable() {
+function getMasterBatchFromControlTable(ss=null) {
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
     const controlSheet = ss.getSheetByName('Market_Control'); // Your sheet's name
     if (!controlSheet) throw new Error("Sheet 'Market_Control' not found.");
 

@@ -19,6 +19,117 @@ function isSdeJobRunning() {
   return SCRIPT_PROPS.getProperty('SDE_JOB_RUNNING') === 'true';
 }
 
+/**
+ * Executes the complex Restock List logic in the background.
+ * This final version completely stabilizes the QUERY string by using fixed ColN indices 
+ * and removing the slow sqlFromHeaderNamesEx function calls.
+ * Target: Need To Buy!C4
+ */
+function generateRestockQuery() {
+  const SCRIPT_NAME = 'generateRestockQuery';
+  const TARGET_SHEET_NAME = 'Need To Buy'; 
+  const TARGET_CELL = 'C4'; 
+  
+  // *** FINAL STABILIZED COLUMN INDICES ***
+  // These are the fixed, unbreakable references from MarketOverviewData!B3:BA687.
+  const COL = {
+    ITEM_NAME: 'Col2',
+    TARGET_QTY: 'Col4',
+    WAREHOUSE_QTY: 'Col28',
+    BUY_ORDER_QTY: 'Col15',
+    MARGIN: 'Col45',
+    DAYS_OF_INV: 'Col29',
+    TOTAL_MARKET_QTY: 'Col33',
+    VOLUME: 'Col20',           
+    MARKET_VOLUME: 'Col21',    
+    GROUP: 'Col3'              
+  };
+
+  // NOTE: This removes all calls to the custom function.
+  executeWithWaitLock(() => {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
+    if (!sheet) {
+      Logger.log(`Target sheet ${TARGET_SHEET_NAME} not found.`);
+      return;
+    }
+
+    // --- 1. READ DYNAMIC FILTERS ---
+    const filterValues = sheet.getRange('B5:B18').getValues(); 
+    const filterDaysTarget = filterValues[0][0];
+    const filterMargin = filterValues[2][0];
+    const filterGroup = filterValues[4][0]; // B9 (The Group Filter)
+    const sortDirection = filterValues[6][0];
+    const sortColumnHeader = filterValues[8][0]; 
+    const limitNum = filterValues[13][0];
+    
+    // --- 2. STABILIZE GROUP FILTER LOGIC (Handles B9 empty case) ---
+    let groupWhereClause = '';
+    if (filterGroup) {
+      // Escape single quotes and convert to lower case for the SQL LIKE/CONTAINS
+      const safeFilterGroup = filterGroup.toString().toLowerCase().replace(/'/g, `''`);
+      
+      // If B9 has a value, include the filter
+      groupWhereClause = ` AND LOWER(${COL.GROUP}) Contains '${safeFilterGroup}'`;
+    }
+    // If B9 is blank, groupWhereClause remains empty, correctly filtering ALL groups.
+    
+    // --- 3. STABILIZE SORT COLUMN ---
+    let sortCol = "Col2"; 
+    switch (sortColumnHeader.toString().trim()) {
+      case 'Quantity': 
+      case 'TARGET_QTY': 
+        sortCol = "Col2"; break;
+      case 'Total Market Quantity': sortCol = "Col3"; break;
+      case '30-day traded volume': 
+      case 'Volume': 
+        sortCol = "Col4"; break;
+      case 'Listed Volume (Feed Sell)': 
+      case 'Market_Volume': 
+        sortCol = "Col5"; break;
+      case 'Warehouse Qty': sortCol = "Col6"; break;
+      case 'Margin': sortCol = "Col7"; break;
+      case 'Item Name': sortCol = "Col1"; break;
+      default: sortCol = "Col2"; break;
+    }
+    
+    // --- 4. CONSTRUCT FINAL QUERY STRING ---
+    
+    // SELECT: Fixed ColN indices
+    const sqlSelect = `SELECT ${COL.ITEM_NAME}, ${COL.TARGET_QTY}-${COL.WAREHOUSE_QTY}, ${COL.TOTAL_MARKET_QTY}, ${COL.VOLUME}, ${COL.MARKET_VOLUME}, ${COL.WAREHOUSE_QTY}, ${COL.MARGIN}`;
+
+    // WHERE: Combined fixed ColN and dynamic group filter logic
+    const sqlWhere = `WHERE (${COL.BUY_ORDER_QTY} is null AND ${COL.DAYS_OF_INV} < ${filterDaysTarget} AND ${COL.MARGIN} >= ${filterMargin} ${groupWhereClause} AND ${COL.ITEM_NAME} IS NOT NULL)`;
+
+    const sqlLabel = `LABEL ${COL.TARGET_QTY}-${COL.WAREHOUSE_QTY} 'Quantity'`;
+    
+    const orderBySql = `ORDER BY ${sortCol} ${sortDirection}`;
+    const limitSql = (limitNum == "No Limit" || !limitNum || limitNum == 0) ? "" : `LIMIT ${limitNum}`;
+    
+    const dataRangeRef = 'MarketOverviewData!B3:BA687';
+    
+  // The final constructed string is assembled using an Array.join(' ') for guaranteed spacing.
+const queryClauses = [
+    sqlSelect, 
+    sqlWhere, 
+    orderBySql, 
+    limitSql,
+    sqlLabel
+];
+
+// 1. Join all clauses with a single space.
+const finalQueryString = queryClauses.join(' '); 
+
+const finalFormula = `=IF(Utility!B3<>1,, QUERY(${dataRangeRef}, "${finalQueryString.trim()}", 1))`;
+
+// 3. WRITE TO SHEET (Target: Need To Buy!C4)
+sheet.getRange(TARGET_CELL).setFormula(finalFormula);
+    
+    
+    Logger.log(`Successfully updated restock query in ${TARGET_CELL}.`);
+
+  }, SCRIPT_NAME); 
+}
 
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
@@ -204,9 +315,7 @@ function getChacterNameFromID(charIds, show_column_headings = true) {
   return chars;
 }
 
-/**
- * Replace [Header Name] tokens in a QUERY-like SQL with ColN,
- */
+
 /**
  * Replace [Header Name] tokens in a QUERY-like SQL with ColN,
  */
