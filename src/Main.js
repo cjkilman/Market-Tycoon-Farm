@@ -20,11 +20,11 @@ function isSdeJobRunning() {
 }
 
 /**
- * Simple onEdit trigger.
+ * Installable onEdit trigger.
  * Calls generateRestockQuery() if a relevant filter cell is changed.
  * @param {Object} e The event object.
  */
-function onEdit(e) {
+function respondToEdit(e) { // <-- RENAMED from onEdit
   // Exit if no event object (e.g., running from script editor)
   if (!e) {
     return;

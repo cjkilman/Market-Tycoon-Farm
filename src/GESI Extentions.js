@@ -1255,6 +1255,15 @@ function runAllLedgerImports() {
     // Log error, but cycle is complete
   }
 
+
+    try {
+    // Assumes runContractLedgerPhase and its sub-functions no longer use internal lock
+    runIndustryLedgerPhase(ss);
+  } catch (e) {
+    log.error('runIndustryLedgerPhase FAILED', e.message);
+    // Log error, but cycle is complete
+  }
+
   log.info('--- Full Ledger Import Cycle Complete ---');
   // NOTE: No lock release here, executeLocked handles it.
   return true;
