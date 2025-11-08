@@ -229,18 +229,21 @@ function generateRestockQuery() {
   Logger.log(`Successfully updated restock query in ${TARGET_CELL}.`);
 }
 
+// Find your existing onOpen() function in Main.js
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
-  // Or DocumentApp or FormApp.
   ui.createMenu('Sheet Tools')
     .addItem('Refresh All Data', 'refreshData')
-    .addItem('Update SDE Data', 'sde_job_START')        // <-- NEW: Starts the robust stateful job
-    .addItem('CANCEL SDE Update', 'sde_job_FINALIZE')    // <-- NEW: Manual cleanup
+    .addItem('Update SDE Data', 'sde_job_START') 
+    .addItem('CANCEL SDE Update', 'sde_job_FINALIZE') 
     .addItem('Authorize Script (First Run)', 'forceAuthorization')
     .addItem("Recalculate/Refresh", "Full_Recalculate_Cycle")
     .addSeparator() 
     .addItem('Reset All Job History', 'resetIndustryLedgerProperties')
-    .addItem('Run Industry Ledger Update', '_runIndustryLedgerUpdate_MENU') 
+    .addItem('Run Industry Ledger Update', '_runIndustryLedgerUpdate_MENU')
+    .addSeparator() // <-- Add a new separator
+    .addItem('[Manufacturing] 1. Refresh Location Names', 'refreshLocationManager') // <-- ADD THIS
+    .addItem('[Manufacturing] 2. Update Material Hangar', 'updateMaterialHangar')   // <-- ADD THIS
     .addToUi();
 }
 
