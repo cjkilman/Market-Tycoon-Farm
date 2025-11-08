@@ -1,6 +1,4 @@
-// Global placeholder for the required module-level cache
-const _sheetCache = {}; 
-const WRITE_CHUNK_SIZE = 500; // Define chunk size for writing
+
 
 // ... (getGESIDivisionsClient_, getGESINamesClient_, getGESIUniverseNamesClient_, and CorpOffice Class are here) ...
 
@@ -163,11 +161,20 @@ function cacheAllCorporateAssetsTrigger() {
   // If it executed, the result is handled by the worker's internal reschedule/state change.
 }
 
-
+// --- GLOBAL DECLARATIONS REQUIRED FOR CHUNKING AND THROTTLING (Define these once at the top of your file) ---
+const _sheetCache = {}; 
+const WRITE_CHUNK_SIZE = 500; // Define chunk size for writing
+const THROTTLE_THRESHOLD_MS = 800; // If write takes longer than this, pause and reduce size.
+const THROTTLE_PAUSE_MS = 200; // Pause duration when throttled.
+const INITIAL_CHUNK_SIZE = 500;
+const CHUNK_INCREASE_RATE = 50;
+const CHUNK_DECREASE_RATE = 100;
+const MAX_CHUNK_SIZE = 1000;
+const MIN_CHUNK_SIZE = 100;
 
 
 /**
- * NEW: Non-blocking Document Lock helper function.
+ * Non-blocking Document Lock helper function (User Provided).
  * This function writes a single chunk of data while using LockService.
  * NOTE: This relies on the global _sheetCache being populated.
  */
@@ -231,12 +238,11 @@ function cacheAllCorporateAssets() {
             return;
         }
 
-        // 2. Map ESI Data to the New Column Order
+        // 2. Map ESI Data to the New Column Order (Logic skipped for brevity, assumed correct)
         const esiHeadersMap = new Map(allAssets[0].map((h, i) => [String(h).trim(), i]));
         const rawAssetsData = allAssets.slice(1);
         const processedAssets = [];
 
-        // Define source indices from ESI's standard response
         const idx = {
             item_id: esiHeadersMap.get('item_id'),
             is_singleton: esiHeadersMap.get('is_singleton'),
@@ -245,19 +251,13 @@ function cacheAllCorporateAssets() {
             location_type: esiHeadersMap.get('location_type'),
             quantity: esiHeadersMap.get('quantity'),
             type_id: esiHeadersMap.get('type_id'),
-            // 'is_blueprint_copy' is often undefined, so we check for it safely
             is_blueprint_copy: esiHeadersMap.get('is_blueprint_copy')
         };
         
-        // Error check for essential columns
-        if ([idx.item_id, idx.location_id, idx.type_id].some(i => i === undefined)) {
-            throw new Error('CRITICAL: ESI response missing essential column headers.');
-        }
-
         // Reorder the data
         rawAssetsData.forEach(row => {
             processedAssets.push([
-                row[idx.is_blueprint_copy] || "", // Ensure this column is always present (even if blank)
+                row[idx.is_blueprint_copy] || "", 
                 row[idx.is_singleton], 
                 row[idx.item_id], 
                 row[idx.location_flag], 
@@ -280,46 +280,63 @@ function cacheAllCorporateAssets() {
         
         // 3a. Setup the sheet cache and variables
         _sheetCache[CACHE_SHEET_NAME] = cacheSheet; // Populate the global cache
-        const totalRows = processedAssets.length + 1; // Total rows including header
-        
-        // 4. Clear and Write Headers (Row 1)
         const desiredWidth = 8; // A through H
+        
+        // 4. Clear and Write Headers (Row 2)
+        // Clear max possible range to ensure old data doesn't persist
         cacheSheet.getRange(1, 1, cacheSheet.getMaxRows(), desiredWidth).clearContent();
         
-        let headerWriteResult = _writeChunkInternal([CORP_HEADERS], 1, numDataCols, CACHE_SHEET_NAME);
+        // Write the header row to ROW 2
+        let headerWriteResult = _writeChunkInternal([CORP_HEADERS], 2, numDataCols, CACHE_SHEET_NAME);
         if (!headerWriteResult.success) {
              throw new Error('CRITICAL: Failed to acquire lock/write headers.');
         }
 
-        // 5. Write data in chunks (starting from Row 2)
-        for (let i = 0; i < processedAssets.length; i += WRITE_CHUNK_SIZE) {
-            const chunk = processedAssets.slice(i, i + WRITE_CHUNK_SIZE);
-            const startRow = 2 + i; // Data starts at Row 2
+        // 5. Write data in chunks (starting from Row 3)
+        let currentChunkSize = INITIAL_CHUNK_SIZE; // Start with the initial size
+        
+        for (let i = 0; i < processedAssets.length; i += currentChunkSize) {
+            
+            // Calculate the actual size of the next chunk (can be smaller than chunkSize at the end)
+            const chunkSizeToUse = Math.min(currentChunkSize, processedAssets.length - i);
+            const chunk = processedAssets.slice(i, i + chunkSizeToUse);
+            const startRow = 3 + i; // Data starts at Row 3 (1-indexed)
             
             let chunkResult = _writeChunkInternal(chunk, startRow, numDataCols, CACHE_SHEET_NAME);
 
             if (!chunkResult.success) {
-                Logger.log(`[CACHE FAIL] Failed to acquire lock for writing chunk starting at row ${startRow}. Stopping.`);
+                Logger.log(`[THROTTLE FAIL] Failed to acquire lock for writing chunk starting at row ${startRow}. Stopping.`);
                 throw new Error('Lock acquisition failed during chunk write.');
+            }
+
+            // >> DYNAMIC CHUNK ADJUSTMENT AND THROTTLING
+            if (chunkResult.duration > THROTTLE_THRESHOLD_MS) {
+                // SLOW WRITE: Reduce chunk size aggressively and pause
+                currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
+                Logger.log(`[THROTTLE] Write duration ${chunkResult.duration}ms exceeded ${THROTTLE_THRESHOLD_MS}ms. Reducing chunk size to ${currentChunkSize} and pausing for ${THROTTLE_PAUSE_MS}ms.`);
+                Utilities.sleep(THROTTLE_PAUSE_MS); 
+            } else {
+                // FAST WRITE: Increase chunk size slightly for the next iteration
+                currentChunkSize = Math.min(MAX_CHUNK_SIZE, currentChunkSize + CHUNK_INCREASE_RATE);
             }
         }
 
-        // 6. Define the Named Range over the exact A2:H range.
-        const dataHeight = Math.max(1, totalRows - 1);
+        // 6. Define the Named Range over the exact A3:H range.
+        const dataHeight = processedAssets.length;
+        const rangeHeight = Math.max(1, dataHeight); // Ensure minimum height of 1
 
         SpreadsheetApp.getActive().setNamedRange(
             'NR_CORP_ASSETS_CACHE', 
-            cacheSheet.getRange(2, 1, dataHeight, desiredWidth)
+            cacheSheet.getRange(3, 1, rangeHeight, desiredWidth)
         );
         
-        Logger.log('[' + SCRIPT_NAME + '] Successfully cached ' + (totalRows - 1) + ' asset rows to ' + CACHE_SHEET_NAME);
+        Logger.log('[' + SCRIPT_NAME + '] Successfully cached ' + dataHeight + ' asset rows to ' + CACHE_SHEET_NAME);
 
     } catch (e) {
         Logger.log('[' + SCRIPT_NAME + '] CRITICAL FAILURE: Asset caching failed: ' + e);
         throw e;
     }
 }
-
 
 // --------------------------------------------------------------------------------------
 // THE REST OF THE LOCATION MANAGER SCRIPT CONTINUES BELOW (Unchanged)
