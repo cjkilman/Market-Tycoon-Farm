@@ -242,8 +242,8 @@ function onOpen() {
     .addItem('Reset All Job History', 'resetIndustryLedgerProperties')
     .addItem('Run Industry Ledger Update', '_runIndustryLedgerUpdate_MENU')
     .addSeparator() // <-- Add a new separator
-    .addItem('[Manufacturing] 1. Refresh Location Names', 'refreshLocationManager') // <-- ADD THIS
-    .addItem('[Manufacturing] 2. Update Material Hangar', 'updateMaterialHangar')   // <-- ADD THIS
+  .addItem('[Manufacturing] 1. Refresh Location Names', 'refreshLocationManager') // <-- Runs InventoryManager.refreshLocationManager()
+  .addItem('[Manufacturing] 2. Update Material Hangar', 'updateMaterialHangar')   // <-- Runs InventoryManager.updateMaterialHangar()
     .addToUi();
 }
 

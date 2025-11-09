@@ -1,3 +1,5 @@
+/* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, ScriptApp, fuzzworkCacheRefresh_TimeGated, getMasterBatchFromControlTable, withSheetLock, getOrCreateSheet, cacheAllCorporateAssetsTrigger, triggerLedgerImportCycle, fuzAPI, _fetchProcessedLootData, runLootLedgerDelta, Ledger_Import_CorpJournal, syncContracts, runIndustryLedgerPhase, runLootDeltaPhase, runContractLedgerPhase */
+
 // Global variable to track recursion depth for this lock type
 var EXECUTION_LOCK_DEPTH_TRY = 0;
 // Global variable to track recursion depth for this lock type
@@ -7,7 +9,6 @@ var EXECUTION_LOCK_DEPTH_WAIT = 0;
 const LOCK_TIMEOUT_MS = 5000;
 const LOCK_WAIT_TIMEOUT_MS = 30000; // Default wait
 
-
 /**
  * Global property key for system-wide maintenance mode.
  */
@@ -15,7 +16,7 @@ if (typeof GLOBAL_STATE_KEY === 'undefined') {
   /**
    * Global property key for system-wide maintenance mode.
    */
-  var  GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
+  var   GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
 }
 
 
@@ -26,9 +27,6 @@ const STATE_FLAGS = {
   FINALIZING: 'FINALIZING'
 };
 
-/**
- * Helper to create a new one-time "retry" trigger.
- */
 /**
  * Helper to create a new one-time "retry" trigger.
  * --- FIX: Now checks for Maintenance Mode ---
@@ -42,7 +40,7 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
   }
   
   // --- NEW: MAINTENANCE MODE CHECK ---
-  // SCRIPT_PROPS must be globally defined
+  // FIX: Corrected SCRIPT_PROPS to PropertiesService.getScriptProperties()
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const systemState = SCRIPT_PROP.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
 
@@ -131,10 +129,12 @@ function _resetMarketDataJobState(error) {
     SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP); // Clear the finalizer step
     SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP); // <-- ADDED
     SCRIPT_PROP.deleteProperty('marketDataJobIsActive'); // Legacy flag cleanup
-    // --- CLEAR ASSET CACHE STATE ---
-    SCRIPT_PROP.deleteProperty('AssetCache_Data_V2');
-    SCRIPT_PROP.deleteProperty('AssetCache_NextRow');
+    
+    // --- FIX: REMOVED ASSET CACHE DELETION ---
+    // SCRIPT_PROP.deleteProperty('AssetCache_Data_V2');
+    // SCRIPT_PROP.deleteProperty('AssetCache_NextRow');
     // -------------------------------
+    
   } catch (propError) {
     console.error(`Error deleting script properties: ${propError.message}`);
   }
@@ -149,6 +149,8 @@ function _resetMarketDataJobState(error) {
 
 /**
  * Runs ALL simple, non-stateful cache warmers and triggers (like asset fetching).
+ * FIX: This function is NO LONGER CALLED by the master orchestrator.
+ * It is now only a placeholder for manual execution if needed.
  */
 function runAllSimpleCacheJobs() {
   const SCRIPT_NAME = 'runAllSimpleCacheJobs';
@@ -325,9 +327,10 @@ function masterOrchestrator() {
     }
     
     // --- 2. Run Simple Jobs (Asset Cache, Ledger Syncs, etc.) ---
-    // Execute simple job runner under the master lock.
-    console.log(`Dispatching SIMPLE CACHE JOBS (Assets/Ledgers).`);
-    executeWithTryLock(runAllSimpleCacheJobs, 'runAllSimpleCacheJobs');
+    // FIX: This call is REMOVED to prevent timeouts and lock conflicts.
+    // Asset/Ledger jobs should run on their own separate, less frequent triggers (e.g., hourly).
+    // console.log(`Dispatching SIMPLE CACHE JOBS (Assets/Ledgers).`);
+    // runAllSimpleCacheJobs(); // <-- This was the bug, it's now removed.
 
   }
   console.log(`Master orchestrator finished checks for minute ${currentMinute}.`);
@@ -395,8 +398,8 @@ function triggerCacheWarmerWithRetry() {
     } else {
       console.log(`Cache warmer finished (min ${currentMinute}): Dispatching MARKET DATA UPDATE.`);
       // FIX: Set the new lease time before dispatching the job
-      const NOW_MS = new Date().getTime();
-      const NEW_LEASE = NOW_MS + 280000; // 4m 40s
+      const NOW_MS_INNER = new Date().getTime(); // Use new timestamp
+      const NEW_LEASE = NOW_MS_INNER + 280000; // 4m 40s
       SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
 
       // *** FIX: Change synchronous call to ASYNCHRONOUS schedule ***
@@ -406,8 +409,9 @@ function triggerCacheWarmerWithRetry() {
   } else if (result === false) {
     // --- Case 3: Ran but did NOT complete fully (hit time limit) ---
     console.log(`${funcName} ran but hit its time limit. Rescheduling wrapper.`);
-
     scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
+  } else {
+    // --- Case 4: Unexpected return value ---
     console.warn(`${funcName} execution by ${wrapperFuncName} returned unexpected value: ${result}`);
   }
 }
@@ -450,10 +454,13 @@ function _updateMarketDataSheetWorker() {
   // --- END: DYNAMIC CHUNKING LOGIC ---
 
   // --- PREDICTIVE SCHEDULING CONSTANTS ---
-  const SOFT_LIMIT_MS = 280000;      // 4m 40s - Soft limit
-  const RESCHEDULE_DELAY_MS = 5000;  // 5 seconds - Used for error backoff
+  const SOFT_LIMIT_MS = 280000;       // 4m 40s - Soft limit
+  const RESCHEDULE_DELAY_MS = 5000;   // 5 seconds - Used for error backoff
   const FULL_RUN_RESCHEDULE_MS = 285000; // 4m 45s - Used for predictive scheduling
-  const SAFE_MARGIN_MS = 50000;      // 50s margin for hard timeout
+  const SAFE_MARGIN_MS = 50000;       // 50s margin for hard timeout
+
+  // --- LOCK WAIT TIME ---
+  const docTryLockWaitMs = 5 * 1000; // Document Lock tryLock wait time
 
   // --- FIX: Lease Property ---
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
@@ -535,7 +542,7 @@ function _updateMarketDataSheetWorker() {
           if (lastRow > 1) {
             console.log(`Clearing content from row 2 to ${lastRow}.`);
             sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns())
-              .clearContent();
+                 .clearContent();
           }
           console.log(`[Setup Step 2] RECOVERY: Resetting headers.`);
           sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
@@ -545,7 +552,7 @@ function _updateMarketDataSheetWorker() {
         else if (setupStep === 3) {
           sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
           if (!sheet) throw new Error(`Failed to create/verify sheet in Step 3`);
-          console.log(`[Setup Step 3] Post-Handoff check. Ensuring sheet is hidden.`);
+          console.log(`[Setup Step 3] Post-handoff check. Ensuring sheet is hidden.`);
           sheet.hideSheet();
           SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
@@ -599,8 +606,8 @@ function _updateMarketDataSheetWorker() {
         // --- NEW: Save current chunk size ---
         SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
         
-        scheduleOneTimeTrigger('updateMarketDataSheet', FULL_RUN_RESCHEDULE_DELAY_MS);
-        console.warn(`WARNING: Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULE_DELAY_MS / 60000} minutes.`);
+        scheduleOneTimeTrigger('updateMarketDataSheet', FULL_RUN_RESCHEDULE_MS);
+        console.warn(`WARNING: Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULE_MS / 60000} minutes.`);
         return; // Exit current execution
       }
 
@@ -843,8 +850,6 @@ function finalizeMarketDataUpdate() {
       // Uses withSheetLock from Utility.js
       withSheetLock(() => {
         const tempSheet = ss.getSheetByName(tempSheetName);
-        const finalSheetName = 'Market_Data_Raw';
-        const oldSheetName = 'Market_Data_Old'; // Sheet to be deleted later by cleanupOldSheet
         const liveSheet = ss.getSheetByName(finalSheetName);
 
         // --- Pre-swap Validation ---
@@ -863,6 +868,8 @@ function finalizeMarketDataUpdate() {
         }
 
         console.log("Acquired Document Lock for sheet swap (WaitLock).");
+
+        // --- STEP 1 LOGIC IS REMOVED HERE ---
 
         // --- STEP 2: RENAME LIVE to OLD ---
         if (step === 2) {
@@ -949,6 +956,7 @@ function _deleteOldSheetWorker() {
       if (oldSheet) {
         ss.deleteSheet(oldSheet);
         console.log(`Sheet '${oldSheetName}' deleted.`);
+        // Utilities.sleep(45000);
         SpreadsheetApp.flush(); // Force the delete operation to complete
       } else {
         console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
@@ -964,3 +972,106 @@ function _deleteOldSheetWorker() {
   scheduleOneTimeTrigger('finalizeMarketDataUpdate', RETRY_DELAY_MS);
   console.log("Step 1 complete. Scheduled next phase (Step 2) for retry.");
 }
+
+/**
+ * Run this function ONCE from the editor to set up triggers.
+ */
+function setupStaggeredTriggers() {
+  console.log("Setting up/Resetting orchestrator triggers...");
+
+  // Clean up all known triggers managed by this orchestrator
+  const managedFunctions = [
+    'fuzzworkCacheRefresh_TimeGated',
+    'triggerCacheWarmerWithRetry',
+    'updateMarketDataSheet',
+    'finalizeMarketDataUpdate',
+    'cleanupOldSheet', // Include this if it had its own trigger previously
+    'masterOrchestrator',
+    'runAllLedgerImports', // Legacy
+    'triggerLedgerImportCycle', // Legacy monolith
+    'cacheAllCorporateAssetsTrigger',
+    'runLootAndJournalSync', // NEW
+    'runContractSync', // NEW
+    'runIndustrySync' // NEW
+  ];
+
+  let totalDeleted = 0;
+  managedFunctions.forEach(funcName => {
+    totalDeleted += deleteTriggersByName(funcName);
+  });
+  console.log(`Total existing clock triggers deleted: ${totalDeleted}.`);
+
+  try {
+    // 1. Market Data (15 min)
+    ScriptApp.newTrigger('masterOrchestrator')
+      .timeBased().everyMinutes(15).create();
+    console.log('SUCCESS: Created 15-minute trigger for masterOrchestrator.');
+
+    // --- FIX: Create SEPARATE triggers for the heavy jobs ---
+    // 2. Asset Job (runs once per hour)
+    ScriptApp.newTrigger('cacheAllCorporateAssetsTrigger')
+      .timeBased().everyHours(1).nearMinute(0).create();
+    console.log('SUCCESS: Created 1-hour trigger for cacheAllCorporateAssetsTrigger.');
+
+    // 3. Loot/Journal Sync (Hourly, at :10)
+    ScriptApp.newTrigger('runLootAndJournalSync')
+      .timeBased().everyHours(1).nearMinute(10).create();
+    console.log('SUCCESS: Created 1-hour trigger for runLootAndJournalSync.');
+
+    // 4. Contract Sync (Hourly, at :20)
+    ScriptApp.newTrigger('runContractSync')
+      .timeBased().everyHours(1).nearMinute(20).create();
+    console.log('SUCCESS: Created 1-hour trigger for runContractSync.');
+
+    // 5. Industry Ledger (Hourly, at :30)
+    ScriptApp.newTrigger('runIndustrySync')
+      .timeBased().everyHours(1).nearMinute(30).create();
+    console.log('SUCCESS: Created 1-hour trigger for runIndustrySync.');
+
+  } catch (e) {
+    console.error(`Failed to create new triggers: ${e.message}. Please check permissions and script validity.`);
+  }
+}
+
+/**
+ * Public function to manually trigger an immediate retry or "bump" the stalled job.
+ */
+function bumpMarketDataJob() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
+  const quickUpdateDelayMs = 5000; // 5 seconds delay
+
+  console.log("MANUAL BUMP initiated.");
+
+  // 1. Attempt to clear the lease, allowing the job to start fresh.
+  const leaseRaw = SCRIPT_PROP.getProperty(PROP_KEY_LEASE);
+  if (leaseRaw) {
+    const leaseUntil = parseInt(leaseRaw, 10);
+    const NOW_MS = new Date().getTime();
+    if (leaseUntil > NOW_MS) {
+      // Clear the lease forcibly
+      SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
+      console.warn(`Forcibly expired the job lease (was set until ${new Date(leaseUntil)}).`);
+    }
+  }
+
+  // 2. Schedule the next step immediately.
+  scheduleOneTimeTrigger('updateMarketDataSheet', quickUpdateDelayMs);
+  console.log(`SUCCESS: Scheduled 'updateMarketDataSheet' in 5 seconds to resume job.`);
+}
+
+
+/**
+ * Manual reset function for the market data job.
+ */
+function manualResetMarketDataJob() {
+  console.log("MANUAL RESET initiated for Market Data job.");
+  _resetMarketDataJobState(new Error("Manual reset requested via editor"));
+  console.log("MANUAL RESET: Market Data job state has been reset.");
+  // Optional: Immediately try to run the orchestrator to kick things off
+  // try { masterOrchestrator(); } catch(e) { console.error("Error during post-reset orchestrator run:", e); }
+}
+
+
+// NOTE: Assumes getMasterBatchFromControlTable, fuzAPI exist
+// NOTE: Assumes getOrCreateSheet (from Utility.js) exists
