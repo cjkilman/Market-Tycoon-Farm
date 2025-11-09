@@ -7,6 +7,7 @@ var EXECUTION_LOCK_DEPTH_WAIT = 0;
 const LOCK_TIMEOUT_MS = 5000;
 const LOCK_WAIT_TIMEOUT_MS = 30000; // Default wait
 
+
 /**
  * Global property key for system-wide maintenance mode.
  */
@@ -42,7 +43,8 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
   
   // --- NEW: MAINTENANCE MODE CHECK ---
   // SCRIPT_PROPS must be globally defined
-  const systemState = SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const systemState = SCRIPT_PROP.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
 
   // --- END: MAINTENANCE MODE CHECK ---
 
@@ -129,6 +131,10 @@ function _resetMarketDataJobState(error) {
     SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP); // Clear the finalizer step
     SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP); // <-- ADDED
     SCRIPT_PROP.deleteProperty('marketDataJobIsActive'); // Legacy flag cleanup
+    // --- CLEAR ASSET CACHE STATE ---
+    SCRIPT_PROP.deleteProperty('AssetCache_Data_V2');
+    SCRIPT_PROP.deleteProperty('AssetCache_NextRow');
+    // -------------------------------
   } catch (propError) {
     console.error(`Error deleting script properties: ${propError.message}`);
   }
@@ -141,8 +147,32 @@ function _resetMarketDataJobState(error) {
 }
 
 
+/**
+ * Runs ALL simple, non-stateful cache warmers and triggers (like asset fetching).
+ */
+function runAllSimpleCacheJobs() {
+  const SCRIPT_NAME = 'runAllSimpleCacheJobs';
 
-
+  // --- LIST OF SIMPLE JOBS TO RUN ---
+  // Note: These functions handle their own internal locking/execution.
+  
+  // 1. Run the Asset Cache Update (Resilient Job)
+  Logger.log('[' + SCRIPT_NAME + '] Dispatching Asset Cache Update...');
+  if (typeof cacheAllCorporateAssetsTrigger === 'function') {
+      // The trigger function manages its own internal script lock and resumption logic.
+      cacheAllCorporateAssetsTrigger(); 
+  }
+  
+  // 2. Run Ledger Import (Requires its own script lock/handling)
+  Logger.log('[' + SCRIPT_NAME + '] Dispatching All Ledger Imports...');
+  if (typeof triggerLedgerImportCycle === 'function') {
+      // The trigger function manages its own internal script lock and resumption logic.
+      triggerLedgerImportCycle();
+  }
+  // ------------------------------------
+  
+  return true;
+}
 
 
 /**
@@ -282,17 +312,23 @@ function masterOrchestrator() {
     }
   } else { // *** Covers 0-14 and 45-59 (Cache Warmer) ***
     console.log(`Master orchestrator (min ${currentMinute}): In cache warmer window.`);
-    console.log(`Dispatching CACHE WARMER wrapper.`);
-
-    // --- FIX: Check result of TryLock and schedule retry if skipped ---
+    
+    // --- 1. Run Complex Job (Fuzzwork, manages resume state) ---
+    console.log(`Dispatching COMPLEX CACHE WARMER wrapper (Fuzzwork).`);
     const result = executeWithTryLock(triggerCacheWarmerWithRetry, 'triggerCacheWarmerWithRetry');
 
+    // If Fuzzwork job was skipped due to lock, schedule its retry.
     if (result === null) {
-      const retryDelayMs = 2 * 60 * 1000; // 2 min delay
-      console.warn(`Master orchestrator: Cache warmer dispatch was skipped by lock. Scheduling retry.`);
+      const retryDelayMs = 2 * 60 * 1000; 
+      console.warn(`Master orchestrator: Fuzzwork job was skipped by lock. Scheduling retry.`);
       scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', retryDelayMs);
     }
-    // --- END FIX ---
+    
+    // --- 2. Run Simple Jobs (Asset Cache, Ledger Syncs, etc.) ---
+    // Execute simple job runner under the master lock.
+    console.log(`Dispatching SIMPLE CACHE JOBS (Assets/Ledgers).`);
+    executeWithTryLock(runAllSimpleCacheJobs, 'runAllSimpleCacheJobs');
+
   }
   console.log(`Master orchestrator finished checks for minute ${currentMinute}.`);
 }
@@ -319,7 +355,6 @@ function triggerCacheWarmerWithRetry() {
   const wrapperFuncName = 'triggerCacheWarmerWithRetry';
 
   // --- FIXED CONSTANTS ---
-  const FULL_RUN_RESCHEDULE_MS = 285000; // 4m 45s - Predictive reschedule
   const retryDelayMs = 2 * 60 * 1000; // 2 minutes retry delay
   const quickUpdateDelayMs = 5000; // 5 seconds delay before trying market update
   // -----------------------
@@ -331,23 +366,18 @@ function triggerCacheWarmerWithRetry() {
   const isJobActive = leaseUntil > NOW_MS;
   // ---------------------------
 
-  // --- FIX: Log only the function name using .name property ---
   console.log(`Wrapper ${wrapperFuncName} called. Attempting to run function ${funcToRun.name} using executeWithTryLock...`);
-  // --- END FIX ---
 
   const result = executeWithTryLock(funcToRun, funcName); // result is true (full run), false (incomplete), or null (skipped)
 
   if (result === null) {
     // --- Case 1: Skipped due to Script Lock ---
-    // This logic is now handled by the masterOrchestrator, but kept as a redundant safety net.
     console.warn(`${funcName} was skipped due to Script Lock. Scheduling retry for ${wrapperFuncName}.`);
     scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
 
   } else if (result === true) {
     // --- Case 2: Ran AND Completed Fully ---
     console.log(`${funcName} completed a full run successfully.`);
-
-    // *** REMOVED OPPORTUNISTIC CLEANUP BLOCK ***
 
     // --- Lease Check / Job Dispatch ---
     const currentMinute = new Date().getMinutes();
@@ -373,111 +403,13 @@ function triggerCacheWarmerWithRetry() {
       scheduleOneTimeTrigger('updateMarketDataSheet', quickUpdateDelayMs);
     }
 
-    // --- END OF MODIFICATION ---
-
   } else if (result === false) {
     // --- Case 3: Ran but did NOT complete fully (hit time limit) ---
     console.log(`${funcName} ran but hit its time limit. Rescheduling wrapper.`);
 
-    // --- FIX: ADD THIS LOGIC ---
-    // The inner function no longer reschedules itself. The wrapper must do it
-    // to ensure the lock is always present on every run.
     scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
-    // You could also use FULL_RUN_RESCHEDULE_MS if you prefer a longer delay
-    // --- END FIX ---
-    // --- Case 4: Unexpected return value ---
     console.warn(`${funcName} execution by ${wrapperFuncName} returned unexpected value: ${result}`);
   }
-}
-
-
-/**
- * Cache refresh function. Called by wrapper.
- * Processes the Fuzzworks cache queue in batches within time limits.
- * Sets cooldown timestamp upon successful completion.
- * @returns {boolean} True if a full run completed, false otherwise.
- */
-function fuzzworkCacheRefresh_TimeGated() {
-  // --- Configuration ---
-  // --- FIX: Increased batch size for efficiency ---
-  const SUB_BATCH_SIZE = 2500;
-  // ----------------------------------------------
-  const TIME_LIMIT_MS = 270000; // 4m 30s
-  const PROP_KEY_RESUME = 'cacheRefresh_lastIndex';
-  const PROP_KEY_COOLDOWN = 'cacheRefresh_lastFullCompletion';
-  // --- End Configuration ---
-
-  const properties = PropertiesService.getScriptProperties();
-  const START_TIME = new Date().getTime();
-  const NOW_MS = START_TIME;
-
-  console.log("Starting Fuzzworks cache refresh cycle...");
-  let completedFullRun = false; // Flag to track full completion
-
-  try {
-    // 1. Get all requests
-    const allRequests = getMasterBatchFromControlTable();
-    if (!allRequests || allRequests.length === 0) {
-      console.log("Cache Refresh: Control Table empty. Resetting state.");
-      properties.deleteProperty(PROP_KEY_RESUME);
-      properties.deleteProperty(PROP_KEY_COOLDOWN);
-      return true; // Consider empty table as a 'completed' state
-    }
-    console.log(`Total requests found: ${allRequests.length}`);
-
-    // 2. Determine starting point
-    const resumeIndexRaw = properties.getProperty(PROP_KEY_RESUME);
-    let startIndex = resumeIndexRaw ? parseInt(resumeIndexRaw, 10) : 0;
-    if (isNaN(startIndex) || startIndex < 0 || startIndex >= allRequests.length) {
-      startIndex = 0;
-      console.log(`Cache refresh: Starting/Restarting from index 0.`);
-    } else {
-      console.log(`Cache refresh: Resuming from index ${startIndex}.`);
-    }
-
-    let itemsProcessedThisRun = 0;
-
-    // 3. Process requests in batches
-    while (startIndex < allRequests.length) {
-      const currentTime = new Date().getTime();
-      // Time Limit Check
-      if (currentTime - START_TIME > TIME_LIMIT_MS) {
-        properties.setProperty(PROP_KEY_RESUME, startIndex.toString());
-        console.warn(`⚠️ Cache refresh time limit hit after ${itemsProcessedThisRun} items. Next run starts at index ${startIndex}. RESCHEDULING SELF.`);
-        // scheduleOneTimeTrigger('fuzzworkCacheRefresh_TimeGated', 30 * 1000);
-        return false; // <-- Did not complete fully
-      }
-
-      // Process sub-batch
-      const endIndex = Math.min(startIndex + SUB_BATCH_SIZE, allRequests.length);
-      const currentSubBatch = allRequests.slice(startIndex, endIndex);
-      if (currentSubBatch.length > 0) {
-        console.log(`Processing sub-batch: Indices ${startIndex} to ${endIndex - 1} (${currentSubBatch.length} items)`);
-        try {
-          fuzAPI.getDataForRequests(currentSubBatch);
-          itemsProcessedThisRun += currentSubBatch.length;
-        } catch (apiError) {
-          console.error(`Error processing sub-batch indices ${startIndex}-${endIndex - 1}: ${apiError.message}. Skipping batch.`);
-        }
-      }
-      startIndex = endIndex;
-    } // End while loop
-
-    // 4. Full Completion: Reset resume state and set cooldown timestamp
-    properties.deleteProperty(PROP_KEY_RESUME);
-    properties.setProperty(PROP_KEY_COOLDOWN, NOW_MS.toString());
-    console.log(`Cache refresh: Successfully processed all ${allRequests.length} items. Cooldown timestamp set. Index reset.`);
-    completedFullRun = true; // <-- Set flag on full completion
-
-  } catch (e) {
-    console.error(`Unhandled error during cache refresh: ${e.message}\nStack: ${e.stack}`);
-    completedFullRun = false; // Ensure flag is false on error
-  } finally {
-    const duration = (new Date().getTime() - START_TIME) / 1000;
-    console.log(`Cache refresh execution block finished in ${duration.toFixed(2)} seconds.`);
-  }
-  // Return completion status
-  return completedFullRun; // <-- RETURN STATUS
 }
 
 
@@ -501,19 +433,8 @@ function updateMarketDataSheet() {
 }
 
 /**
- * Note: This file contains the corrected _updateMarketDataSheetWorker function.
- * Other functions from the original Orchestrator.js file are omitted for brevity,
- * but would be present in the full file.
+ * Worker function for the Market Data Update.
  */
-/**
- * Note: This file contains the corrected _updateMarketDataSheetWorker function.
- * Other functions from the original Orchestrator.js file are omitted for brevity,
- * but would be present in the full file.
- */
-
-// --- Assume other Orchestrator.js functions exist here ---
-// ... (deleteTriggersByName, _resetMarketDataJobState, executeWithTryLock, etc.) ...
-
 function _updateMarketDataSheetWorker() {
   // --- Configuration ---
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -533,11 +454,6 @@ function _updateMarketDataSheetWorker() {
   const RESCHEDULE_DELAY_MS = 5000;  // 5 seconds - Used for error backoff
   const FULL_RUN_RESCHEDULE_MS = 285000; // 4m 45s - Used for predictive scheduling
   const SAFE_MARGIN_MS = 50000;      // 50s margin for hard timeout
-
-  // --- LOCK WAIT TIME ---
-  const docTryLockWaitMs = 5 * 1000; // Document Lock tryLock wait time
-
-  // --- REMOVED DYNAMIC THROTTLING ---
 
   // --- FIX: Lease Property ---
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
@@ -629,7 +545,7 @@ function _updateMarketDataSheetWorker() {
         else if (setupStep === 3) {
           sheet = getOrCreateSheet(ss, tempSheetName, DATA_SHEET_HEADERS);
           if (!sheet) throw new Error(`Failed to create/verify sheet in Step 3`);
-          console.log(`[Setup Step 3] Post-handoff check. Ensuring sheet is hidden.`);
+          console.log(`[Setup Step 3] Post-Handoff check. Ensuring sheet is hidden.`);
           sheet.hideSheet();
           SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP);
         }
@@ -683,8 +599,8 @@ function _updateMarketDataSheetWorker() {
         // --- NEW: Save current chunk size ---
         SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
         
-        scheduleOneTimeTrigger('updateMarketDataSheet', FULL_RUN_RESCHEDULE_MS);
-        console.warn(`WARNING: Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULE_MS / 60000} minutes.`);
+        scheduleOneTimeTrigger('updateMarketDataSheet', FULL_RUN_RESCHEDULE_DELAY_MS);
+        console.warn(`WARNING: Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULE_DELAY_MS / 60000} minutes.`);
         return; // Exit current execution
       }
 
@@ -927,6 +843,8 @@ function finalizeMarketDataUpdate() {
       // Uses withSheetLock from Utility.js
       withSheetLock(() => {
         const tempSheet = ss.getSheetByName(tempSheetName);
+        const finalSheetName = 'Market_Data_Raw';
+        const oldSheetName = 'Market_Data_Old'; // Sheet to be deleted later by cleanupOldSheet
         const liveSheet = ss.getSheetByName(finalSheetName);
 
         // --- Pre-swap Validation ---
@@ -945,8 +863,6 @@ function finalizeMarketDataUpdate() {
         }
 
         console.log("Acquired Document Lock for sheet swap (WaitLock).");
-
-        // --- STEP 1 LOGIC IS REMOVED HERE ---
 
         // --- STEP 2: RENAME LIVE to OLD ---
         if (step === 2) {
@@ -1033,7 +949,6 @@ function _deleteOldSheetWorker() {
       if (oldSheet) {
         ss.deleteSheet(oldSheet);
         console.log(`Sheet '${oldSheetName}' deleted.`);
-        // Utilities.sleep(45000);
         SpreadsheetApp.flush(); // Force the delete operation to complete
       } else {
         console.log(`Sheet '${oldSheetName}' not found; skipping deletion.`);
@@ -1049,87 +964,3 @@ function _deleteOldSheetWorker() {
   scheduleOneTimeTrigger('finalizeMarketDataUpdate', RETRY_DELAY_MS);
   console.log("Step 1 complete. Scheduled next phase (Step 2) for retry.");
 }
-
-/**
- * Run this function ONCE from the editor to set up triggers.
- */
-function setupStaggeredTriggers() {
-  console.log("Setting up/Resetting orchestrator triggers...");
-
-  // Clean up all known triggers managed by this orchestrator
-  const managedFunctions = [
-    'fuzzworkCacheRefresh_TimeGated',
-    'triggerCacheWarmerWithRetry',
-    'updateMarketDataSheet',
-    'finalizeMarketDataUpdate',
-    'cleanupOldSheet', // Include this if it had its own trigger previously
-    'masterOrchestrator',
-    'runAllLedgerImports', // Assuming GESI might use a similar pattern
-    'triggerLedgerImportCycle'
-  ];
-
-  let totalDeleted = 0;
-  managedFunctions.forEach(funcName => {
-    totalDeleted += deleteTriggersByName(funcName);
-  });
-  console.log(`Total existing clock triggers deleted: ${totalDeleted}.`);
-
-  try {
-    // Setup the main Master Orchestrator Trigger (every 15 min)
-    ScriptApp.newTrigger('masterOrchestrator')
-      .timeBased().everyMinutes(15).create();
-    console.log('SUCCESS: Created 15-minute trigger for masterOrchestrator.');
-
-    // Add back GESI trigger if needed (assuming it runs independently)
-    // FIX: Change to every 2 hours
-    ScriptApp.newTrigger('triggerLedgerImportCycle')
-      .timeBased().everyHours(2).create(); // Changed from .hourly() to .everyHours(2)
-    console.log('SUCCESS: Created 2-hour trigger for triggerLedgerImportCycle.');
-
-  } catch (e) {
-    console.error(`Failed to create new triggers: ${e.message}. Please check permissions and script validity.`);
-  }
-}
-
-/**
- * Public function to manually trigger an immediate retry or "bump" the stalled job.
- */
-function bumpMarketDataJob() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
-  const quickUpdateDelayMs = 5000; // 5 seconds delay
-
-  console.log("MANUAL BUMP initiated.");
-
-  // 1. Attempt to clear the lease, allowing the job to start fresh.
-  const leaseRaw = SCRIPT_PROP.getProperty(PROP_KEY_LEASE);
-  if (leaseRaw) {
-    const leaseUntil = parseInt(leaseRaw, 10);
-    const NOW_MS = new Date().getTime();
-    if (leaseUntil > NOW_MS) {
-      // Clear the lease forcibly
-      SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
-      console.warn(`Forcibly expired the job lease (was set until ${new Date(leaseUntil)}).`);
-    }
-  }
-
-  // 2. Schedule the next step immediately.
-  scheduleOneTimeTrigger('updateMarketDataSheet', quickUpdateDelayMs);
-  console.log(`SUCCESS: Scheduled 'updateMarketDataSheet' in 5 seconds to resume job.`);
-}
-
-
-/**
- * Manual reset function for the market data job.
- */
-function manualResetMarketDataJob() {
-  console.log("MANUAL RESET initiated for Market Data job.");
-  _resetMarketDataJobState(new Error("Manual reset requested via editor"));
-  console.log("MANUAL RESET: Market Data job state has been reset.");
-  // Optional: Immediately try to run the orchestrator to kick things off
-  // try { masterOrchestrator(); } catch(e) { console.error("Error during post-reset orchestrator run:", e); }
-}
-
-
-// NOTE: Assumes getMasterBatchFromControlTable, fuzAPI exist
-// NOTE: Assumes getOrCreateSheet (from Utility.js) exists
