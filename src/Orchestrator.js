@@ -212,7 +212,7 @@ function executeWithTryLock(funcToRun, functionName, timeoutMs = LOCK_TIMEOUT_MS
     } catch (e) {
       console.error(`Unhandled exception in ${functionName}: ${e.message} \nStack: ${e.stack}`);
       Logger.log(`Unhandled exception in ${functionName}: ${e.message}`);
-      throw e; // Re-throw to be caught by GAS
+     
     } finally {
       lock.releaseLock();
       console.log(`Script Lock released for ${functionName}.`);

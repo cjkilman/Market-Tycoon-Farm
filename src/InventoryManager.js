@@ -11,6 +11,7 @@
 const ASSET_CACHE_DATA_KEY = 'AssetCache_Data_V2';
 const ASSET_CACHE_ROW_INDEX_KEY = 'AssetCache_NextRow';
 const ASSET_JOB_STATUS_KEY = 'AssetCache_Status_Key';
+const ASSET_CHUNK_SIZE_KEY = 'AssetCache_ChunkSize';
 
 // Time Constants (in milliseconds)
 const SOFT_LIMIT_MS = 280000; // 4m 40s (Safety limit for predictive reschedule)
@@ -34,10 +35,10 @@ const NPC_STATION_ID_MAX = 70000000;     // IDs above this are typically player-
 // FIX: Merged the 4 known bad IDs with the 24 "dead leaf" IDs
 const GHOST_ITEM_IDS = new Set([
   9007199254740992, 9007199254740993, 9007199254740994, 9007199254740995,
-  1042136670568, 1042139243054, 1043862654421, 1038876191270, 1044532547334, 1050483607331, 
-  1039962719245, 1036200304791, 1047736829320, 1028141962065, 1031195155767, 1034862502178, 
-  1034862547753, 1040928243616, 1047961260476, 1030142093671, 1030289543328, 1031616387594, 
-  1033808818685, 1034429286734, 1042134935603, 1047745393662, 1047758618232, 1047959246356 
+  1042136670568, 1042139243054, 1043862654421, 1038876191270, 1044532547334, 1050483607331,
+  1039962719245, 1036200304791, 1047736829320, 1028141962065, 1031195155767, 1034862502178,
+  1034862547753, 1040928243616, 1047961260476, 1030142093671, 1030289543328, 1031616387594,
+  1033808818685, 1034429286734, 1042134935603, 1047745393662, 1047758618232, 1047959246356
 ]);
 const EXCLUDED_CONTAINER_TYPE_IDS = new Set([28317, 28318]); // Delivery Hangars, Fleet Hangars
 
@@ -129,12 +130,12 @@ function _fetchAssetsConcurrently(mainChar) {
       allAssets.push([
         // FIX: Added obj.is_blueprint_copy to match the 8-column convention
         obj.is_blueprint_copy,
-        obj.is_singleton, 
-        obj.item_id, 
-        obj.location_flag, 
+        obj.is_singleton,
+        obj.item_id,
+        obj.location_flag,
         obj.location_id,
-        obj.location_type, 
-        obj.quantity, 
+        obj.location_type,
+        obj.quantity,
         obj.type_id
       ]);
     });
@@ -164,12 +165,12 @@ function _fetchAssetsConcurrently(mainChar) {
             allAssets.push([
               // FIX: Added obj.is_blueprint_copy to match the 8-column convention
               obj.is_blueprint_copy,
-              obj.is_singleton, 
-              obj.item_id, 
-              obj.location_flag, 
+              obj.is_singleton,
+              obj.item_id,
+              obj.location_flag,
               obj.location_id,
-              obj.location_type, 
-              obj.quantity, 
+              obj.location_type,
+              obj.quantity,
               obj.type_id
             ]);
           });
@@ -191,11 +192,12 @@ function _fetchAssetsConcurrently(mainChar) {
 function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
   const chunkStartTime = new Date().getTime();
   let writeDurationMs = 0;
-  
+  let writeSuccess = true; // Assume success initially
+
   const docLock = LockService.getDocumentLock();
 
   if (!docLock.tryLock(DOC_LOCK_TIMEOUT_MS)) {
-    return { success: false, duration: 0 };
+    return { success: false, duration: 0 }; // Lock Acquisition Failure
   }
 
   try {
@@ -209,13 +211,21 @@ function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
 
   } catch (e) {
     Logger.log(`_writeChunkInternal: Write failed while locked: ${e.message}`);
-    throw e;
+    Logger.log("dataChunk: L:" + dataChunk.length + " C: " + numCols);
+    writeSuccess = false; // Mark Service/API failure
+
+    // Re-throw critical logic errors (like cache miss) to be caught by outer safety nets
+    if (e.message.startsWith('CRITICAL:')) {
+      throw e;
+    }
+
   } finally {
     docLock.releaseLock();
     writeDurationMs = new Date().getTime() - chunkStartTime;
   }
 
-  return { success: true, duration: writeDurationMs };
+  // Return the actual success status based on the try/catch result
+  return { success: writeSuccess, duration: writeDurationMs };
 }
 
 /**
@@ -223,50 +233,52 @@ function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
  * NOTE: Headers are intentionally placed in ROW 2 (A2:H2) per user instruction.
  */
 function _prepareCacheSheet() {
-    const SCRIPT_NAME = '_prepareCacheSheet';
-    
-    const docLock = LockService.getDocumentLock();
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
-    
-    if (!cacheSheet) { Logger.log(`[${SCRIPT_NAME}] ERROR: Target sheet '${CACHE_SHEET_NAME}' not found.`); return { success: false, duration: 0 }; }
-    
-    // Add to cache for chunk writer
-    _sheetCache[CACHE_SHEET_NAME] = cacheSheet; 
-    
-    const lockStartTime = new Date().getTime();
-    
-    // Use a very long waitLock for this critical, one-time operation.
-    docLock.waitLock(CRIT_LOCK_WAIT_MS); 
-    const lockAcquiredTime = new Date().getTime();
-    
-    try {
-        const writeStartTime = new Date().getTime(); 
-        
-        // 1. CLEAR CONTENT: Clear content from ROW 3 downwards (A3:H...).
-        const lastRow = cacheSheet.getMaxRows();
-        if (lastRow > 2) {
-            // Clears all rows from A3 down to the maximum row, columns A through H.
-            cacheSheet.getRange("A3:H" + lastRow).clearContent();
-        }
-        
-        // 2. HEADER WRITE: Write headers to ROW 2 (A2:H2) as explicitly instructed.
-        cacheSheet.getRange("A2:H2").setValues([ASSET_CACHE_HEADERS]);
+  const SCRIPT_NAME = '_prepareCacheSheet';
 
-        const criticalWriteDuration = new Date().getTime() - writeStartTime;
-        Logger.log(`[${SCRIPT_NAME}] CRIT-WRITE: Cleared/Wrote headers in ${criticalWriteDuration}ms. Headers placed in ROW 2.`);
-        
-        return { success: true, duration: lockAcquiredTime - lockStartTime };
-        
-    } catch (e) { 
-        Logger.log(`[${SCRIPT_NAME}] CRITICAL ERROR during sheet preparation: ${e}`);
-        return { success: false, duration: 0 };
-    } 
-    finally {
-        docLock.releaseLock();
-        SpreadsheetApp.flush();
-        Logger.log(`[${SCRIPT_NAME}] LOCK STATS: Lock Released after preparation.`);
+  const docLock = LockService.getDocumentLock();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
+
+  if (!cacheSheet) { Logger.log(`[${SCRIPT_NAME}] ERROR: Target sheet '${CACHE_SHEET_NAME}' not found.`); return { success: false, duration: 0 }; }
+
+  // Add to cache for chunk writer
+  _sheetCache[CACHE_SHEET_NAME] = cacheSheet;
+
+  const lockStartTime = new Date().getTime();
+
+  // Use a very long waitLock for this critical, one-time operation.
+  docLock.waitLock(CRIT_LOCK_WAIT_MS);
+  const lockAcquiredTime = new Date().getTime();
+
+  try {
+    const writeStartTime = new Date().getTime();
+
+    // 1. AGGRESSIVE CLEAR: Delete all rows below the header row (Row 2).
+    // This physically shrinks the sheet, ensuring no old content remains.
+    const lastRow = cacheSheet.getMaxRows();
+    if (lastRow > 2) {
+      // Delete from Row 3 (the first data row) downwards
+      cacheSheet.getRange("A3:H" + lastRow).clearContent();
     }
+
+    // 2. HEADER WRITE: Write headers to ROW 2 (A2:H2).
+    // This must be done AFTER deletion as deletion preserves the header.
+    cacheSheet.getRange("A2:H2").setValues([ASSET_CACHE_HEADERS]);
+
+    const criticalWriteDuration = new Date().getTime() - writeStartTime;
+    Logger.log(`[${SCRIPT_NAME}] CRIT-WRITE: Deleted old rows and wrote headers in ${criticalWriteDuration}ms. Headers placed in ROW 2.`);
+
+    return { success: true, duration: lockAcquiredTime - lockStartTime };
+
+  } catch (e) {
+    Logger.log(`[${SCRIPT_NAME}] CRITICAL ERROR during sheet preparation: ${e}`);
+    return { success: false, duration: 0 };
+  }
+  finally {
+    docLock.releaseLock();
+    SpreadsheetApp.flush();
+    Logger.log(`[${SCRIPT_NAME}] LOCK STATS: Lock Released after preparation.`);
+  }
 }
 
 
@@ -281,16 +293,16 @@ function _dispatchAssetJob() {
 
   // If the job is paused (has a next row index), let the pending retry trigger handle it.
   if (SCRIPT_PROP.getProperty(ASSET_CACHE_ROW_INDEX_KEY)) {
-      Logger.log("Dispatch: Resumable asset job is paused. Bailing out to allow pending retry trigger to resume it.");
-      return; 
+    Logger.log("Dispatch: Resumable asset job is paused. Bailing out to allow pending retry trigger to resume it.");
+    return;
   }
 
   // If not paused, dispatch the main trigger function.
   if (typeof cacheAllCorporateAssetsTrigger === 'function') {
-      Logger.log("Dispatch: Job not paused. Calling cacheAllCorporateAssetsTrigger to initiate or acquire lock.");
-      cacheAllCorporateAssetsTrigger();
+    Logger.log("Dispatch: Job not paused. Calling cacheAllCorporateAssetsTrigger to initiate or acquire lock.");
+    cacheAllCorporateAssetsTrigger();
   } else {
-      Logger.error("Dispatch: Error: cacheAllCorporateAssetsTrigger function not found."); 
+    Logger.log("Dispatch: Error: cacheAllCorporateAssetsTrigger function not found.");
   }
 }
 
@@ -302,7 +314,7 @@ function cacheAllCorporateAssetsTrigger() {
   const funcName = 'cacheAllCorporateAssets';
 
   // executeWithTryLock acquires the script lock and holds it for the worker's execution.
-  const result = executeWithTryLock(cacheAllCorporateAssets, funcName); 
+  const result = executeWithTryLock(cacheAllCorporateAssets, funcName);
 
   if (result === null) {
     // Action: Log and rely on the higher-level trigger (Dispatcher)
@@ -315,185 +327,219 @@ function cacheAllCorporateAssetsTrigger() {
  * This is a RESUMABLE, time-gated job to overcome the 6-minute hard limit.
  */
 function cacheAllCorporateAssets() {
-    const SCRIPT_NAME = 'cacheAllCorporateAssets';
-    
-    const SCRIPT_PROP = PropertiesService.getScriptProperties();
-    const START_TIME = new Date().getTime();
+  const SCRIPT_NAME = 'cacheAllCorporateAssets';
 
-    // Start current chunk size at MIN_CHUNK_SIZE, but overridden for the first iteration
-    let currentChunkSize = MIN_CHUNK_SIZE; 
-    let previousDuration = 0; 
-    
-    // --- PHASE 1: Data Acquisition (Fetch or Resume) ---
-    let processedAssets = [];
-    const cachedAssetData = SCRIPT_PROP.getProperty(ASSET_CACHE_DATA_KEY);
-    let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(ASSET_CACHE_ROW_INDEX_KEY) || '0', 10);
-    let jobStatus = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const START_TIME = new Date().getTime();
 
-    if (cachedAssetData) {
-        processedAssets = JSON.parse(cachedAssetData);
-        Logger.log(`[STATE] Resuming job. Status: ${jobStatus}. Loaded ${processedAssets.length} assets from properties.`);
-        
-        if (nextWriteRow === 0 && jobStatus === 'FETCHED') {
-            // Scenario 3: Timed out after fetch, before sheet clear. Proceed to prepare sheet.
-            Logger.log(`[STATE] Detected FETCHED status. Proceeding to critical sheet preparation.`);
-            // Fall through to PHASE 2A
-        } else if (nextWriteRow > 0 && jobStatus === 'WRITING') {
-            // Scenario 2: Resume mid-write.
-            currentChunkSize = MIN_CHUNK_SIZE; // Start conservatively on resume
-        } else {
-            // Default case for corrupted state but existing data
-            currentChunkSize = MIN_CHUNK_SIZE; 
-        }
+  // Read persisted size, default to MIN_CHUNK_SIZE (50) if not found
+  let currentChunkSize = parseInt(SCRIPT_PROP.getProperty(ASSET_CHUNK_SIZE_KEY) || MIN_CHUNK_SIZE.toString(), 10);
+  currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize); // Ensure it's never too low
+  let previousDuration = 0;
 
-    } else {
-        // --- NEW JOB START (Scenario 1) ---
-        const mainChar = GESI.getMainCharacter();
-        const allAssets = _fetchAssetsConcurrently(mainChar); // <-- This now returns 8 columns
+  // --- PHASE 1: Data Acquisition (Fetch or Resume) ---
+  let processedAssets = [];
+  const cachedAssetData = SCRIPT_PROP.getProperty(ASSET_CACHE_DATA_KEY);
+  let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(ASSET_CACHE_ROW_INDEX_KEY) || '0', 10);
+  let jobStatus = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
 
-        if (allAssets.length <= 1) { Logger.log('[' + SCRIPT_NAME + '] WARNING: No assets retrieved.'); return; }
-        
-        // Get the data rows (allAssets[0] is the header)
-        const rawAssetsData = allAssets.slice(1);
-        
-        // FIX: No transformation needed. The data from _fetchAssetsConcurrently is now
-        // already in the correct 8-column format.
-        processedAssets = rawAssetsData;
+  if (cachedAssetData) {
+    processedAssets = JSON.parse(cachedAssetData);
+    Logger.log(`[STATE] Resuming job. Status: ${jobStatus}. Loaded ${processedAssets.length} assets from properties.`);
 
-        // Save data and update state to FETCHED.
-        SCRIPT_PROP.setProperty(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets));
-        SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, '0');
-        SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'FETCHED');
-        Logger.log(`[STATE] New job started. Assets saved. Status: FETCHED.`);
-
-        // Exit and schedule continuation to allow a clean execution for the sheet clear.
-        scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000); 
-        return; 
-    }
-    
-    // Re-acquire sheet access for Phase 2/3
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
-    
-    if (!cacheSheet) { Logger.log('[' + SCRIPT_NAME + '] ERROR: Target sheet not found for write phase.'); return; }
-    _sheetCache[CACHE_SHEET_NAME] = cacheSheet; 
-
-    // --- PHASE 2A: Critical Sheet Preparation (Only run once after successful fetch) ---
     if (nextWriteRow === 0 && jobStatus === 'FETCHED') {
-        Logger.log(`[PHASE 2A] Executing critical sheet clear and header write...`);
-        const result = _prepareCacheSheet(); // Call the isolated function
-        
-        if (!result.success) {
-            Logger.error(`[PHASE 2A] Failed to clear sheet. Aborting.`);
-            return;
-        }
-
-        // Set status to WRITING and schedule the continuation to start the chunk loop.
-        SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'WRITING');
-        Logger.log(`[STATE] Sheet prepared. Status: WRITING. Scheduling next run to start chunking.`);
-        scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
-        return; 
+      // Scenario 3: Timed out after fetch, before sheet clear. Proceed to prepare sheet.
+      Logger.log(`[STATE] Detected FETCHED status. Proceeding to critical sheet preparation.`);
+      // Fall through to PHASE 2A
+    } else if (nextWriteRow > 0 && jobStatus === 'WRITING') {
+      // Scenario 2: Resume mid-write.
+      currentChunkSize = MIN_CHUNK_SIZE; // Start conservatively on resume
+    } else {
+      // Default case for corrupted state but existing data
+      currentChunkSize = MIN_CHUNK_SIZE;
     }
 
+  } else {
+    // --- NEW JOB START (Scenario 1) ---
+    const mainChar = GESI.getMainCharacter();
+    const allAssets = _fetchAssetsConcurrently(mainChar); // <-- This now returns 8 columns
 
-    // --- PHASE 2B: Resumable Chunk Write Loop (Status MUST be WRITING) ---
-    if (jobStatus !== 'WRITING') {
-         Logger.log(`[STATE] Job status is not WRITING (${jobStatus}). Bailing out.`);
-         return;
-    }
-    // ⚠️ NEW: Log PropertiesService performance at the start of the writing loop
-if (typeof _measurePropertyService !== 'undefined') {
-  const propLatency = _measurePropertyService();
-  Logger.log(`[PERF] PropertyService latency at start of WRITING phase: ${propLatency}ms`);
-}
-    
-    // Loop continues from nextWriteRow
-    for (let i = nextWriteRow; i < processedAssets.length; i += currentChunkSize) {
-        const elapsedTime = new Date().getTime() - START_TIME;
+    if (allAssets.length <= 1) { Logger.log('[' + SCRIPT_NAME + '] WARNING: No assets retrieved.'); return; }
 
-        // >> PREDICTIVE TIMEOUT CHECK (Bailout)
-        if (elapsedTime > SOFT_LIMIT_MS) {
-            SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-            Logger.warn(`[STATE] Time limit hit after ${elapsedTime}ms. Saving state to resume at row ${i}.`);
-            scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000); 
-            return; // Exit this execution safely
-        }
-        
-        // >> PROACTIVE THROTTLE CHECK
-        if (previousDuration > THROTTLE_THRESHOLD_MS) {
-            currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
-            Logger.log(`[THROTTLE] Duration ${previousDuration}ms exceeded ${THROTTLE_THRESHOLD_MS}ms. Reducing chunk size to ${currentChunkSize} and pausing for ${THROTTLE_PAUSE_MS}ms.`);
-            Utilities.sleep(THROTTLE_PAUSE_MS); 
-            previousDuration = 0; // Reset duration after pause/throttle
-        }
+    // Get the data rows (allAssets[0] is the header)
+    const rawAssetsData = allAssets.slice(1);
 
-        // Data must start writing at physical Row 3 (since Row 2 holds the headers)
-        const startRow = 3 + i; 
-        const chunkSizeToUse = Math.min(currentChunkSize, processedAssets.length - i);
-        const chunk = processedAssets.slice(i, i + chunkSizeToUse);
-        
-       let chunkResult;
-        
-        try {
-            // CRITICAL CALL TO THE LOCKED WRITE FUNCTION
-            chunkResult = _writeChunkInternal(chunk, startRow, NUM_ASSET_COLS, CACHE_SHEET_NAME);
-        } catch (e) {
-            // CATCH 1: Spreadsheets Service Timeout (or other internal error from _writeChunkInternal)
-            Logger.error(`[CRITICAL WRITE ERROR] Service failed during chunk write: ${e.message}. Aggressively reducing chunk size for retry.`);
-            
-            // Aggressive Chunk Size Reduction
-            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+    // [NEW SANITIZATION STEP START]
+    const SANITIZATION_ITEM_ID_INDEX = 2; // 'item_id' (Index 2 of ASSET_CACHE_HEADERS)
+    const SANITIZATION_LOCATION_ID_INDEX = 4; // 'location_id' (Index 4 of ASSET_CACHE_HEADERS)
 
-            // Save state to retry the *same* index (i) with a smaller chunk.
-            SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-            
-            // Reschedule immediately for the next available slot.
-            scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000); 
-            return; // Exit current execution immediately
-        }
+    const sanitizedAssetsData = rawAssetsData.filter(row => {
+      const item_id = Number(row[SANITIZATION_ITEM_ID_INDEX]);
+      const location_id = Number(row[SANITIZATION_LOCATION_ID_INDEX]);
 
-        if (!chunkResult.success) {
-            // Failure to acquire document lock means a concurrency issue, stop job and wait for next scheduled run.
-            Logger.log(`[THROTTLE FAIL] Failed to acquire lock for writing chunk starting at row ${startRow}. Stopping.`);
-            throw new Error('Lock acquisition failed during chunk write.');
-        }
-        
-        previousDuration = chunkResult.duration; 
-        
-        // Increase chunk size if write was fast (proactive acceleration)
-        currentChunkSize = (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0) 
-                            ? Math.min(MAX_CHUNK_SIZE, currentChunkSize + CHUNK_INCREASE_RATE)
-                            : currentChunkSize;
+      // Filter: item_id and location_id must be positive, and must not be a known GHOST item
+      return item_id > 0
+        && location_id > 0
+        && !GHOST_ITEM_IDS.has(item_id); // GHOST_ITEM_IDS is defined globally
+    });
+    // [NEW SANITIZATION STEP END]
 
-        // CRITICAL: Update the state property for resume
-        SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, (i + chunkSizeToUse).toString()); 
+    // FIX: Use the sanitized list for the job data
+    processedAssets = sanitizedAssetsData;
+
+    // Save data and update state to FETCHED.
+    SCRIPT_PROP.setProperty(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets));
+    SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, '0');
+    SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'FETCHED');
+    Logger.log(`[STATE] New job started. Assets saved. Status: FETCHED.`);
+
+    // Exit and schedule continuation to allow a clean execution for the sheet clear.
+    scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
+    return;
+  }
+
+  // Re-acquire sheet access for Phase 2/3
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
+
+  if (!cacheSheet) { Logger.log('[' + SCRIPT_NAME + '] ERROR: Target sheet not found for write phase.'); return; }
+  _sheetCache[CACHE_SHEET_NAME] = cacheSheet;
+
+  // --- PHASE 2A: Critical Sheet Preparation (Only run once after successful fetch) ---
+  if (nextWriteRow === 0 && jobStatus === 'FETCHED') {
+    Logger.log(`[PHASE 2A] Executing critical sheet clear and header write...`);
+    const result = _prepareCacheSheet(); // Call the isolated function
+
+    if (!result.success) {
+      Logger.log(`[PHASE 2A] Failed to clear sheet. Aborting.`);
+      return;
     }
 
-    // --- PHASE 3: Finalization (Clears state on success) ---
-    const dataHeight = processedAssets.length;
-    // Data starts at Row 3 (header at Row 2), so data height must be >= 1
-    const rangeHeight = Math.max(1, dataHeight); 
+    // Set status to WRITING and schedule the continuation to start the chunk loop.
+    SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'WRITING');
+    Logger.log(`[STATE] Sheet prepared. Status: WRITING. Scheduling next run to start chunking.`);
+    scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
+    return;
+  }
 
-    SpreadsheetApp.flush();
-    Logger.log('[' + SCRIPT_NAME + '] Final spreadsheet flush and Named Range creation.');
 
-    // Create/Update Named Range for downstream consumers. Start at Row 3.
-    // 'ss' is already declared and used above, fixing the previous syntax error.
-    cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME); 
+  // --- PHASE 2B: Resumable Chunk Write Loop (Status MUST be WRITING) ---
+  if (jobStatus !== 'WRITING') {
+    Logger.log(`[STATE] Job status is not WRITING (${jobStatus}). Bailing out.`);
+    return;
+  }
+  // 💥 NEW: Log the starting row for the current execution
+  const physicalStartRow = nextWriteRow + 3; // Row 3 is the first data row (index 0)
+  Logger.log(`[STATE] Starting write from ARRAY INDEX ${nextWriteRow} (PHYSICAL ROW ${physicalStartRow} on sheet).`);
+  // 💥 END NEW
+  // ⚠️ NEW: Log PropertiesService performance at the start of the writing loop
+  if (typeof _measurePropertyService !== 'undefined') {
+    const propLatency = _measurePropertyService();
+    Logger.log(`[PERF] PropertyService latency at start of WRITING phase: ${propLatency}ms`);
+  }
 
-    if (cacheSheet) {
-        // Start named range at Row 3
-        ss.setNamedRange(
-            CACHE_NAMED_RANGE, 
-            cacheSheet.getRange(3, 1, rangeHeight, NUM_ASSET_COLS)
-        );
+  // Initialize index from persistent state
+  let i = nextWriteRow;
+
+  while (i < processedAssets.length) {
+    const elapsedTime = new Date().getTime() - START_TIME;
+
+    // >> PREDICTIVE TIMEOUT CHECK (Bailout)
+    if (elapsedTime > SOFT_LIMIT_MS) {
+      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
+      Logger.warn(`[STATE] Time limit hit after ${elapsedTime}ms. Saving state to resume at row ${i}.`);
+      scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
+      return; // Exit this execution safely
     }
-    
-    // FINAL CLEANUP: Clear state properties on success
-    SCRIPT_PROP.deleteProperty(ASSET_CACHE_DATA_KEY);
-    SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
-    SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
-    Logger.log('[' + SCRIPT_NAME + '] Successfully cached ' + dataHeight + ' asset rows. Job finalized.');
+
+    // >> PROACTIVE THROTTLE CHECK
+    if (previousDuration > THROTTLE_THRESHOLD_MS) {
+      currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
+      Logger.log(`[THROTTLE] Duration ${previousDuration}ms exceeded ${THROTTLE_THRESHOLD_MS}ms. Reducing chunk size to ${currentChunkSize} and pausing for ${THROTTLE_PAUSE_MS}ms.`);
+      Utilities.sleep(THROTTLE_PAUSE_MS);
+      previousDuration = 0; // Reset duration after pause/throttle
+    }
+
+    // Data must start writing at physical Row 3 (since Row 2 holds the headers)
+    const startRow = 3 + i;
+    const chunkSizeToUse = Math.min(currentChunkSize, processedAssets.length - i);
+    const chunk = processedAssets.slice(i, i + chunkSizeToUse);
+
+    let chunkResult;
+
+    try {
+      // CRITICAL CALL TO THE LOCKED WRITE FUNCTION
+      chunkResult = _writeChunkInternal(chunk, startRow, NUM_ASSET_COLS, CACHE_SHEET_NAME);
+    } catch (e) {
+      // CATCH 1: Spreadsheets Service Timeout (or other internal error from _writeChunkInternal)
+      Logger.log(`[CRITICAL WRITE ERROR] Service failed during chunk write: ${e.message}. Aggressively reducing chunk size for retry.`);
+      Logger.log("Chink Size:" + chunk.length + " " + startRow + " chunkresult:" + JSON.stringify(chunkResult));
+      // Aggressive Chunk Size Reduction
+      currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+
+      // Save state to retry the *same* index (i) with a smaller chunk.
+      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
+      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, (i + chunkSizeToUse).toString());
+      // Reschedule immediately for the next available slot.
+      scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
+      return; // Exit current execution immediately
+    }
+
+    if (!chunkResult.success) {
+      // CATCH 2: Document Lock Conflict (tryLock failed)
+
+      // Save state to retry the *same* index (i)
+      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
+      SCRIPT_PROP.setProperty(ASSET_CHUNK_SIZE_KEY, currentChunkSize.toString());
+      // Aggressive Halving on Lock Conflict (Back off before next attempt)
+      currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+
+      Logger.log(`[THROTTLE FAIL] Failed to acquire lock for writing chunk starting at row ${startRow}. Reducing chunk size to ${currentChunkSize}. Stopping and scheduling retry.`);
+      Logger.log("Chink Size:" + chunk.length + " " + startRow + " chunkresult:" + JSON.stringify(chunkResult));
+      // Reschedule immediately for the next available slot.
+      scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
+      return; // Exit current execution gracefully
+    }
+
+    previousDuration = chunkResult.duration;
+
+    // Increase chunk size if write was fast (proactive acceleration)
+    currentChunkSize = (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0)
+      ? Math.min(MAX_CHUNK_SIZE, currentChunkSize + CHUNK_INCREASE_RATE)
+      : currentChunkSize;
+    // 💥 CRITICAL FIX: Manually advance 'i' for the next loop iteration
+    i += chunkSizeToUse;
+    // CRITICAL: Update the state property for resume
+    SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, (i + chunkSizeToUse).toString());
+    SCRIPT_PROP.setProperty(ASSET_CHUNK_SIZE_KEY, currentChunkSize.toString());
+  }
+
+  // --- PHASE 3: Finalization (Clears state on success) ---
+  const dataHeight = processedAssets.length;
+  // Data starts at Row 3 (header at Row 2), so data height must be >= 1
+  const rangeHeight = Math.max(1, dataHeight);
+
+  SpreadsheetApp.flush();
+  Logger.log('[' + SCRIPT_NAME + '] Final spreadsheet flush and Named Range creation.');
+
+  // Create/Update Named Range for downstream consumers. Start at Row 3.
+  // 'ss' is already declared and used above, fixing the previous syntax error.
+  cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
+
+  if (cacheSheet) {
+    // Start named range at Row 3
+    ss.setNamedRange(
+      CACHE_NAMED_RANGE,
+      cacheSheet.getRange(3, 1, rangeHeight, NUM_ASSET_COLS)
+    );
+  }
+
+  // FINAL CLEANUP: Clear state properties on success
+  SCRIPT_PROP.deleteProperty(ASSET_CACHE_DATA_KEY);
+  SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
+  SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
+  SCRIPT_PROP.deleteProperty(ASSET_CHUNK_SIZE_KEY);
+  Logger.log('[' + SCRIPT_NAME + '] Successfully cached ' + dataHeight + ' asset rows. Job finalized.');
 }
 
 
@@ -521,7 +567,7 @@ function _buildHeaderMap(sheet) {
       headerMap.set(String(header).trim(), index);
     }
   });
-  
+
   return { headerMap: headerMap, headerRowIndex: headerRowIndex };
 }
 
@@ -532,7 +578,7 @@ function _buildSdeTypeMap() {
   const SCRIPT_NAME = '_buildSdeTypeMap';
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('SDE_invTypes');
   if (!sheet) {
-    Logger.error(`[${SCRIPT_NAME}] CRITICAL: "SDE_invTypes" sheet not found.`);
+    Logger.log(`[${SCRIPT_NAME}] CRITICAL: "SDE_invTypes" sheet not found.`);
     return new Map();
   }
 
@@ -544,7 +590,7 @@ function _buildSdeTypeMap() {
   const typeNameIndex = headerMap.get('typeName');
 
   if (typeIdIndex === undefined || typeNameIndex === undefined) {
-    Logger.error(`[${SCRIPT_NAME}] CRITICAL: Missing 'typeID' or 'typeName' columns in 'SDE_invTypes'.`);
+    Logger.log(`[${SCRIPT_NAME}] CRITICAL: Missing 'typeID' or 'typeName' columns in 'SDE_invTypes'.`);
     return new Map();
   }
 
@@ -557,7 +603,7 @@ function _buildSdeTypeMap() {
       typeMap.set(Number(typeId), typeName);
     }
   }
-  
+
   if (typeMap.size === 0) {
     Logger.warn(`[${SCRIPT_NAME}] WARNING: 'SDE_invTypes' data is empty. Location names will fail. Run SDE Update.`);
   }
@@ -571,7 +617,7 @@ function _buildStationMap() {
   const SCRIPT_NAME = '_buildStationMap';
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('SDE_staStations');
   if (!sheet) {
-    Logger.error(`[${SCRIPT_NAME}] CRITICAL: "SDE_staStations" sheet not found.`);
+    Logger.log(`[${SCRIPT_NAME}] CRITICAL: "SDE_staStations" sheet not found.`);
     return new Map();
   }
 
@@ -583,7 +629,7 @@ function _buildStationMap() {
   const stationNameIndex = headerMap.get('stationName');
 
   if (stationIdIndex === undefined || stationNameIndex === undefined) {
-    Logger.error(`[${SCRIPT_NAME}] CRITICAL: Missing 'stationID' or 'stationName' columns in 'SDE_staStations'.`);
+    Logger.log(`[${SCRIPT_NAME}] CRITICAL: Missing 'stationID' or 'stationName' columns in 'SDE_staStations'.`);
     return new Map();
   }
 
@@ -596,7 +642,7 @@ function _buildStationMap() {
       stationMap.set(Number(stationId), stationName);
     }
   }
-  
+
   if (stationMap.size === 0) {
     Logger.warn(`[${SCRIPT_NAME}] WARNING: 'SDE_staStations' data is empty. Location names will fail. Run SDE Update.`);
   }
@@ -613,7 +659,7 @@ function _buildHangarNameMap() {
 
   // FAILSAFE: Hardcoded defaults for EVE Corp Hangars (CorpSAG1 to CorpSAG7)
   const defaultHangars = {
-    'CorpSAG1': 'General Hangar', 'CorpSAG2': 'Financial', 'CorpSAG3': 'Manufacturing', 
+    'CorpSAG1': 'General Hangar', 'CorpSAG2': 'Financial', 'CorpSAG3': 'Manufacturing',
     'CorpSAG4': 'Mining', 'CorpSAG5': 'R&D', 'CorpSAG6': 'Storage', 'CorpSAG7': 'Assembly'
   };
 
@@ -636,8 +682,8 @@ function _buildHangarNameMap() {
     });
     Logger.log(`[${SCRIPT_NAME}] Successfully fetched and parsed custom names from ESI.`);
 
-  } catch (e) { 
-    Logger.log(`[${SCRIPT_NAME}] WARNING: Failed to fetch divisions from ESI. Using defaults. Error: ${e}`); 
+  } catch (e) {
+    Logger.log(`[${SCRIPT_NAME}] WARNING: Failed to fetch divisions from ESI. Using defaults. Error: ${e}`);
   }
 
   // 3. APPLY FAILSAFE DEFAULTS (Fills in any missing names)
@@ -670,8 +716,8 @@ function isOfficeValue_(targetId, corpOfficesMap) {
 function refreshLocationManager() {
   const SCRIPT_NAME = 'refreshLocationManager';
   const TARGET_SHEET_NAME = LOCATION_MANAGER_SHEET_NAME;
-  const CACHE_RANGE_NAME = CACHE_NAMED_RANGE; 
-  
+  const CACHE_RANGE_NAME = CACHE_NAMED_RANGE;
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   if (!sheet) { Logger.log(`[${SCRIPT_NAME}] Target sheet '${TARGET_SHEET_NAME}' not found.`); return; }
@@ -685,7 +731,7 @@ function refreshLocationManager() {
 
   // CRITICAL CHECK: Abort if SDE data is missing (prevents all names from failing)
   if (sdeTypeMap.size === 0 || stationMap.size === 0) {
-    Logger.error(`[${SCRIPT_NAME}] CRITICAL: Missing SDE Item or Station data. Run SDE Update first. Aborting.`);
+    Logger.log(`[${SCRIPT_NAME}] CRITICAL: Missing SDE Item or Station data. Run SDE Update first. Aborting.`);
     SpreadsheetApp.getUi().alert('CRITICAL ERROR: SDE Data is missing. Run Sheet Tools -> Update SDE Data first.');
     return;
   }
@@ -699,14 +745,14 @@ function refreshLocationManager() {
   let allLocations = [];
 
   const BATCH_SIZE = 1000;
-  
+
   try {
     // 2. Read Assets from Named Range (local read)
     const cachedRange = ss.getRangeByName(CACHE_RANGE_NAME);
-    if (!cachedRange) { 
-      Logger.log(`[${SCRIPT_NAME}] CRITICAL: Named Range '${CACHE_RANGE_NAME}' not found. Run asset cache first.`); 
+    if (!cachedRange) {
+      Logger.log(`[${SCRIPT_NAME}] CRITICAL: Named Range '${CACHE_RANGE_NAME}' not found. Run asset cache first.`);
       SpreadsheetApp.getUi().alert('CRITICAL ERROR: Asset cache not found. Run asset job first.');
-      return; 
+      return;
     }
 
     const allAssetsData = cachedRange.getValues(); // <<--- Reads asset data rows from Named Range
@@ -721,49 +767,49 @@ function refreshLocationManager() {
     const asset_locationTypeIndex = assetsHeader.get('location_type');
 
     // 4. Loop assets to find Offices/Containers
-    allAssetsData.forEach(row => { 
-        const item_id = Number(row[asset_itemIdIndex]);
-        const type_id = Number(row[asset_typeIdIndex]);
-        const location_id = Number(row[asset_locationIdIndex]);
-        const location_flag = String(row[asset_locationFlagIndex]);
-        const location_type = String(row[asset_locationTypeIndex]).toLowerCase();
-        
-        // 4a. Find Corp Office Folders (Branch -> Root mapping)
-        // FIX: This now correctly identifies offices using 'location_type'
-        if (location_type === 'office') {
-            // item_id is the Office Folder ID (the "Branch"), location_id is the Station/Structure ID (the "Root")
-            corpOfficesMap.set(item_id, new CorpOffice(item_id, location_id));
-            
-            // If the root is a structure (player-owned), add it for name resolution later
-            if (location_id > NPC_STATION_ID_MAX && !locationNameResolver.has(location_id)) {
-                missingLocationIds.add(location_id);
-            }
+    allAssetsData.forEach(row => {
+      const item_id = Number(row[asset_itemIdIndex]);
+      const type_id = Number(row[asset_typeIdIndex]);
+      const location_id = Number(row[asset_locationIdIndex]);
+      const location_flag = String(row[asset_locationFlagIndex]);
+      const location_type = String(row[asset_locationTypeIndex]).toLowerCase();
+
+      // 4a. Find Corp Office Folders (Branch -> Root mapping)
+      // FIX: This now correctly identifies offices using 'location_type'
+      if (location_type === 'office') {
+        // item_id is the Office Folder ID (the "Branch"), location_id is the Station/Structure ID (the "Root")
+        corpOfficesMap.set(item_id, new CorpOffice(item_id, location_id));
+
+        // If the root is a structure (player-owned), add it for name resolution later
+        if (location_id > NPC_STATION_ID_MAX && !locationNameResolver.has(location_id)) {
+          missingLocationIds.add(location_id);
+        }
+      }
+
+      // 4b. Find Other Top-Level Containers
+      // CRITICAL BUG FIX: Added check to see if the item is a container
+      const typeName = sdeTypeMap.get(type_id) || "";
+
+      if (
+        typeName.toLowerCase().includes('container') && // <-- THIS IS THE FIX
+        item_id >= ASSET_ID_MIN_BOUND &&
+        !isOfficeValue_(item_id, corpOfficesMap) &&
+        !GHOST_ITEM_IDS.has(item_id) &&
+        !EXCLUDED_CONTAINER_TYPE_IDS.has(type_id) &&
+        location_flag === 'CorpDeliveries' // Common flag for containers/loot in space/structures
+      ) {
+
+        // We use the container's item_id as the key. 
+        // FIX: Store an object with parentLocationId AND the flag
+        if (!uniqueOtherContainers.has(item_id)) {
+          uniqueOtherContainers.set(item_id, { parentLocationId: location_id, flag: location_flag });
         }
 
-        // 4b. Find Other Top-Level Containers
-        // CRITICAL BUG FIX: Added check to see if the item is a container
-        const typeName = sdeTypeMap.get(type_id) || "";
-        
-        if (
-            typeName.toLowerCase().includes('container') && // <-- THIS IS THE FIX
-            item_id >= ASSET_ID_MIN_BOUND && 
-            !isOfficeValue_(item_id, corpOfficesMap) && 
-            !GHOST_ITEM_IDS.has(item_id) && 
-            !EXCLUDED_CONTAINER_TYPE_IDS.has(type_id) &&
-            location_flag === 'CorpDeliveries' // Common flag for containers/loot in space/structures
-            ) { 
-            
-            // We use the container's item_id as the key. 
-            // FIX: Store an object with parentLocationId AND the flag
-            if (!uniqueOtherContainers.has(item_id)) {
-                uniqueOtherContainers.set(item_id, { parentLocationId: location_id, flag: location_flag });
-            }
-            
-            // Collect the root location ID if it's a structure
-            if (location_id > NPC_STATION_ID_MAX && !locationNameResolver.has(location_id)) {
-                missingLocationIds.add(location_id);
-            }
+        // Collect the root location ID if it's a structure
+        if (location_id > NPC_STATION_ID_MAX && !locationNameResolver.has(location_id)) {
+          missingLocationIds.add(location_id);
         }
+      }
     });
 
     // 5. Resolve missing Root IDs (Structures and Stations) via ESI
@@ -784,25 +830,25 @@ function refreshLocationManager() {
       const universeNamesClient = getGESIUniverseNamesClient_();
       Logger.log(`[${SCRIPT_NAME}] Resolving ${npcIdsToResolve.length} missing NPC Station IDs via ESI.`);
       try {
-          // FIX: This now uses the correct GESI executeRaw method with an object payload
-          const resolvedNamesData = universeNamesClient.executeRaw({ ids: npcIdsToResolve.map(String) });
-          // FIX: This now correctly parses the categorized response from /universe/ids
-          if (resolvedNamesData) {
-              // Check all categories ESI might return for a station/system ID
-              const categories = ['stations', 'systems', 'regions', 'alliances', 'corporations', 'characters'];
-              categories.forEach(category => {
-                  if (resolvedNamesData[category] && Array.isArray(resolvedNamesData[category])) {
-                      resolvedNamesData[category].forEach(entity => {
-                          const id = Number(entity.id);
-                          if (entity.name) {
-                              locationNameResolver.set(id, entity.name);
-                          }
-                      });
-                  }
+        // FIX: This now uses the correct GESI executeRaw method with an object payload
+        const resolvedNamesData = universeNamesClient.executeRaw({ ids: npcIdsToResolve.map(String) });
+        // FIX: This now correctly parses the categorized response from /universe/ids
+        if (resolvedNamesData) {
+          // Check all categories ESI might return for a station/system ID
+          const categories = ['stations', 'systems', 'regions', 'alliances', 'corporations', 'characters'];
+          categories.forEach(category => {
+            if (resolvedNamesData[category] && Array.isArray(resolvedNamesData[category])) {
+              resolvedNamesData[category].forEach(entity => {
+                const id = Number(entity.id);
+                if (entity.name) {
+                  locationNameResolver.set(id, entity.name);
+                }
               });
-          }
+            }
+          });
+        }
       } catch (e) {
-          Logger.log(`[${SCRIPT_NAME}] WARNING: ESI call to resolve missing NPC station IDs failed: ${e}`);
+        Logger.log(`[${SCRIPT_NAME}] WARNING: ESI call to resolve missing NPC station IDs failed: ${e}`);
       }
     }
 
@@ -813,7 +859,7 @@ function refreshLocationManager() {
       // This assumes getCorpAuthChar is available in another file (e.g., GESI Extentions.js)
       const mainChar = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar(ss) : GESI.getMainCharacter();
       Logger.log(`[${SCRIPT_NAME}] Resolving ${structureIdsToResolve.length} Structure IDs via ESI using char: ${mainChar}`);
-      
+
       for (const structureId of structureIdsToResolve) {
         try {
           // This endpoint must be called one-by-one and is authenticated
@@ -825,16 +871,16 @@ function refreshLocationManager() {
           }
           Utilities.sleep(50); // Add a small sleep to avoid hammering the endpoint
         } catch (e) {
-            // Log the "Forbidden" error here
-            Logger.log(`[${SCRIPT_NAME}] WARNING: ESI call for structure ID ${structureId} failed: ${e.message}`);
-            locationNameResolver.set(structureId, `Structure (ID: ${structureId})`);
+          // Log the "Forbidden" error here
+          Logger.log(`[${SCRIPT_NAME}] WARNING: ESI call for structure ID ${structureId} failed: ${e.message}`);
+          locationNameResolver.set(structureId, `Structure (ID: ${structureId})`);
         }
       }
     }
-    
+
     // 5.5 FIX: Populate locationName in CorpOffice objects *after* all names are resolved
     corpOfficesMap.forEach(office => {
-        office.locationName = locationNameResolver.get(office.locationId) || ('Unknown Location ID: ' + office.locationId);
+      office.locationName = locationNameResolver.get(office.locationId) || ('Unknown Location ID: ' + office.locationId);
     });
 
 
@@ -843,86 +889,86 @@ function refreshLocationManager() {
     const allContainerIds = [...uniqueOtherContainers.keys()];
     // FIX: This filter now uses the complete GHOST_ITEM_IDS list
     const validContainerIds = allContainerIds.map(Number).filter(id => id >= ASSET_ID_MIN_BOUND && !GHOST_ITEM_IDS.has(id));
-    
+
     const namesClient = getGESINamesClient_();
 
-    if (validContainerIds.length > 0) { 
-        Logger.log(`[${SCRIPT_NAME}] Resolving ${validContainerIds.length} container names via ESI in batches.`);
-        
-        for (let i = 0; i < validContainerIds.length; i += BATCH_SIZE) {
-            const batchIds = validContainerIds.slice(i, i + BATCH_SIZE);
-            try {
-                // FIX: This also uses executeRaw for consistency
-                const rawNames = namesClient.executeRaw({ item_ids: batchIds });
-                if (Array.isArray(rawNames)) {
-                    rawNames.forEach(namedAsset => {
-                        const itemId = Number(namedAsset.item_id);
-                        if (namedAsset.name) {
-                            namesMap.set(itemId, namedAsset.name);
-                        }
-                    });
-                }
-            } catch (e) {
-                Logger.log(`[${SCRIPT_NAME}] WARNING: ESI batch call for container names failed at batch ${i}: ${e}`);
-                // FIX: If a batch fails (e.g., "Invalid IDs"), stop looping to prevent timeout
-                Logger.log(`[${SCRIPT_NAME}] Stopping name resolution loop due to batch failure.`);
-                break; 
-            }
+    if (validContainerIds.length > 0) {
+      Logger.log(`[${SCRIPT_NAME}] Resolving ${validContainerIds.length} container names via ESI in batches.`);
+
+      for (let i = 0; i < validContainerIds.length; i += BATCH_SIZE) {
+        const batchIds = validContainerIds.slice(i, i + BATCH_SIZE);
+        try {
+          // FIX: This also uses executeRaw for consistency
+          const rawNames = namesClient.executeRaw({ item_ids: batchIds });
+          if (Array.isArray(rawNames)) {
+            rawNames.forEach(namedAsset => {
+              const itemId = Number(namedAsset.item_id);
+              if (namedAsset.name) {
+                namesMap.set(itemId, namedAsset.name);
+              }
+            });
+          }
+        } catch (e) {
+          Logger.log(`[${SCRIPT_NAME}] WARNING: ESI batch call for container names failed at batch ${i}: ${e}`);
+          // FIX: If a batch fails (e.g., "Invalid IDs"), stop looping to prevent timeout
+          Logger.log(`[${SCRIPT_NAME}] Stopping name resolution loop due to batch failure.`);
+          break;
         }
+      }
     }
 
     // 7. Build final location list (Hangars and Containers)
 
     // 7a. Hangar divisions (Flags CorpSAG1-7)
     corpOfficesMap.forEach(office => {
-        // FIX: Use the pre-resolved name from the object
-        const rootLocationName = office.locationName; 
-        
-        hangarMap.forEach((hangarName, flag) => {
-            // office.itemId is the ID of the office folder, which becomes the location_id for items inside it.
-            allLocations.push([
-                rootLocationName, 
-                hangarName, 
-                office.itemId, 
-                flag, 
-                'Hangar Division', 
-                false, // IsSalesHangar (Checkbox column)
-                false  // IsMaterialHangar (Checkbox column)
-            ]);
-        });
+      // FIX: Use the pre-resolved name from the object
+      const rootLocationName = office.locationName;
+
+      hangarMap.forEach((hangarName, flag) => {
+        // office.itemId is the ID of the office folder, which becomes the location_id for items inside it.
+        allLocations.push([
+          rootLocationName,
+          hangarName,
+          office.itemId,
+          flag,
+          'Hangar Division',
+          false, // IsSalesHangar (Checkbox column)
+          false  // IsMaterialHangar (Checkbox column)
+        ]);
+      });
     });
 
     // 7b. Other Containers (jetcans, secure containers, etc.)
     // FIX: This loop now correctly extracts the stored flag and parentLocationId
     uniqueOtherContainers.forEach((containerData, containerItemId) => {
-        const parentLocationId = containerData.parentLocationId;
-        const hangarFlag = containerData.flag; // <-- This is the real flag
+      const parentLocationId = containerData.parentLocationId;
+      const hangarFlag = containerData.flag; // <-- This is the real flag
 
-        // Find the typeId for this container item from the asset cache data
-        const assetRow = allAssetsData.find(row => row[asset_itemIdIndex] === containerItemId);
-        const typeId = assetRow ? assetRow[asset_typeIdIndex] : null;
-        
-        // 1. Try custom name 2. Try SDE name 3. Default
-        const containerName = namesMap.get(containerItemId) || sdeTypeMap.get(typeId) || 'Unnamed Container (ID: ' + containerItemId + ')';
-        const rootLocationName = locationNameResolver.get(parentLocationId) || ('Unknown Location ID: ' + parentLocationId);
-        
-        // This container's item_id is its own location ID
-        allLocations.push([
-            rootLocationName, 
-            '', // <-- Hangar Name is BLANK
-            containerItemId, 
-            hangarFlag, // <-- FIX: Use the real flag (e.g., 'CorpDeliveries')
-            containerName, // <-- Container name (e.g., "Militants") goes in Type col
-            false,
-            false
-        ]);
+      // Find the typeId for this container item from the asset cache data
+      const assetRow = allAssetsData.find(row => row[asset_itemIdIndex] === containerItemId);
+      const typeId = assetRow ? assetRow[asset_typeIdIndex] : null;
+
+      // 1. Try custom name 2. Try SDE name 3. Default
+      const containerName = namesMap.get(containerItemId) || sdeTypeMap.get(typeId) || 'Unnamed Container (ID: ' + containerItemId + ')';
+      const rootLocationName = locationNameResolver.get(parentLocationId) || ('Unknown Location ID: ' + parentLocationId);
+
+      // This container's item_id is its own location ID
+      allLocations.push([
+        rootLocationName,
+        '', // <-- Hangar Name is BLANK
+        containerItemId,
+        hangarFlag, // <-- FIX: Use the real flag (e.g., 'CorpDeliveries')
+        containerName, // <-- Container name (e.g., "Militants") goes in Type col
+        false,
+        false
+      ]);
     });
 
   } catch (e) { Logger.log(`[${SCRIPT_NAME}] Error during asset processing: ${e}`); }
 
   // C. Clear and Write to Sheet
   sheet.clear();
-  const headers = [ 'Office Location', 'Hangar Name', 'Location ID', 'Hangar Flag', 'Type', 'IsSalesHangar', 'IsMaterialHangar' ];
+  const headers = ['Office Location', 'Hangar Name', 'Location ID', 'Hangar Flag', 'Type', 'IsSalesHangar', 'IsMaterialHangar'];
 
   // Sort the final list (sort by Office Location, then Hangar Name)
   allLocations.sort((a, b) => {
@@ -931,7 +977,7 @@ function refreshLocationManager() {
     if (officeA !== officeB) return officeA.localeCompare(officeB);
     return String(a[1]).localeCompare(String(b[1]));
   });
-  
+
   const outputData = [headers, ...allLocations];
 
   if (allLocations.length === 0) {
