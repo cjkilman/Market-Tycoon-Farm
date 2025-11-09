@@ -358,7 +358,7 @@ function triggerCacheWarmerWithRetry() {
   // --- END FIX ---
 
   const funcToRun = fuzAPI.cacheRefresh;
-  const funcName = 'fuzzworkCacheRefresh_TimeGated';
+  const funcName = 'fuzAPI.cacheRefres';
   const wrapperFuncName = 'triggerCacheWarmerWithRetry';
 
   // --- FIXED CONSTANTS ---
@@ -1061,14 +1061,12 @@ function setupStaggeredTriggers() {
 
   // Clean up all known triggers managed by this orchestrator
   const managedFunctions = [
-    'fuzzworkCacheRefresh_TimeGated',
+    'fuzAPI.cacheRefres',
     'triggerCacheWarmerWithRetry',
     'updateMarketDataSheet',
     'finalizeMarketDataUpdate',
     'cleanupOldSheet', // Include this if it had its own trigger previously
     'masterOrchestrator',
-    'runAllLedgerImports', // Legacy
-    'triggerLedgerImportCycle', // Legacy monolith
     'cacheAllCorporateAssetsTrigger',
     'runLootAndJournalSync', // NEW
     'runContractSync', // NEW

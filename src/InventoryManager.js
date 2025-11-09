@@ -432,7 +432,25 @@ if (typeof _measurePropertyService !== 'undefined') {
         const chunkSizeToUse = Math.min(currentChunkSize, processedAssets.length - i);
         const chunk = processedAssets.slice(i, i + chunkSizeToUse);
         
-        let chunkResult = _writeChunkInternal(chunk, startRow, NUM_ASSET_COLS, CACHE_SHEET_NAME);
+       let chunkResult;
+        
+        try {
+            // CRITICAL CALL TO THE LOCKED WRITE FUNCTION
+            chunkResult = _writeChunkInternal(chunk, startRow, NUM_ASSET_COLS, CACHE_SHEET_NAME);
+        } catch (e) {
+            // CATCH 1: Spreadsheets Service Timeout (or other internal error from _writeChunkInternal)
+            Logger.error(`[CRITICAL WRITE ERROR] Service failed during chunk write: ${e.message}. Aggressively reducing chunk size for retry.`);
+            
+            // Aggressive Chunk Size Reduction
+            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+
+            // Save state to retry the *same* index (i) with a smaller chunk.
+            SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
+            
+            // Reschedule immediately for the next available slot.
+            scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000); 
+            return; // Exit current execution immediately
+        }
 
         if (!chunkResult.success) {
             // Failure to acquire document lock means a concurrency issue, stop job and wait for next scheduled run.

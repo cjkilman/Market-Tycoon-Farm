@@ -36,12 +36,15 @@ function getOrCreateSheet(ss, name, headers) {
     // 2. SET HEADERS AND MINIMALLY ADJUST COLUMNS
     // We only perform heavy pruning/adjusting when NEW, not when existing.
     const maxCols = sheet.getMaxColumns();
-    if (maxCols > headerCount) {
+    if (maxCols < headerCount) {
       // Delete excess columns added by default (26 -> 9)
-      sheet.deleteColumns(headerCount + 1, maxCols - headerCount);
-    } else if (maxCols < headerCount) {
       sheet.insertColumnsAfter(maxCols, headerCount - maxCols);
     }
+
+         
+    // if (maxCols > headerCount) {
+    //   sheet.deleteColumns(headerCount + 1, maxCols - headerCount);
+    // } Disabled for Time outs
 
     sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
     console.log(`Headers set for new sheet '${sheetName}'.`);
