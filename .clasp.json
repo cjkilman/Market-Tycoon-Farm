@@ -12,5 +12,20 @@
   "jsonExtensions": [
     ".json"
   ],
-  "filePushOrder": []
+  "filePushOrder": [
+    "src/Logger.js",
+    "src/Utility.js",
+    "src/project Time.js",
+    "src/GESI Extentions.js",
+    "src/fuzHelpers.js",
+    "src/fuzAPI_combined.js",
+    "src/MaterialLedger.js",
+    "src/IndustryLedger.gs.js",
+    "src/InventoryManager.js",
+    "src/SDE_Job_Controller.gs.js",
+    "src/Orchestrator.js",
+    "src/Refresh.js",
+    "src/test.js",
+    "src/Main.js"
+  ]
 }
