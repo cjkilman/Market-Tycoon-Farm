@@ -1,4 +1,4 @@
-/* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, ScriptApp, fuzzworkCacheRefresh_TimeGated, getMasterBatchFromControlTable, withSheetLock, getOrCreateSheet, cacheAllCorporateAssetsTrigger, triggerLedgerImportCycle, fuzAPI, _fetchProcessedLootData, runLootLedgerDelta, Ledger_Import_CorpJournal, syncContracts, runIndustryLedgerPhase, runLootDeltaPhase, runContractLedgerPhase */
+/* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, ScriptApp, fuzzworkCacheRefresh_TimeGated, getMasterBatchFromControlTable, withSheetLock, getOrCreateSheet, cacheAllCorporateAssetsTrigger, triggerLedgerImportCycle, fuzAPI, _fetchProcessedLootData, runLootLedgerDelta, Ledger_Import_CorpJournal, syncContracts, runIndustryLedgerPhase, runLootDeltaPhase, runContractLedgerPhase, runAllLedgerImports, LoggerEx */
 
 // Global variable to track recursion depth for this lock type
 var EXECUTION_LOCK_DEPTH_TRY = 0;
@@ -972,6 +972,84 @@ function _deleteOldSheetWorker() {
   scheduleOneTimeTrigger('finalizeMarketDataUpdate', RETRY_DELAY_MS);
   console.log("Step 1 complete. Scheduled next phase (Step 2) for retry.");
 }
+
+// ----------------------------------------------------------------------
+// --- NEW: SMALL, TRIGGER-ABLE WRAPPER FUNCTIONS ---
+// ----------------------------------------------------------------------
+
+/**
+ * Runs ONLY the Loot and Journal syncs.
+ * Designed to be called by a dedicated hourly trigger.
+ */
+function runLootAndJournalSync() {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  executeWithTryLock(() => {
+    log.info('--- Starting Loot & Journal Sync Cycle ---');
+    
+    try {
+      log.info('Running _fetchProcessedLootData (External Data Sync)...');
+      const lootData = _fetchProcessedLootData(); // Assumes this function is in scope (e.g., from GESI Extentions)
+      if (lootData) {
+        log.info('Executing loot delta calculation and import...');
+        runLootDeltaPhase(ss); // Assumes this function is in scope
+      }
+    } catch (e) {
+      log.error('Loot Sync failed', e);
+    }
+
+    try {
+      log.info('Running Ledger_Import_CorpJournal...');
+      Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); // Assumes this is in scope
+    } catch (e) {
+      log.error('Corp Journal Import failed', e);
+    }
+
+  }, 'runLootAndJournalSync');
+}
+
+/**
+ * Runs ONLY the Contract sync.
+ * Designed to be called by a dedicated hourly trigger.
+ */
+function runContractSync() {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  executeWithTryLock(() => {
+    log.info('--- Starting Contract Sync Cycle ---');
+    try {
+      log.info('Running syncContracts (Fetch RAW data)...');
+      runContractLedgerPhase(ss); // Assumes this is in scope (from GESI Extentions)
+    } catch (e) {
+      log.error('Contract Sync failed', e);
+    }
+  }, 'runContractSync');
+}
+
+/**
+ * Runs ONLY the Industry Ledger sync.
+ * Designed to be called by a dedicated hourly trigger.
+ */
+function runIndustrySync() {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  executeWithTryLock(() => {
+    log.info('--- Starting Industry Ledger Sync Cycle ---');
+    try {
+      runIndustryLedgerPhase(ss); // This is the monolith from IndustryLedger.gs.js
+    } catch (e) {
+      log.error('Industry Ledger Phase failed', e);
+    }
+  }, 'runIndustrySync');
+}
+
+
+// ----------------------------------------------------------------------
+// --- TRIGGER SETUP ---
+// ----------------------------------------------------------------------
 
 /**
  * Run this function ONCE from the editor to set up triggers.
