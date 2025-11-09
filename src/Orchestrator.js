@@ -380,7 +380,7 @@ function triggerCacheWarmerWithRetry() {
 
   } else if (result === true) {
     // --- Case 2: Ran AND Completed Fully ---
-    console.log(`${funcName} completed a full run successfully.`);
+    console.log(`${funcToRun} completed a full run successfully.`);
 
     // --- Lease Check / Job Dispatch ---
     const currentMinute = new Date().getMinutes();
@@ -478,15 +478,6 @@ function _updateMarketDataSheetWorker() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = null; // Initialize as null
   let batchesProcessedThisRun = 0; // Initialize batchesProcessedThisRun here
-
-  // --- State Initialization & Validation ---
-  let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
-  console.log(`Current Step: ${currentStep}`);
-
-  if (currentStep === STATE_FLAGS.FINALIZING) {
-    console.warn(`State is ${STATE_FLAGS.FINALIZING}. Exiting _updateMarketDataSheetWorker.`);
-    return;
-  }
 
   const masterRequests = getMasterBatchFromControlTable(ss);
 
@@ -607,7 +598,7 @@ function _updateMarketDataSheetWorker() {
         SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, currentChunkSize.toString());
         
         scheduleOneTimeTrigger('updateMarketDataSheet', FULL_RUN_RESCHEDULE_MS);
-        console.warn(`WARNING: Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULE_MS / 60000} minutes.`);
+        console.warn(`WARNING: Time limit hit after processing ${batchesProcessedThisRun} batches in this run. Saved state (index ${requestStartIndex}, row ${nextWriteRow}). PREDICTIVE RESCHEDULED for ${FULL_RUN_RESCHEDULED_MS / 60000} minutes.`);
         return; // Exit current execution
       }
 
@@ -850,6 +841,8 @@ function finalizeMarketDataUpdate() {
       // Uses withSheetLock from Utility.js
       withSheetLock(() => {
         const tempSheet = ss.getSheetByName(tempSheetName);
+        const finalSheetName = 'Market_Data_Raw';
+        const oldSheetName = 'Market_Data_Old'; // Sheet to be deleted later by cleanupOldSheet
         const liveSheet = ss.getSheetByName(finalSheetName);
 
         // --- Pre-swap Validation ---
@@ -868,8 +861,6 @@ function finalizeMarketDataUpdate() {
         }
 
         console.log("Acquired Document Lock for sheet swap (WaitLock).");
-
-        // --- STEP 1 LOGIC IS REMOVED HERE ---
 
         // --- STEP 2: RENAME LIVE to OLD ---
         if (step === 2) {
@@ -1021,7 +1012,12 @@ function runContractSync() {
     log.info('--- Starting Contract Sync Cycle ---');
     try {
       log.info('Running syncContracts (Fetch RAW data)...');
-      runContractLedgerPhase(ss); // Assumes this is in scope (from GESI Extentions)
+      // NOTE: runContractLedgerPhase will use the RAW contracts to process the ledger.
+      // The old runContractLedgerPhase must be refactored to NOT call syncContracts.
+      // Since we don't have that file, we run syncContracts here.
+      const charIdMap = _charIdMap(ss) || {}; // Assuming _charIdMap is available
+      syncContracts(ss, charIdMap);
+      runContractLedgerPhase(ss); // Process Ledger after RAW data sync
     } catch (e) {
       log.error('Contract Sync failed', e);
     }
