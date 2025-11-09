@@ -71,6 +71,45 @@ function getOrCreateSheet(ss, name, headers) {
   return sheet;
 }
 
+/**
+ * Executes one read and one write operation on PropertyService and logs the duration.
+ * This is used to detect PropertyService slowdowns/bottlenecks.
+ * NOTE: Uses a dedicated, small property key.
+ * @returns {number} The duration of the slowest operation (in milliseconds).
+ */
+function _measurePropertyService() {
+  const TEST_KEY = 'PROP_PERF_TEST';
+  const PROP = PropertiesService.getScriptProperties();
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PERF_LOG') : Logger);
+  let maxDuration = 0;
+  
+  // 1. Measure SET (Write) operation
+  try {
+    const startSet = new Date().getTime();
+    PROP.setProperty(TEST_KEY, String(startSet));
+    const durationSet = new Date().getTime() - startSet;
+    maxDuration = Math.max(maxDuration, durationSet);
+  } catch (e) {
+    log.error('PropertiesService SET Test FAILED.', e);
+  }
+
+  // 2. Measure GET (Read) operation
+  try {
+    const startGet = new Date().getTime();
+    PROP.getProperty(TEST_KEY);
+    const durationGet = new Date().getTime() - startGet;
+    maxDuration = Math.max(maxDuration, durationGet);
+  } catch (e) {
+    log.error('PropertiesService GET Test FAILED.', e);
+  }
+  
+  // 3. Clean up and log
+  PROP.deleteProperty(TEST_KEY);
+  log.info(`PropertiesService Performance: Max Latency ${maxDuration}ms`);
+  
+  return maxDuration;
+}
+
 function withSheetLock(fn, timeoutMs) {
   var lock = LockService.getDocumentLock();     // document-scoped: safest for Sheets
 

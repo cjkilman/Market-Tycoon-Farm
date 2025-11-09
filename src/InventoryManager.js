@@ -401,6 +401,11 @@ function cacheAllCorporateAssets() {
          Logger.log(`[STATE] Job status is not WRITING (${jobStatus}). Bailing out.`);
          return;
     }
+    // ⚠️ NEW: Log PropertiesService performance at the start of the writing loop
+if (typeof _measurePropertyService !== 'undefined') {
+  const propLatency = _measurePropertyService();
+  Logger.log(`[PERF] PropertyService latency at start of WRITING phase: ${propLatency}ms`);
+}
     
     // Loop continues from nextWriteRow
     for (let i = nextWriteRow; i < processedAssets.length; i += currentChunkSize) {
