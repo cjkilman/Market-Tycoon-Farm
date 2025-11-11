@@ -274,6 +274,8 @@ function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
   return { success: writeSuccess, duration: writeDurationMs };
 }
 
+state = {lasteCompletedIndex: xxx}; //Maintain State Settings along the chain
+  return { success: writeSuccess, duration: writeDurationMs, state: state, error:message };
 /**
  * Clears the target sheet and writes the headers. Must be called before Phase 2.
  * NOTE: Headers are intentionally placed in ROW 2 (A2:H2) per user instruction.
@@ -1141,4 +1143,124 @@ function updateMaterialHangar() {
 
   sheet.setFrozenRows(1);
   Logger.log(`[${SCRIPT_NAME}] MaterialHangar updated with ${outputRows.length} unique material rows.`);
+}
+
+/**
+ * Trigger wrapper for the Location Name Cache job.
+ */
+function runLocationNameCacheSync() {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  
+  executeWithTryLock(() => {
+    log.info('--- Starting Location Name Cache Sync Cycle ---');
+    // We must build a lightweight stateObject for this job
+    const state = {
+      ss: SpreadsheetApp.getActiveSpreadsheet(),
+      logInfo: log.info,
+      logError: log.error,
+      metrics: { startTime: new Date().getTime() },
+      config: { SOFT_LIMIT_MS: 280000 } // Use default soft limit
+    };
+    // Call the new worker
+    M_LocationNameCache(state);
+  }, 'runLocationNameCacheSync');
+}
+
+/**
+ * Orchestrator Module: M_LocationCacheMaintenance
+ * Refreshes the static SDE location data (mapDenormalize) and prunes old Ghost IDs.
+ * This worker uses the standardized resilient utilities for all I/O operations.
+ * * * @param {Object} stateObject The current job state/context object from the Orchestrator.
+ * @returns {Object} Status Object: {success: bool, ...}
+ */
+function M_LocationCacheMaintenance(stateObject) {
+    const state = stateObject;
+    
+    // Safety check for logging (essential in these utility modules)
+    const logInfo = state.logInfo || Logger.log;
+    const logError = state.logError || Logger.log;
+
+    const LOCATION_CACHE_SHEET = "Location_Name_Cache"; // Sheet to read/write mapDenormalize data
+    const MAP_DENORMALIZE_FILE = "mapDenormalize.csv"; // Fuzzwork source file name
+    
+    try {
+        // --- STEP 1: FETCH LATEST SDE DATA (Check Version and Download) ---
+        logInfo("Starting static location data check/fetch.");
+
+        // NOTE: This call is clean—it assumes sdeLib is accessible and handles the version check internally.
+        const SDE_DATA_FOR_WRITE = sdeLib().fetchSDEFile(MAP_DENORMALIZE_FILE); 
+        
+        // Data is empty only if version is current or download failed.
+        if (SDE_DATA_FOR_WRITE.length === 0) {
+            logInfo("Static location SDE is current or download failed. Proceeding to prune.");
+        } else {
+            // New data exists; overwrite the full sheet cache.
+            // NOTE: We only write if new data was fetched, otherwise we proceed to prune.
+            const WRITE_STATUS = Utility.writeDataToSheet(
+                LOCATION_CACHE_SHEET, 
+                SDE_DATA_FOR_WRITE, 
+                1, // SDE sheet data usually starts on Row 1 (header is Row 0 in array)
+                1, 
+                state
+            );
+            
+            if (!WRITE_STATUS.success) {
+                // If the large write fails, return the status for Orchestrator to save resume state
+                return WRITE_STATUS;
+            }
+        }
+        
+        // --- STEP 2: DYNAMIC DATA PRUNING (Ghost ID Cleanup) ---
+        logInfo("Starting Location Cache Pruning (Ghost ID cleanup).");
+        
+        // Define the custom filter logic (The core business rule: 90-day cutoff)
+        const PRUNING_CUTOFF_DAYS = 90;
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - PRUNING_CUTOFF_DAYS); 
+
+        // 1. Define the custom filter logic (The pruning rule)
+        const pruningFilter = (row) => {
+            // NOTE: Assumes the LOCATION_ID is column index 0 and LAST_ACCESSED_DATE is index 4 (from sheet structure)
+            const locationId = Number(row[0]); 
+            // In a real mapDenormalize cache, we'd have a column for Last_Accessed_Date.
+            // For now, we use a placeholder index and check for high IDs.
+            const isStaticNPC = locationId < 100000000000;
+            const isRecentlyUsed = true; // Placeholder for actual date check
+
+            return isStaticNPC || isRecentlyUsed;
+        };
+
+        // 2. Execute the reusable filtering utility to get the clean list
+        const PRUNED_DATA = Utility.processAndFilterRows(
+            LOCATION_CACHE_SHEET, 
+            pruningFilter, 
+            state
+        );
+        
+        // 3. Final Write: Overwrite the sheet with the pruned list
+        const FINAL_WRITE_STATUS = Utility.writeDataToSheet(
+            LOCATION_CACHE_SHEET, 
+            PRUNED_DATA, 
+            1, // Overwrite all data (including header on Row 1)
+            1, 
+            state
+        );
+        
+        if (!FINAL_WRITE_STATUS.success) {
+             return FINAL_WRITE_STATUS;
+        }
+
+        // --- FINAL SUCCESS RETURN ---
+        return {
+            success: true, 
+            rowsProcessed: FINAL_WRITE_STATUS.rowsProcessed, 
+            duration: 0, 
+            state: state, 
+            error: ""
+        };
+
+    } catch (e) {
+        logError(`CRITICAL FAILURE in M_LocationCacheMaintenance: ${e.message}`);
+        return { success: false, error: e.message };
+    }
 }
