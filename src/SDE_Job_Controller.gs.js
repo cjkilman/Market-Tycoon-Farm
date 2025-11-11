@@ -523,6 +523,7 @@ const fetchSDEFile = (fileName, headers = null, publishedOnly = false) => {
   // --- Return the Public Interface ---
   return {
     SdePage: SdePage, // SdePage class is now defined inside sdeLib
+    fetchSDEFile: fetchSDEFile,
     buildSDEs: buildSDEs
   };
 };
