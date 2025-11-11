@@ -102,6 +102,49 @@ const sdeLib = () => {
     return sheet;
   };
 
+
+
+/**
+ * Downloads a specific CSV file from Fuzzwork and parses it using the robust internal parser.
+ * This is the public interface for the Orchestrator to fetch SDE files like mapDenormalize.
+ * @param {string} fileName - The name of the CSV file to download (e.g., 'mapDenormalize.csv').
+ * @param {Array<string>} [headers=null] - Array of specific columns to keep.
+ * @param {boolean} [publishedOnly=false] - Whether to filter for published items.
+ * @returns {Array<Array>} The 2D array of parsed data (including header row), or [] on failure.
+ */
+const fetchSDEFile = (fileName, headers = null, publishedOnly = false) => {
+    const SCRIPT_NAME = 'fetchSDEFile';
+    
+    // NOTE: Assumes downloadTextData and CSVToArray are available in the sdeLib scope.
+    
+    try {
+        if (!fileName || typeof fileName !== 'string') {
+            throw new Error("File name is required.");
+        }
+        
+        // 1. Download the file content (reusing existing logic)
+        // This relies on the downloadTextData helper within the sdeLib closure.
+        const csvContent = downloadTextData(fileName); 
+        
+        // 2. Parse the data (reusing existing robust parser)
+        // Uses the built-in CSVToArray logic pattern for robust parsing and column filtering.
+        const parsedData = CSVToArray(csvContent, ",", headers, publishedOnly); 
+        
+        if (!parsedData || parsedData.length < 2) {
+            throw new Error("Parsed data is empty or invalid after download.");
+        }
+        
+        console.log(`${SCRIPT_NAME}: Successfully downloaded and parsed ${parsedData.length} rows from ${fileName}.`);
+        
+        return parsedData;
+
+    } catch (e) {
+        console.error(`${SCRIPT_NAME}: FATAL ERROR during SDE fetch: ${e.message}`);
+        // Returns empty array on failure, forcing the worker to handle the error state.
+        return []; 
+    }
+};
+
   /**
    * ==================================================================
    * --- BUG FIX: REPLACED CSVToArray ---

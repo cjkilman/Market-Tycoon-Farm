@@ -54,6 +54,52 @@ const CACHE_NAMED_RANGE = 'NR_CORP_ASSETS_CACHE';
 // Global sheet cache map for chunk writing (Required for _writeChunkInternal)
 const _sheetCache = {};
 
+/**
+ * Resolves a Structure ID by checking the persistent cache first, then ESI.
+ * @param {number} structureId
+ * @param {object} ss The Spreadsheet object for fetching auth char.
+ * @param {object} structureCacheMap The local Map to update/check.
+ * @param {object} SCRIPT_PROP The persistent property service.
+ * @returns {string} The resolved structure name.
+ */
+function _getStructureNameFromCacheOrESI(structureId, ss, structureCacheMap, SCRIPT_PROP) {
+    // Check local map (for current run)
+    if (structureCacheMap.has(structureId)) {
+        return structureCacheMap.get(structureId);
+    }
+
+    const structureIdString = structureId.toString();
+    const CACHE_KEY = 'StructName_' + structureIdString;
+    const structuresClient = getGESIStructuresClient_();
+    
+    // Check persistent cache
+    const cachedName = SCRIPT_PROP.getProperty(CACHE_KEY);
+    if (cachedName) {
+        structureCacheMap.set(structureId, cachedName);
+        return cachedName;
+    }
+    
+    // Fallback: Must call ESI (slow, sequential, authenticated call)
+    const mainChar = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar(ss) : GESI.getMainCharacter();
+    
+    try {
+        const structureData = structuresClient.executeRaw({ structure_id: structureId, name: mainChar });
+        const name = structureData && structureData.name ? structureData.name : `Structure (ID: ${structureIdString})`;
+        
+        // Save to persistent cache and local map
+        SCRIPT_PROP.setProperty(CACHE_KEY, name);
+        structureCacheMap.set(structureId, name);
+        Utilities.sleep(50); // Respect the 50ms delay after ESI call
+        return name;
+    } catch (e) {
+        Logger.log(`[ESI_CACHE] WARNING: ESI call for structure ID ${structureId} failed: ${e.message}.`);
+        const fallbackName = `Structure (ID: ${structureIdString})`;
+        // Save fallback to prevent hitting ESI again on next run
+        SCRIPT_PROP.setProperty(CACHE_KEY, fallbackName);
+        structureCacheMap.set(structureId, fallbackName);
+        return fallbackName;
+    }
+}
 
 // --- 2. PERSISTENT CLIENTS AND CORE CLASSES ---
 
@@ -251,24 +297,24 @@ function _prepareCacheSheet() {
   const lockAcquiredTime = new Date().getTime();
 
   try {
-    const writeStartTime = new Date().getTime();
+        const writeStartTime = new Date().getTime(); 
+        
+        // 1. AGGRESSIVE CLEAR: Delete all rows below the header row (Row 2).
+        // This physically shrinks the sheet, ensuring no old content remains.
+        const lastRow = cacheSheet.getMaxRows();
+        if (lastRow > 2) {
+           // Delete from Row 3 (the first data row) downwards
+           cacheSheet.getRange("A3:H" + lastRow).clearContent();
+        }
+        
+        // 2. HEADER WRITE: Write headers to ROW 2 (A2:H2).
+        // This must be done AFTER deletion as deletion preserves the header.
+        cacheSheet.getRange("A2:H2").setValues([ASSET_CACHE_HEADERS]);
 
-    // 1. AGGRESSIVE CLEAR: Delete all rows below the header row (Row 2).
-    // This physically shrinks the sheet, ensuring no old content remains.
-    const lastRow = cacheSheet.getMaxRows();
-    if (lastRow > 2) {
-      // Delete from Row 3 (the first data row) downwards
-      cacheSheet.getRange("A3:H" + lastRow).clearContent();
-    }
-
-    // 2. HEADER WRITE: Write headers to ROW 2 (A2:H2).
-    // This must be done AFTER deletion as deletion preserves the header.
-    cacheSheet.getRange("A2:H2").setValues([ASSET_CACHE_HEADERS]);
-
-    const criticalWriteDuration = new Date().getTime() - writeStartTime;
-    Logger.log(`[${SCRIPT_NAME}] CRIT-WRITE: Deleted old rows and wrote headers in ${criticalWriteDuration}ms. Headers placed in ROW 2.`);
-
-    return { success: true, duration: lockAcquiredTime - lockStartTime };
+        const criticalWriteDuration = new Date().getTime() - writeStartTime;
+        Logger.log(`[${SCRIPT_NAME}] CRIT-WRITE: Deleted old rows and wrote headers in ${criticalWriteDuration}ms. Headers placed in ROW 2.`);
+        
+        return { success: true, duration: lockAcquiredTime - lockStartTime };
 
   } catch (e) {
     Logger.log(`[${SCRIPT_NAME}] CRITICAL ERROR during sheet preparation: ${e}`);
@@ -332,9 +378,9 @@ function cacheAllCorporateAssets() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const START_TIME = new Date().getTime();
 
-  // Read persisted size, default to MIN_CHUNK_SIZE (50) if not found
-  let currentChunkSize = parseInt(SCRIPT_PROP.getProperty(ASSET_CHUNK_SIZE_KEY) || MIN_CHUNK_SIZE.toString(), 10);
-  currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize); // Ensure it's never too low
+// Read persisted size, default to MIN_CHUNK_SIZE (50) if not found
+    let currentChunkSize = parseInt(SCRIPT_PROP.getProperty(ASSET_CHUNK_SIZE_KEY) || MIN_CHUNK_SIZE.toString(), 10);
+    currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize); // Ensure it's never too low
   let previousDuration = 0;
 
   // --- PHASE 1: Data Acquisition (Fetch or Resume) ---
@@ -438,10 +484,10 @@ function cacheAllCorporateAssets() {
     Logger.log(`[PERF] PropertyService latency at start of WRITING phase: ${propLatency}ms`);
   }
 
-  // Initialize index from persistent state
-  let i = nextWriteRow;
+// Initialize index from persistent state
+let i = nextWriteRow; 
 
-  while (i < processedAssets.length) {
+while (i < processedAssets.length) {
     const elapsedTime = new Date().getTime() - START_TIME;
 
     // >> PREDICTIVE TIMEOUT CHECK (Bailout)
@@ -473,13 +519,13 @@ function cacheAllCorporateAssets() {
     } catch (e) {
       // CATCH 1: Spreadsheets Service Timeout (or other internal error from _writeChunkInternal)
       Logger.log(`[CRITICAL WRITE ERROR] Service failed during chunk write: ${e.message}. Aggressively reducing chunk size for retry.`);
-      Logger.log("Chink Size:" + chunk.length + " " + startRow + " chunkresult:" + JSON.stringify(chunkResult));
+Logger.log("Chink Size:"+chunk.length+" "+ startRow+" chunkresult:" + JSON.stringify(chunkResult));
       // Aggressive Chunk Size Reduction
       currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
 
       // Save state to retry the *same* index (i) with a smaller chunk.
       SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, (i + chunkSizeToUse).toString());
+SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, (i + chunkSizeToUse).toString());
       // Reschedule immediately for the next available slot.
       scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
       return; // Exit current execution immediately
@@ -490,12 +536,12 @@ function cacheAllCorporateAssets() {
 
       // Save state to retry the *same* index (i)
       SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-      SCRIPT_PROP.setProperty(ASSET_CHUNK_SIZE_KEY, currentChunkSize.toString());
+SCRIPT_PROP.setProperty(ASSET_CHUNK_SIZE_KEY, currentChunkSize.toString());
       // Aggressive Halving on Lock Conflict (Back off before next attempt)
       currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
 
       Logger.log(`[THROTTLE FAIL] Failed to acquire lock for writing chunk starting at row ${startRow}. Reducing chunk size to ${currentChunkSize}. Stopping and scheduling retry.`);
-      Logger.log("Chink Size:" + chunk.length + " " + startRow + " chunkresult:" + JSON.stringify(chunkResult));
+Logger.log("Chink Size:"+chunk.length+" "+ startRow+" chunkresult:" + JSON.stringify(chunkResult));
       // Reschedule immediately for the next available slot.
       scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
       return; // Exit current execution gracefully
@@ -507,7 +553,7 @@ function cacheAllCorporateAssets() {
     currentChunkSize = (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0)
       ? Math.min(MAX_CHUNK_SIZE, currentChunkSize + CHUNK_INCREASE_RATE)
       : currentChunkSize;
-    // 💥 CRITICAL FIX: Manually advance 'i' for the next loop iteration
+// 💥 CRITICAL FIX: Manually advance 'i' for the next loop iteration
     i += chunkSizeToUse;
     // CRITICAL: Update the state property for resume
     SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, (i + chunkSizeToUse).toString());
@@ -717,7 +763,7 @@ function refreshLocationManager() {
   const SCRIPT_NAME = 'refreshLocationManager';
   const TARGET_SHEET_NAME = LOCATION_MANAGER_SHEET_NAME;
   const CACHE_RANGE_NAME = CACHE_NAMED_RANGE;
-
+const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   if (!sheet) { Logger.log(`[${SCRIPT_NAME}] Target sheet '${TARGET_SHEET_NAME}' not found.`); return; }
@@ -776,7 +822,7 @@ function refreshLocationManager() {
 
       // 4a. Find Corp Office Folders (Branch -> Root mapping)
       // FIX: This now correctly identifies offices using 'location_type'
-      if (location_type === 'office') {
+      if (location_type === 'OfficeFolder') {
         // item_id is the Office Folder ID (the "Branch"), location_id is the Station/Structure ID (the "Root")
         corpOfficesMap.set(item_id, new CorpOffice(item_id, location_id));
 
@@ -852,30 +898,19 @@ function refreshLocationManager() {
       }
     }
 
-    // 5b. Resolve Player Structures (using GET /universe/structures/{structure_id}/)
+// 5b. Resolve Player Structures (using Persistent Cache or ESI)
     if (structureIdsToResolve.length > 0) {
-      const structuresClient = getGESIStructuresClient_(); // Uses the new helper
-      // FIX: Use the correct getCorpAuthChar function to get the Director token
-      // This assumes getCorpAuthChar is available in another file (e.g., GESI Extentions.js)
-      const mainChar = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar(ss) : GESI.getMainCharacter();
-      Logger.log(`[${SCRIPT_NAME}] Resolving ${structureIdsToResolve.length} Structure IDs via ESI using char: ${mainChar}`);
-
-      for (const structureId of structureIdsToResolve) {
-        try {
-          // This endpoint must be called one-by-one and is authenticated
-          const structureData = structuresClient.executeRaw({ structure_id: structureId, name: mainChar });
-          if (structureData && structureData.name) {
-            locationNameResolver.set(structureId, structureData.name);
-          } else {
-            locationNameResolver.set(structureId, `Structure (ID: ${structureId})`);
-          }
-          Utilities.sleep(50); // Add a small sleep to avoid hammering the endpoint
-        } catch (e) {
-          // Log the "Forbidden" error here
-          Logger.log(`[${SCRIPT_NAME}] WARNING: ESI call for structure ID ${structureId} failed: ${e.message}`);
-          locationNameResolver.set(structureId, `Structure (ID: ${structureId})`);
+        Logger.log(`[${SCRIPT_NAME}] Resolving ${structureIdsToResolve.length} Structure IDs via Cache/ESI...`);
+        for (const structureId of structureIdsToResolve) {
+            // Use the new helper function
+            const name = _getStructureNameFromCacheOrESI(
+                structureId, 
+                ss, 
+                locationNameResolver, 
+                SCRIPT_PROP
+            );
+            // The locationNameResolver is updated internally by the helper
         }
-      }
     }
 
     // 5.5 FIX: Populate locationName in CorpOffice objects *after* all names are resolved
@@ -889,8 +924,6 @@ function refreshLocationManager() {
     const allContainerIds = [...uniqueOtherContainers.keys()];
     // FIX: This filter now uses the complete GHOST_ITEM_IDS list
     const validContainerIds = allContainerIds.map(Number).filter(id => id >= ASSET_ID_MIN_BOUND && !GHOST_ITEM_IDS.has(id));
-
-    const namesClient = getGESINamesClient_();
 
     if (validContainerIds.length > 0) {
       Logger.log(`[${SCRIPT_NAME}] Resolving ${validContainerIds.length} container names via ESI in batches.`);

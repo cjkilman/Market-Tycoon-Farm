@@ -6,12 +6,12 @@
  * @param {string[]} headers - Array of header strings
  * @returns {GoogleAppsScript.Spreadsheet.Sheet}
  */
-function getOrCreateSheet(ss, name, headers) { 
+function getOrCreateSheet(ss, name, headers) {
   // --- Input Validation (Retained) ---
   if (!ss || typeof ss.getSheetByName !== 'function') {
     ss = SpreadsheetApp.getActiveSpreadsheet();
     if (!ss) {
-        throw new Error("getOrCreateSheet: Could not get active spreadsheet.");
+      throw new Error("getOrCreateSheet: Could not get active spreadsheet.");
     }
   }
   if (typeof name !== 'string' || name.trim() === '') {
@@ -22,7 +22,7 @@ function getOrCreateSheet(ss, name, headers) {
   }
   // --- End Input Validation ---
 
-  const sheetName = name.trim(); 
+  const sheetName = name.trim();
   const headerCount = headers.length;
   let sheet = ss.getSheetByName(sheetName);
   let isNewSheet = false;
@@ -41,7 +41,7 @@ function getOrCreateSheet(ss, name, headers) {
       sheet.insertColumnsAfter(maxCols, headerCount - maxCols);
     }
 
-         
+
     // if (maxCols > headerCount) {
     //   sheet.deleteColumns(headerCount + 1, maxCols - headerCount);
     // } Disabled for Time outs
@@ -60,17 +60,17 @@ function getOrCreateSheet(ss, name, headers) {
     // The recovery path in Orchestrator *must* succeed, but its sheet manipulation
     // caused the timeout. The only thing we absolutely must ensure is the header is present.
     try {
-        // Attempt to just set the headers, ignoring what's already there (fast overwrite)
-        sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
-        console.log(`Headers overwritten/verified for existing sheet.`);
+      // Attempt to just set the headers, ignoring what's already there (fast overwrite)
+      sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
+      console.log(`Headers overwritten/verified for existing sheet.`);
     } catch (e) {
-        // If even this fails, rethrow.
-        throw new Error(`Failed during minimal header set on existing sheet: ${e.message}`);
+      // If even this fails, rethrow.
+      throw new Error(`Failed during minimal header set on existing sheet: ${e.message}`);
     }
   }
 
   // NOTE: Clearing contents is now left entirely to Orchestrator._updateMarketDataSheetWorker
-  
+
   return sheet;
 }
 
@@ -85,7 +85,7 @@ function _measurePropertyService() {
   const PROP = PropertiesService.getScriptProperties();
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PERF_LOG') : Logger);
   let maxDuration = 0;
-  
+
   // 1. Measure SET (Write) operation
   try {
     const startSet = new Date().getTime();
@@ -105,11 +105,11 @@ function _measurePropertyService() {
   } catch (e) {
     log.error('PropertiesService GET Test FAILED.', e);
   }
-  
+
   // 3. Clean up and log
   PROP.deleteProperty(TEST_KEY);
   log.info(`PropertiesService Performance: Max Latency ${maxDuration}ms`);
-  
+
   return maxDuration;
 }
 
@@ -117,36 +117,425 @@ function withSheetLock(fn, timeoutMs) {
   var lock = LockService.getDocumentLock();     // document-scoped: safest for Sheets
 
   try {
-      console.log(`Attempting to acquire Document Lock (wait ${timeoutMs || 30000}ms)...`);
-      lock.waitLock(timeoutMs || 30000);           // waits up to timeout
-      console.log("Document Lock acquired.");
-      return fn(); // Execute the function while holding the lock
+    console.log(`Attempting to acquire Document Lock (wait ${timeoutMs || 30000}ms)...`);
+    lock.waitLock(timeoutMs || 30000);           // waits up to timeout
+    console.log("Document Lock acquired.");
+    return fn(); // Execute the function while holding the lock
   } catch (e) {
-      // Log lock timeout specifically
-      if (e.message.includes("Lock wait timeout")) {
-          console.error(`Failed to acquire Document Lock within ${timeoutMs || 30000}ms.`);
-      } else {
-          console.error(`Error during locked operation: ${e.message}`);
-      }
-      
-      throw e; // Re-throw the error
+    // Log lock timeout specifically
+    if (e.message.includes("Lock wait timeout")) {
+      console.error(`Failed to acquire Document Lock within ${timeoutMs || 30000}ms.`);
+    } else {
+      console.error(`Error during locked operation: ${e.message}`);
+    }
+
+    throw e; // Re-throw the error
   } finally {
     try {
-        lock.releaseLock();                         // releases even if fn throws
-        console.log("Document Lock released.");
+      lock.releaseLock();                         // releases even if fn throws
+      console.log("Document Lock released.");
     } catch (rlErr) {
-        console.error("CRITICAL: Failed to release Document Lock!", rlErr);
-        // Depending on context, you might want to handle this failure differently
+      console.error("CRITICAL: Failed to release Document Lock!", rlErr);
+      // Depending on context, you might want to handle this failure differently
     }
   }
 }
 
+/**
+ * Safely writes a large 2D array of data to a sheet in throttled batches, integrating LockService resilience.
+ * This function performs the dynamic chunk size adjustment and checks for the overall job time limit.
+ * * NOTE: This utility does NOT call SpreadsheetApp.flush(); the calling Orchestrator module must do that.
+ * * @param {string} sheetName The name of the sheet to write to.
+ * @param {Array<Array>} dataArray The 2D array of data to be written.
+ * @param {number} startRow The row number where data begins (usually 2).
+ * @param {number} startCol The column number where data begins (usually 1).
+ * @param {Object} [stateObject] Optional object containing ss, config, and resume metrics.
+ * @returns {Object} Status Object: {success: bool, rowsProcessed: num, duration: num, state: stateObject, error: string, bailout_reason: string}
+ */
+function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject) {
+  // 1. DEFINE STATE AND CONFIG
+  var state = stateObject || {};
+
+  // Micro-Optimization: Use state object's SS reference, fall back if not provided
+  var ss = state.ss || SpreadsheetApp.getActiveSpreadsheet();
+
+  var targetSheet;
+
+  // Fetch critical config from state or use safe defaults
+  var docLockTimeoutMs = state.config && state.config.DOC_LOCK_TIMEOUT_MS || 5000;
+  var THROTTLE_THRESHOLD_MS = state.config && state.config.THROTTLE_THRESHOLD_MS || 800;
+  var THROTTLE_PAUSE_MS = state.config && state.config.THROTTLE_PAUSE_MS || 200;
+  var SOFT_LIMIT_MS = state.config && state.config.SOFT_LIMIT_MS || 0;
+
+  // Fetch throttling constants for math
+  var CHUNK_INCREASE_RATE = state.config && state.config.CHUNK_INCREASE_RATE || 50;
+  var CHUNK_DECREASE_RATE = state.config && state.config.CHUNK_DECREASE_RATE || 200;
+  var MIN_CHUNK_SIZE = state.config && state.config.MIN_CHUNK_SIZE || 50;
+  var MAX_CHUNK_SIZE = state.config && state.config.MAX_CHUNK_SIZE || 5000;
+
+  // Fetch mutable metrics from state or initialize
+  var startTime = state.metrics && state.metrics.startTime || 0;
+  var currentChunkSize = state.config && state.config.currentChunkSize || MIN_CHUNK_SIZE;
+  var previousDuration = state.metrics && state.metrics.previousDuration || 0;
+  var rowsProcessed = state.metrics && state.metrics.rowsProcessed || 0;
+  var i = state.nextBatchIndex || 0; // Resume point
+
+  var dataLength = dataArray.length;
+  var numCols = 0;
+  var docLock = LockService.getDocumentLock();
+
+  try {
+    targetSheet = ss.getSheetByName(sheetName);
+    if (!targetSheet) {
+      throw new Error("Sheet not found: " + sheetName);
+    }
+
+    numCols = dataLength > 0 ? dataArray[0].length : 0;
+    if (numCols === 0 && dataLength > 0) {
+      throw new Error("Data array is corrupted (zero columns).");
+    }
+
+    // CRITICAL STEP: Clear ONLY the data area below the header (startRow preserves Row 1)
+    if (startRow <= targetSheet.getMaxRows()) {
+      targetSheet.getRange(startRow, 1, targetSheet.getMaxRows() - startRow + 1, targetSheet.getMaxColumns()).clearContent();
+    }
+
+    if (state.logInfo) state.logInfo("Starting batch write. Rows: " + dataLength + ", Resume Index: " + i);
+
+    // --- START RESILIENT BATCH WRITE LOOP (while loop) ---
+    while (i < dataLength) {
+
+      // 2. PREDICTIVE BAILOUT CHECK (Check total elapsed time for job limit)
+      if (startTime && SOFT_LIMIT_MS > 0 && (new Date().getTime() - startTime > SOFT_LIMIT_MS)) {
+        var bailoutMsg = "Job reached predictive soft time limit. Reschedule required.";
+        if (state.logWarn) state.logWarn(bailoutMsg);
+
+        // Return failure, providing the last duration for worker to assess speed on resume
+        return {
+          success: false,
+          rowsProcessed: rowsProcessed,
+          duration: previousDuration, // Provide last known speed
+          state: state,
+          error: bailoutMsg,
+          bailout_reason: "PREDICTIVE_BAILOUT" // CRITICAL TAG
+        };
+      }
+
+      // 3. DYNAMIC THROTTLING CHECK & ADJUSTMENT
+      if (previousDuration > THROTTLE_THRESHOLD_MS) {
+        // Throttle Down (The crash-avoidance math)
+        currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
+
+        if (state.logInfo) state.logInfo("[THROTTLE] Pausing for " + THROTTLE_PAUSE_MS + "ms to yield execution.");
+        Utilities.sleep(THROTTLE_PAUSE_MS);
+        previousDuration = 0; // Reset duration after pause
+      }
+
+      var chunkStartTime = new Date().getTime();
+      var batch = dataArray.slice(i, i + currentChunkSize);
+      var numRows = batch.length;
+      var targetRow = startRow + i;
+
+      // --- ATOMIC CHUNK WRITE LOGIC (Lock/Release/Yank) ---
+      if (!docLock.tryLock(docLockTimeoutMs)) {
+        throw new Error("LockAcquisitionFailure: Could not acquire Document Lock.");
+      }
+
+      try {
+        // The actual sheet write call
+        targetSheet
+          .getRange(targetRow, startCol, numRows, numCols)
+          .setValues(batch);
+
+        // --- SUCCESS PATH ---
+        docLock.releaseLock();
+        previousDuration = new Date().getTime() - chunkStartTime;
+
+        // Throttle Up (The acceleration math)
+        if (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0) {
+          currentChunkSize = Math.min(MAX_CHUNK_SIZE, currentChunkSize + CHUNK_INCREASE_RATE);
+        }
+
+        // Update metrics in the memory state object
+        rowsProcessed += numRows;
+        if (state.metrics) state.metrics.rowsProcessed = rowsProcessed;
+
+        // CRITICAL: Manually advance index 'i' and update persistent state
+        i += currentChunkSize;
+        if (state.nextBatchIndex) state.nextBatchIndex = i;
+        if (state.config) state.config.currentChunkSize = currentChunkSize; // Save new chunk size
+
+      } catch (e) {
+        // Service Timeout or other write error (The "Yank" operation)
+        docLock.releaseLock();
+        var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + targetRow + ". Error: " + e.message;
+        if (state.logError) state.logError(errorMessage);
+
+        // FAILURE STATUS OBJECT: Returns the final memory state and failure data
+        return {
+          success: false,
+          rowsProcessed: rowsProcessed,
+          duration: previousDuration,
+          state: state,
+          error: errorMessage
+        };
+      }
+    }
+    // --- END RESILIENT BATCH WRITE LOOP ---
+
+    // Final success return
+    if (state.logInfo) state.logInfo("Write SUCCESS. Total Rows Written: " + rowsProcessed);
+
+    // SUCCESS STATUS OBJECT: Returns the final memory state and success data
+    return {
+      success: true,
+      rowsProcessed: rowsProcessed,
+      duration: previousDuration,
+      state: state,
+      error: ""
+    };
+
+  } catch (e) {
+    // Catches: Sheet Not Found, LockAcquisitionFailure (Uncaught)
+    var finalErrorMsg = e.message;
+
+    if (state.logError) state.logError("CRITICAL FAILURE in writeDataToSheet. Error: " + finalErrorMsg);
+
+    // CATASTROPHIC FAILURE STATUS OBJECT: Returns the final memory state before the crash
+    return {
+      success: false,
+      rowsProcessed: rowsProcessed,
+      duration: 0,
+      state: state,
+      error: finalErrorMsg
+    };
+  }
+}
+
+/**
+ * Reads all data rows from a sheet, filters them using a custom function, and returns the resulting 2D array.
+ * * @param {string} sheetName The name of the sheet to read from.
+ * @param {function} filterFunction A custom function (row, index) => boolean 
+ * that returns TRUE if the row should be KEPT (i.e., passed the pruning check).
+ * @param {Object} [stateObject] Optional object containing the pre-loaded ss reference and logging hooks.
+ * @returns {Array<Array>} The 2D array of filtered rows (including the header row).
+ */
+function processAndFilterRows(sheetName, filterFunction, stateObject) {
+  var state = stateObject || {};
+
+  // Micro-Optimization: Use state object's SS reference, fall back if not provided
+  var ss = state.ss || SpreadsheetApp.getActiveSpreadsheet();
+  var sourceSheet;
+
+  try {
+    sourceSheet = ss.getSheetByName(sheetName);
+    if (!sourceSheet) {
+      throw new Error("Source sheet not found: " + sheetName);
+    }
+  } catch (e) {
+    if (state.logError) state.logError("CRITICAL: Failed to get sheet reference. Error: " + e.message);
+    return [];
+  }
+
+  // --- Data Extraction ---
+  var lastRow = sourceSheet.getLastRow();
+  var lastCol = sourceSheet.getLastColumn();
+  var headerRows = 1;
+
+  // Check if there are any data rows to process
+  if (lastRow <= headerRows || lastCol === 0) {
+    if (state.logInfo) state.logInfo("Sheet " + sheetName + " is empty or contains only headers.");
+    // Return an array containing just the header, if it exists
+    return lastRow >= 1 ? sourceSheet.getRange(1, 1, 1, lastCol).getValues() : [];
+  }
+
+  // Read all data starting from Row 1
+  var allRows = sourceSheet.getRange(1, 1, lastRow, lastCol).getValues();
+
+  var header = allRows[0];
+  var dataRows = allRows.slice(headerRows); // Remove the header row
+  var keptRows = [];
+  var initialCount = dataRows.length;
+
+  // --- Filtering Logic ---
+  dataRows.forEach(function (row, index) {
+    // Apply the custom filter function provided by the worker module
+    if (filterFunction(row, index)) {
+      keptRows.push(row);
+    }
+  });
+
+  var rowsRemoved = initialCount - keptRows.length;
+
+  // Re-attach the header to the front of the kept rows
+  var finalDataForWrite = [header].concat(keptRows);
+
+  if (state.logInfo) state.logInfo(
+    "Filtering complete in " + sheetName + ". Kept: " + keptRows.length + ", Removed: " + rowsRemoved
+  );
+
+  // Return the final 2D array, ready for writeDataToSheet
+  return finalDataForWrite;
+}
+
+/**
+ * Safely writes a large 2D array of data to a sheet in throttled batches, integrating LockService resilience.
+ * This function handles the entire batch loop and checks for the overall job time limit.
+ * * NOTE: This utility does NOT call SpreadsheetApp.flush(); the calling Orchestrator module must do that.
+ * * * @param {string} sheetName The name of the sheet to write to.
+ * @param {Array<Array>} dataArray The 2D array of data to be written.
+ * @param {number} startRow The row number where data begins (usually 2).
+ * @param {number} startCol The column number where data begins (usually 1).
+ * @param {Object} [stateObject] Optional object containing ss, config, and resume metrics.
+ * @returns {Object} Status Object: {success: bool, rowsProcessed: num, duration: num, state: stateObject, error: string, bailout_reason: string}
+ */
+function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject) {
+  // 1. DEFINE STATE AND CONFIG (Defensive Coding)
+  var state = stateObject || {};
+  var ss = state.ss || SpreadsheetApp.getActiveSpreadsheet(); // Micro-optimization
+
+  // Fetch critical config from state or use safe defaults
+  var docLockTimeoutMs = state.config && state.config.DOC_LOCK_TIMEOUT_MS || 5000;
+  var currentChunkSize = state.config && state.config.currentChunkSize || 5000;
+  var THROTTLE_THRESHOLD_MS = state.config && state.config.THROTTLE_THRESHOLD_MS || 800;
+  var THROTTLE_PAUSE_MS = state.config && state.config.THROTTLE_PAUSE_MS || 200;
+  var SOFT_LIMIT_MS = state.config && state.config.SOFT_LIMIT_MS || 0; // The predictive limit
+
+  // Fetch metrics from state or initialize
+  var startTime = state.metrics && state.metrics.startTime || 0;
+  var previousDuration = state.metrics && state.metrics.previousDuration || 0;
+  var rowsProcessed = state.metrics && state.metrics.rowsProcessed || 0;
+  var i = state.nextBatchIndex || 0; // Resume point
+
+  var targetSheet;
+  var dataLength = dataArray.length;
+  var numCols = 0;
+  var docLock = LockService.getDocumentLock();
+
+  try {
+    targetSheet = ss.getSheetByName(sheetName);
+    if (!targetSheet) {
+      throw new Error("Sheet not found: " + sheetName);
+    }
+
+    numCols = dataLength > 0 ? dataArray[0].length : 0;
+    if (numCols === 0 && dataLength > 0) {
+      throw new Error("Data array is corrupted (zero columns).");
+    }
+
+    // CRITICAL STEP: Clear ONLY the data area below the header (startRow preserves Row 1)
+    if (startRow <= targetSheet.getMaxRows()) {
+      targetSheet.getRange(startRow, 1, targetSheet.getMaxRows() - startRow + 1, targetSheet.getMaxColumns()).clearContent();
+    }
+
+    if (state.logInfo) state.logInfo("Starting batch write. Rows: " + dataLength + ", Resume Index: " + i);
+
+    // --- START RESILIENT BATCH WRITE LOOP (while loop) ---
+    while (i < dataLength) {
+
+      // 2. PREDICTIVE BAILOUT CHECK (Check total elapsed time for job limit)
+      if (startTime && SOFT_LIMIT_MS > 0 && (new Date().getTime() - startTime > SOFT_LIMIT_MS)) {
+        var bailoutMsg = "Job reached predictive soft time limit. Reschedule required.";
+        if (state.logWarn) state.logWarn(bailoutMsg);
+
+        // Return failure, providing the last duration for worker to assess speed on resume
+        return {
+          success: false,
+          rowsProcessed: rowsProcessed,
+          duration: previousDuration,
+          state: state,
+          error: bailoutMsg,
+          bailout_reason: "PREDICTIVE_BAILOUT" // CRITICAL TAG
+        };
+      }
+
+      // 3. DYNAMIC THROTTLING CHECK (Pause if previous write was too slow)
+      if (previousDuration > THROTTLE_THRESHOLD_MS) {
+        if (state.logInfo) state.logInfo("[THROTTLE] Pausing for " + THROTTLE_PAUSE_MS + "ms to yield execution.");
+        Utilities.sleep(THROTTLE_PAUSE_MS);
+        previousDuration = 0; // Reset duration after pause
+      }
+
+      var chunkStartTime = new Date().getTime();
+      var batch = dataArray.slice(i, i + currentChunkSize);
+      var numRows = batch.length;
+      var targetRow = startRow + i;
+
+      // --- ATOMIC CHUNK WRITE LOGIC (Lock/Release/Yank) ---
+      if (!docLock.tryLock(docLockTimeoutMs)) {
+        throw new Error("LockAcquisitionFailure: Could not acquire Document Lock.");
+      }
+
+      try {
+        // The actual sheet write call
+        targetSheet
+          .getRange(targetRow, startCol, numRows, numCols)
+          .setValues(batch);
+
+        // --- SUCCESS PATH ---
+        docLock.releaseLock();
+        previousDuration = new Date().getTime() - chunkStartTime;
+
+        // Update metrics in the memory state object
+        rowsProcessed += numRows;
+        if (state.metrics) state.metrics.rowsProcessed = rowsProcessed;
+
+        // CRITICAL: Manually advance index 'i' only upon SUCCESS
+        i += currentChunkSize;
+        if (state.nextBatchIndex) state.nextBatchIndex = i;
+
+      } catch (e) {
+        // Service Timeout or other write error (The "Yank" operation)
+        docLock.releaseLock();
+        var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + targetRow + ". Error: " + e.message;
+        if (state.logError) state.logError(errorMessage);
+
+        // FAILURE STATUS OBJECT: Returns the final memory state and failure data
+        return {
+          success: false,
+          rowsProcessed: rowsProcessed,
+          duration: previousDuration,
+          state: state,
+          error: errorMessage
+        };
+      }
+    }
+    // --- END RESILIENT BATCH WRITE LOOP ---
+
+    // Final success return (No flush here)
+    if (state.logInfo) state.logInfo("Write SUCCESS. Total Rows Written: " + rowsProcessed);
+
+    // SUCCESS STATUS OBJECT: Returns the final memory state and success data
+    return {
+      success: true,
+      rowsProcessed: rowsProcessed,
+      duration: previousDuration,
+      state: state,
+      error: ""
+    };
+
+  } catch (e) {
+    // Catches: Sheet Not Found, LockAcquisitionFailure (Uncaught)
+    var finalErrorMsg = e.message;
+
+    if (state.logError) state.logError("CRITICAL FAILURE in writeDataToSheet. Error: " + finalErrorMsg);
+
+    // CATASTROPHIC FAILURE STATUS OBJECT: Returns the final memory state before the crash
+    return {
+      success: false,
+      rowsProcessed: rowsProcessed,
+      duration: 0,
+      state: state,
+      error: finalErrorMsg
+    };
+  }
+}
 
 /**
  * Utility helpers — generic functions reused across modules.
  * Keep this file focused on non-domain-specific helpers.
  */
-var Utility = (function(){
+var Utility = (function () {
   'use strict';
 
   /**
@@ -162,12 +551,12 @@ var Utility = (function(){
     opts = opts || {};
     var ignoreNonPositive = opts.ignoreNonPositive !== false; // default true
     if (!values || !values.length) return '';
-    var nums = values.map(function(v){ return (typeof v === 'number' ? v : Number(v)); })
-                     .filter(function(v){ return Number.isFinite(v) && (!ignoreNonPositive || v > 0); })
-                     .sort(function(a,b){ return a-b; });
+    var nums = values.map(function (v) { return (typeof v === 'number' ? v : Number(v)); })
+      .filter(function (v) { return Number.isFinite(v) && (!ignoreNonPositive || v > 0); })
+      .sort(function (a, b) { return a - b; });
     if (!nums.length) return '';
-    var mid = Math.floor(nums.length/2);
-    return (nums.length % 2) ? nums[mid] : (nums[mid-1] + nums[mid]) / 2;
+    var mid = Math.floor(nums.length / 2);
+    return (nums.length % 2) ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
   }
 
   /**
@@ -197,15 +586,15 @@ var Utility = (function(){
 
   /** HM wrappers that defer to PT.coerceHM, preserving legacy array API */
   function toHM(val) {
-    var hm = (typeof PT !== 'undefined' && PT && typeof PT.coerceHM === 'function') ? PT.coerceHM(val) : {h:0, m:0};
+    var hm = (typeof PT !== 'undefined' && PT && typeof PT.coerceHM === 'function') ? PT.coerceHM(val) : { h: 0, m: 0 };
     return hm;
   }
   function _toHM(val) {
     var hm = toHM(val);
-    return [hm.h|0, hm.m|0];
+    return [hm.h | 0, hm.m | 0];
   }
   // Register global legacy _toHM if not already defined
-  try { if (typeof globalThis !== 'undefined' && typeof globalThis._toHM !== 'function') { globalThis._toHM = _toHM; } } catch (e) {}
+  try { if (typeof globalThis !== 'undefined' && typeof globalThis._toHM !== 'function') { globalThis._toHM = _toHM; } } catch (e) { }
 
   return {
     median: median,
