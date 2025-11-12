@@ -7,9 +7,12 @@
 /* global SpreadsheetApp, Logger, GESI, UrlFetchApp, PropertiesService, 
    refreshData, forceAuthorization, Full_Recalculate_Cycle, 
    sde_job_START, sde_job_FINALIZE, isSdeJobRunning, 
-   runIndustryLedgerUpdate */
+   runIndustryLedgerUpdate, refreshLocationManager, updateMaterialHangar,
+   pruneLocationCache */ // <-- Added pruneLocationCache
 
 // --- SDE Job Control Globals ---
+// (Assuming SCRIPT_PROPS is defined here or in another file loaded before Main.js)
+// var SCRIPT_PROPS = PropertiesService.getScriptProperties(); 
 
 /**
  * NEW: Helper to check the lock (Logic is in SDE_Job_Controller.gs, check uses this property)
@@ -242,8 +245,9 @@ function onOpen() {
     .addItem('Reset All Job History', 'resetIndustryLedgerProperties')
     .addItem('Run Industry Ledger Update', '_runIndustryLedgerUpdate_MENU')
     .addSeparator() // <-- Add a new separator
-  .addItem('[Manufacturing] 1. Refresh Location Names', 'refreshLocationManager') // <-- Runs InventoryManager.refreshLocationManager()
-  .addItem('[Manufacturing] 2. Update Material Hangar', 'updateMaterialHangar')   // <-- Runs InventoryManager.updateMaterialHangar()
+    .addItem('[Manufacturing] 1. Refresh Location Names', 'refreshLocationManager') // <-- Runs InventoryManager.refreshLocationManager()
+    .addItem('[Manufacturing] 2. Update Material Hangar', 'updateMaterialHangar')   // <-- Runs InventoryManager.updateMaterialHangar()
+    .addItem('[Manufacturing] 3. Prune Location Cache', 'pruneLocationCache') // <-- *** NEW MENU ITEM ***
     .addToUi();
 }
 
