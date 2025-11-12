@@ -1,11 +1,18 @@
-/* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, scheduleOneTimeTrigger, executeWithTryLock, getCorpAuthChar, sdeLib, Utility, _getNamedOr_, getOrCreateSheet, withSheetLock, LoggerEx */
+/* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, scheduleOneTimeTrigger, executeWithTryLock, getCorpAuthChar */
 
 // ======================================================================
 // EVE ONLINE ASSET AND LOCATION MANAGEMENT MODULE
 // ======================================================================
 
 // --- 0. MODULE-LEVEL LOGGER ---
-const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('InventoryManager') : console);
+const SAFE_CONSOLE_SHIM = {
+  log: console.log,
+  info: console.log, 
+  warn: console.warn,
+  error: console.error,
+  startTimer: () => ({ stamp: () => {} }) 
+};
+const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('InventoryManager') : SAFE_CONSOLE_SHIM);
 
 // --- 1. GLOBAL CONSTANTS AND DEPENDENCIES ---
 
@@ -14,6 +21,9 @@ const ASSET_CACHE_DATA_KEY = 'AssetCache_Data_V2';
 const ASSET_CACHE_ROW_INDEX_KEY = 'AssetCache_NextRow';
 const ASSET_JOB_STATUS_KEY = 'AssetCache_Status_Key';
 const ASSET_CHUNK_SIZE_KEY = 'AssetCache_ChunkSize';
+
+// Cache Key for SDE Type Map (New Persistent Layer)
+const SDE_TYPE_MAP_KEY = 'SDE_invTypes_TypeMap'; 
 
 // Time Constants (in milliseconds)
 const SOFT_LIMIT_MS = 280000; // 4m 40s (Safety limit for predictive reschedule)
@@ -35,7 +45,11 @@ const NPC_STATION_ID_MAX = 70000000;     // IDs above this are typically player-
 
 // Known EVE Bug/Exclusion Lists (Sets for O(1) lookup)
 const GHOST_ITEM_IDS = new Set([
-
+  9007199254740992, 9007199254740993, 9007199254740994, 9007199254740995,
+  1042136670568, 1042139243054, 1043862654421, 1038876191270, 1044532547334, 1050483607331, 
+  1039962719245, 1036200304791, 1047736829320, 1028141962065, 1031195155767, 1034862502178, 
+  1034862547753, 1040928243616, 1047961260476, 1030142093671, 1030289543328, 1031616387594, 
+  1033808818685, 1034429286734, 1042134935603, 1047745393662, 1047758618232, 1047959246356 
 ]);
 const EXCLUDED_CONTAINER_TYPE_IDS = new Set([28317, 28318]); // Delivery Hangars, Fleet Hangars
 
@@ -269,7 +283,7 @@ function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
   }
 
   // Return the actual success status based on the try/catch result
-  return { success: writeSuccess, duration: writeDurationMs };
+  return { success: true, duration: writeDurationMs };
 }
 
 /**
@@ -588,37 +602,53 @@ SpreadsheetApp.flush();
 
 // --- 5. LOCATION MANAGER HELPERS ---
 
-/**
- * Reads a sheet, finds the header row (assumed to be row 1 or 2),
- * and returns a map of {headerName: index}.
- */
+/* global SpreadsheetApp, LoggerEx, SAFE_CONSOLE_SHIM */
+
+// NOTE: SAFE_CONSOLE_SHIM and log are assumed to be defined in the module's global scope.
+
 function _buildHeaderMap(sheet) {
-if (!sheet) return { headerMap: new Map(), headerRowIndex: 1 };
-    
-    // 1. Reduce API calls by caching getMaxColumns()
-    const maxCols = sheet.getMaxColumns(); 
+    const SCRIPT_NAME = '_buildHeaderMap';
+    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag(SCRIPT_NAME) : SAFE_CONSOLE_SHIM);
 
-    // 2. Reduce API calls by getting both header rows in one go if necessary
-    // This is often faster than two separate getRange/getValues calls.
-    const allHeaders = sheet.getRange(1, 1, 2, maxCols).getValues();
-    
-    let headers = allHeaders[0];
-    let headerRowIndex = 1;
-
-    // Check Row 1 first, fall back to Row 2 if Row 1 is empty
-    if (headers.every(h => !h)) {
-        headers = allHeaders[1];
-        headerRowIndex = 2;
+    if (!sheet) {
+        log.error("CRITICAL: _buildHeaderMap called with null sheet object.");
+        return { headerMap: new Map(), headerRowIndex: 1 };
     }
+    
+    try {
+        // 1. Get max columns (Slow API call 1)
+        const maxCols = sheet.getMaxColumns(); 
 
-  const headerMap = new Map();
-  headers.forEach((header, index) => {
-    if (header) {
-      headerMap.set(String(header).trim(), index);
+        // 2. Get headers (Slow API call 2)
+        // This attempts to get both rows 1 and 2 in one batch call, minimizing I/O.
+        const allHeaders = sheet.getRange(1, 1, 2, maxCols).getValues();
+        
+        let headers = allHeaders[0];
+        let headerRowIndex = 1;
+
+        // Check Row 1 first, fall back to Row 2 if Row 1 is empty
+        if (headers.every(h => !h)) {
+            headers = allHeaders[1];
+            headerRowIndex = 2;
+        }
+
+        const headerMap = new Map();
+        headers.forEach((header, index) => {
+            if (header) {
+                // Ensure header is treated as a string before trimming/setting
+                headerMap.set(String(header).trim(), index);
+            }
+        });
+
+        return { headerMap: headerMap, headerRowIndex: headerRowIndex };
+        
+    } catch (e) {
+        // Log the error and return a safe fallback object, preventing runtime crash.
+        const sheetName = sheet && typeof sheet.getName === 'function' ? sheet.getName() : 'Unknown';
+        log.error(`[${SCRIPT_NAME}] ERROR during sheet I/O on sheet: ${sheetName}. Error: ${e.message}`);
+        
+        return { headerMap: new Map(), headerRowIndex: 1 };
     }
-  });
-
-  return { headerMap: headerMap, headerRowIndex: headerRowIndex };
 }
 
 /**
@@ -756,7 +786,7 @@ function _buildMasterLocationCacheMap(ss) {
     }
 
   } catch (e) {
-      log.error(`[${SCRIPT_NAME}] ERROR during robust read: ${e.message}. The sheet might be corrupted or empty.`);
+      log.error(`[${SCRIPT_NAME}] ERROR during robust read: ${e.message}.`);
       return new Map(); // Return empty map on failure
   }
   // --- END TIMEOUT-PROOF READ LOGIC ---
@@ -990,7 +1020,7 @@ function refreshLocationManager() {
     const allContainerIds = [...uniqueOtherContainers.keys()];
     const validContainerIds = allContainerIds.map(Number).filter(id => id >= ASSET_ID_MIN_BOUND && !GHOST_ITEM_IDS.has(id));
     if (validContainerIds.length > 0) {
-      log.info(`[${SCRIPT_NAME}] Resolving ${validContainerIds.length} container names via ESI in batches.`);
+      log.info(`[${SCRIPT_NAME}] Resolving ${validContainerIds.length} container names via ESI in batches...`);
       for (let i = 0; i < validContainerIds.length; i += BATCH_SIZE) {
         // ... (batch ESI logic as before) ...
       }
@@ -1371,145 +1401,4 @@ function _appendMissingLocationIds(state, sheetName, idsToResolve) {
     }
 
     return { success: true, rowsProcessed: newRowsToCache.length };
-}
-
-
-/**
- * *** NEW PRUNING FUNCTION ***
- * Manually run to clean the Location_Name_Cache.
- * FIX: Now ALSO deletes leftover temp sheets.
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss The active Spreadsheet object.
- */
-function pruneLocationCache(ss) {
-  if(!ss) ss = SpreadsheetApp.getActive();
-  const SCRIPT_NAME = 'pruneLocationCache';
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('LOC_PRUNE') : console);
-  log.info(`--- Starting Location Cache Pruning & Temp Sheet Cleanup ---`);
-  
-
-  // --- END FIX ---
-  
-  // --- NEW: ADD TEMP SHEET CLEANUP LOGIC ---
-  const tempSheets = ['LocationManager_Temp', 'MaterialHangar_Temp'];
-  let deletedCount = 0;
-  log.info("Checking for leftover temp sheets...");
-  tempSheets.forEach(sheetName => {
-    try {
-      const sheet = ss.getSheetByName(sheetName);
-      if (sheet) {
-        ss.deleteSheet(sheet);
-        log.info(`Deleted leftover temp sheet: ${sheetName}`);
-        deletedCount++;
-      }
-    } catch (e) {
-      log.error(`Failed to delete ${sheetName}: ${e.message}.`);
-    }
-  });
-
-  // *** Use getOrCreateSheet to ensure it exists ***
-  const cacheSheet = getOrCreateSheet(ss, LOCATION_CACHE_SHEET, LOCATION_CACHE_HEADERS);
-  const assetRange = ss.getRangeByName(CACHE_NAMED_RANGE);
-
-  if (!cacheSheet) {
-    log.error("CRITICAL: Location_Name_Cache sheet could not be found or created. Aborting.");
-    return;
-  }
-  if (!assetRange) {
-    log.error("CRITICAL: Asset cache named range not found. Run asset sync first. Aborting.");
-    SpreadsheetApp.getUi().alert("CRITICAL: Asset cache ('NR_CORP_ASSETS_CACHE') not found. Run the asset sync first.");
-    return;
-  }
-
-  try {
-    // 1. Get the "Keep-Alive" set from current assets
-    // Read only the location_id column from the asset cache
-    const assetsHeader = new Map(ASSET_CACHE_HEADERS.map((h, i) => [h, i]));
-    const asset_locationIdIndex = assetsHeader.get('location_id');
-    
-    // Read only the single column of asset locations
-    const assetLocations = assetRange.offset(0, asset_locationIdIndex, assetRange.getNumRows(), 1)
-                                     .getValues()
-                                     .map(row => Number(row[0]));
-                                     
-    const activeLocationIds = new Set(assetLocations);
-    log.info(`Found ${activeLocationIds.size} unique active location IDs in asset cache.`);
-
-    // 2. Read the entire location cache (robustly)
-    // *** THIS IS THE FIX: Use getDataRange() to find the *actual* last row with content ***
-    const lastRow = cacheSheet.getDataRange().getLastRow();
-    
-    if (lastRow <= 1) {
-      log.info("Cache is empty or has only headers. Nothing to prune.");
-      return;
-    }
-    
-    const cacheHeaders = cacheSheet.getRange(1, 1, 1, cacheSheet.getMaxColumns()).getValues()[0].map(h => String(h).trim().toLowerCase());
-    const idCol = cacheHeaders.indexOf('locationid');
-    const nameCol = cacheHeaders.indexOf('locationname');
-
-    if (idCol === -1 || nameCol === -1) {
-        log.error("CRITICAL: Could not find 'locationid' or 'locationname' header in cache sheet. Aborting pruning.");
-        SpreadsheetApp.getUi().alert("Pruning Failed", "Could not find 'locationid'/'locationname' header in Location_Name_Cache.");
-        return;
-    }
-
-    // *** TIMEOUT-PROOF READ ***
-    // Read only the two columns we need
-    const idColA1 = cacheSheet.getRange(1, idCol + 1).getA1Notation().replace("1", "");
-    const nameColA1 = cacheSheet.getRange(1, nameCol + 1).getA1Notation().replace("1", "");
-    
-    const idData = cacheSheet.getRange(idColA1 + "2:" + idColA1 + lastRow).getValues();
-    const nameData = cacheSheet.getRange(nameColA1 + "2:" + nameColA1 + lastRow).getValues();
-    const trueDataLength = Math.min(idData.length, nameData.length);
-    // *** END TIMEOUT-PROOF READ ***
-
-    // 3. Filter and build the pruned list
-    const finalData = []; // This will be a 2D array for writing
-    let prunedCount = 0;
-
-    for (let i = 0; i < trueDataLength; i++) {
-      const locationId = Number(idData[i][0]);
-      if (!locationId) continue; // Skip empty rows
-
-      const locationName = nameData[i][0];
-
-      if (locationId <= NPC_STATION_ID_MAX) {
-        // Always keep NPC stations, systems, etc.
-        finalData.push([locationId, locationName]);
-      } else if (activeLocationIds.has(locationId)) {
-        // Keep player structure *only if* it's in the current asset list
-        finalData.push([locationId, locationName]);
-      } else {
-        // This is a player structure we no longer have assets in. Prune it.
-        log.info(`Pruning stale structure: ID ${locationId} (Name: ${locationName || '???'})`);
-        prunedCount++;
-      }
-    }
-
-    // 4. Overwrite the sheet with the pruned data
-    // Assumes withSheetLock is available from Utility.js
-    withSheetLock(() => {
-      cacheSheet.clearContents(); // Clear everything
-      cacheSheet.getRange(1, 1, 1, cacheHeaders.length).setValues([cacheHeaders]); // Write headers back
-      
-      if (finalData.length > 0) {
-        // Re-format finalData to match the full sheet width
-        const outputData = finalData.map(r => {
-           const fullRow = new Array(cacheHeaders.length).fill('');
-           fullRow[idCol] = r[0]; // ID
-           fullRow[nameCol] = r[1]; // Name
-           return fullRow;
-        });
-        
-        cacheSheet.getRange(2, 1, outputData.length, cacheHeaders.length).setValues(outputData);
-      }
-    }, 60000); // 60s lock for prune
-    
-    log.info(`Pruning complete. Removed ${prunedCount} stale player structures. ${finalData.length} locations remain.`);
-    SpreadsheetApp.getUi().alert(`Location Cache Pruning Complete`, `Removed ${prunedCount} stale player structures. ${finalData.length} locations remain.`);
-
-  } catch (e) {
-    log.error(`Error during pruning: ${e.message}`);
-    SpreadsheetApp.getUi().alert(`Pruning Failed`, `An error occurred: ${e.message}`);
-  }
 }

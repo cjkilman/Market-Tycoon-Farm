@@ -1,14 +1,14 @@
 // ContractItems_Fetchers.gs.js
 // Robust, GAS-safe contract sync for EVE (GESI):
-//    • Two-phase listing: CHARACTER → CORPORATION (no mixing of scopes)
-//    • Items fetched with HEADERS (boolean; default true in GESI)
-//    • Single canonical endpoints: positional arguments
-//    • Per-doc cache for auth names; per-user cache for items (scope-partitioned)
-//    • LoggerEx integration (marketTracker style)
-//    • All major functions now accept an optional 'ss' (Spreadsheet) argument.
-//    • Uses executeLocked pattern for top-level locking and retry.
+//    * Two-phase listing: CHARACTER -> CORPORATION (no mixing of scopes)
+//    * Items fetched with HEADERS (boolean; default true in GESI)
+//    * Single canonical endpoints: positional arguments
+//    * Per-doc cache for auth names; per-user cache for items (scope-partitioned)
+//    * LoggerEx integration (marketTracker style)
+//    * All major functions now accept an optional 'ss' (Spreadsheet) argument.
+//    * Uses executeLocked pattern for top-level locking and retry.
 //
-/* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx, ML, getOrCreateSheet, PT, _charIdMap, _getData_, _toNumberISK_, executeLocked, scheduleOneTimeTrigger, deleteTriggersByName */
+/* global GESI, CacheService, SpreadsheetApp, LockService, Utilities, Session, LoggerEx, ML, getOrCreateSheet, PT, _charIdMap, _getData_, _toNumberISK_, executeLocked, scheduleOneTimeTrigger, deleteTriggersByName, _measureSpreadsheetLatency */
 
 // ==========================================================================================
 // CONFIG & CONSTANTS
@@ -43,7 +43,7 @@ const CORP_JOURNAL_RESUME_PROP = 'CORP_JOURNAL_DIV_RESUME'; // Property for resu
 // NEW: Property to store the transaction ID of the most recently fetched (newest) record.
 const CORP_JOURNAL_LAST_ID = 'CORP_JOURNAL_LAST_TRANSACTION_ID';
 
-// --- Raw_loot (rolling 30d total) → Material_Ledger (post deltas) ------------
+// --- Raw_loot (rolling 30d total) -> Material_Ledger (post deltas) ------------
 const RAW_LOOT_SHEET = 'Raw_loot';
 const SNAP_KEY = 'raw_loot:snapshot:v2'; // doc properties key
 
@@ -68,12 +68,12 @@ var GESI_CONTRACT_COLS = [
 ];
 
 // Cache TTLs (seconds)
-var GESI_TTL = (typeof GESI_TTL === 'object' && GESI_TTL) || {};
+var GESI_TTL = (GESI_TTL != null && typeof GESI_TTL === 'object') ? GESI_TTL : {};
 GESI_TTL.chars = (GESI_TTL.chars != null) ? GESI_TTL.chars : 21600; // 6h (document cache)
 GESI_TTL.contracts = (GESI_TTL.contracts != null) ? GESI_TTL.contracts : 900;    // 15m (unused here)
 GESI_TTL.items = (GESI_TTL.items != null) ? GESI_TTL.items : 900;    // 15m (user cache)
 
-// ADDED: Module-level cache variable to store the authorized character name
+// ADDED: Module-level cache variable to store the authenticated character name
 // only once per script execution.
 var _cachedAuthChar = null;
 // ADDED: Cache for Named Ranges to avoid slow API lookups
@@ -232,7 +232,7 @@ function _getNamedOr_(name, fallback) {
 }
 
 
-// Lookback days resolver (Named Range "LOOKBACK_DAYS" → Utility!B2 → default)
+// Lookback days resolver (Named Range "LOOKBACK_DAYS" -> Utility!B2 -> default)
 function getLookbackDays(ss) { // ADDED ss ARGUMENT
   ss = ss || SpreadsheetApp.getActiveSpreadsheet(); // Fallback to ensure 'ss' is defined
   var v = null;
@@ -274,7 +274,7 @@ function getCharNamesFast() {
   return names;
 }
 
-// Resolve corp auth character (override → GESI.name → NamedRange/Utility → first authed)
+// Resolve corp auth character (override -> GESI.name -> NamedRange/Utility -> first authed)
 function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
   // --- PHASE 1: FASTEST EXIT (In-Memory Cache / Persistent Property) ---
   if (_cachedAuthChar) {
@@ -290,11 +290,28 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
   }
 
   // --- PHASE 2: EXPENSIVE RESOLUTION (Sheet I/O / API Calls) ---
+  const SAFE_CONSOLE_SHIM = {
+    log: console.log,
+    info: console.log, // <-- CRITICAL FIX: Ensures log.info() is callable
+    warn: console.warn,
+    error: console.error,
+    startTimer: () => ({ stamp: () => {} })
+  };
+  const GESI_LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('GESI_AUTH') : SAFE_CONSOLE_SHIM);
+  const t = GESI_LOG.startTimer('getCorpAuthChar_SlowPath'); 
 
   try {
     var log = LoggerEx.withTag('GESI');
     const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet(); // Fallback if ss is null/undefined
     log.info("Checking for Authized Corp Character (SLOW PATH)");
+    
+    // *** NEW: Spreadsheet Latency Check ***
+    if (typeof _measureSpreadsheetLatency !== 'undefined') {
+        const ssLatency = _measureSpreadsheetLatency();
+        log.info(`[PERF] Spreadsheet Latency at start of SLOW PATH: ${ssLatency}ms`);
+    }
+    // *** END NEW ***
+    
     var desired = "";
 
     // Helper function optimized for speed by caching Named Range lookups
@@ -389,16 +406,19 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
       _cachedAuthChar = desired;
       props.setProperty(_CORP_AUTH_CHAR_PROP, desired); // Persist for future fast runs
     }
+    
+    t.stamp('Auth_Resolved'); // <-- ADDED STAMP
 
     return desired;
   } catch (e) {
     // If an error occurs (e.g. network/GESI), rely on GESI.name fallback
     LoggerEx.withTag('GESI').error('getCorpAuthChar failed during slow path:', e);
+    t.stamp('Auth_Failed'); // <-- ADDED STAMP
     return (GESI && GESI.name) || '';
   }
 }
 
-/** Build Char name → ID map (Implementation) */
+/** Build Char name -> ID map (Implementation) */
 function _charIdMap(ss) { // ADDED ss ARGUMENT
   // --- IMPLEMENTATION OF NAME-TO-ID MAP (Based on Corp Members) ---
   if (_cachedCharIdMap) {
@@ -464,12 +484,12 @@ function _charIdMap(ss) { // ADDED ss ARGUMENT
 // NORMALIZERS
 //==========================================================================================
 
-// Normalize CONTRACT LIST results → [{ ch, c }]
+// Normalize CONTRACT LIST results -> [{ ch, c }]
 function _normalizeCharContracts(res, names) {
   var tuples = [];
   if (!res || !res.length) return tuples;
 
-  // per-char arrays (aligned to names) — handle this FIRST
+  // per-char arrays (aligned to names) -- handle this FIRST
   if (Array.isArray(res[0]) && res[0].length && typeof res[0][0] === 'object') {
     for (var a = 0; a < names.length; a++) {
       var arr = res[a] || [];
@@ -496,7 +516,7 @@ function _normalizeCharContracts(res, names) {
   }
 
   // headerless rows
-  if (Array.isArray(res[0]) && typeof res[0][0] !== 'string') {
+  if (ArrayArray(res[0]) && typeof res[0][0] !== 'string') {
     for (var r = 0; r < res.length; r++) {
       var row = res[r];
       var c = {};
@@ -555,7 +575,7 @@ function _normalizeCorpContracts(res, corpAuthName) {
   return tuples;
 }
 
-// ITEMS: we always request headers; normalize header/object → {is_included, is_singleton, quantity, type_id}
+// ITEMS: we always request headers; normalize header/object -> {is_included, is_singleton, quantity, type_id}
 function normalizeItemRows(rows) {
   if (!rows || !rows.length) return [];
   // Tabular with header row
@@ -685,7 +705,7 @@ function raw_corporations_corporation_contracts_contract_items(contract_id, name
 function _pickCharForContract(candidates, contractRow, idMap) {
   // candidates: array of { ch, c } for the same contract_id
   // contractRow: any one of those (for acceptor_id, etc.)
-  // idMap: { name → character_id } from CharIDMap()
+  // idMap: { name -> character_id } from CharIDMap()
   if (!candidates || !candidates.length) return '';
 
   var acc = String(contractRow.acceptor_id || '').trim();
@@ -706,7 +726,7 @@ function _pickCharForContract(candidates, contractRow, idMap) {
 
 // --- REMOVED withSheetLock wrapper ---
 /**
- * --- Raw_loot (rolling 30d total) → Material_Ledger (post deltas) ------------
+ * --- Raw_loot (rolling 30d total) -> Material_Ledger (post deltas) ------------
  * Internal helper for calculating loot deltas and updating the snapshot.
  * Assumes lock is held by caller.
  */
@@ -807,7 +827,7 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
 }
 
 // --- REMOVED withSheetLock wrapper ---
-/** ===== JOURNAL → Material_Ledger & Sales_Ledger (Buy and Sell Sides) =====================
+/** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Buy and Sell Sides) =====================
  * Imports corporate market transactions (buy and sell) for Division 3 only.
  * Assumes lock is held by caller.
  */
@@ -970,9 +990,9 @@ function runLootDeltaPhase(ss) {
   }
 }
 
-// --- REMOVED withSheetLock wrapper from sheet writing part ---
+// --- REMOVED withSheetLock wrapper ---
 /**
- * SYNC: Two-phase (CHAR first → CORP). No scope mixing.
+ * SYNC: Two-phase (CHAR first -> CORP). No scope mixing.
  * Assumes lock is held by caller.
  */
 function syncContracts(ss, charIdMap) {
@@ -1048,13 +1068,13 @@ function contractsToMaterialLedger(ss, charIdMap) {
   const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
   const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
   if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
-  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) { log.log('contracts→ledger', { status: 'Skipped: RAW sheets empty.' }); return 0; }
+  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) { log.log('contracts->ledger', { status: 'Skipped: RAW sheets empty.' }); return 0; }
 
   const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
   const hC = C.shift();
   const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
   const hI = I.shift();
-  if (C.length === 0 || I.length === 0) { log.log('contracts→ledger', { status: 'Skipped: No raw data found.' }); return 0; }
+  if (C.length === 0 || I.length === 0) { log.log('contracts->ledger', { status: 'Skipped: No raw data found.' }); return 0; }
 
   const ix = (arr, name) => arr.indexOf(name);
   const colC = { char: ix(hC, "char"), contract_id: ix(hC, "contract_id"), type: ix(hC, "type"), status: ix(hC, "status"), acceptor_id: ix(hC, "acceptor_id"), date_issued: ix(hC, "date_issued") };
@@ -1070,12 +1090,12 @@ function contractsToMaterialLedger(ss, charIdMap) {
   for (let q = 0; q < C.length; q++) { const rowC = C[q]; /* ... filtering logic ... */ const cid2 = rowC[colC.contract_id]; const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : ""; const items = itemsByCid[cid2] || []; for (const it of items) { if (!it.is_included || it.qty <= 0) continue; outRows.push({ date: issued, type_id: it.type_id, qty: it.qty, source: "CONTRACT", contract_id: cid2, char: rowC[colC.char] || "" }); } }
 
 
-  if (outRows.length === 0) { log.log('contracts→ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
+  if (outRows.length === 0) { log.log('contracts->ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
 
   // --- Code previously inside withSheetLock now runs directly ---
   const keys = ['source', 'char', 'contract_id', 'type_id'];
   const count = MaterialLedger.upsert(keys, outRows);
-  log.log('contracts→ledger', { appended_or_updated: count, processed_rows: outRows.length });
+  log.log('contracts->ledger', { appended_or_updated: count, processed_rows: outRows.length });
   return count; // Return actual count
 }
 
@@ -1094,13 +1114,13 @@ function contractsToSalesLedger(ss, charIdMap) {
   const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
   const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
   if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
-  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) { log.log('contracts→sales_ledger', { status: 'Skipped: RAW sheets empty.' }); return 0; }
+  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) { log.log('contracts->sales_ledger', { status: 'Skipped: RAW sheets empty.' }); return 0; }
 
   const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
   const hC = C.shift();
   const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
   const hI = I.shift();
-  if (C.length === 0 || I.length === 0) { log.log('contracts→sales_ledger', { status: 'Skipped: No raw data found.' }); return 0; }
+  if (C.length === 0 || I.length === 0) { log.log('contracts->sales_ledger', { status: 'Skipped: No raw data found.' }); return 0; }
 
   const ix = (arr, name) => arr.indexOf(name);
   const colC = { char: ix(hC, "char"), contract_id: ix(hC, "contract_id"), type: ix(hC, "type"), status: ix(hC, "status"), issuer_id: ix(hC, "issuer_id"), date_issued: ix(hC, "date_issued"), price: ix(hC, "price") };
@@ -1115,12 +1135,12 @@ function contractsToSalesLedger(ss, charIdMap) {
   for (let q = 0; q < C.length; q++) { const rowC = C[q]; /* ... filtering logic ... */ const cid2 = rowC[colC.contract_id]; const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : ""; const items = itemsByCid[cid2] || []; const price = Number(rowC[colC.price] || 0); for (const it of items) { if (!it.is_included || it.qty <= 0) continue; let unit_price_filled = it.qty > 0 ? price / it.qty : 0; outRows.push({ date: issued, type_id: it.type_id, qty: -it.qty, unit_value: '', unit_value_filled: unit_price_filled, source: "SALE", contract_id: cid2, char: rowC[colC.char] || "" }); } }
 
 
-  if (outRows.length === 0) { log.log('contracts→sales_ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
+  if (outRows.length === 0) { log.log('contracts->sales_ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
 
   // --- Code previously inside withSheetLock now runs directly ---
   const keys = ['source', 'char', 'contract_id', 'type_id'];
   const count = SalesLedger.upsert(keys, outRows);
-  log.log('contracts→sales_ledger', { appended_or_updated: count, processed_rows: outRows.length });
+  log.log('contracts->sales_ledger', { appended_or_updated: count, processed_rows: outRows.length });
   return count; // Return actual count
 }
 
@@ -1163,7 +1183,6 @@ function rebuildContractUnitCosts(ss) {
   log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: outRows.length });
   return count;
 }
-
 
 /**
  * NEW: Helper function to run all contract processing steps.

@@ -53,6 +53,39 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
+ * Executes a single, simple, uncached Sheet API read operation and logs the duration.
+ * Used to measure Spreadsheet service latency.
+ * NOTE: Assumes there is a Sheet named 'Utility' or 'Sheet1' with content in A1.
+ * @returns {number} The duration of the Sheet GET operation (in milliseconds).
+ */
+function _measureSpreadsheetLatency() {
+  const TEST_CELL = 'A1';
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PERF_LOG') : Logger);
+  let duration = 0;
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Utility') || ss.getSheets()[0]; // Use first sheet if Utility is missing
+
+    if (!sheet) {
+      log.error('Spreadsheet Latency Test FAILED: No sheets found.');
+      return 0;
+    }
+
+    const startGet = new Date().getTime();
+    // Perform a forced read operation
+    sheet.getRange(TEST_CELL).getValue();
+    duration = new Date().getTime() - startGet;
+    
+    log.info(`Spreadsheet Latency: ${duration}ms`);
+  } catch (e) {
+    log.error('Spreadsheet Latency Test FAILED.', e);
+  }
+
+  return duration;
+}
+
+/**
  * Executes one read and one write operation on PropertyService and logs the duration.
  * This is used to detect PropertyService slowdowns/bottlenecks.
  * NOTE: Uses a dedicated, small property key.
