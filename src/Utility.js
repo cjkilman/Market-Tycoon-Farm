@@ -52,6 +52,160 @@ function getOrCreateSheet(ss, name, headers) {
   return sheet;
 }
 
+/* global SpreadsheetApp, LockService, PropertiesService, LoggerEx, SAFE_CONSOLE_SHIM */
+
+const CHUNK_SIZE_LIMIT = 8500; // Safe limit below the official 9KB threshold
+//const CHUNK_INDEX_SUFFIX = ':IDX';
+
+/**
+ * Stores a large string by splitting it into multiple chunks in PropertiesService.
+ */
+function _writeShardedProperty(propService, baseKey, largeJsonString) {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Sharder') : console);
+  const totalLength = largeJsonString.length;
+  const numChunks = Math.ceil(totalLength / CHUNK_SIZE_LIMIT);
+  const keysToWrite = {};
+
+  for (let i = 0; i < numChunks; i++) {
+    const start = i * CHUNK_SIZE_LIMIT;
+    const end = Math.min(start + CHUNK_SIZE_LIMIT, totalLength);
+    const chunk = largeJsonString.substring(start, end);
+    keysToWrite[baseKey + ':' + i] = chunk;
+  }
+  keysToWrite[baseKey + CHUNK_INDEX_SUFFIX] = String(numChunks);
+  
+  // Use setProperties for atomic writing of the chunks
+  propService.setProperties(keysToWrite, true); // true = delete other keys
+  log.log(`Sharded property '${baseKey}' into ${numChunks} chunks.`);
+}
+
+/**
+ * Reads a large string property that was split into multiple chunks (shards).
+ * @returns {string|null} The reconstructed JSON string, or null if corrupt/missing.
+ */
+function _readShardedProperty(propService, baseKey) {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Sharder') : console);
+  
+  // 1. Get the index key to find the number of chunks
+  const numChunksRaw = propService.getProperty(baseKey + CHUNK_INDEX_SUFFIX);
+  if (!numChunksRaw) {
+    return null;
+  }
+  const numChunks = parseInt(numChunksRaw, 10);
+  
+  // 2. Build the list of keys to retrieve
+  const keysToGet = [];
+  for (let i = 0; i < numChunks; i++) {
+    keysToGet.push(baseKey + ':' + i);
+  }
+
+  // 3. Get all chunks
+  const chunksMap = propService.getProperties(); 
+  
+  const result = [];
+  for (let i = 0; i < numChunks; i++) {
+    const key = baseKey + ':' + i;
+    const chunk = chunksMap[key];
+    if (chunk == null) {
+      // If any chunk is missing, the data is corrupt/expired
+      log.error(`Sharded property '${baseKey}' corrupt: Missing chunk ${i}.`);
+      return null;
+    }
+    result.push(chunk);
+  }
+
+  return result.join('');
+}
+/**
+ * Deletes all Script Properties that are not recognized as essential configuration
+ * or active job resumption markers. This tool is designed to free up space 
+ * when the 500 KB quota is exceeded.
+ */
+function cleanupUnusedScriptProperties() {
+    // --- 1. WHITELIST: ESSENTIAL KEYS TO KEEP ---
+    // These keys are defined across your module files (e.g., Orchestrator, InventoryManager).
+    const ESSENTIAL_KEYS_PREFIX = [
+        'SDE_invTypes_TypeMap',  // The large SDE cache key
+        'AssetCache_',           // Asset job resumption markers
+        'StructName_',           // Structure name persistent cache
+        '_CORP_AUTH_CHAR_PROP',  // GESI Auth character persistence
+        'CORP_JOURNAL_LAST_ID',  // Ledger resume anchor
+        'GLOBAL_SYSTEM_STATE',   // Maintenance mode flag
+        'marketDataJobLeaseUntil', // Orchestrator Lease
+        'marketDataJobStep',     // Orchestrator state
+        'marketDataFinalizeStep', // Orchestrator finalizer step
+        'marketDataNextWriteRow', // Orchestrator write position
+        'marketDataRequestIndex', // Orchestrator request index
+        'marketDataChunkSize',    // Orchestrator chunk size
+        'SDE_JOB_RUNNING',        // SDE Job Controller flags
+        'SDE_JOB_LIST',
+        'SDE_JOB_INDEX',
+        'SDE_JOB_CHUNK_INDEX',
+        'SDE_LAST_WRITE_MS'
+    ];
+    
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
+    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('QUOTA_CLEANER') : console);
+    
+    log.info('--- Starting Unused Property Cleanup ---');
+    
+    try {
+        const allProperties = SCRIPT_PROP.getProperties();
+        const allKeys = Object.keys(allProperties);
+        let keysToDelete = [];
+        let keysKept = [];
+
+        // --- 2. IDENTIFY KEYS FOR DELETION ---
+        allKeys.forEach(key => {
+            const isEssential = ESSENTIAL_KEYS_PREFIX.some(prefix => key.startsWith(prefix));
+            
+            if (isEssential) {
+                keysKept.push(key);
+            } else {
+                keysToDelete.push(key);
+            }
+        });
+        
+        // --- 3. EXECUTE DELETION (Using stable individual deletion) ---
+        if (keysToDelete.length > 0) {
+            log.warn(`Identified ${keysToDelete.length} non-essential keys for deletion. This process is slow.`);
+            
+            // ** CRITICAL FIX: Use the stable, individual delete method **
+            keysToDelete.forEach(key => {
+                // This will execute successfully in all Apps Script environments.
+                SCRIPT_PROP.deleteProperty(key);
+            });
+            // ** END CRITICAL FIX **
+
+            log.info(`✅ Successfully deleted ${keysToDelete.length} keys.`);
+        } else {
+            log.warn("No unessential keys found. Storage quota should be clear.");
+        }
+
+        // --- 4. REPORT STATUS ---
+        const finalKeyCount = Object.keys(SCRIPT_PROP.getProperties()).length;
+        log.info(`Final Key Count: ${finalKeyCount}. Keys remaining: ${keysKept.join(', ')}`);
+        
+    } catch (e) {
+        log.error(`FATAL CLEANUP ERROR: ${e.message}. Quota may still be exceeded.`);
+        // Note: Individual deletion is slow and may still hit a time limit, but the TypeError is fixed.
+        throw e;
+    }
+}
+
+/**
+ * Adds the cleanup tool to the custom menu.
+ * (Assumed to be placed in src/Main.js within the onOpen function)
+ */
+function addCleanupToolToMenu() {
+    const ui = SpreadsheetApp.getUi();
+    ui.createMenu('Sheet Tools')
+        // ... (other menu items) ...
+        .addSeparator()
+        .addItem('🛠️ DEBUG: Cleanup Property Quota', 'cleanupUnusedScriptProperties')
+        .addToUi();
+}
+
 /**
  * Executes a single, simple, uncached Sheet API read operation and logs the duration.
  * Used to measure Spreadsheet service latency.

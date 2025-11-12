@@ -358,7 +358,7 @@ function triggerCacheWarmerWithRetry() {
   // --- END FIX ---
 
   const funcToRun = fuzAPI.cacheRefresh;
-  const funcName = 'fuzAPI.cacheRefres';
+  const funcName = 'fuzAPI.cacheRefresh';
   const wrapperFuncName = 'triggerCacheWarmerWithRetry';
 
   // --- FIXED CONSTANTS ---

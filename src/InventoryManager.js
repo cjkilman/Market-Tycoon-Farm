@@ -602,10 +602,10 @@ SpreadsheetApp.flush();
 
 // --- 5. LOCATION MANAGER HELPERS ---
 
-/* global SpreadsheetApp, LoggerEx, SAFE_CONSOLE_SHIM */
-
-// NOTE: SAFE_CONSOLE_SHIM and log are assumed to be defined in the module's global scope.
-
+/**
+ * Reads a sheet, finds the header row (assumed to be row 1 or 2),
+ * and returns a map of {headerName: index}.
+ */
 function _buildHeaderMap(sheet) {
     const SCRIPT_NAME = '_buildHeaderMap';
     const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag(SCRIPT_NAME) : SAFE_CONSOLE_SHIM);
@@ -651,14 +651,37 @@ function _buildHeaderMap(sheet) {
     }
 }
 
+// ... (omitted helper functions for brevity) ...
+
 /**
  * Reads the 'SDE_invTypes' sheet dynamically and builds a Map of (typeID -> typeName).
- * FIX: Now uses robust, timeout-proof column read.
+ * FIX: Now uses robust, timeout-proof column read with PropertiesService caching and SHARDING.
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss The active Spreadsheet object.
  */
 function _buildSdeTypeMap(ss) {
   const SCRIPT_NAME = '_buildSdeTypeMap';
-  // --- FIX: Use passed-in ss object ---
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const SDE_TYPE_MAP_KEY = 'SDE_invTypes_TypeMap';
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag(SCRIPT_NAME) : SAFE_CONSOLE_SHIM);
+  
+  // --- PHASE 1: FAST CACHE CHECK (Using Sharded Read) ---
+  const cachedMapJson = _readShardedProperty(SCRIPT_PROP, SDE_TYPE_MAP_KEY);
+  
+  if (cachedMapJson) {
+      try {
+          // JSON.parse is fast and local
+          const mapArray = JSON.parse(cachedMapJson);
+          const cachedMap = new Map(mapArray);
+          log.info(`[${SCRIPT_NAME}] Loaded ${cachedMap.size} entries from PropertiesService cache (Sharded).`);
+          return cachedMap;
+      } catch (e) {
+          log.error(`[${SCRIPT_NAME}] Failed to parse sharded SDE map. Forcing sheet read. Error: ${e.message}`);
+          // Fall through to slow sheet read
+      }
+  }
+  // --- END PHASE 1: FAST CACHE CHECK ---
+
+  // --- PHASE 2: SLOW SHEET READ (Execution continues here if cache is cold) ---
   const sheet = ss.getSheetByName('SDE_invTypes');
   if (!sheet) {
     log.error(`[${SCRIPT_NAME}] CRITICAL: "SDE_invTypes" sheet not found.`);
@@ -687,8 +710,7 @@ function _buildSdeTypeMap(ss) {
   // --- TIMEOUT-PROOF READ LOGIC ---
   const typeMap = new Map();
   try {
-    // Get A1 notation for the columns (e.g., "A", "B")
-    // +1 because getRange is 1-indexed
+    // Construct A1 notations for robust column reading
     const idColA1 = sheet.getRange(1, typeIdIndex + 1).getA1Notation().replace("1", "");
     const nameColA1 = sheet.getRange(1, typeNameIndex + 1).getA1Notation().replace("1", "");
     
@@ -697,9 +719,8 @@ function _buildSdeTypeMap(ss) {
     
     log.info(`[${SCRIPT_NAME}] Robust read: Reading ${dataRange} and ${nameRange}...`);
 
-    // Read *only* the ID column data
+    // CRASH POINT: This synchronous I/O causes the service timeout
     const idData = sheet.getRange(dataRange).getValues().flat();
-    // Read *only* the Name column data
     const nameData = sheet.getRange(nameRange).getValues().flat();
 
     const trueDataLength = Math.min(idData.length, nameData.length);
@@ -712,14 +733,30 @@ function _buildSdeTypeMap(ss) {
       }
     }
     log.info(`[${SCRIPT_NAME}] Robust read complete. Built SDE type map with ${typeMap.size} entries.`);
+
+    // --- PHASE 3: CACHE RESULT (Store using Sharded Write) ---
+    if (typeMap.size > 0) {
+        try {
+            // Convert Map to Array of arrays for JSON serialization
+            const mapArray = Array.from(typeMap.entries());
+            const largeJsonString = JSON.stringify(mapArray);
+            
+            // ** CRITICAL FIX: Write using the sharding function **
+            _writeShardedProperty(SCRIPT_PROP, SDE_TYPE_MAP_KEY, largeJsonString);
+            
+            log.info(`[${SCRIPT_NAME}] Successfully saved ${typeMap.size} entries using sharded storage.`);
+        } catch(e) {
+            // This catches any residual error if the sharder fails
+            log.error(`[${SCRIPT_NAME}] Failed to save map to properties (Sharder failed). Error: ${e.message}`);
+        }
+    }
+    // --- END PHASE 3: CACHE RESULT ---
   
   } catch (e) {
-     log.error(`[${SCRIPT_NAME}] ERROR during SDE robust read: ${e.message}.`);
-     return new Map(); // Return empty map on failure
+     log.error(`[${SCRIPT_NAME}] FATAL ERROR during SDE robust read/write: ${e.message}`);
+     throw e; // Re-throw the error to be caught by the dispatcher
   }
-  // --- END TIMEOUT-PROOF READ LOGIC ---
-
-
+  
   if (typeMap.size === 0) {
     log.warn(`[${SCRIPT_NAME}] WARNING: 'SDE_invTypes' data is empty. Location names will fail. Run SDE Update.`);
   }
@@ -753,9 +790,9 @@ function _buildMasterLocationCacheMap(ss) {
     // *** Find columns by our standard headers ***
     const idCol = headers.indexOf('locationid');
     const nameCol = headers.indexOf('locationname');
-    
+
     if (idCol === -1 || nameCol === -1) {
-       log.error(`[${SCRIPT_NAME}] CRITICAL: Could not find 'locationid' or 'locationname' in "${LOCATION_CACHE_SHEET}".`);
+       log.error(`[${SCRIPT_NAME}] CRITICAL: Could not find 'locationid' or 'locationname' header in cache sheet. Aborting pruning.`);
        return locationMap;
     }
 
@@ -892,7 +929,8 @@ function refreshLocationManager() {
 
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const ss = SpreadsheetApp.getActiveSpreadsheet(); // <-- This line should no longer time out
-  
+    const sdeTypeMap = _buildSdeTypeMap(ss); // Moved to prime cache early
+
   // --- NEW: Check for existing temp sheet ---
   const oldTemp = ss.getSheetByName(TEMP_SHEET_NAME);
   if (oldTemp) {
@@ -921,8 +959,8 @@ function refreshLocationManager() {
 
   // 1. Build SDE Type Map and Hangar Map
   // --- FIX: Pass 'ss' to helpers ---
-  const sdeTypeMap = _buildSdeTypeMap(ss); // <-- THIS IS THE CORRECTED CALL
-  const hangarMap = _buildHangarNameMap(); // Does not require 'ss'
+
+const hangarMap = _buildHangarNameMap(ss); // Does not require 'ss'
   let locationNameResolver = _buildMasterLocationCacheMap(ss);
   
   // CRITICAL CHECK: Abort if SDE item data is missing
