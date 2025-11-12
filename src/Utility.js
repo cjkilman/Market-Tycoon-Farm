@@ -33,40 +33,18 @@ function getOrCreateSheet(ss, name, headers) {
     sheet = ss.insertSheet(sheetName);
     isNewSheet = true;
 
-    // 2. SET HEADERS AND MINIMALLY ADJUST COLUMNS
-    // We only perform heavy pruning/adjusting when NEW, not when existing.
-    const maxCols = sheet.getMaxColumns();
-    if (maxCols < headerCount) {
-      // Delete excess columns added by default (26 -> 9)
-      sheet.insertColumnsAfter(maxCols, headerCount - maxCols);
-    }
-
-
-    // if (maxCols > headerCount) {
-    //   sheet.deleteColumns(headerCount + 1, maxCols - headerCount);
-    // } Disabled for Time outs
-
+    // --- *** SIMPLIFIED LOGIC *** ---
+    // DO NOT attempt to adjust columns. This is what causes the timeout.
+    // Just set the headers.
     sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
     console.log(`Headers set for new sheet '${sheetName}'.`);
 
   } else {
-    // EXISTING SHEET: Perform no expensive column/header manipulation.
-    // The sheet worker (Orchestrator.js) will handle clearing contents (clearContent) 
-    // and resetting headers only if needed, or rely on the final swap logic.
-    console.log(`Sheet '${sheetName}' exists. Skipping column/header cleanup.`);
-
-    // --- CRITICAL RE-INSERTION FOR ERROR RECOVERY (Step 2) ---
-    // If we're here, it means we are in the ERROR RECOVERY path of Orchestrator (Setup Step 2)
-    // The recovery path in Orchestrator *must* succeed, but its sheet manipulation
-    // caused the timeout. The only thing we absolutely must ensure is the header is present.
-    try {
-      // Attempt to just set the headers, ignoring what's already there (fast overwrite)
-      sheet.getRange(1, 1, 1, headerCount).setValues([headers]);
-      console.log(`Headers overwritten/verified for existing sheet.`);
-    } catch (e) {
-      // If even this fails, rethrow.
-      throw new Error(`Failed during minimal header set on existing sheet: ${e.message}`);
-    }
+    // --- *** CORRECTED LOGIC *** ---
+    // EXISTING SHEET: Do *nothing* except log.
+    // Do NOT rewrite headers. This was causing the timeout.
+    console.log(`Sheet '${sheetName}' exists. Skipping creation and header write.`);
+    // --- *** END CORRECTION *** ---
   }
 
   // NOTE: Clearing contents is now left entirely to Orchestrator._updateMarketDataSheetWorker
@@ -196,9 +174,13 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     }
 
     // CRITICAL STEP: Clear ONLY the data area below the header (startRow preserves Row 1)
-    if (startRow <= targetSheet.getMaxRows()) {
+    // *** FIX: Check if startRow is within the sheet's bounds before clearing ***
+    if (startRow > 0 && startRow <= targetSheet.getMaxRows()) {
       targetSheet.getRange(startRow, 1, targetSheet.getMaxRows() - startRow + 1, targetSheet.getMaxColumns()).clearContent();
+    } else if (startRow > targetSheet.getMaxRows()) {
+      // If startRow is beyond the sheet, there's nothing to clear. This is fine.
     }
+
 
     if (state.logInfo) state.logInfo("Starting batch write. Rows: " + dataLength + ", Resume Index: " + i);
 
@@ -312,6 +294,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
   }
 }
 
+
 /**
  * Reads all data rows from a sheet, filters them using a custom function, and returns the resulting 2D array.
  * * @param {string} sheetName The name of the sheet to read from.
@@ -338,19 +321,18 @@ function processAndFilterRows(sheetName, filterFunction, stateObject) {
   }
 
   // --- Data Extraction ---
-  var lastRow = sourceSheet.getLastRow();
-  var lastCol = sourceSheet.getLastColumn();
+  // *** FIX: Use getDataRange() to get the *actual* last row with data ***
+  var dataRange = sourceSheet.getDataRange();
+  var allRows = dataRange.getValues();
   var headerRows = 1;
 
   // Check if there are any data rows to process
-  if (lastRow <= headerRows || lastCol === 0) {
+  if (allRows.length <= headerRows) {
     if (state.logInfo) state.logInfo("Sheet " + sheetName + " is empty or contains only headers.");
     // Return an array containing just the header, if it exists
-    return lastRow >= 1 ? sourceSheet.getRange(1, 1, 1, lastCol).getValues() : [];
+    return allRows.length >= 1 ? [allRows[0]] : [];
   }
-
-  // Read all data starting from Row 1
-  var allRows = sourceSheet.getRange(1, 1, lastRow, lastCol).getValues();
+  // *** END FIX ***
 
   var header = allRows[0];
   var dataRows = allRows.slice(headerRows); // Remove the header row
@@ -378,161 +360,10 @@ function processAndFilterRows(sheetName, filterFunction, stateObject) {
   return finalDataForWrite;
 }
 
-/**
- * Safely writes a large 2D array of data to a sheet in throttled batches, integrating LockService resilience.
- * This function handles the entire batch loop and checks for the overall job time limit.
- * * NOTE: This utility does NOT call SpreadsheetApp.flush(); the calling Orchestrator module must do that.
- * * * @param {string} sheetName The name of the sheet to write to.
- * @param {Array<Array>} dataArray The 2D array of data to be written.
- * @param {number} startRow The row number where data begins (usually 2).
- * @param {number} startCol The column number where data begins (usually 1).
- * @param {Object} [stateObject] Optional object containing ss, config, and resume metrics.
- * @returns {Object} Status Object: {success: bool, rowsProcessed: num, duration: num, state: stateObject, error: string, bailout_reason: string}
- */
-function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject) {
-  // 1. DEFINE STATE AND CONFIG (Defensive Coding)
-  var state = stateObject || {};
-  var ss = state.ss || SpreadsheetApp.getActiveSpreadsheet(); // Micro-optimization
-
-  // Fetch critical config from state or use safe defaults
-  var docLockTimeoutMs = state.config && state.config.DOC_LOCK_TIMEOUT_MS || 5000;
-  var currentChunkSize = state.config && state.config.currentChunkSize || 5000;
-  var THROTTLE_THRESHOLD_MS = state.config && state.config.THROTTLE_THRESHOLD_MS || 800;
-  var THROTTLE_PAUSE_MS = state.config && state.config.THROTTLE_PAUSE_MS || 200;
-  var SOFT_LIMIT_MS = state.config && state.config.SOFT_LIMIT_MS || 0; // The predictive limit
-
-  // Fetch metrics from state or initialize
-  var startTime = state.metrics && state.metrics.startTime || 0;
-  var previousDuration = state.metrics && state.metrics.previousDuration || 0;
-  var rowsProcessed = state.metrics && state.metrics.rowsProcessed || 0;
-  var i = state.nextBatchIndex || 0; // Resume point
-
-  var targetSheet;
-  var dataLength = dataArray.length;
-  var numCols = 0;
-  var docLock = LockService.getDocumentLock();
-
-  try {
-    targetSheet = ss.getSheetByName(sheetName);
-    if (!targetSheet) {
-      throw new Error("Sheet not found: " + sheetName);
-    }
-
-    numCols = dataLength > 0 ? dataArray[0].length : 0;
-    if (numCols === 0 && dataLength > 0) {
-      throw new Error("Data array is corrupted (zero columns).");
-    }
-
-    // CRITICAL STEP: Clear ONLY the data area below the header (startRow preserves Row 1)
-    if (startRow <= targetSheet.getMaxRows()) {
-      targetSheet.getRange(startRow, 1, targetSheet.getMaxRows() - startRow + 1, targetSheet.getMaxColumns()).clearContent();
-    }
-
-    if (state.logInfo) state.logInfo("Starting batch write. Rows: " + dataLength + ", Resume Index: " + i);
-
-    // --- START RESILIENT BATCH WRITE LOOP (while loop) ---
-    while (i < dataLength) {
-
-      // 2. PREDICTIVE BAILOUT CHECK (Check total elapsed time for job limit)
-      if (startTime && SOFT_LIMIT_MS > 0 && (new Date().getTime() - startTime > SOFT_LIMIT_MS)) {
-        var bailoutMsg = "Job reached predictive soft time limit. Reschedule required.";
-        if (state.logWarn) state.logWarn(bailoutMsg);
-
-        // Return failure, providing the last duration for worker to assess speed on resume
-        return {
-          success: false,
-          rowsProcessed: rowsProcessed,
-          duration: previousDuration,
-          state: state,
-          error: bailoutMsg,
-          bailout_reason: "PREDICTIVE_BAILOUT" // CRITICAL TAG
-        };
-      }
-
-      // 3. DYNAMIC THROTTLING CHECK (Pause if previous write was too slow)
-      if (previousDuration > THROTTLE_THRESHOLD_MS) {
-        if (state.logInfo) state.logInfo("[THROTTLE] Pausing for " + THROTTLE_PAUSE_MS + "ms to yield execution.");
-        Utilities.sleep(THROTTLE_PAUSE_MS);
-        previousDuration = 0; // Reset duration after pause
-      }
-
-      var chunkStartTime = new Date().getTime();
-      var batch = dataArray.slice(i, i + currentChunkSize);
-      var numRows = batch.length;
-      var targetRow = startRow + i;
-
-      // --- ATOMIC CHUNK WRITE LOGIC (Lock/Release/Yank) ---
-      if (!docLock.tryLock(docLockTimeoutMs)) {
-        throw new Error("LockAcquisitionFailure: Could not acquire Document Lock.");
-      }
-
-      try {
-        // The actual sheet write call
-        targetSheet
-          .getRange(targetRow, startCol, numRows, numCols)
-          .setValues(batch);
-
-        // --- SUCCESS PATH ---
-        docLock.releaseLock();
-        previousDuration = new Date().getTime() - chunkStartTime;
-
-        // Update metrics in the memory state object
-        rowsProcessed += numRows;
-        if (state.metrics) state.metrics.rowsProcessed = rowsProcessed;
-
-        // CRITICAL: Manually advance index 'i' only upon SUCCESS
-        i += currentChunkSize;
-        if (state.nextBatchIndex) state.nextBatchIndex = i;
-
-      } catch (e) {
-        // Service Timeout or other write error (The "Yank" operation)
-        docLock.releaseLock();
-        var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + targetRow + ". Error: " + e.message;
-        if (state.logError) state.logError(errorMessage);
-
-        // FAILURE STATUS OBJECT: Returns the final memory state and failure data
-        return {
-          success: false,
-          rowsProcessed: rowsProcessed,
-          duration: previousDuration,
-          state: state,
-          error: errorMessage
-        };
-      }
-    }
-    // --- END RESILIENT BATCH WRITE LOOP ---
-
-    // Final success return (No flush here)
-    if (state.logInfo) state.logInfo("Write SUCCESS. Total Rows Written: " + rowsProcessed);
-
-    // SUCCESS STATUS OBJECT: Returns the final memory state and success data
-    return {
-      success: true,
-      rowsProcessed: rowsProcessed,
-      duration: previousDuration,
-      state: state,
-      error: ""
-    };
-
-  } catch (e) {
-    // Catches: Sheet Not Found, LockAcquisitionFailure (Uncaught)
-    var finalErrorMsg = e.message;
-
-    if (state.logError) state.logError("CRITICAL FAILURE in writeDataToSheet. Error: " + finalErrorMsg);
-
-    // CATASTROPHIC FAILURE STATUS OBJECT: Returns the final memory state before the crash
-    return {
-      success: false,
-      rowsProcessed: rowsProcessed,
-      duration: 0,
-      state: state,
-      error: finalErrorMsg
-    };
-  }
-}
+// *** NOTE: The redundant second definition of writeDataToSheet was removed. ***
 
 /**
- * Utility helpers — generic functions reused across modules.
+ * Utility helpers -- generic functions reused across modules.
  * Keep this file focused on non-domain-specific helpers.
  */
 var Utility = (function () {
