@@ -381,8 +381,38 @@ function cacheAllCorporateAssetsTrigger() {
 }
 
 /**
- * Executes the full ESI asset pull and writes the result to a local sheet.
- * This is a RESUMABLE, time-gated job to overcome the 6-minute hard limit.
+ * KEY FOR THE NEW STATE OBJECT USED BY writeDataToSheet
+ * This replaces the old ASSET_CACHE_ROW_INDEX_KEY and ASSET_CHUNK_SIZE_KEY
+ */
+const ASSET_WRITE_STATE_KEY = 'ASSET_WRITE_STATE';
+
+/**
+ * Orchestrator function to fetch all corporate assets and write them to a
+ * cache sheet using a resumable, stateful batch write process.
+ *
+ * This function is designed to be run multiple times via a trigger.
+ *
+ * REFACTOR NOTES:
+ * This function is now fully integrated with the advanced `writeDataToSheet` utility.
+ *
+ * - Phase 1 (Fetch): Unchanged. Fetches all data, saves to PropertiesService,
+ * sets status to FETCHED, and reschedules.
+ * - Phase 2A (Prepare): Unchanged. Clears the sheet, writes headers, sets
+ * status to WRITING.
+ * - NEW in Phase 2A: It now ALSO creates the *initial state object* for
+ * `writeDataToSheet` and saves it to ASSET_WRITE_STATE_KEY.
+ * - Phase 2B (Write):
+ * - REMOVED: The entire `while (i < processedAssets.length)` loop.
+ * - REMOVED: All manual chunking, throttling, and index management (i).
+ * - ADDED: It now loads the `processedAssets` array and the `writeState` object.
+ * - ADDED: It calls `writeDataToSheet` ONCE, passing the *full* data array
+ * and the state object.
+ * - If `writeDataToSheet` returns `success: false` (e.g., timeout), this
+ * function saves the *new* state from the return value back to
+ * PropertiesService and reschedules itself.
+ * - If `writeDataToSheet` returns `success: true`, the write is finished,
+ * and the function proceeds to Phase 3.
+ * - Phase 3 (Finalize): Unchanged, but now also deletes ASSET_WRITE_STATE_KEY.
  */
 function cacheAllCorporateAssets() {
   const SCRIPT_NAME = 'cacheAllCorporateAssets';
@@ -390,32 +420,18 @@ function cacheAllCorporateAssets() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const START_TIME = new Date().getTime();
 
-// Read persisted size, default to MIN_CHUNK_SIZE (50) if not found
-    let currentChunkSize = parseInt(SCRIPT_PROP.getProperty(ASSET_CHUNK_SIZE_KEY) || MIN_CHUNK_SIZE.toString(), 10);
-    currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize); // Ensure it's never too low
-  let previousDuration = 0;
-
   // --- PHASE 1: Data Acquisition (Fetch or Resume) ---
   let processedAssets = [];
   const cachedAssetData = SCRIPT_PROP.getProperty(ASSET_CACHE_DATA_KEY);
+  // nextWriteRow is now ONLY used to check if we are in Phase 2A or 2B.
   let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(ASSET_CACHE_ROW_INDEX_KEY) || '0', 10);
   let jobStatus = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
 
   if (cachedAssetData) {
     processedAssets = JSON.parse(cachedAssetData);
     log.info(`[STATE] Resuming job. Status: ${jobStatus}. Loaded ${processedAssets.length} assets from properties.`);
-
-    if (nextWriteRow === 0 && jobStatus === 'FETCHED') {
-      // Scenario 3: Timed out after fetch, before sheet clear. Proceed to prepare sheet.
-      log.info(`[STATE] Detected FETCHED status. Proceeding to critical sheet preparation.`);
-      // Fall through to PHASE 2A
-    } else if (nextWriteRow > 0 && jobStatus === 'WRITING') {
-      // Scenario 2: Resume mid-write.
-      currentChunkSize = MIN_CHUNK_SIZE; // Start conservatively on resume
-    } else {
-      // Default case for corrupted state but existing data
-      currentChunkSize = MIN_CHUNK_SIZE;
-    }
+    
+    // (Other resume scenarios from original code are handled by the new flow)
 
   } else {
     // --- NEW JOB START (Scenario 1) ---
@@ -447,7 +463,7 @@ function cacheAllCorporateAssets() {
 
     // Save data and update state to FETCHED.
     SCRIPT_PROP.setProperty(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets));
-    SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, '0');
+    SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, '0'); // Still use '0' to trigger Phase 2A
     SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'FETCHED');
     log.info(`[STATE] New job started. Assets saved. Status: FETCHED.`);
 
@@ -472,115 +488,119 @@ function cacheAllCorporateAssets() {
       log.error(`[PHASE 2A] Failed to clear sheet. Aborting.`);
       return;
     }
+    
+    // --- NEW: Initialize the state object for writeDataToSheet ---
+    // We pass our job constants into the state config for writeDataToSheet to use.
+    const initialWriteState = {
+      // ss: ss, // Will be re-attached on load (cannot be stringified)
+      nextBatchIndex: 0,
+      config: {
+        TARGET_WRITE_TIME_MS: 3000, // Default from writeDataToSheet
+        MAX_FACTOR: 1.5,            // Default from writeDataToSheet
+        DOC_LOCK_TIMEOUT_MS: 5000,  // Default from writeDataToSheet
+        // Pass job-level constants into the writer's config
+        THROTTLE_THRESHOLD_MS: THROTTLE_THRESHOLD_MS, 
+        THROTTLE_PAUSE_MS: THROTTLE_PAUSE_MS,
+        SOFT_LIMIT_MS: SOFT_LIMIT_MS,
+        CHUNK_DECREASE_RATE: CHUNK_DECREASE_RATE,
+        MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
+        MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
+        currentChunkSize: MIN_CHUNK_SIZE // Start with min chunk size
+      },
+      metrics: {
+        startTime: START_TIME, // Use this execution's start time
+        previousDuration: 0,
+        rowsProcessed: 0
+      }
+      // Logger functions will be re-attached on load
+    };
+    
+    // Save the new state object
+    SCRIPT_PROP.setProperty(ASSET_WRITE_STATE_KEY, JSON.stringify(initialWriteState));
 
-    // Set status to WRITING and schedule the continuation to start the chunk loop.
+    // Set status to WRITING and schedule the continuation to start the write loop.
     SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'WRITING');
-    log.info(`[STATE] Sheet prepared. Status: WRITING. Scheduling next run to start chunking.`);
+    // We can now update/remove the old row index key, as it's superseded by ASSET_WRITE_STATE_KEY
+    SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY); 
+    
+    log.info(`[STATE] Sheet prepared. Initial write-state created. Status: WRITING. Scheduling next run to start chunking.`);
     scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
     return;
   }
 
 
-  // --- PHASE 2B: Resumable Chunk Write Loop (Status MUST be WRITING) ---
+  // --- PHASE 2B: Resumable Chunk Write (Delegated to writeDataToSheet) ---
   if (jobStatus !== 'WRITING') {
     log.warn(`[STATE] Job status is not WRITING (${jobStatus}). Bailing out.`);
     return;
   }
-  // NEW: Log the starting row for the current execution
-  const physicalStartRow = nextWriteRow + 3; // Row 3 is the first data row (index 0)
-  log.info(`[STATE] Starting write from ARRAY INDEX ${nextWriteRow} (PHYSICAL ROW ${physicalStartRow} on sheet).`);
-  // END NEW
-  // NEW: Log PropertiesService performance at the start of the writing loop
-  if (typeof _measurePropertyService !== 'undefined') {
-    const propLatency = _measurePropertyService();
-    log.info(`[PERF] PropertyService latency at start of WRITING phase: ${propLatency}ms`);
+
+  // Load the state for writeDataToSheet
+  const writeStateString = SCRIPT_PROP.getProperty(ASSET_WRITE_STATE_KEY);
+  if (!writeStateString) {
+    log.error(`[CRITICAL] Job status is WRITING but ASSET_WRITE_STATE_KEY is missing. Aborting.`);
+    return;
+  }
+  
+  let writeState = JSON.parse(writeStateString);
+
+  // Re-attach non-serializable properties (ss, loggers) and update runtime metric (startTime)
+  writeState.ss = ss; // Attach the active spreadsheet object
+  writeState.metrics.startTime = START_TIME; // Update start time for this execution's bailout check
+  // Re-attach loggers
+  writeState.logInfo = (typeof log !== 'undefined') ? log.info : console.log;
+  writeState.logWarn = (typeof log !== 'undefined') ? log.warn : console.warn;
+  writeState.logError = (typeof log !== 'undefined') ? log.error : console.error;
+
+  log.info(`[PHASE 2B] Calling writeDataToSheet. Resuming from index: ${writeState.nextBatchIndex || 0}`);
+  
+  // --- THIS IS THE CORE CHANGE ---
+  // Call writeDataToSheet ONCE with the FULL data array and the resumable state.
+  // It will run its own internal loop until it finishes or times out.
+  const result = writeDataToSheet(
+    CACHE_SHEET_NAME,
+    processedAssets, // The *full* data array
+    3,               // Data starts on physical row 3
+    1,               // Data starts on physical col 1
+    writeState       // The resumable state object
+  );
+  // -----------------------------
+
+  if (result.success) {
+    // IT'S DONE! Proceed to Phase 3 (Finalization).
+    log.info(`[PHASE 2B] writeDataToSheet completed successfully. Total rows: ${result.rowsProcessed}. Proceeding to finalization.`);
+    
+  } else {
+    // IT FAILED (Timeout, Lock, etc.) - We must reschedule.
+    log.warn(`[PHASE 2B] writeDataToSheet returned a non-success state. Reason: ${result.error}`);
+    
+    // Save the *new* state returned by the function for the next run.
+    // We must strip non-JSON-serializable properties before saving.
+    const stateToSave = result.state;
+    delete stateToSave.ss;
+    delete stateToSave.logInfo;
+    delete stateToSave.logWarn;
+    delete stateToSave.logError;
+
+    SCRIPT_PROP.setProperty(ASSET_WRITE_STATE_KEY, JSON.stringify(stateToSave));
+    
+    log.info(`[STATE] Saving write state to resume at index: ${stateToSave.nextBatchIndex}. Scheduling next run.`);
+    scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
+    return; // Exit this execution.
   }
 
-// Initialize index from persistent state
-let i = nextWriteRow; 
-
-while (i < processedAssets.length) {
-    const elapsedTime = new Date().getTime() - START_TIME;
-
-    // >> PREDICTIVE TIMEOUT CHECK (Bailout)
-    if (elapsedTime > SOFT_LIMIT_MS) {
-      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-      log.warn(`[STATE] Time limit hit after ${elapsedTime}ms. Saving state to resume at row ${i}.`);
-      scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
-      return; // Exit this execution safely
-    }
-
-    // >> PROACTIVE THROTTLE CHECK
-    if (previousDuration > THROTTLE_THRESHOLD_MS) {
-      currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
-      log.info(`[THROTTLE] Duration ${previousDuration}ms exceeded ${THROTTLE_THRESHOLD_MS}ms. Reducing chunk size to ${currentChunkSize} and pausing for ${THROTTLE_PAUSE_MS}ms.`);
-      Utilities.sleep(THROTTLE_PAUSE_MS);
-      previousDuration = 0; // Reset duration after pause/throttle
-    }
-
-    // Data must start writing at physical Row 3 (since Row 2 holds the headers)
-    const startRow = 3 + i;
-    const chunkSizeToUse = Math.min(currentChunkSize, processedAssets.length - i);
-    const chunk = processedAssets.slice(i, i + chunkSizeToUse);
-
-    let chunkResult;
-
-    try {
-      // CRITICAL CALL TO THE LOCKED WRITE FUNCTION
-      chunkResult = _writeChunkInternal(chunk, startRow, NUM_ASSET_COLS, CACHE_SHEET_NAME);
-    } catch (e) {
-      // CATCH 1: Spreadsheets Service Timeout (or other internal error from _writeChunkInternal)
-      log.error(`[CRITICAL WRITE ERROR] Service failed during chunk write: ${e.message}. Aggressively reducing chunk size for retry.`);
-      log.error("Chink Size:"+chunk.length+" "+ startRow+" chunkresult:" + JSON.stringify(chunkResult));
-      // Aggressive Chunk Size Reduction
-      currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
-
-      // Save state to retry the *same* index (i) with a smaller chunk.
-      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-      // Reschedule immediately for the next available slot.
-      scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
-      return; // Exit current execution immediately
-    }
-
-    if (!chunkResult.success) {
-      // CATCH 2: Document Lock Conflict (tryLock failed)
-
-      // Save state to retry the *same* index (i)
-      SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-      SCRIPT_PROP.setProperty(ASSET_CHUNK_SIZE_KEY, currentChunkSize.toString());
-      // Aggressive Halving on Lock Conflict (Back off before next attempt)
-      currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
-
-      log.warn(`[THROTTLE FAIL] Failed to acquire lock for writing chunk starting at row ${startRow}. Reducing chunk size to ${currentChunkSize}. Stopping and scheduling retry.`);
-      log.warn("Chink Size:"+chunk.length+" "+ startRow+" chunkresult:" + JSON.stringify(chunkResult));
-      // Reschedule immediately for the next available slot.
-      scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
-      return; // Exit current execution gracefully
-    }
-
-    previousDuration = chunkResult.duration;
-
-    // Increase chunk size if write was fast (proactive acceleration)
-    currentChunkSize = (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0)
-      ? Math.min(MAX_CHUNK_SIZE, currentChunkSize + CHUNK_INCREASE_RATE)
-      : currentChunkSize;
-    // CRITICAL FIX: Manually advance 'i' for the next loop iteration
-    i += chunkSizeToUse;
-    // CRITICAL: Update the state property for resume
-    SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, i.toString());
-    SCRIPT_PROP.setProperty(ASSET_CHUNK_SIZE_KEY, currentChunkSize.toString());
-  }
 
   // --- PHASE 3: Finalization (Clears state on success) ---
+  // This code block is now ONLY reached if `result.success` was true.
+  
   const dataHeight = processedAssets.length;
   // Data starts at Row 3 (header at Row 2), so data height must be >= 1
   const rangeHeight = Math.max(1, dataHeight);
 
-SpreadsheetApp.flush();
+  SpreadsheetApp.flush();
   log.info('[' + SCRIPT_NAME + '] Final spreadsheet flush and Named Range creation.');
 
   // Create/Update Named Range for downstream consumers. Start at Row 3.
-  // 'ss' is already declared and used above, fixing the previous syntax error.
   cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
 
   if (cacheSheet) {
@@ -593,12 +613,15 @@ SpreadsheetApp.flush();
 
   // FINAL CLEANUP: Clear state properties on success
   SCRIPT_PROP.deleteProperty(ASSET_CACHE_DATA_KEY);
-  SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
   SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
+  SCRIPT_PROP.deleteProperty(ASSET_WRITE_STATE_KEY); // <-- Clean up the new state key
+  
+  // Clean up old/redundant keys just in case
+  SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
   SCRIPT_PROP.deleteProperty(ASSET_CHUNK_SIZE_KEY);
+  
   log.info('[' + SCRIPT_NAME + '] Successfully cached ' + dataHeight + ' asset rows. Job finalized.');
 }
-
 
 // --- 5. LOCATION MANAGER HELPERS ---
 
