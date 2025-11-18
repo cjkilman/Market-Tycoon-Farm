@@ -240,7 +240,7 @@ function onOpen() {
     .addItem('Update SDE Data', 'sde_job_START') 
     .addItem('CANCEL SDE Update', 'sde_job_FINALIZE') 
     .addItem('Authorize Script (First Run)', 'forceAuthorization')
-    .addItem("Recalculate/Refresh", "Full_Recalculate_Cycle")
+    .addItem("Cache Corp Assets", "cacheAllCorporateAssetsTrigger")
     .addSeparator() 
     .addItem('Reset All Job History', 'resetIndustryLedgerProperties')
     .addItem('Run Industry Ledger Update', '_runIndustryLedgerUpdate_MENU')

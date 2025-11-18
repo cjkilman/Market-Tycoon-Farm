@@ -582,9 +582,9 @@ function sde_job_START() {
 
     // Halt Formulas
     const ss = getSS();
-    const loadingHelper = ss.getRange("'Utility'!B3:D3");
+    const loadingHelper = ss.getRange("'Utility'!B3:C3");
     const backupSettings = loadingHelper.getValues();
-    loadingHelper.setValues([[0, 0, 0]]);
+    loadingHelper.setValues([[0, 0]]);
     // --- YOUR SUGGESTED FLUSH ---
     SpreadsheetApp.flush(); // Forces the sheet to update NOW
     // --- END FLUSH ---
@@ -601,12 +601,13 @@ function sde_job_START() {
     // Define the Job List
     const { SdePage } = sdeLib(); // Get SdePage class from the library
     const sdePages = [
-      new SdePage("SDE_invTypes", "invTypes.csv", ["typeID", "groupID", "typeName", "volume"]),
-      new SdePage("SDE_staStations", "staStations.csv", ["stationID", "stationName", "solarSystemID", "regionID"]),
-      new SdePage("SDE_industryActivityProducts", "industryActivityProducts.csv", ["typeID", "activityID", "productTypeID", "quantity"]),
-      new SdePage("SDE_industryActivityMaterials", "industryActivityMaterials.csv", ["typeID", "activityID", "materialTypeID", "quantity"]),
-      new SdePage("SDE_invGroups", "invGroups.csv", ["groupID", "categoryID", "groupName"]),
-      new SdePage("SDE_invCategories", "invCategories.csv", ["categoryID", "categoryName"])
+                    new SdePage(
+                    "SDE_invTypes",
+                    "invTypes.csv",
+                      // Optional headers,  
+                      // invTypes is 100+ megabytes. Select columns needed to help it load faster. 
+                      [ "typeID","groupID","typeName","volume","marketGroupID"]
+                      )
     ];
 
     // Save State & Start First Trigger
@@ -706,13 +707,22 @@ function sde_job_PROCESS() {
     ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(2000).create();
 
   } catch (e) {
-    // --- FIX: Resilience for API timeouts (Service Spreadsheets timed out) ---
-    // If buildSDEs threw an error (but saved state), we re-trigger to resume.
-    Logger.log(`RESUMABLE ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message} at line ${e.lineNumber}. Re-triggering to attempt resume.`);
-    _deleteTriggersFor('sde_job_PROCESS');
-    // Wait 10s to give the Google API service time to recover from the timeout.
-    ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(10000).create();
-    // --- END FIX ---
+  const errorMessage = e.message.toLowerCase();
+    
+    // Check for fatal errors that should NOT resume
+    if (errorMessage.includes("csvtoarray") || errorMessage.includes("not found") || errorMessage.includes("critical")) {
+      
+      Logger.log(`FATAL ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message}. Calling FINALIZE to abort.`);
+      sde_job_FINALIZE(); // This is the "Die and reset"
+    
+    } else {
+      
+      // Assume it's a temporary timeout, as intended
+      Logger.log(`RESUMABLE ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message}. Re-triggering to attempt resume.`);
+      _deleteTriggersFor('sde_job_PROCESS');
+      ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(10000).create();
+    
+    }
   } finally {
     lock.releaseLock();
     console.log('PROCESS: Lock released.');
@@ -742,7 +752,7 @@ function sde_job_FINALIZE() {
       const backupSettings = JSON.parse(backupSettingsJSON);
       const ss = getSS(); // Optimization
       // FIX: Changed range from B3:C3 (2 cols) to B3:D3 (3 cols)
-      const loadingHelper = ss.getRange("'Utility'!B3:D3");
+      const loadingHelper = ss.getRange("'Utility'!B3:C3");
       loadingHelper.setValues(backupSettings);
       Logger.log('FINALIZE: Restored formula settings.');
     }

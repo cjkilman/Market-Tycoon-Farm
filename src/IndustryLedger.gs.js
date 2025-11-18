@@ -16,6 +16,9 @@ const INDUSTRY_ACTIVITY_MANUFACTURING = 1;
 const INDUSTRY_ACTIVITY_COPYING = 5;
 const INDUSTRY_ACTIVITY_INVENTION = 8;
 
+const INDUSTRY_JOB_PHASE = 'IndustryJobPhase'; 
+const SOFT_TIME_LIMIT_MS = 280000; // 4 minutes 40 seconds soft limit
+
 // --- CACHE SHARDING CONSTANTS ---
 const BPO_RAW_CACHE_KEY = 'BPO_RAW_INVENTORY_V1';
 const BPO_RAW_CACHE_TTL = 3600; // 1 hour TTL
@@ -173,45 +176,77 @@ function _getColIndexMap(headers, requiredHeaders) {
 // --- MASTER ADD-ON INTEGRATION ---
 // ----------------------------------------------------------------------
 
+// src/IndustryLedger.gs.js
+
 /**
  * Executes the full two-stage Industry Ledger process under the main system lock.
+ * Now acts as a resumable state machine to prevent exceeding maximum execution time.
  */
 function runIndustryLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const START_TIME = new Date().getTime();
 
   log.info('--- Starting Industry Ledger Phase (BPC Costing & Manufacturing COGS) ---');
 
-  // ⚠️ CRITICAL STEP: The slow GESI Client call runs here (5 min timeout).
-  try {
-    log.info('Running background fetch and cache of ESI Corp Jobs...');
-    _getCorporateJobsRaw(true); // Forces a fresh GESI Client call & cache write
-    log.info('ESI Corp Jobs successfully cached.');
-  } catch (e) {
-    // If the GESI Client call fails (Authorization/Rate Limit), the script stops.
-    log.error('Background ESI Corp Jobs fetch FAILED. Check Authorization/Scopes! Skipping Ledger update.', e);
-    return;
+  // Read current phase, defaults to 0 (Fetch)
+  let phase = parseInt(SCRIPT_PROP.getProperty(INDUSTRY_JOB_PHASE) || '0', 10);
+  
+  if (phase === 0) {
+    // Phase 0: FETCH ESI DATA (Must complete before next steps)
+    try {
+      log.info('Phase 0: Running background fetch and cache of ESI Corp Jobs...');
+      _getCorporateJobsRaw(true); // Forces a fresh GESI Client call & cache write
+      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '1'); // Advance to next phase
+      phase = 1;
+    } catch (e) {
+      log.error('Phase 0 (Fetch) FAILED. Check Authorization/Scopes!', e);
+      return; // Exit on hard failure
+    }
   }
-  // END CRITICAL STEP
-
-  // --- STAGE 1 & 2 will now run quickly, reading the fast cache ---
-  try {
-    log.info('Running BPC Creation Ledger (Stage 1: Calculate WAC)...');
-    runBpcCreationLedger(ss);
-  } catch (e) {
-    log.error('BPC Creation Ledger (Stage 1) FAILED. Subsequent costing may use stale BPC data.', e);
+  
+  if (phase === 1) {
+    // Phase 1: BPC COSTING (Time-gated)
+    if (Date.now() - START_TIME > SOFT_TIME_LIMIT_MS) {
+        log.warn('Phase 1 (BPC Costing) skipped: Execution time limit pending. Reschedule.');
+        return; // Exit gracefully, property holds '1'
+    }
+    try {
+      log.info('Phase 1: Running BPC Creation Ledger (Stage 1: Calculate WAC)...');
+      runBpcCreationLedger(ss);
+      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '2'); // Advance to next phase
+      phase = 2;
+    } catch (e) {
+      log.error('Phase 1 (BPC Costing) FAILED:', e);
+      // Exit, property holds '2', so next run attempts Phase 2.
+    }
   }
 
-  try {
-    log.info('Running Manufacturing Ledger Update (Stage 2: COGS)...');
-    // This function will now read the FAST ESI Corp Jobs data from the cache.
-    runIndustryLedgerUpdate(ss);
-  } catch (e) {
-    log.error('Manufacturing Ledger Update (Stage 2) FAILED', e);
+  if (phase === 2) {
+    // Phase 2: MANUFACTURING COGS (Time-gated)
+    if (Date.now() - START_TIME > SOFT_TIME_LIMIT_MS) {
+        log.warn('Phase 2 (Manufacturing COGS) skipped: Execution time limit pending. Reschedule.');
+        return; // Exit gracefully, property holds '2'
+    }
+    try {
+      log.info('Phase 2: Running Manufacturing Ledger Update (Stage 2: COGS)...');
+      runIndustryLedgerUpdate(ss);
+      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '3'); // Advance to cleanup
+      phase = 3;
+    } catch (e) {
+      log.error('Phase 2 (Manufacturing COGS) FAILED:', e);
+      // Exit, property holds '3', so next run attempts Phase 3.
+    }
+  }
+
+  if (phase === 3) {
+    // Phase 3: CLEANUP (Final step)
+    SCRIPT_PROP.deleteProperty(INDUSTRY_JOB_PHASE);
+    log.info('Phase 3: Cleanup complete.');
   }
 
   log.info('--- Industry Ledger Phase Complete ---');
 }
-
 
 // ----------------------------------------------------------------------
 // --- MAIN FUNCTION STAGE 1: BPC Cost Calculation (WAC) ---

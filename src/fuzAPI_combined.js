@@ -470,8 +470,10 @@ const fuzAPI = (() => {
     const allKnownRequests = getMasterBatchFromControlTable(); // Assumes exists
     if (allKnownRequests && allKnownRequests.length > 0) {
       getDataForRequests(allKnownRequests); // This now handles negative caching internally
+      return true;
     } else {
       console.log("fuzAPI Full Cache Refresh: Control Table is empty or failed to load.");
+      return true;
     }
   }
 

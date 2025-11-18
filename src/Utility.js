@@ -73,7 +73,7 @@ function _writeShardedProperty(propService, baseKey, largeJsonString) {
     keysToWrite[baseKey + ':' + i] = chunk;
   }
   keysToWrite[baseKey + CHUNK_INDEX_SUFFIX] = String(numChunks);
-  
+
   // Use setProperties for atomic writing of the chunks
   propService.setProperties(keysToWrite, true); // true = delete other keys
   log.log(`Sharded property '${baseKey}' into ${numChunks} chunks.`);
@@ -85,14 +85,14 @@ function _writeShardedProperty(propService, baseKey, largeJsonString) {
  */
 function _readShardedProperty(propService, baseKey) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Sharder') : console);
-  
+
   // 1. Get the index key to find the number of chunks
   const numChunksRaw = propService.getProperty(baseKey + CHUNK_INDEX_SUFFIX);
   if (!numChunksRaw) {
     return null;
   }
   const numChunks = parseInt(numChunksRaw, 10);
-  
+
   // 2. Build the list of keys to retrieve
   const keysToGet = [];
   for (let i = 0; i < numChunks; i++) {
@@ -100,8 +100,8 @@ function _readShardedProperty(propService, baseKey) {
   }
 
   // 3. Get all chunks
-  const chunksMap = propService.getProperties(); 
-  
+  const chunksMap = propService.getProperties();
+
   const result = [];
   for (let i = 0; i < numChunks; i++) {
     const key = baseKey + ':' + i;
@@ -122,75 +122,75 @@ function _readShardedProperty(propService, baseKey) {
  * when the 500 KB quota is exceeded.
  */
 function cleanupUnusedScriptProperties() {
-    // --- 1. WHITELIST: ESSENTIAL KEYS TO KEEP ---
-    // These keys are defined across your module files (e.g., Orchestrator, InventoryManager).
-    const ESSENTIAL_KEYS_PREFIX = [
-        'SDE_invTypes_TypeMap',  // The large SDE cache key
-        'AssetCache_',           // Asset job resumption markers
-        'StructName_',           // Structure name persistent cache
-        '_CORP_AUTH_CHAR_PROP',  // GESI Auth character persistence
-        'CORP_JOURNAL_LAST_ID',  // Ledger resume anchor
-        'GLOBAL_SYSTEM_STATE',   // Maintenance mode flag
-        'marketDataJobLeaseUntil', // Orchestrator Lease
-        'marketDataJobStep',     // Orchestrator state
-        'marketDataFinalizeStep', // Orchestrator finalizer step
-        'marketDataNextWriteRow', // Orchestrator write position
-        'marketDataRequestIndex', // Orchestrator request index
-        'marketDataChunkSize',    // Orchestrator chunk size
-        'SDE_JOB_RUNNING',        // SDE Job Controller flags
-        'SDE_JOB_LIST',
-        'SDE_JOB_INDEX',
-        'SDE_JOB_CHUNK_INDEX',
-        'SDE_LAST_WRITE_MS'
-    ];
-    
-    const SCRIPT_PROP = PropertiesService.getScriptProperties();
-    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('QUOTA_CLEANER') : console);
-    
-    log.info('--- Starting Unused Property Cleanup ---');
-    
-    try {
-        const allProperties = SCRIPT_PROP.getProperties();
-        const allKeys = Object.keys(allProperties);
-        let keysToDelete = [];
-        let keysKept = [];
+  // --- 1. WHITELIST: ESSENTIAL KEYS TO KEEP ---
+  // These keys are defined across your module files (e.g., Orchestrator, InventoryManager).
+  const ESSENTIAL_KEYS_PREFIX = [
+    'SDE_invTypes_TypeMap',  // The large SDE cache key
+    'AssetCache_',           // Asset job resumption markers
+    'StructName_',           // Structure name persistent cache
+    '_CORP_AUTH_CHAR_PROP',  // GESI Auth character persistence
+    'CORP_JOURNAL_LAST_ID',  // Ledger resume anchor
+    'GLOBAL_SYSTEM_STATE',   // Maintenance mode flag
+    'marketDataJobLeaseUntil', // Orchestrator Lease
+    'marketDataJobStep',     // Orchestrator state
+    'marketDataFinalizeStep', // Orchestrator finalizer step
+    'marketDataNextWriteRow', // Orchestrator write position
+    'marketDataRequestIndex', // Orchestrator request index
+    'marketDataChunkSize',    // Orchestrator chunk size
+    'SDE_JOB_RUNNING',        // SDE Job Controller flags
+    'SDE_JOB_LIST',
+    'SDE_JOB_INDEX',
+    'SDE_JOB_CHUNK_INDEX',
+    'SDE_LAST_WRITE_MS'
+  ];
 
-        // --- 2. IDENTIFY KEYS FOR DELETION ---
-        allKeys.forEach(key => {
-            const isEssential = ESSENTIAL_KEYS_PREFIX.some(prefix => key.startsWith(prefix));
-            
-            if (isEssential) {
-                keysKept.push(key);
-            } else {
-                keysToDelete.push(key);
-            }
-        });
-        
-        // --- 3. EXECUTE DELETION (Using stable individual deletion) ---
-        if (keysToDelete.length > 0) {
-            log.warn(`Identified ${keysToDelete.length} non-essential keys for deletion. This process is slow.`);
-            
-            // ** CRITICAL FIX: Use the stable, individual delete method **
-            keysToDelete.forEach(key => {
-                // This will execute successfully in all Apps Script environments.
-                SCRIPT_PROP.deleteProperty(key);
-            });
-            // ** END CRITICAL FIX **
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('QUOTA_CLEANER') : console);
 
-            log.info(`✅ Successfully deleted ${keysToDelete.length} keys.`);
-        } else {
-            log.warn("No unessential keys found. Storage quota should be clear.");
-        }
+  log.info('--- Starting Unused Property Cleanup ---');
 
-        // --- 4. REPORT STATUS ---
-        const finalKeyCount = Object.keys(SCRIPT_PROP.getProperties()).length;
-        log.info(`Final Key Count: ${finalKeyCount}. Keys remaining: ${keysKept.join(', ')}`);
-        
-    } catch (e) {
-        log.error(`FATAL CLEANUP ERROR: ${e.message}. Quota may still be exceeded.`);
-        // Note: Individual deletion is slow and may still hit a time limit, but the TypeError is fixed.
-        throw e;
+  try {
+    const allProperties = SCRIPT_PROP.getProperties();
+    const allKeys = Object.keys(allProperties);
+    let keysToDelete = [];
+    let keysKept = [];
+
+    // --- 2. IDENTIFY KEYS FOR DELETION ---
+    allKeys.forEach(key => {
+      const isEssential = ESSENTIAL_KEYS_PREFIX.some(prefix => key.startsWith(prefix));
+
+      if (isEssential) {
+        keysKept.push(key);
+      } else {
+        keysToDelete.push(key);
+      }
+    });
+
+    // --- 3. EXECUTE DELETION (Using stable individual deletion) ---
+    if (keysToDelete.length > 0) {
+      log.warn(`Identified ${keysToDelete.length} non-essential keys for deletion. This process is slow.`);
+
+      // ** CRITICAL FIX: Use the stable, individual delete method **
+      keysToDelete.forEach(key => {
+        // This will execute successfully in all Apps Script environments.
+        SCRIPT_PROP.deleteProperty(key);
+      });
+      // ** END CRITICAL FIX **
+
+      log.info(`✅ Successfully deleted ${keysToDelete.length} keys.`);
+    } else {
+      log.warn("No unessential keys found. Storage quota should be clear.");
     }
+
+    // --- 4. REPORT STATUS ---
+    const finalKeyCount = Object.keys(SCRIPT_PROP.getProperties()).length;
+    log.info(`Final Key Count: ${finalKeyCount}. Keys remaining: ${keysKept.join(', ')}`);
+
+  } catch (e) {
+    log.error(`FATAL CLEANUP ERROR: ${e.message}. Quota may still be exceeded.`);
+    // Note: Individual deletion is slow and may still hit a time limit, but the TypeError is fixed.
+    throw e;
+  }
 }
 
 /**
@@ -198,12 +198,12 @@ function cleanupUnusedScriptProperties() {
  * (Assumed to be placed in src/Main.js within the onOpen function)
  */
 function addCleanupToolToMenu() {
-    const ui = SpreadsheetApp.getUi();
-    ui.createMenu('Sheet Tools')
-        // ... (other menu items) ...
-        .addSeparator()
-        .addItem('🛠️ DEBUG: Cleanup Property Quota', 'cleanupUnusedScriptProperties')
-        .addToUi();
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Sheet Tools')
+    // ... (other menu items) ...
+    .addSeparator()
+    .addItem('🛠️ DEBUG: Cleanup Property Quota', 'cleanupUnusedScriptProperties')
+    .addToUi();
 }
 
 /**
@@ -230,13 +230,55 @@ function _measureSpreadsheetLatency() {
     // Perform a forced read operation
     sheet.getRange(TEST_CELL).getValue();
     duration = new Date().getTime() - startGet;
-    
+
     log.info(`Spreadsheet Latency: ${duration}ms`);
   } catch (e) {
     log.error('Spreadsheet Latency Test FAILED.', e);
   }
 
   return duration;
+}
+
+/**
+ * Executes a function with a Document Lock using a non-blocking TryLock pattern.
+ * NOTE: This function returns a complex state object {success, state, error} on completion
+ * or throws an error if the internal function throws.
+ * * @param {function} fn The function containing critical spreadsheet operations.
+ * @param {number} [timeoutMs=5000] The time (in ms) to wait for the lock via tryLock.
+ * @returns {Object} A standardized result object {success: boolean, state: any, error: string}.
+ */
+function guardedSheetTransaction(fn, timeoutMs = 5000) {
+  var lock = LockService.getDocumentLock();
+
+  // 1. Attempt TryLock (non-blocking acquisition)
+  if (!lock.tryLock(timeoutMs)) {
+    // Handles skip/bail gracefully by returning a standardized failure object
+    console.warn(`Document Lock busy: Skipping critical sheet transaction.`);
+    return { success: false, state: null, error: "Lock Conflict/Busy" };
+  }
+
+  try {
+    console.log("Document Lock acquired via tryLock.");
+    // Execute the critical function and capture its return value
+    const state = fn();
+
+    // FIX: Corrected typo from 'sucess' to 'success'
+    return { success: true, state: state, error: "" };
+
+  } catch (e) {
+    console.error(`CRITICAL ERROR during locked sheet operation: ${e.message}`);
+    // Re-throw the error outside the lock release mechanism for the worker to catch.
+    return { success: false, state: null, error: e.message };
+
+  } finally {
+    // 2. Guaranteed Release
+    try {
+      lock.releaseLock();
+      console.log("Document Lock released.");
+    } catch (rlErr) {
+      console.error("CRITICAL: Failed to release Document Lock!", rlErr);
+    }
+  }
 }
 
 /**
@@ -278,30 +320,47 @@ function _measurePropertyService() {
   return maxDuration;
 }
 
-function withSheetLock(fn, timeoutMs) {
-  var lock = LockService.getDocumentLock();     // document-scoped: safest for Sheets
+// src/Utility.js
+
+// src/Utility.js
+
+/**
+ * REPLACEMENT for the original withSheetLock function.
+ * Executes a function with a Document Lock using a non-blocking TryLock pattern.
+ * * This prevents the script from being killed while waiting for the lock, 
+ * eliminating the "stuck lock" problem.
+ *
+ * @param {function} fn The function containing critical spreadsheet operations.
+ * @param {number} [timeoutMs=5000] The time (in ms) to wait for the lock via tryLock.
+ * @returns {any} The result of fn, or undefined if execution was skipped due to lock conflict.
+ */
+function withSheetLock(fn, timeoutMs = 5000) {
+  var lock = LockService.getDocumentLock();
+
+  // 1. Attempt TryLock (non-blocking acquisition)
+  if (!lock.tryLock(timeoutMs)) {
+    console.warn(`Document Lock busy: Skipping critical sheet transaction.`);
+    return; // Returns undefined, signaling a skip
+  }
 
   try {
-    console.log(`Attempting to acquire Document Lock (wait ${timeoutMs || 30000}ms)...`);
-    lock.waitLock(timeoutMs || 30000);           // waits up to timeout
-    console.log("Document Lock acquired.");
-    return fn(); // Execute the function while holding the lock
-  } catch (e) {
-    // Log lock timeout specifically
-    if (e.message.includes("Lock wait timeout")) {
-      console.error(`Failed to acquire Document Lock within ${timeoutMs || 30000}ms.`);
-    } else {
-      console.error(`Error during locked operation: ${e.message}`);
-    }
+    console.log("Document Lock acquired via tryLock.");
+    // Execute the critical function (e.g., deleteSheet, insertSheet, clearContent)
+    return fn();
 
-    throw e; // Re-throw the error
+  } catch (e) {
+    console.error(`CRITICAL ERROR during locked sheet operation: ${e.message}`);
+    // Re-throw the error outside the lock release mechanism for worker to catch.
+    throw e;
+
   } finally {
+    // 2. Guaranteed Release (even if the function threw an error)
     try {
-      lock.releaseLock();                         // releases even if fn throws
+      lock.releaseLock();
       console.log("Document Lock released.");
     } catch (rlErr) {
+      // This catches the exact platform error that causes original stickiness
       console.error("CRITICAL: Failed to release Document Lock!", rlErr);
-      // Depending on context, you might want to handle this failure differently
     }
   }
 }
@@ -309,7 +368,8 @@ function withSheetLock(fn, timeoutMs) {
 /**
  * Safely writes a large 2D array of data to a sheet in throttled batches, integrating LockService resilience.
  * This function performs the dynamic chunk size adjustment and checks for the overall job time limit.
- * * NOTE: This utility does NOT call SpreadsheetApp.flush(); the calling Orchestrator module must do that.
+ * * NOTE: This utility no longer performs structural clearing or chunk size re-initialization 
+ * on its own, relying entirely on the Orchestrator for those steps.
  * * @param {string} sheetName The name of the sheet to write to.
  * @param {Array<Array>} dataArray The 2D array of data to be written.
  * @param {number} startRow The row number where data begins (usually 2).
@@ -326,24 +386,31 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 
   var targetSheet;
 
-  // Fetch critical config from state or use safe defaults
-  var docLockTimeoutMs = state.config && state.config.DOC_LOCK_TIMEOUT_MS || 5000;
-  var THROTTLE_THRESHOLD_MS = state.config && state.config.THROTTLE_THRESHOLD_MS || 800;
-  var THROTTLE_PAUSE_MS = state.config && state.config.THROTTLE_PAUSE_MS || 200;
-  var SOFT_LIMIT_MS = state.config && state.config.SOFT_LIMIT_MS || 0;
+  // Define constants for the new logic (can be overridden in state.config)
+  const TARGET_WRITE_TIME_MS = state.config.TARGET_WRITE_TIME_MS || 3000;
+  const MAX_FACTOR = state.config.MAX_FACTOR || 1.5; // Cap the increase to 50% per step
+
+  // --- CRITICAL FIX: Harden variable initialization against null/undefined ---
+  // Ensure non-numeric inputs (null, undefined) default to a safe number.
+  var docLockTimeoutMs = Number(state.config && state.config.DOC_LOCK_TIMEOUT_MS) || 5000; 
+  var THROTTLE_THRESHOLD_MS = Number(state.config && state.config.THROTTLE_THRESHOLD_MS) || 800;
+  var THROTTLE_PAUSE_MS = Number(state.config && state.config.THROTTLE_PAUSE_MS) || 200;
+  var SOFT_LIMIT_MS = Number(state.config && state.config.SOFT_LIMIT_MS) || 0;
 
   // Fetch throttling constants for math
-  var CHUNK_INCREASE_RATE = state.config && state.config.CHUNK_INCREASE_RATE || 50;
-  var CHUNK_DECREASE_RATE = state.config && state.config.CHUNK_DECREASE_RATE || 200;
-  var MIN_CHUNK_SIZE = state.config && state.config.MIN_CHUNK_SIZE || 50;
-  var MAX_CHUNK_SIZE = state.config && state.config.MAX_CHUNK_SIZE || 5000;
-
+  var CHUNK_DECREASE_RATE = Number(state.config && state.config.CHUNK_DECREASE_RATE) || 200;
+  var MIN_CHUNK_SIZE = Number(state.config && state.config.MIN_CHUNK_SIZE) || 50;
+  var MAX_CHUNK_SIZE = Number(state.config && state.config.MAX_CHUNK_SIZE) || 5000;
+  // --- END CRITICAL FIX ---
+  
   // Fetch mutable metrics from state or initialize
   var startTime = state.metrics && state.metrics.startTime || 0;
   var currentChunkSize = state.config && state.config.currentChunkSize || MIN_CHUNK_SIZE;
   var previousDuration = state.metrics && state.metrics.previousDuration || 0;
   var rowsProcessed = state.metrics && state.metrics.rowsProcessed || 0;
   var i = state.nextBatchIndex || 0; // Resume point
+
+  // * Conflicting chunk size initialization removed *
 
   var dataLength = dataArray.length;
   var numCols = 0;
@@ -360,35 +427,17 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
       throw new Error("Data array is corrupted (zero columns).");
     }
 
-    // CRITICAL STEP: Clear ONLY the data area below the header (startRow preserves Row 1)
-    // *** FIX: Check if startRow is within the sheet's bounds before clearing ***
-    if (startRow > 0 && startRow <= targetSheet.getMaxRows()) {
-      targetSheet.getRange(startRow, 1, targetSheet.getMaxRows() - startRow + 1, targetSheet.getMaxColumns()).clearContent();
-    } else if (startRow > targetSheet.getMaxRows()) {
-      // If startRow is beyond the sheet, there's nothing to clear. This is fine.
-    }
-
+    // * Structural clearing logic removed *
 
     if (state.logInfo) state.logInfo("Starting batch write. Rows: " + dataLength + ", Resume Index: " + i);
+
+    // REDUNDANT CHUNK SIZE INITIALIZATION BLOCK REMOVED.
 
     // --- START RESILIENT BATCH WRITE LOOP (while loop) ---
     while (i < dataLength) {
 
-      // 2. PREDICTIVE BAILOUT CHECK (Check total elapsed time for job limit)
-      if (startTime && SOFT_LIMIT_MS > 0 && (new Date().getTime() - startTime > SOFT_LIMIT_MS)) {
-        var bailoutMsg = "Job reached predictive soft time limit. Reschedule required.";
-        if (state.logWarn) state.logWarn(bailoutMsg);
-
-        // Return failure, providing the last duration for worker to assess speed on resume
-        return {
-          success: false,
-          rowsProcessed: rowsProcessed,
-          duration: previousDuration, // Provide last known speed
-          state: state,
-          error: bailoutMsg,
-          bailout_reason: "PREDICTIVE_BAILOUT" // CRITICAL TAG
-        };
-      }
+      // 2. PREDICTIVE BAILOUT CHECK (Logic commented out for hard timeout resilience)
+      // ...
 
       // 3. DYNAMIC THROTTLING CHECK & ADJUSTMENT
       if (previousDuration > THROTTLE_THRESHOLD_MS) {
@@ -402,15 +451,42 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 
       var chunkStartTime = new Date().getTime();
       var batch = dataArray.slice(i, i + currentChunkSize);
-      var numRows = batch.length;
+      var numRows = batch.length; // Actual number of rows being written
       var targetRow = startRow + i;
 
       // --- ATOMIC CHUNK WRITE LOGIC (Lock/Release/Yank) ---
       if (!docLock.tryLock(docLockTimeoutMs)) {
-        throw new Error("LockAcquisitionFailure: Could not acquire Document Lock.");
+        // If lock acquisition fails in the middle of a job, signal a bailout to worker.
+        return {
+          success: false,
+          rowsProcessed: rowsProcessed,
+          duration: previousDuration,
+          state: state,
+          error: "LockAcquisitionFailure: Could not acquire Document Lock.",
+          bailout_reason: "LOCK_CONFLICT"
+        };
+      }
+
+      // 2. PREDICTIVE BAILOUT CHECK (Check total elapsed time for job limit)
+      if (startTime && SOFT_LIMIT_MS > 0 && (new Date().getTime() - startTime > SOFT_LIMIT_MS)) {
+        var bailoutMsg = "Job reached predictive soft time limit. Reschedule required.";
+        if (state.logWarn) state.logWarn(bailoutMsg);
+
+        // Return failure, providing the last duration for worker to assess speed on resume
+        // and including the CRITICAL TAG for the Orchestrator to detect.
+        return {
+          success: false,
+          rowsProcessed: rowsProcessed,
+          duration: previousDuration, // Provide last known speed
+          state: state,
+          error: bailoutMsg,
+          bailout_reason: "PREDICTIVE_BAILOUT" // CRITICAL TAG
+        };
+
       }
 
       try {
+
         // The actual sheet write call
         targetSheet
           .getRange(targetRow, startCol, numRows, numCols)
@@ -420,25 +496,42 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
         docLock.releaseLock();
         previousDuration = new Date().getTime() - chunkStartTime;
 
+        // --- DYNAMIC CHUNK SIZE ADJUSTMENT (New Logic) ---
         // Throttle Up (The acceleration math)
         if (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0) {
-          currentChunkSize = Math.min(MAX_CHUNK_SIZE, currentChunkSize + CHUNK_INCREASE_RATE);
+          const adjustmentFactor = TARGET_WRITE_TIME_MS / previousDuration;
+          const limitedFactor = Math.min(adjustmentFactor, MAX_FACTOR);
+
+          // Adjust the size for the NEXT chunk
+          currentChunkSize = Math.round(currentChunkSize * limitedFactor);
+
+          // Enforce Min/Max bounds
+          currentChunkSize = Math.min(MAX_CHUNK_SIZE, currentChunkSize);
         }
 
         // Update metrics in the memory state object
         rowsProcessed += numRows;
-        if (state.metrics) state.metrics.rowsProcessed = rowsProcessed;
+        state.metrics.rowsProcessed = rowsProcessed;
 
-        // CRITICAL: Manually advance index 'i' and update persistent state
-        i += currentChunkSize;
-        if (state.nextBatchIndex) state.nextBatchIndex = i;
-        if (state.config) state.config.currentChunkSize = currentChunkSize; // Save new chunk size
+        // CRITICAL FIX: Manually advance index 'i' by the actual number of rows written (numRows).
+        i += numRows;
+
+        state.nextBatchIndex = i;
+        state.config.currentChunkSize = currentChunkSize; // Save new chunk size
 
       } catch (e) {
         // Service Timeout or other write error (The "Yank" operation)
+
         docLock.releaseLock();
         var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + targetRow + ". Error: " + e.message;
-        if (state.logError) state.logError(errorMessage);
+        state.logError(errorMessage);
+
+        // --- CRITICAL FIX: Ensure final state is saved before returning failure ---
+        // The index 'i' holds the starting index of the failed batch (the correct checkpoint).
+        state.nextBatchIndex = rowsProcessed;
+        state.config.currentChunkSize = currentChunkSize;
+        // --------------------------------------------------------------------------
+
 
         // FAILURE STATUS OBJECT: Returns the final memory state and failure data
         return {
@@ -455,7 +548,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     // Final success return
     if (state.logInfo) state.logInfo("Write SUCCESS. Total Rows Written: " + rowsProcessed);
 
-    // SUCCESS STATUS OBJECT: Returns the final memory state and success data
+    // SUCCESS STATUS OBJECT: Returns the final memory memory state and success data
     return {
       success: true,
       rowsProcessed: rowsProcessed,
@@ -481,7 +574,52 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
   }
 }
 
+const CONDITIONAL_FLUSH_THRESHOLD_MS = 5000; // 5 seconds: Threshold to trigger flush
 
+/**
+ * Executes a simple Sheet API read operation to measure latency.
+ * If latency exceeds a threshold, it forces a SpreadsheetApp.flush()
+ * to commit pending structural changes.
+ * * NOTE: Assumes 'Utility' or 'Sheet1' exists with content in A1.
+ * @param {number} [thresholdMs=CONDITIONAL_FLUSH_THRESHOLD_MS] The time (in ms) above which a flush should be performed.
+ * @returns {number} The measured latency of the Sheet GET operation (in milliseconds).
+ */
+function performLatencyCheckAndFlush(thresholdMs = CONDITIONAL_FLUSH_THRESHOLD_MS) {
+  const TEST_CELL = 'A1';
+  // Use the existing LoggerEx if available
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PERF_FLUSH') : Logger);
+  let duration = 0;
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    // Use first sheet if Utility is missing, as defined in _measureSpreadsheetLatency
+    const sheet = ss.getSheetByName('Utility') || ss.getSheets()[0];
+
+    if (!sheet) {
+      log.error('Latency Test FAILED: No sheets found.');
+      return 0;
+    }
+
+    const startGet = new Date().getTime();
+    // Perform a forced read operation (uncached, raw I/O)
+    sheet.getRange(TEST_CELL).getValue();
+    duration = new Date().getTime() - startGet;
+
+    log.info(`Spreadsheet Latency (GET A1): ${duration}ms. Threshold: ${thresholdMs}ms.`);
+
+    if (duration > thresholdMs) {
+      log.warn(`Latency ${duration}ms exceeded threshold. Forcing SpreadsheetApp.flush() to commit pending operations.`);
+      // This is the core action: flush when performance is slow.
+      SpreadsheetApp.flush();
+      log.warn(`Forced flush successful.`);
+    }
+
+  } catch (e) {
+    log.error('Spreadsheet Latency Test FAILED.', e);
+  }
+
+  return duration;
+}
 /**
  * Reads all data rows from a sheet, filters them using a custom function, and returns the resulting 2D array.
  * * @param {string} sheetName The name of the sheet to read from.
@@ -547,6 +685,88 @@ function processAndFilterRows(sheetName, filterFunction, stateObject) {
   return finalDataForWrite;
 }
 
+/**
+  * Performs an Atomic Swap (delete old, rename new) using a non-blocking TryLock.
+  * If the lock is busy, the operation is skipped immediately.
+  * * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss The Spreadsheet object.
+  * @param {string} oldSheetName The name of the sheet to be DELETED and REPLACED.
+  * @param {string} newSheetName The name of the sheet containing the NEW data.
+  * @returns {Object} Status Object: {success: boolean, duration: number, errorMessage: string}
+  */
+function atomicSwapAndFlush(ss, oldSheetName, newSheetName) {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
+  const startTime = new Date().getTime();
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  let swapSuccess = false;
+  let errorMessage = "";
+  const docLock = LockService.getDocumentLock();
+
+  // 1. Attempt to acquire TryLock
+  if (!docLock.tryLock(5000)) {
+    errorMessage = `Lock conflict: Could not acquire Document Lock within 5000ms. Atomic swap skipped.`;
+    log.warn(errorMessage);
+    return {
+      success: false,
+      duration: new Date().getTime() - startTime,
+      errorMessage: errorMessage
+    };
+  }
+
+  try {
+    // 2. Lock Acquired: Execute Critical Swap
+    const oldSheet = ss.getSheetByName(oldSheetName);
+    const newSheet = ss.getSheetByName(newSheetName);
+
+    if (!newSheet) {
+      errorMessage = `CRITICAL SWAP FAILED: New sheet '${newSheetName}' not found.`;
+      log.error(errorMessage);
+      throw new Error("New sheet for swap is missing.");
+    }
+
+    // 2a. Delete the old sheet (The slow I/O operation)
+    if (oldSheet) {
+      ss.deleteSheet(oldSheet);
+      log.info(`Deleted old sheet: ${oldSheetName}`);
+    }
+
+    // 2b. Rename the new sheet
+    newSheet.setName(oldSheetName);
+    newSheet.showSheet(); // Ensure the resulting sheet is visible
+    log.info(`SUCCESS: Sheet '${newSheetName}' renamed to '${oldSheetName}'.`);
+    swapSuccess = true;
+
+  } catch (e) {
+    // Catch errors during the rename/delete process
+    if (!errorMessage) {
+      errorMessage = `CRITICAL SWAP FAILED. Error: ${e.message}`;
+      log.error(errorMessage);
+    }
+  } finally {
+    // 3. Robust Lock Release
+    try {
+      docLock.releaseLock();
+    } catch (rlErr) {
+      // Log the critical failure to release the lock but continue the return flow.
+      log.error("CRITICAL: Failed to release Document Lock in atomicSwap!", rlErr);
+    }
+  }
+
+  // 4. Flush (outside lock and only on success)
+  if (swapSuccess) {
+    SpreadsheetApp.flush();
+  }
+
+  const duration = new Date().getTime() - startTime;
+
+  // 5. Final standardized return structure
+  return {
+    success: swapSuccess,
+    duration: duration,
+    errorMessage: errorMessage
+  };
+}
+
 // *** NOTE: The redundant second definition of writeDataToSheet was removed. ***
 
 /**
@@ -576,6 +796,13 @@ var Utility = (function () {
     var mid = Math.floor(nums.length / 2);
     return (nums.length % 2) ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
   }
+
+
+
+  // src/Utility.js
+
+  // ... near other constants
+
 
   /**
    * Local-tz window check with strict argument validation.

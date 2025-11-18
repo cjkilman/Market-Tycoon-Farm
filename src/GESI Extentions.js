@@ -232,7 +232,7 @@ function _getNamedOr_(name, fallback) {
 }
 
 
-// Lookback days resolver (Named Range "LOOKBACK_DAYS" -> Utility!B2 -> default)
+// Lookback days resolver (Named Range "LOOKBACK_DAYS" -> default)
 function getLookbackDays(ss) { // ADDED ss ARGUMENT
   ss = ss || SpreadsheetApp.getActiveSpreadsheet(); // Fallback to ensure 'ss' is defined
   var v = null;
@@ -240,10 +240,6 @@ function getLookbackDays(ss) { // ADDED ss ARGUMENT
     var nr = ss.getRangeByName('LOOKBACK_DAYS');
     if (nr) v = nr.getValue();
   } catch (_) { }
-  if (v == null) {
-    var util = ss.getSheetByName('Utility');
-    if (util) { try { v = util.getRange(2, 2).getValue(); } catch (_) { } }
-  }
   var n = parseInt(v, 10);
   if (!(Number(n) === n && isFinite(n))) n = CONTRACT_LOOKBACK_DAYS;
   if (n < 1) n = 1;
