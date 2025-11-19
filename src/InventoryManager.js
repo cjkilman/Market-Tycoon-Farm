@@ -547,10 +547,21 @@ function cacheAllCorporateAssets() {
   // Re-attach non-serializable properties (ss, loggers) and update runtime metric (startTime)
   writeState.ss = ss; // Attach the active spreadsheet object
   writeState.metrics.startTime = START_TIME; // Update start time for this execution's bailout check
-  // Re-attach loggers
-  writeState.logInfo = (typeof log !== 'undefined') ? log.info : console.log;
-  writeState.logWarn = (typeof log !== 'undefined') ? log.warn : console.warn;
-  writeState.logError = (typeof log !== 'undefined') ? log.error : console.error;
+  
+  // --- ROBUST LOGGER RE-ATTACHMENT ---
+  // Use the global 'log' object if it exists (from a library like LoggerEx),
+  // otherwise, fall back to the built-in Apps Script 'Logger' service.
+  if (typeof log !== 'undefined' && typeof log.info === 'function') {
+    writeState.logInfo = log.info;
+    writeState.logWarn = log.warn;
+    writeState.logError = log.error;
+  } else {
+    // Fallback to built-in Logger
+    writeState.logInfo = function(msg) { Logger.log(String(msg)); };
+    writeState.logWarn = function(msg) { Logger.log(String(msg)); };
+    writeState.logError = function(msg) { Logger.log(String(msg)); };
+  }
+  // --- END LOGGER RE-ATTACHMENT ---
 
   log.info(`[PHASE 2B] Calling writeDataToSheet. Resuming from index: ${writeState.nextBatchIndex || 0}`);
   

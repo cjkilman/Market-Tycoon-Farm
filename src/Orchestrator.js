@@ -1,8 +1,8 @@
 /* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, ScriptApp, 
- getMasterBatchFromControlTable, withSheetLock, getOrCreateSheet, 
-cacheAllCorporateAssetsTrigger, triggerLedgerImportCycle, fuzAPI, _fetchProcessedLootData, 
+  getMasterBatchFromControlTable, withSheetLock, getOrCreateSheet, 
+cacheAllCorporateAssets, cacheAllCorporateAssetsTrigger, triggerLedgerImportCycle, fuzAPI, _fetchProcessedLootData, 
 runLootLedgerDelta, Ledger_Import_CorpJournal, syncContracts, runIndustryLedgerPhase,
- runLootDeltaPhase, runContractLedgerPhase, runAllLedgerImports, LoggerEx */
+  runLootDeltaPhase, runContractLedgerPhase, runAllLedgerImports, LoggerEx, writeDataToSheet, guardedSheetTransaction, atomicSwapAndFlush */
 
 // Global variable to track recursion depth for this lock type
 var EXECUTION_LOCK_DEPTH_TRY = 0;
@@ -19,6 +19,12 @@ const oldSheetName = 'Market_Data_Old';
 const RETRY_DELAY_MS = 30 * 1000;
 const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
 
+// --- NEW TIME GATING CONSTANTS ---
+const HOURLY_RUN_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
+const PROP_KEY_LAST_RUN_TS = 'MAINTENANCE_LAST_RUN_TS_'; // Prefix for job-specific timestamp
+// ---------------------------------
+
+// --- REMOVED MARKET DISPATCH STAGGER CONSTANT (No longer needed) ---
 
 
 /**
@@ -145,6 +151,7 @@ function _resetMarketDataJobState(error) {
     SCRIPT_PROP.deleteProperty(PROP_KEY_FINALIZER_STEP); // Clear the finalizer step
     SCRIPT_PROP.deleteProperty(PROP_KEY_SETUP_STEP); // <-- ADDED
     SCRIPT_PROP.deleteProperty('marketDataJobIsActive'); // Legacy flag cleanup
+    // SCRIPT_PROP.deleteProperty(PROP_KEY_MARKET_STAGGER); // <-- STAGGER PROPERTY REMOVED
 
     // --- FIX: REMOVED ASSET CACHE DELETION ---
     // SCRIPT_PROP.deleteProperty('AssetCache_Data_V2');
@@ -167,25 +174,30 @@ function _resetMarketDataJobState(error) {
  * Runs ALL simple, non-stateful cache warmers and triggers (like asset fetching).
  * FIX: This function is NO LONGER CALLED by the master orchestrator.
  * It is now only a placeholder for manual execution if needed.
+ * NOTE: This function is being kept ONLY for manual execution/legacy as it
+ * was causing lock conflicts when called by the new queue system.
  */
 function runAllSimpleCacheJobs() {
   const SCRIPT_NAME = 'runAllSimpleCacheJobs';
 
-  // --- LIST OF SIMPLE JOBS TO RUN ---
-  // Note: These functions handle their own internal locking/execution.
+  // --- LIST OF SIMPLE JOBS TO RUN (Using their unlocked worker equivalents) ---
 
   // 1. Run the Asset Cache Update (Resilient Job)
   Logger.log('[' + SCRIPT_NAME + '] Dispatching Asset Cache Update...');
-  if (typeof cacheAllCorporateAssetsTrigger === 'function') {
-    // The trigger function manages its own internal script lock and resumption logic.
-    cacheAllCorporateAssetsTrigger();
+  if (typeof cacheAllCorporateAssets === 'function') {
+    // CALLING WORKER DIRECTLY TO AVOID LOCK CONFLICT
+    cacheAllCorporateAssets();
+  } else {
+    Logger.warn('[' + SCRIPT_NAME + '] cacheAllCorporateAssets not found.');
   }
 
-  // 2. Run Ledger Import (Requires its own script lock/handling)
+  // 2. Run Loot and Journal Sync (Workers that were modified below)
   Logger.log('[' + SCRIPT_NAME + '] Dispatching All Ledger Imports...');
-  if (typeof triggerLedgerImportCycle === 'function') {
-    // The trigger function manages its own internal script lock and resumption logic.
-    triggerLedgerImportCycle();
+  if (typeof runLootAndJournalSync === 'function') {
+    // CALLING WORKER DIRECTLY TO AVOID LOCK CONFLICT
+    runLootAndJournalSync();
+  } else {
+    Logger.warn('[' + SCRIPT_NAME + '] runLootAndJournalSync not found.');
   }
   // ------------------------------------
 
@@ -321,119 +333,179 @@ function masterOrchestrator() {
 
   console.log(`Master orchestrator (min ${currentMinute}): Checking time window.`);
 
-  // --- Staggering Logic ---
-  if (currentMinute >= 15 && currentMinute < 45) { // *** Window: Minutes 15-44 (Market Update) ***
-
+  // --- NEW 30-MINUTE DISPATCH LOGIC ---
+  if (currentMinute === 0 || currentMinute === 30) { 
+    // *** Window: Minutes 00 and 30 (NEW Market Update) ***
     if (isJobActive) {
-      console.log(`Master orchestrator: Job is active (Lease expires in ${((leaseUntil - NOW_MS) / 60000).toFixed(1)} min). Allowing current thread to continue (Heartbeat).`);
+      console.log(`Master orchestrator (min ${currentMinute}): Job is active. Skipping NEW dispatch.`);
     } else {
-
-      // --- NEW LOGIC: OPPORTUNISTIC DISPATCH (No longer gated by specific minute) ---
-      console.log(`Master orchestrator (min ${currentMinute}): Job is inactive. Dispatching MARKET DATA UPDATE opportunistically.`);
-
+      console.log(`Master orchestrator (min ${currentMinute}): Job is inactive. DISPATCHING NEW MARKET DATA JOB.`);
+      
       // Set the new lease time before dispatching the job
       const NEW_LEASE = NOW_MS + 280000; // 4m 40s
       SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
 
       updateMarketDataSheet(); // Calls the now-locked public wrapper
     }
-  } else { // *** Covers 0-14 and 45-59 (Maintenance Window) ***
-    console.log(`Master orchestrator (min ${currentMinute}): In dedicated Maintenance window.`);
+  } 
+  
+  else if (currentMinute === 15 || currentMinute === 45) { 
+    // *** Window: Minutes 15 and 45 (NUDGE or MAINTENANCE) ***
+    console.log(`Master orchestrator (min ${currentMinute}): In Nudge/Maintenance window.`);
 
-    // --- 1. Run Complex Job (Fuzzwork, manages resume state) ---
-    console.log(`Dispatching COMPLEX CACHE WARMER wrapper (Fuzzwork).`);
-    const result = executeWithTryLock(triggerCacheWarmerWithRetry, 'triggerCacheWarmerWithRetry');
+    // --- PRIORITY CHECK: MARKET DATA JOB RESUME (NUDGE) ---
+    // If the market job failed mid-write (PROCESSING) or is still trying to start (NEW_RUN), nudge it.
+    if (marketDataStep === STATE_FLAGS.PROCESSING || marketDataStep === STATE_FLAGS.NEW_RUN) { 
+        console.log(`Master orchestrator: Market job is in ${marketDataStep} state. Allowing nudge/resume.`);
+        updateMarketDataSheet(); // Nudges the job to run a chunk/start setup
+        return; // Exit, prioritized market job resume
+    }
 
-    // If Fuzzwork job was skipped due to lock, schedule its retry.
+    // --- 1. Run Maintenance Jobs ---
+    // Only run maintenance if the market job is completely done/inactive.
+    console.log(`Dispatching MAINTENANCE JOBS wrapper.`);
+    const result = executeWithTryLock(runMaintenanceJobs, 'runMaintenanceJobs');
+
+    // If Maintenance job was skipped due to lock, schedule its retry.
     if (result === null) {
       const retryDelayMs = 2 * 60 * 1000;
-      console.warn(`Master orchestrator: Fuzzwork job was skipped by lock. Scheduling retry.`);
-      scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', retryDelayMs);
+      console.warn(`Master orchestrator: Maintenance job was skipped by lock. Scheduling retry.`);
+      scheduleOneTimeTrigger('runMaintenanceJobs', retryDelayMs);
     }
   }
+
   console.log(`Master orchestrator finished checks for minute ${currentMinute}.`);
 }
 
 /**
- * Wrapper function for the cache warmer.
- * Attempts to run the cache warmer using executeWithTryLock.
- * If skipped due to lock, it schedules a one-time retry trigger for itself.
- * If completed fully, attempts opportunistic cleanup and checks if market update should be triggered.
+ * MAINTENANCE JOB RUNNER (Replaces Cache Warmer)
+ * * This function runs during the "Quiet Windows" (00-14 and 45-59).
+ * It orchestrates heavy background tasks that shouldn't compete with Market Data.
+ * * UPDATED: Now supports a QUEUE of maintenance jobs.
+ * - MAINTENANCE_JOB_QUEUE: List of function names to run.
+ * - MAINTENANCE_QUEUE_INDEX: Property to track which job is next.
+ * * LOGIC:
+ * - Reads the queue index.
+ * - Executes the specific job.
+ * - If the job is resumable (like cacheAllCorporateAssets), it checks its specific state keys.
+ * - If a job is "done" (or returns true/void), it increments the index for the NEXT window run.
  */
-function triggerCacheWarmerWithRetry() {
+function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-
+  const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
+  
+  // --- DEFINE THE QUEUE HERE ---
+  // The queue now only contains UNLOCKED WORKER functions.
+  const JOB_QUEUE = [
+    'cacheAllCorporateAssets', // Resumable Asset Job
+    'runLootAndJournalSync',   // Ledger Syncs (Now an UNLOCKED worker)
+    'runContractSync',         // Contract Sync (Now an UNLOCKED worker)
+    'runIndustrySync'          // Industry Sync (Now an UNLOCKED worker)
+  ];
+  
   // --- FIX: Add Finalizing Check ---
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
-    console.warn("Cache Warmer: Skipping execution, job is FINALIZING.");
-    return; // Do not run if the main job is finalizing
+    console.warn("Maintenance Job: Skipping execution, Market Data job is FINALIZING.");
+    return; 
   }
   // --- END FIX ---
 
-  // const funcToRun = fuzAPI.cacheRefresh; // Function reference removed
-  const funcName = 'CacheCheck'; // Simplified log name
-  const wrapperFuncName = 'triggerCacheWarmerWithRetry';
-
-  // --- FIXED CONSTANTS ---
+  const wrapperFuncName = 'runMaintenanceJobs';
   const retryDelayMs = 2 * 60 * 1000; // 2 minutes retry delay
-  const quickUpdateDelayMs = 5000; // 5 seconds delay before trying market update
-  // -----------------------
-
-  // --- FIX: Lease Property ---
-  const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
-  const leaseUntil = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_LEASE) || '0', 10);
   const NOW_MS = new Date().getTime();
-  const isJobActive = leaseUntil > NOW_MS;
-  // ---------------------------
 
-  console.log('Wrapper ' + wrapperFuncName + ' called. Attempting to run scheduling check...');
+  // --- QUEUE LOGIC ---
+  // Get current index, default to 0. Wrap around using modulo if we exceeded length previously.
+  let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
+  
+  // Sanity check index
+  if (currentIndex >= JOB_QUEUE.length) {
+    currentIndex = 0; // Reset to start
+  }
 
-  // *** FIX: Simulate a successful run (result = true) by bypassing the expensive function call ***
-  const result = true;
+  const currentJobName = JOB_QUEUE[currentIndex];
+  console.log(`[Maintenance] Queue Index: ${currentIndex}/${JOB_QUEUE.length}. Selected Job: ${currentJobName}`);
 
-  if (result === null) {
-    // Case 1: Skipped due to Script Lock (Defunct, but structure maintained)
-    console.warn(funcName + ' was skipped due to Script Lock. Scheduling retry for ' + wrapperFuncName + '.');
-    scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
+  // --- TIME WINDOW STATE LOGIC (Only relevant for ASSET JOB reset) ---
+  const currentMinute = new Date().getMinutes();
+  const isWindowStart = (currentMinute <= 2) || (currentMinute >= 45 && currentMinute <= 47);
 
-  } else if (result === true) {
-    // --- Case 2: Ran AND Completed Fully (The Schedule Check) ---
-    console.log('Schedule check completed successfully.');
+  // SPECIAL HANDLING FOR RESUMABLE JOBS (like cacheAllCorporateAssets)
+  if (currentJobName === 'cacheAllCorporateAssets') {
+     const ASSET_JOB_STATUS_KEY = 'ASSET_JOB_STATUS';
+     const currentAssetStatus = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
 
-    // --- Lease Check / Job Dispatch ---
-    const currentMinute = new Date().getMinutes();
-    console.log('Maintenance finished (min ' + currentMinute + '). Scheduling market update immediately.');
+     if (isWindowStart) {
+        console.log(`[Maintenance] Window Start (min ${currentMinute}). Forcing RESET for ${currentJobName}.`);
+        // Force fresh start for resumable job
+        SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
+        SCRIPT_PROP.deleteProperty('ASSET_CACHE_DATA');
+        SCRIPT_PROP.deleteProperty('ASSET_WRITE_STATE');
+     } else {
+        // Mid-window: If job is NOT active, we might want to skip or move to next?
+        if (!currentAssetStatus) {
+            console.log(`[Maintenance] Mid-window (min ${currentMinute}) but ${currentJobName} is not active. It may have finished. Moving queue index.`);
+            // Job seems done or inactive, increment queue for next run
+            let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+            SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+            return; // Skip execution this time
+        }
+     }
+  }
 
-    // FIX: Check for expired lease (stuck job) and only clear the lease before dispatching
-    if (!isJobActive && leaseUntil > 0 && leaseUntil <= NOW_MS) {
-      console.warn('Maintenance Check: Found expired lease (' + new Date(leaseUntil) + '). Clearing lease to allow immediate dispatch.');
-      // *** FIX: Minimal action: only clear the lease and log the event ***
-      SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
-    }
+  // --- HOURLY RUN CHECK (For all non-resumable jobs) ---
+  const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
+  const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
+  
+  // If the job is NOT the resumable asset job, and it ran recently, skip and rotate.
+  if (currentJobName !== 'cacheAllCorporateAssets' && (NOW_MS - lastRunTimestamp) < HOURLY_RUN_INTERVAL_MS) {
+      console.log(`[Maintenance] Skipping ${currentJobName}: Ran ${(NOW_MS - lastRunTimestamp) / 60000} mins ago. Rotating queue.`);
+      // Job is skipped, move to the next item immediately to allow other jobs to run opportunistically.
+      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+      return; 
+  }
+  // ----------------------------------------------------
 
-    if (isJobActive) {
-      console.log('Maintenance Check finished: Market data job is already active. Skipping new dispatch.');
+  console.log(`[Maintenance] Executing job: ${currentJobName}`);
+
+  try {
+    // DYNAMIC FUNCTION EXECUTION - **THIS CALL IS NOW UNLOCKED**
+    const fn = this[currentJobName]; 
+    
+    if (typeof fn === 'function') {
+        fn(); // Execute the job (which is now a worker, not a locked wrapper)
+        console.log(`[Maintenance] Job ${currentJobName} executed successfully.`);
+        
+        // LOGIC FOR COMPLETION:
+        // 1. Update timestamp for non-resumable jobs
+        // 2. Rotate index for non-resumable jobs
+        
+        if (currentJobName !== 'cacheAllCorporateAssets') {
+             // 1. Update timestamp
+             SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+             
+             // 2. Rotate index
+             let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+             SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+             console.log(`[Maintenance] Non-resumable job finished. Timestamp updated. Queue rotated to index ${nextIndex}.`);
+        }
+        
     } else {
-      console.log('Maintenance Check finished (min ' + currentMinute + '): Dispatching MARKET DATA UPDATE.');
-      // FIX: Set the new lease time before dispatching the job
-      const NOW_MS_INNER = new Date().getTime(); // Use new timestamp
-      const NEW_LEASE = NOW_MS_INNER + 280000; // 4m 40s
-      SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
-
-      // *** FIX: Change synchronous call to ASYNCHRONOUS schedule ***
-      scheduleOneTimeTrigger('updateMarketDataSheet', quickUpdateDelayMs);
+        console.error(`CRITICAL: Function ${currentJobName} not found in global scope!`);
+        // Skip this bad job next time
+        let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+        SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
     }
-
-  } else if (result === false) {
-    // Case 3: Ran but did NOT complete fully (Defunct)
-    console.log(funcName + ' ran but hit its time limit. Rescheduling wrapper.');
-    scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
-  } else {
-    // Case 4: Unexpected return value (Defunct)
-    console.warn(funcName + ' execution by ' + wrapperFuncName + ' returned unexpected value: ' + result);
+    
+  } catch (e) {
+      console.error(`[Maintenance] Job ${currentJobName} Failed: ${e.message}`);
+      // If a non-resumable job fails, we skip its run and schedule a retry of the whole runner.
+      scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
   }
 }
+
 function forceReleaseStuckScriptLock() {
   const lock = LockService.getScriptLock();
   const log = (typeof Logger !== 'undefined' ? Logger : console);
@@ -686,7 +758,8 @@ function manualResetMarketDataJobAndDispatch() {
     'marketDataJobStep', 'marketDataJobLeaseUntil',
     'marketDataFinalizeStep', 'marketDataSetupStep',
     'marketDataNextWriteRow', 'marketDataChunkSize',
-    'marketDataRequestIndex', 'marketDataJobIsActive'
+    'marketDataRequestIndex', 'marketDataJobIsActive',
+    // PROP_KEY_MARKET_STAGGER // Stagger property removed
   ];
 
   keysToDelete.forEach(key => SCRIPT_PROP.deleteProperty(key));
@@ -762,76 +835,74 @@ function finalizeMarketDataUpdate() {
 
 
 // ----------------------------------------------------------------------
-// --- NEW: SMALL, TRIGGER-ABLE WRAPPER FUNCTIONS ---
+// --- NEW: SMALL, TRIGGER-ABLE WORKER FUNCTIONS (Removed lock wrappers) ---
 // ----------------------------------------------------------------------
 
 /**
  * Runs ONLY the Loot and Journal syncs.
- * Designed to be called by a dedicated hourly trigger.
+ * NOTE: Removed executeWithTryLock wrapper, this is now a pure worker.
  */
 function runLootAndJournalSync() {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  // FIX: Define ss locally
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  // No lock check needed; caller (runMaintenanceJobs) handles the lock.
 
-  executeWithTryLock(() => {
-    log.info('--- Starting Loot & Journal Sync Cycle ---');
+  log.info('--- Starting Loot & Journal Sync Cycle (Worker) ---');
 
-    try {
-      log.info('Running _fetchProcessedLootData (External Data Sync)...');
-      const lootData = _fetchProcessedLootData(); // Assumes this function is in scope (e.g., from GESI Extentions)
-      if (lootData) {
-        log.info('Executing loot delta calculation and import...');
-        runLootDeltaPhase(ss); // Assumes this function is in scope
-      }
-    } catch (e) {
-      log.error('Loot Sync failed', e);
+  try {
+    log.info('Running _fetchProcessedLootData (External Data Sync)...');
+    // Assuming _fetchProcessedLootData is unlocked or uses a Document Lock
+    const lootData = _fetchProcessedLootData(); 
+    if (lootData) {
+      log.info('Executing loot delta calculation and import...');
+      runLootDeltaPhase(ss); 
     }
+  } catch (e) {
+    log.error('Loot Sync failed', e);
+  }
 
-    try {
-      log.info('Running Ledger_Import_CorpJournal...');
-      Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); // Assumes this is in scope
-    } catch (e) {
-      log.error('Corp Journal Import failed', e);
-    }
-
-  }, 'runLootAndJournalSync');
+  try {
+    log.info('Running Ledger_Import_CorpJournal...');
+    Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); 
+  } catch (e) {
+    log.error('Corp Journal Import failed', e);
+  }
 }
 
 /**
  * Runs ONLY the Contract sync.
- * Designed to be called by a dedicated hourly trigger.
+ * NOTE: Removed executeWithTryLock wrapper, this is now a pure worker.
  */
 function runContractSync() {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  // FIX: Define ss locally
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  executeWithTryLock(() => {
-    log.info('--- Starting Contract Sync Cycle ---');
-    try {
-      log.info('Running syncContracts (Fetch RAW data)...');
-      runContractLedgerPhase(ss); // Assumes this is in scope (from GESI Extentions)
-    } catch (e) {
-      log.error('Contract Sync failed', e);
-    }
-  }, 'runContractSync');
+  log.info('--- Starting Contract Sync Cycle (Worker) ---');
+  try {
+    log.info('Running syncContracts (Fetch RAW data)...');
+    runContractLedgerPhase(ss); 
+  } catch (e) {
+    log.error('Contract Sync failed', e);
+  }
 }
 
 /**
  * Runs ONLY the Industry Ledger sync.
- * Designed to be called by a dedicated hourly trigger.
+ * NOTE: Removed executeWithTryLock wrapper, this is now a pure worker.
  */
 function runIndustrySync() {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  // FIX: Define ss locally
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  executeWithTryLock(() => {
-    log.info('--- Starting Industry Ledger Sync Cycle ---');
-    try {
-      runIndustryLedgerPhase(ss); // This is the monolith from IndustryLedger.gs.js
-    } catch (e) {
-      log.error('Industry Ledger Phase failed', e);
-    }
-  }, 'runIndustrySync');
+  log.info('--- Starting Industry Ledger Sync Cycle (Worker) ---');
+  try {
+    runIndustryLedgerPhase(ss); 
+  } catch (e) {
+    log.error('Industry Ledger Phase failed', e);
+  }
 }
 
 
@@ -853,10 +924,11 @@ function setupStaggeredTriggers() {
     'finalizeMarketDataUpdate',
     'cleanupOldSheet', // Include this if it had its own trigger previously
     'masterOrchestrator',
-    'cacheAllCorporateAssetsTrigger',
-    'runLootAndJournalSync', // NEW
-    'runContractSync', // NEW
-    'runIndustrySync' // NEW
+    'cacheAllCorporateAssetsTrigger', // CLEANING UP OLD ASSET TRIGGER
+    'runLootAndJournalSync', 
+    'runContractSync', 
+    'runIndustrySync', 
+    'runMaintenanceJobs' 
   ];
 
   let totalDeleted = 0;
@@ -870,27 +942,16 @@ function setupStaggeredTriggers() {
     ScriptApp.newTrigger('masterOrchestrator')
       .timeBased().everyMinutes(15).create();
     console.log('SUCCESS: Created 15-minute trigger for masterOrchestrator.');
+    
+    // 2. Maintenance Job Runner (runs every 15 mins during the quiet windows)
+    // Note: The orchestrator handles calling this using executeWithTryLock.
+    // We remove the hourly trigger that was added before, as the orchestrator handles its scheduling.
+    
+    // 3. Asset Job (This is now handled by runMaintenanceJobs)
+    // The previous dedicated hourly trigger for assets is now removed above.
 
-    // --- FIX: Create SEPARATE triggers for the heavy jobs ---
-    // 2. Asset Job (runs once per hour)
-    ScriptApp.newTrigger('cacheAllCorporateAssetsTrigger')
-      .timeBased().everyHours(1).nearMinute(0).create();
-    console.log('SUCCESS: Created 1-hour trigger for cacheAllCorporateAssetsTrigger.');
-
-    // 3. Loot/Journal Sync (Hourly, at :10)
-    ScriptApp.newTrigger('runLootAndJournalSync')
-      .timeBased().everyHours(1).nearMinute(10).create();
-    console.log('SUCCESS: Created 1-hour trigger for runLootAndJournalSync.');
-
-    // 4. Contract Sync (Hourly, at :20)
-    ScriptApp.newTrigger('runContractSync')
-      .timeBased().everyHours(1).nearMinute(20).create();
-    console.log('SUCCESS: Created 1-hour trigger for runContractSync.');
-
-    // 5. Industry Ledger (Hourly, at :30)
-    ScriptApp.newTrigger('runIndustrySync')
-      .timeBased().everyHours(1).nearMinute(30).create();
-    console.log('SUCCESS: Created 1-hour trigger for runIndustrySync.');
+    // 4. Loot/Journal Sync (Hourly, at :10) - NOW CALLED BY ORCHESTRATOR
+    // The previous dedicated trigger for these are now removed above.
 
   } catch (e) {
     console.error(`Failed to create new triggers: ${e.message}. Please check permissions and script validity.`);
