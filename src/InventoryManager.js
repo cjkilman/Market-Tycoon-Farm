@@ -17,7 +17,8 @@ if (typeof SAFE_CONSOLE_SHIM === 'undefined') {
       startTimer: function() { return { stamp: function() {} }; } 
     };
 }
-const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('InventoryManager') : SAFE_CONSOLE_SHIM);
+// CRITICAL FIX: Use a unique variable name to avoid conflict with 'const log' in other files.
+var inventoryLog = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('InventoryManager') : SAFE_CONSOLE_SHIM);
 
 // --- 1. GLOBAL CONSTANTS AND DEPENDENCIES ---
 
@@ -133,7 +134,7 @@ function _writeShardedProperty(baseKey, largeString) {
     
     // Save the count/metadata under a unique key, also with 1 hour TTL
     cache.put(baseKey + '_COUNT', shardCount.toString(), ASSET_CACHE_TTL_SECONDS);
-    log.info('[SHARDING] Saved ' + shardCount + ' shards to CacheService for key ' + baseKey);
+    inventoryLog.info('[SHARDING] Saved ' + shardCount + ' shards to CacheService for key ' + baseKey);
 }
 
 /** Reads a large string from sharded property keys in CacheService and reconstructs the string. */
@@ -156,7 +157,7 @@ function _readShardedProperty(baseKey) {
     
     // Check for integrity (ensure all expected keys were returned)
     if (Object.keys(shards).length !== shardCount) {
-        log.error('[SHARDING] Data integrity failure: Missing shards. Counted ' + Object.keys(shards).length + ' shards, expected ' + shardCount);
+        inventoryLog.error('[SHARDING] Data integrity failure: Missing shards. Counted ' + Object.keys(shards).length + ' shards, expected ' + shardCount);
         return null; 
     }
     
@@ -166,7 +167,7 @@ function _readShardedProperty(baseKey) {
         const chunk = shards[baseKey + '_' + i];
         // We already checked the count, so this should be fine, but a final check is safe.
         if (!chunk) { 
-            log.error('[SHARDING] Data integrity failure during reconstruction. Missing index ' + i);
+            inventoryLog.error('[SHARDING] Data integrity failure during reconstruction. Missing index ' + i);
             return null;
         }
         fullString += chunk;
@@ -216,7 +217,7 @@ function _getStructureNameFromCacheOrESI(structureId, ss, structureCacheMap, SCR
         Utilities.sleep(50); // Respect the 50ms delay after ESI call
         return name;
     } catch (e) {
-        log.error('[ESI_CACHE] WARNING: ESI call for structure ID ' + structureId + ' failed: ' + e.message + '.');
+        inventoryLog.error('[ESI_CACHE] WARNING: ESI call for structure ID ' + structureId + ' failed: ' + e.message + '.');
         const fallbackName = 'Structure (ID: ' + structureIdString + ')';
         // Save fallback to prevent hitting ESI again on next run
         SCRIPT_PROP.setProperty(CACHE_KEY, fallbackName);
@@ -291,12 +292,12 @@ function _fetchAssetsConcurrently(mainChar) {
 
     // Check for data existence
     if (!dataPage1 || dataPage1.length === 0) {
-        log.error('[' + SCRIPT_NAME + '] CRITICAL: Page 1 returned no data.');
+        inventoryLog.error('[' + SCRIPT_NAME + '] CRITICAL: Page 1 returned no data.');
         throw new Error('Failed to fetch initial asset page. Result was empty or malformed.');
     }
 
     maxPages = Number(metadata['X-Pages'] || metadata['x-pages']) || 1;
-    log.info('[' + SCRIPT_NAME + '] Found ' + maxPages + ' pages of assets. Fetching sequentially via executeRaw...');
+    inventoryLog.info('[' + SCRIPT_NAME + '] Found ' + maxPages + ' pages of assets. Fetching sequentially via executeRaw...');
 
     // Process Page 1 Data
     dataPage1.forEach(obj => {
@@ -313,7 +314,7 @@ function _fetchAssetsConcurrently(mainChar) {
       const pageData = Array.isArray(result) ? result : (result.data || []);
 
       if (pageData.length === 0 && page <= maxPages) {
-        log.error('[' + SCRIPT_NAME + '] CRITICAL: Page ' + page + ' returned no data. Expected ' + maxPages + ' pages total.');
+        inventoryLog.error('[' + SCRIPT_NAME + '] CRITICAL: Page ' + page + ' returned no data. Expected ' + maxPages + ' pages total.');
         throw new Error('Asset Fetch CRITICAL: Sequential page ' + page + ' failed. Data integrity compromised.');
       }
       
@@ -328,11 +329,11 @@ function _fetchAssetsConcurrently(mainChar) {
 
   } catch (e) {
     // This catches GESI's internal error (like 401) or our manual throw
-    log.error('[' + SCRIPT_NAME + '] FATAL ESI ERROR: ' + e.message);
+    inventoryLog.error('[' + SCRIPT_NAME + '] FATAL ESI ERROR: ' + e.message);
     throw new Error('Asset Fetch CRITICAL: ESI failed during fetch/parse. Reschedule fetch.');
   }
 
-  log.info('[' + SCRIPT_NAME + '] Sequential fetch complete. Total asset rows found: ' + (allAssets.length - 1));
+  inventoryLog.info('[' + SCRIPT_NAME + '] Sequential fetch complete. Total asset rows found: ' + (allAssets.length - 1));
   return allAssets;
 }
 
@@ -347,7 +348,7 @@ function _prepareCacheSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
 
-  if (!cacheSheet) { log.error('[' + SCRIPT_NAME + '] ERROR: Target sheet \'' + CACHE_SHEET_NAME + '\' not found.'); return { success: false, duration: 0 }; }
+  if (!cacheSheet) { inventoryLog.error('[' + SCRIPT_NAME + '] ERROR: Target sheet \'' + CACHE_SHEET_NAME + '\' not found.'); return { success: false, duration: 0 }; }
 
   // Add to cache for chunk writer
   _sheetCache[CACHE_SHEET_NAME] = cacheSheet;
@@ -374,18 +375,18 @@ function _prepareCacheSheet() {
     cacheSheet.getRange('A2:H2').setValues([ASSET_CACHE_HEADERS]);
 
     const criticalWriteDuration = new Date().getTime() - writeStartTime;
-    log.info('[' + SCRIPT_NAME + '] CRIT-WRITE: Deleted old rows and wrote headers in ' + criticalWriteDuration + 'ms. Headers placed in ROW 2.');
+    inventoryLog.info('[' + SCRIPT_NAME + '] CRIT-WRITE: Deleted old rows and wrote headers in ' + criticalWriteDuration + 'ms. Headers placed in ROW 2.');
     
     return { success: true, duration: lockAcquiredTime - lockStartTime };
 
   } catch (e) {
-    log.error('[' + SCRIPT_NAME + '] CRITICAL ERROR during sheet preparation: ' + e);
+    inventoryLog.error('[' + SCRIPT_NAME + '] CRITICAL ERROR during sheet preparation: ' + e);
     return { success: false, duration: 0 };
   }
   finally {
     docLock.releaseLock();
 
-    log.info('[' + SCRIPT_NAME + '] LOCK STATS: Lock Released after preparation.');
+    inventoryLog.info('[' + SCRIPT_NAME + '] LOCK STATS: Lock Released after preparation.');
   }
 }
 
@@ -401,16 +402,16 @@ function _dispatchAssetJob() {
 
   // If the job is paused (has a next row index), let the pending retry trigger handle it.
   if (SCRIPT_PROP.getProperty(ASSET_CACHE_ROW_INDEX_KEY)) {
-    log.info("Dispatch: Resumable asset job is paused. Bailing out to allow pending retry trigger to resume it.");
+    inventoryLog.info("Dispatch: Resumable asset job is paused. Bailing out to allow pending retry trigger to resume it.");
     return;
   }
 
   // If not paused, dispatch the main trigger function.
   if (typeof cacheAllCorporateAssetsTrigger === 'function') {
-    log.info("Dispatch: Job not paused. Calling cacheAllCorporateAssetsTrigger to initiate or acquire lock.");
+    inventoryLog.info("Dispatch: Job not paused. Calling cacheAllCorporateAssetsTrigger to initiate or acquire lock.");
     cacheAllCorporateAssetsTrigger();
   } else {
-    log.error("Dispatch: Error: cacheAllCorporateAssetsTrigger function not found.");
+    inventoryLog.error("Dispatch: Error: cacheAllCorporateAssetsTrigger function not found.");
   }
 }
 
@@ -427,7 +428,7 @@ function cacheAllCorporateAssetsTrigger() {
 
   if (result === null) {
     // Action: Log and rely on the higher-level trigger (Dispatcher)
-    log.warn(funcName + ' skipped due to Script Lock conflict. Waiting for next scheduled run.');
+    inventoryLog.warn(funcName + ' skipped due to Script Lock conflict. Waiting for next scheduled run.');
   }
 }
 
@@ -454,13 +455,13 @@ function cacheAllCorporateAssets() {
 
   if (cachedAssetDataJson) {
     processedAssets = JSON.parse(cachedAssetDataJson);
-    log.info('[STATE] Resuming job. Status: ' + jobStatus + '. Loaded ' + processedAssets.length + ' assets from properties.');
+    inventoryLog.info('[STATE] Resuming job. Status: ' + jobStatus + '. Loaded ' + processedAssets.length + ' assets from properties.');
   } else {
     // --- NEW JOB START (Scenario 1) ---
     const mainChar = GESI.getMainCharacter();
     const allAssets = _fetchAssetsConcurrently(mainChar); // This function will now THROW on failure.
 
-    if (allAssets.length <= 1) { log.warn('[' + SCRIPT_NAME + '] WARNING: No assets retrieved.'); return; }
+    if (allAssets.length <= 1) { inventoryLog.warn('[' + SCRIPT_NAME + '] WARNING: No assets retrieved.'); return; }
 
     const rawAssetsData = allAssets.slice(1);
     
@@ -488,7 +489,7 @@ function cacheAllCorporateAssets() {
 
     SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, '0');
     SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, ASSET_JOB_STATUS_FLAG.FETCHED); // Use flag here
-    log.info('[STATE] New job started. Assets saved. Status: ' + ASSET_JOB_STATUS_FLAG.FETCHED + '.');
+    inventoryLog.info('[STATE] New job started. Assets saved. Status: ' + ASSET_JOB_STATUS_FLAG.FETCHED + '.');
 
     scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
     return;
@@ -496,15 +497,15 @@ function cacheAllCorporateAssets() {
 
   // Re-acquire sheet access for Phase 2/3
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss.getSheetByName(CACHE_SHEET_NAME)) { log.error('[' + SCRIPT_NAME + '] ERROR: Target sheet not found for write phase.'); return; }
+  if (!ss.getSheetByName(CACHE_SHEET_NAME)) { inventoryLog.error('[' + SCRIPT_NAME + '] ERROR: Target sheet not found for write phase.'); return; }
 
   // --- PHASE 2A: Critical Sheet Preparation ---
   // The job must be in FETCHED state to run this, guaranteeing data is loaded.
   if (jobStatus === ASSET_JOB_STATUS_FLAG.FETCHED) { 
-    log.info('[PHASE 2A] Executing critical sheet clear and header write...');
+    inventoryLog.info('[PHASE 2A] Executing critical sheet clear and header write...');
     const result = _prepareCacheSheet();
 
-    if (!result.success) { log.error('[PHASE 2A] Failed to clear sheet. Aborting.'); return; }
+    if (!result.success) { inventoryLog.error('[PHASE 2A] Failed to clear sheet. Aborting.'); return; }
     
     // --- Initialize the writeState object ---
     const initialWriteState = {
@@ -530,18 +531,18 @@ function cacheAllCorporateAssets() {
     SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, ASSET_JOB_STATUS_FLAG.WRITING); // Set to WRITING
     SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY); // Remove old index key
     
-    log.info('[STATE] Sheet prepared. Initial write-state created. Status: ' + ASSET_JOB_STATUS_FLAG.WRITING + '. Scheduling next run to start chunking.');
+    inventoryLog.info('[STATE] Sheet prepared. Initial write-state created. Status: ' + ASSET_JOB_STATUS_FLAG.WRITING + '. Scheduling next run to start chunking.');
     scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
     return;
   }
 
 
   // --- PHASE 2B: Resumable Chunk Write (Delegated to writeDataToSheet) ---
-  if (jobStatus !== ASSET_JOB_STATUS_FLAG.WRITING) { log.warn('[STATE] Job status is not WRITING (' + jobStatus + '). Bailing out.'); return; }
+  if (jobStatus !== ASSET_JOB_STATUS_FLAG.WRITING) { inventoryLog.warn('[STATE] Job status is not WRITING (' + jobStatus + '). Bailing out.'); return; }
 
   // CRITICAL: Read sharded data from CacheService
   const writeStateString = SCRIPT_PROP.getProperty(ASSET_WRITE_STATE_KEY);
-  if (!writeStateString) { log.error('[CRITICAL] Job status is WRITING but ASSET_WRITE_STATE_KEY is missing. Aborting.'); return; }
+  if (!writeStateString) { inventoryLog.error('[CRITICAL] Job status is WRITING but ASSET_WRITE_STATE_KEY is missing. Aborting.'); return; }
   
   let writeState = JSON.parse(writeStateString);
 
@@ -549,15 +550,15 @@ function cacheAllCorporateAssets() {
   writeState.ss = ss; 
   writeState.metrics.startTime = START_TIME; 
   
-  if (typeof log !== 'undefined' && typeof log.info === 'function') {
-    writeState.logInfo = log.info; writeState.logWarn = log.warn; writeState.logError = log.error;
+  if (typeof inventoryLog !== 'undefined' && typeof inventoryLog.info === 'function') {
+    writeState.logInfo = inventoryLog.info; writeState.logWarn = inventoryLog.warn; writeState.logError = inventoryLog.error;
   } else {
     writeState.logInfo = function(msg) { Logger.log(String(msg)); };
     writeState.logWarn = function(msg) { Logger.log(String(msg)); };
     writeState.logError = function(msg) { Logger.log(String(msg)); };
   }
 
-  log.info('[PHASE 2B] Calling writeDataToSheet. Resuming from index: ' + (writeState.nextBatchIndex || 0));
+  inventoryLog.info('[PHASE 2B] Calling writeDataToSheet. Resuming from index: ' + (writeState.nextBatchIndex || 0));
   
   // Call writeDataToSheet ONCE with the FULL data array and the resumable state.
   const result = writeDataToSheet(
@@ -566,7 +567,7 @@ function cacheAllCorporateAssets() {
 
   if (result.success) {
     // IT'S DONE! Schedule the Finalization.
-    log.info('[PHASE 2B] writeDataToSheet completed successfully. Total rows: ' + result.rowsProcessed + '. Scheduling finalization.');
+    inventoryLog.info('[PHASE 2B] writeDataToSheet completed successfully. Total rows: ' + result.rowsProcessed + '. Scheduling finalization.');
     
     scheduleOneTimeTrigger('finalizeAssetCache', 5000);
 
@@ -582,7 +583,7 @@ function cacheAllCorporateAssets() {
     
   } else {
     // IT FAILED (Timeout, Lock, etc.) - Reschedule.
-    log.warn('[PHASE 2B] writeDataToSheet returned a non-success state. Reason: ' + result.error);
+    inventoryLog.warn('[PHASE 2B] writeDataToSheet returned a non-success state. Reason: ' + result.error);
     
     // Save the *new* state returned by the function for the next run.
     const stateToSave = result.state;
@@ -591,7 +592,7 @@ function cacheAllCorporateAssets() {
     // We do NOT save chunk size to a separate key here; it's saved inside ASSET_WRITE_STATE_KEY.
     SCRIPT_PROP.setProperty(ASSET_WRITE_STATE_KEY, JSON.stringify(stateToSave));
     
-    log.info('[STATE] Saving write state to resume at index: ' + stateToSave.nextBatchIndex + '. Scheduling next run.');
+    inventoryLog.info('[STATE] Saving write state to resume at index: ' + stateToSave.nextBatchIndex + '. Scheduling next run.');
     scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', RESCHEDULE_PAUSE_MS); // <-- NOW USES THE PAUSE
     return; // Exit this execution.
   }
@@ -609,18 +610,18 @@ function finalizeAssetCache() {
     // FIX: Define a higher retry delay (90 seconds)
     const FINALIZE_RETRY_DELAY_MS = 90000; 
 
-    log.info('[' + SCRIPT_NAME + '] Starting final spreadsheet flush and Named Range creation.');
+    inventoryLog.info('[' + SCRIPT_NAME + '] Starting final spreadsheet flush and Named Range creation.');
 
     try {
         // 1. Flush (This is the heavy, risky part)
         SpreadsheetApp.flush();
-        log.info('[' + SCRIPT_NAME + '] Flush successful.');
+        inventoryLog.info('[' + SCRIPT_NAME + '] Flush successful.');
 
         // 2. Create/Update Named Range for downstream consumers.
         const cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
         
         if (!cacheSheet) {
-            log.error('[' + SCRIPT_NAME + '] CRITICAL: Cache sheet ' + CACHE_SHEET_NAME + ' not found during finalization. Cannot create Named Range.');
+            inventoryLog.error('[' + SCRIPT_NAME + '] CRITICAL: Cache sheet ' + CACHE_SHEET_NAME + ' not found during finalization. Cannot create Named Range.');
             return;
         }
 
@@ -633,10 +634,10 @@ function finalizeAssetCache() {
             CACHE_NAMED_RANGE,
             cacheSheet.getRange(3, 1, dataHeight, NUM_ASSET_COLS)
         );
-        log.info('[' + SCRIPT_NAME + '] Successfully created Named Range (' + CACHE_NAMED_RANGE + ') covering ' + dataHeight + ' rows.');
+        inventoryLog.info('[' + SCRIPT_NAME + '] Successfully created Named Range (' + CACHE_NAMED_RANGE + ') covering ' + dataHeight + ' rows.');
 
     } catch (e) {
-        log.error('[' + SCRIPT_NAME + '] CRITICAL FAILURE during finalization: ' + e.message + '. Rescheduling retry.');
+        inventoryLog.error('[' + SCRIPT_NAME + '] CRITICAL FAILURE during finalization: ' + e.message + '. Rescheduling retry.');
         // Reschedule using the increased delay
         scheduleOneTimeTrigger('finalizeAssetCache', FINALIZE_RETRY_DELAY_MS); 
         return;
@@ -648,5 +649,5 @@ function finalizeAssetCache() {
     SCRIPT_PROP.deleteProperty(ASSET_WRITE_STATE_KEY); 
     SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
 
-    log.info('[' + SCRIPT_NAME + '] Job finalized successfully.');
+    inventoryLog.info('[' + SCRIPT_NAME + '] Job finalized successfully.');
 }
