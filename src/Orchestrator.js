@@ -535,6 +535,33 @@ function runLootAndJournalSync() {
   } catch (e) { log.error('Corp Journal Import failed', e); }
 }
 
+/**
+ * Helper function to run the Loot Delta Phase.
+ * Fetches processed loot data and runs the import.
+ */
+function runLootDeltaPhase(ss) {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('LOOT_PHASE') : console);
+  try {
+    log.info('Running _fetchProcessedLootData...');
+    // Note: _fetchProcessedLootData and _runLootDeltaImport are expected to be global
+    // from GESI Extentions.js or Main.js
+    const lootData = _fetchProcessedLootData(); 
+    if (lootData) {
+      log.info('Executing loot delta calculation...');
+      if (typeof _runLootDeltaImport === 'function') {
+          _runLootDeltaImport(ss, lootData, null, null, false);
+      } else {
+          log.warn('_runLootDeltaImport function is missing.');
+      }
+    } else {
+      log.warn('Loot Data fetch returned null.');
+    }
+  } catch (e) {
+    log.error('Loot Delta Phase Failed', e);
+    throw e;
+  }
+}
+
 function bumpMarketDataJob() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';

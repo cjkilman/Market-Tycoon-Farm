@@ -4,7 +4,7 @@
 // SHARED UTILITY BELT (The Engine Room)
 // ======================================================================
 
-// --- GLOBAL CONSTANTS (Defined HERE and ONLY HERE) ---
+// --- GLOBAL CONSTANTS ---
 var MAX_CACHE_CHUNK_SIZE = 8000; 
 var CHUNK_INDEX_SUFFIX = ':IDX';
 
@@ -63,10 +63,16 @@ function atomicSwapAndFlush(ss, targetName, tempName) {
       
       // Prune
       if (currentMaxRows > newRows) {
-         targetSheet.getRange(newRows + 1, 1, currentMaxRows - newRows, targetSheet.getMaxColumns()).clearContent();
+         targetSheet.deleteRows(newRows + 1, currentMaxRows - newRows);
       }
+      if (currentMaxCols > newCols) {
+         targetSheet.deleteColumns(newCols + 1, currentMaxCols - newCols);
+      }
+
       ss.deleteSheet(tempSheet);
+      log.info(`Swapped and Trimmed '${targetName}': ${newRows} rows x ${newCols} cols.`);
     }
+
     SpreadsheetApp.flush();
     return { success: true, errorMessage: null };
   } catch (e) {
@@ -138,7 +144,7 @@ function _deleteShardedData(key) {
 }
 
 /**
- * Writes data to sheet with predictive timeout handling.
+ * Writes data to sheet with UNLOCKED Nitro performance.
  */
 function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject) {
     var state = stateObject || { config: {}, metrics: {} };
@@ -150,6 +156,10 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     var MIN_CHUNK_SIZE = state.config.MIN_CHUNK_SIZE || 100;
     var MAX_CHUNK_SIZE = state.config.MAX_CHUNK_SIZE || 2000;
     var SOFT_LIMIT_MS = state.config.SOFT_LIMIT_MS || 280000;
+    
+    // --- NEW: Use config parameters for acceleration ---
+    var MAX_FACTOR = state.config.MAX_FACTOR || 1.2; // Default to 1.2 if not set
+    var THROTTLE_THRESHOLD_MS = state.config.THROTTLE_THRESHOLD_MS || (TARGET_WRITE_TIME_MS * 0.8);
 
     var i = state.nextBatchIndex || 0;
     var currentChunkSize = state.config.currentChunkSize || MIN_CHUNK_SIZE;
@@ -184,12 +194,19 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
                 
                 var duration = new Date().getTime() - chunkStart;
                 var oldChunk = currentChunkSize;
-                if (duration < TARGET_WRITE_TIME_MS) {
-                    currentChunkSize = Math.min(MAX_CHUNK_SIZE, Math.ceil(currentChunkSize * 1.2));
-                } else {
+                
+                // --- UNLOCKED NITRO LOGIC ---
+                if (duration < THROTTLE_THRESHOLD_MS) {
+                    // Super Fast? Accelerate by MAX_FACTOR (e.g., 2.0x)
+                    currentChunkSize = Math.min(MAX_CHUNK_SIZE, Math.ceil(currentChunkSize * MAX_FACTOR));
+                } else if (duration > TARGET_WRITE_TIME_MS) {
+                    // Too slow? Pump the brakes
                     currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(currentChunkSize * 0.8));
                 }
+                // Else: In the sweet spot, maintain speed.
+
                 logInfo(`[Write] Batch: ${batch.length} rows | Time: ${duration}ms | Chunk: ${oldChunk} -> ${currentChunkSize}`);
+                
                 i += batch.length;
 
             } catch (e) {
