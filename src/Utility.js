@@ -4,6 +4,10 @@
 // SHARED UTILITY BELT (The Engine Room)
 // ======================================================================
 
+// --- GLOBAL CONSTANTS (Defined HERE and ONLY HERE) ---
+var MAX_CACHE_CHUNK_SIZE = 8000; 
+var CHUNK_INDEX_SUFFIX = ':IDX';
+
 /**
  * Get or create a sheet, preserving headers.
  */
@@ -21,10 +25,7 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
- * Zero-Downtime "Value Swap" with Hard Trimming.
- * 1. Expands Target if too small.
- * 2. Overwrites Target with New Data.
- * 3. Deletes (Trims) excess rows and columns to match data size.
+ * Zero-Downtime "Value Swap".
  */
 function atomicSwapAndFlush(ss, targetName, tempName) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
@@ -53,32 +54,19 @@ function atomicSwapAndFlush(ss, targetName, tempName) {
       const currentMaxRows = targetSheet.getMaxRows();
       const currentMaxCols = targetSheet.getMaxColumns();
 
-      // 1. EXPAND (If target is smaller)
-      if (currentMaxRows < newRows) {
-          targetSheet.insertRowsAfter(currentMaxRows, newRows - currentMaxRows);
-      }
-      if (currentMaxCols < newCols) {
-          targetSheet.insertColumnsAfter(currentMaxCols, newCols - currentMaxCols);
-      }
+      // Expand
+      if (currentMaxRows < newRows) targetSheet.insertRowsAfter(currentMaxRows, newRows - currentMaxRows);
+      if (currentMaxCols < newCols) targetSheet.insertColumnsAfter(currentMaxCols, newCols - currentMaxCols);
       
-      // 2. OVERWRITE (Atomic Data Update)
-      if (newRows > 0) {
-          targetSheet.getRange(1, 1, newRows, newCols).setValues(newValues);
-      }
+      // Overwrite
+      if (newRows > 0) targetSheet.getRange(1, 1, newRows, newCols).setValues(newValues);
       
-      // 3. TRIM (Delete excess rows/cols)
-      // This ensures the sheet size matches the data exactly
+      // Prune
       if (currentMaxRows > newRows) {
-         targetSheet.deleteRows(newRows + 1, currentMaxRows - newRows);
+         targetSheet.getRange(newRows + 1, 1, currentMaxRows - newRows, targetSheet.getMaxColumns()).clearContent();
       }
-      if (currentMaxCols > newCols) {
-         targetSheet.deleteColumns(newCols + 1, currentMaxCols - newCols);
-      }
-
       ss.deleteSheet(tempSheet);
-      log.info(`Swapped and Trimmed '${targetName}': ${newRows} rows x ${newCols} cols.`);
     }
-
     SpreadsheetApp.flush();
     return { success: true, errorMessage: null };
   } catch (e) {
@@ -89,7 +77,7 @@ function atomicSwapAndFlush(ss, targetName, tempName) {
   }
 }
 
-
+// --- SHARED CACHE SHARDING FUNCTIONS ---
 
 function _chunkAndPut(key, largeString, ttl = 21600) {
   const cache = CacheService.getScriptCache();
@@ -230,18 +218,3 @@ function guardedSheetTransaction(fn, timeoutMs) {
 }
 
 function withSheetLock(fn, timeoutMs) { return guardedSheetTransaction(fn, timeoutMs).state; }
-
-var Utility = (function () {
-  function median(values, opts) {
-    opts = opts || {};
-    var ignoreNonPositive = opts.ignoreNonPositive !== false;
-    if (!values || !values.length) return '';
-    var nums = values.map(function (v) { return (typeof v === 'number' ? v : Number(v)); })
-      .filter(function (v) { return Number.isFinite(v) && (!ignoreNonPositive || v > 0); })
-      .sort(function (a, b) { return a - b; });
-    if (!nums.length) return '';
-    var mid = Math.floor(nums.length / 2);
-    return (nums.length % 2) ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
-  }
-  return { median: median };
-})();

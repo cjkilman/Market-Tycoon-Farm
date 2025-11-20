@@ -108,6 +108,7 @@ function _fetchAssetsConcurrently(authName) {
     }
 
     try {
+      // 1. Fetch Page 1
       const req1 = client.buildRequest({ corporation_id: corpId, page: 1, name: authName });
       const options1 = {
           method: req1.method || 'get',
@@ -143,6 +144,7 @@ function _fetchAssetsConcurrently(authName) {
       return [headerRow];
     }
 
+    // 2. Fetch Remaining Pages
     if (maxPages > 1) {
         const allRequests = [];
         for (let i = 2; i <= maxPages; i++) {

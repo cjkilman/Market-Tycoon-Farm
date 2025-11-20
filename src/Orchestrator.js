@@ -18,7 +18,7 @@ const RETRY_DELAY_MS = 30 * 1000;
 const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
 
 // --- TIME GATING CONSTANTS ---
-const HOURLY_RUN_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
+const HOURLY_RUN_INTERVAL_MS = 60 * 60 * 1000; 
 const PROP_KEY_LAST_RUN_TS = 'MAINTENANCE_LAST_RUN_TS_'; 
 
 if (typeof GLOBAL_STATE_KEY === 'undefined') {
@@ -32,10 +32,6 @@ const STATE_FLAGS = {
   FINALIZING: 'FINALIZING'
 };
 const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
-const SETUP_STAGE = {
-  DELETE: 'DELETE',
-  RECREATE: 'RECREATE'
-};
 
 /**
  * Helper to create a new one-time "retry" trigger.
@@ -139,6 +135,39 @@ function executeWithTryLock(funcToRun, functionName, timeoutMs = LOCK_TIMEOUT_MS
   }
 }
 
+/**
+ * Wraps a function in a ScriptLock waitLock().
+ */
+function executeWithWaitLock(funcToRun, functionName, timeoutMs = LOCK_WAIT_TIMEOUT_MS) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(timeoutMs);
+  } catch (e) {
+    console.error(`Could not acquire Script Lock for ${functionName}.`);
+    throw e;
+  }
+
+  try {
+    const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+    if (systemState === 'MAINTENANCE') {
+      console.warn(`Skipping ${functionName}: MAINTENANCE mode.`);
+      return null; 
+    }
+
+    console.log(`--- Starting Execution (WaitLock): ${functionName} ---`);
+    return funcToRun();
+  } catch (e) {
+    console.error(`Unhandled exception in ${functionName}: ${e.message}`);
+    throw e; 
+  } finally {
+    lock.releaseLock();
+    console.log(`Script Lock released for ${functionName}.`);
+  }
+}
+
+/**
+ * HIGH-FREQUENCY MASTER ORCHESTRATOR (5-Minute Heartbeat)
+ */
 function masterOrchestrator() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
@@ -149,70 +178,63 @@ function masterOrchestrator() {
   const leaseUntil = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_LEASE) || '0', 10);
   let isJobActive = leaseUntil > NOW_MS;
 
-  // Heartbeat Check
+  // --- HEARTBEAT: Check for dead jobs ---
   if (!isJobActive && leaseUntil > 0 && leaseUntil <= NOW_MS) {
-    console.warn(`Master orchestrator: Found expired lease. Clearing.`);
+    console.warn(`Orchestrator: Expired lease found. Clearing.`);
     SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
     isJobActive = false; 
   }
 
-  // Priority 1: Finalization
+  // --- PRIORITY 1: FINALIZATION ---
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
-    console.log(`Master orchestrator: Finalizing Market Data.`);
-    scheduleOneTimeTrigger("finalizeMarketDataUpdate", 30000);
+    console.log(`Orchestrator: Finalizing Market Data.`);
+    scheduleOneTimeTrigger("finalizeMarketDataUpdate", 15000); // Fast retry
     return;
   }
 
-  // --- NEW 30-MINUTE DISPATCH LOGIC ---
-  if (currentMinute === 0 || currentMinute === 30) { 
-    if (isJobActive) {
-      console.log(`Master orchestrator: Job active. Skipping dispatch.`);
-    } else {
-      console.log(`Master orchestrator: DISPATCHING NEW MARKET DATA JOB.`);
-      const NEW_LEASE = NOW_MS + 280000; 
+  console.log(`Orchestrator (min ${currentMinute}): High-Frequency Check.`);
+
+  // --- PRIORITY 2: MARKET DATA (Always Attempt) ---
+  if (!isJobActive) {
+      // Job is free: Start a new one
+      console.log(`Orchestrator: Market Data Idle. STARTING NEW JOB.`);
+      const NEW_LEASE = NOW_MS + 280000; // 4m 40s
       SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
       updateMarketDataSheet(); 
-    }
   } 
-  
-  else if (currentMinute === 15 || currentMinute === 45) { 
-    console.log(`Master orchestrator: In Maintenance window.`);
+  else if (marketDataStep === STATE_FLAGS.PROCESSING || marketDataStep === STATE_FLAGS.NEW_RUN) {
+      // Job is active but might need a nudge
+      console.log(`Orchestrator: Market Data Active (${marketDataStep}). Nudging.`);
+      updateMarketDataSheet(); 
+  }
 
-    // Nudge Market Data if stuck
-    if (marketDataStep === STATE_FLAGS.PROCESSING || marketDataStep === STATE_FLAGS.NEW_RUN) { 
-        console.log(`Master orchestrator: Nudging Market Data job.`);
-        updateMarketDataSheet(); 
-        return; 
-    }
-
-    // Run Maintenance Jobs (Assets, Ledgers)
-    console.log(`Dispatching MAINTENANCE JOBS.`);
-    const result = executeWithTryLock(runMaintenanceJobs, 'runMaintenanceJobs');
-
-    if (result === null) {
-      console.warn(`Maintenance skipped (Lock). Retry scheduled.`);
-      scheduleOneTimeTrigger('runMaintenanceJobs', 120000);
-    }
+  // --- PRIORITY 3: MAINTENANCE (Opportunistic) ---
+  // Try to run maintenance every ~15 mins, but don't block on it.
+  if (currentMinute % 15 <= 4) { 
+      console.log(`Orchestrator: Attempting Maintenance (Background).`);
+      // We use executeWithTryLock inside runMaintenanceJobs, so it won't block if locked.
+      runMaintenanceJobs();
   }
 }
 
 /**
  * MAINTENANCE JOB RUNNER
- * Runs heavy background tasks during Quiet Windows.
  */
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
   
-  // --- UPDATED JOB QUEUE (Gemini V3) ---
   const JOB_QUEUE = [
-    'cacheAllCorporateAssetsTrigger', // Asset Cache (Resumable)
-    'runLootAndJournalSync',          // Journals
-    'runContractSync',                // Contracts
-    'runIndustrySync'                 // Industry (New Ferrari Engine)
+    'cacheAllCorporateAssetsTrigger', 
+    'runLootAndJournalSync',          
+    'runContractSync',                
+    'runIndustrySync'                 
   ];
   
-  const wrapperFuncName = 'runMaintenanceJobs';
+  // Don't run heavy maintenance if Market Data is in critical phase
+  const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
+  if (marketDataStep === STATE_FLAGS.FINALIZING) return; 
+
   const retryDelayMs = 120000; 
   const NOW_MS = new Date().getTime();
 
@@ -220,26 +242,25 @@ function runMaintenanceJobs() {
   if (currentIndex >= JOB_QUEUE.length) currentIndex = 0;
 
   const currentJobName = JOB_QUEUE[currentIndex];
-  console.log(`[Maintenance] Queue: ${currentIndex}/${JOB_QUEUE.length}. Job: ${currentJobName}`);
-
-  // HOURLY RUN CHECK
+  
+  // Hourly Check (Skip if ran recently)
   const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
   const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
   
-  // Skip if ran recently (except Assets, which manages its own schedule)
   if (currentJobName !== 'cacheAllCorporateAssetsTrigger' && (NOW_MS - lastRunTimestamp) < HOURLY_RUN_INTERVAL_MS) {
-      console.log(`[Maintenance] Skipping ${currentJobName}: Ran recently.`);
+      // Rotate Queue
       let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
       SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
       return; 
   }
 
+  console.log(`[Maintenance] Executing: ${currentJobName}`);
+
   try {
     const fn = this[currentJobName]; 
-    
     if (typeof fn === 'function') {
+        // Try to run. Note: executeWithTryLock inside the workers prevents conflicts.
         fn(); 
-        console.log(`[Maintenance] Job ${currentJobName} executed.`);
         
         if (currentJobName !== 'cacheAllCorporateAssetsTrigger') {
              SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
@@ -247,15 +268,17 @@ function runMaintenanceJobs() {
              SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
         }
     } else {
-        console.error(`CRITICAL: Function ${currentJobName} not found!`);
         let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
         SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
     }
-    
   } catch (e) {
-      console.error(`[Maintenance] Job ${currentJobName} Failed: ${e.message}`);
-      scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs);
+      console.error(`[Maintenance] Failed: ${e.message}`);
   }
+}
+
+function forceReleaseStuckScriptLock() {
+  const lock = LockService.getScriptLock();
+  try { lock.releaseLock(); console.log("Lock released."); } catch (e) {}
 }
 
 /**
@@ -286,7 +309,7 @@ function _updateMarketDataSheetWorker() {
 
   // --- Phase 1: NEW_RUN ---
   if (currentStep === STATE_FLAGS.NEW_RUN || !masterRequests || masterRequests.length === 0) {
-    console.log(`State: ${STATE_FLAGS.NEW_RUN}. Preparing cycle.`);
+    console.log(`State: ${STATE_FLAGS.NEW_RUN}.`);
 
     if (!masterRequests || masterRequests.length === 0) {
       _resetMarketDataJobState(new Error("Control Table empty"));
@@ -298,7 +321,8 @@ function _updateMarketDataSheetWorker() {
       let sheet = ss_inner.getSheetByName(tempSheetName);
 
       if (sheet) {
-        sheet.clearContents();
+        const lastRow = sheet.getMaxRows();
+        if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
       } else {
         sheet = ss_inner.insertSheet(tempSheetName);
       }
@@ -308,12 +332,10 @@ function _updateMarketDataSheetWorker() {
     }, 60000);
 
     if (!setupResult.success) {
-      console.log(`Setup skipped (Lock Busy). Retrying.`);
       scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
       return;
     }
 
-    console.log("Setup complete. Transitioning to PROCESSING.");
     SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, '0'); 
     SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
     currentStep = 'PROCESSING';
@@ -364,7 +386,6 @@ function _updateMarketDataSheetWorker() {
       ss: ss_stable,
       metrics: { startTime: START_TIME },
       config: {
-        // --- NITRO SETTINGS ---
         MAX_CELLS_PER_CHUNK: 60000,    
         TARGET_WRITE_TIME_MS: 5000,    
         MAX_FACTOR : 2.0,              
@@ -378,9 +399,7 @@ function _updateMarketDataSheetWorker() {
     };
 
     const STRICT_MIN_CHUNK = 500;
-    if (writeState.nextBatchIndex === 0) {
-      writeState.config.currentChunkSize = STRICT_MIN_CHUNK;
-    }
+    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = STRICT_MIN_CHUNK;
 
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
 
@@ -399,7 +418,7 @@ function _updateMarketDataSheetWorker() {
       SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
       SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize);
       Utilities.sleep(1000);
-      scheduleOneTimeTrigger('updateMarketDataSheet', 60000);
+      scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
     }
     else {
       _resetMarketDataJobState(new Error(`Write Failure: ${writeResult.error}`));
@@ -452,8 +471,7 @@ function finalizeMarketDataUpdate() {
   }, funcName);
 }
 
-// --- WORKER FUNCTIONS (Unlocked) ---
-
+// --- WORKER FUNCTIONS ---
 function runLootAndJournalSync() {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -461,10 +479,8 @@ function runLootAndJournalSync() {
     const lootData = _fetchProcessedLootData(); 
     if (lootData) runLootDeltaPhase(ss); 
   } catch (e) { log.error('Loot Sync failed', e); }
-
-  try {
-    Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); 
-  } catch (e) { log.error('Corp Journal Import failed', e); }
+  try { Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); } 
+  catch (e) { log.error('Corp Journal Import failed', e); }
 }
 
 function runContractSync() {
@@ -482,32 +498,41 @@ function runIndustrySync() {
 }
 
 function setupStaggeredTriggers() {
-  console.log("Setting up/Resetting orchestrator triggers...");
+  console.log("Setting up 5-MIN TRIGGER...");
 
   const managedFunctions = [
-    'fuzAPI.cacheRefres',
-    'triggerCacheWarmerWithRetry',
-    'updateMarketDataSheet',
-    'finalizeMarketDataUpdate',
-    'cleanupOldSheet',
-    'masterOrchestrator',
-    'cacheAllCorporateAssetsTrigger',
-    'runLootAndJournalSync', 
-    'runContractSync', 
-    'runIndustrySync', 
-    'runMaintenanceJobs' 
+    'fuzAPI.cacheRefres', 'triggerCacheWarmerWithRetry', 'updateMarketDataSheet',
+    'finalizeMarketDataUpdate', 'cleanupOldSheet', 'masterOrchestrator',
+    'cacheAllCorporateAssetsTrigger', 'runLootAndJournalSync', 'runContractSync', 
+    'runIndustrySync', 'runMaintenanceJobs' 
   ];
-
   managedFunctions.forEach(funcName => deleteTriggersByName(funcName));
 
   try {
+    // THE BIG CHANGE: EVERY 5 MINUTES
     ScriptApp.newTrigger('masterOrchestrator')
-      .timeBased().everyMinutes(15).create();
-    console.log('SUCCESS: Created 15-minute trigger for masterOrchestrator.');
+      .timeBased().everyMinutes(5).create();
+    console.log('SUCCESS: Created 5-minute trigger for masterOrchestrator.');
 
   } catch (e) {
-    console.error(`Failed to create new triggers: ${e.message}.`);
+    console.error(`Failed to create triggers: ${e.message}.`);
   }
+}
+
+function runLootAndJournalSync() {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  log.info('--- Starting Loot & Journal Sync Cycle (Worker) ---');
+
+  try {
+    // This calls the function we just added above
+    runLootDeltaPhase(ss); 
+  } catch (e) { log.error('Loot Sync failed', e); }
+
+  try {
+    Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); 
+  } catch (e) { log.error('Corp Journal Import failed', e); }
 }
 
 function bumpMarketDataJob() {
