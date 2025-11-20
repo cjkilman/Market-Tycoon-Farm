@@ -10,8 +10,8 @@ var EXECUTION_LOCK_DEPTH_TRY = 0;
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
 
-const LOCK_TIMEOUT_MS = 5000;
-const LOCK_WAIT_TIMEOUT_MS = 30000; // Default wait
+var LOCK_TIMEOUT_MS = LOCK_TIMEOUT_MS || 5000;
+var LOCK_WAIT_TIMEOUT_MS = LOCK_WAIT_TIMEOUT_MS || 30000; 
 // ... (Ensure these are defined globally in the file or assumed available)
 const finalSheetName = 'Market_Data_Raw';
 const tempSheetName = 'Market_Data_Temp';
@@ -186,7 +186,8 @@ function runAllSimpleCacheJobs() {
   Logger.log('[' + SCRIPT_NAME + '] Dispatching Asset Cache Update...');
   if (typeof cacheAllCorporateAssets === 'function') {
     // CALLING WORKER DIRECTLY TO AVOID LOCK CONFLICT
-    cacheAllCorporateAssets();
+    Logger.warn('[' + SCRIPT_NAME + '] cacheAllCorporateAssets Disabled')
+   // cacheAllCorporateAssets();
   } else {
     Logger.warn('[' + SCRIPT_NAME + '] cacheAllCorporateAssets not found.');
   }
@@ -433,6 +434,7 @@ function runMaintenanceJobs() {
 
   // SPECIAL HANDLING FOR RESUMABLE JOBS (like cacheAllCorporateAssets)
   if (currentJobName === 'cacheAllCorporateAssets') {
+    
      const ASSET_JOB_STATUS_KEY = 'ASSET_JOB_STATUS';
      const currentAssetStatus = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
 

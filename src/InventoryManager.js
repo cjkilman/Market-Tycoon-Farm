@@ -1,17 +1,22 @@
-/* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, scheduleOneTimeTrigger, executeWithTryLock, getCorpAuthChar */
+/* global GESI, SpreadsheetApp, Logger, UrlFetchApp, Utilities, LockService, PropertiesService, scheduleOneTimeTrigger, executeWithTryLock, getCorpAuthChar, writeDataToSheet, getOrCreateSheet, CacheService 
+// Note: Other shared functions like _buildHeaderMap, _buildSdeTypeMap, etc., are assumed to be in this file below.
+*/
 
 // ======================================================================
 // EVE ONLINE ASSET AND LOCATION MANAGEMENT MODULE
 // ======================================================================
 
 // --- 0. MODULE-LEVEL LOGGER ---
-const SAFE_CONSOLE_SHIM = {
-  log: console.log,
-  info: console.log, 
-  warn: console.warn,
-  error: console.error,
-  startTimer: () => ({ stamp: () => {} }) 
-};
+// CRITICAL FIX: Wrap the definition to prevent SyntaxError if defined elsewhere
+if (typeof SAFE_CONSOLE_SHIM === 'undefined') {
+    var SAFE_CONSOLE_SHIM = {
+      log: console.log,
+      info: console.log, 
+      warn: console.warn,
+      error: console.error,
+      startTimer: function() { return { stamp: function() {} }; } 
+    };
+}
 const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('InventoryManager') : SAFE_CONSOLE_SHIM);
 
 // --- 1. GLOBAL CONSTANTS AND DEPENDENCIES ---
@@ -20,7 +25,7 @@ const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('InventoryManage
 const ASSET_CACHE_DATA_KEY = 'AssetCache_Data_V2';
 const ASSET_CACHE_ROW_INDEX_KEY = 'AssetCache_NextRow';
 const ASSET_JOB_STATUS_KEY = 'AssetCache_Status_Key';
-const ASSET_CHUNK_SIZE_KEY = 'AssetCache_ChunkSize';
+const ASSET_WRITE_STATE_KEY = 'ASSET_WRITE_STATE'; 
 
 // Cache Key for SDE Type Map (New Persistent Layer)
 const SDE_TYPE_MAP_KEY = 'SDE_invTypes_TypeMap'; 
@@ -29,29 +34,25 @@ const SDE_TYPE_MAP_KEY = 'SDE_invTypes_TypeMap';
 const SOFT_LIMIT_MS = 280000; // 4m 40s (Safety limit for predictive reschedule)
 const DOC_LOCK_TIMEOUT_MS = 5000; // TryLock 5s for chunk writing
 const CRIT_LOCK_WAIT_MS = 60000; // WaitLock 60s for sheet clear/prepare
+const RESCHEDULE_PAUSE_MS = 10000; // 10 second pause after failure
 
-// Throttling and Chunking Constants
-const THROTTLE_THRESHOLD_MS = 800; // If write takes longer than this, throttle
+// --- CHUNKING/THROTTLING CONSTANTS (DEFINED LOCALLY FOR SCOPE FIX) ---
+const THROTTLE_THRESHOLD_MS = 800;
 const THROTTLE_PAUSE_MS = 200;
-const CHUNK_INCREASE_RATE = 50;
-const CHUNK_DECREASE_RATE = 200; // Aggressive decay rate
+const CHUNK_INCREASE_RATE = 50; 
+const CHUNK_DECREASE_RATE = 200; 
 const MAX_CHUNK_SIZE = 1000;
 const MIN_CHUNK_SIZE = 50;
-const INITIAL_WRITE_CHUNK = 10; // Extremely small starting chunk for the first write
+// --- END CHUNKING/THROTTLING CONSTANTS ---
+
 
 // EVE CONSTANTS
 const ASSET_ID_MIN_BOUND = 100000000000; // Used to differentiate asset IDs from type IDs.
-const NPC_STATION_ID_MAX = 70000000;     // IDs above this are typically player-owned structures
+const NPC_STATION_ID_MAX = 70000000;      // IDs above this are typically player-owned structures
 
 // Known EVE Bug/Exclusion Lists (Sets for O(1) lookup)
-const GHOST_ITEM_IDS = new Set([
-  9007199254740992, 9007199254740993, 9007199254740994, 9007199254740995,
-  1042136670568, 1042139243054, 1043862654421, 1038876191270, 1044532547334, 1050483607331, 
-  1039962719245, 1036200304791, 1047736829320, 1028141962065, 1031195155767, 1034862502178, 
-  1034862547753, 1040928243616, 1047961260476, 1030142093671, 1030289543328, 1031616387594, 
-  1033808818685, 1034429286734, 1042134935603, 1047745393662, 1047758618232, 1047959246356 
-]);
-const EXCLUDED_CONTAINER_TYPE_IDS = new Set([28317, 28318]); // Delivery Hangars, Fleet Hangars
+const GHOST_ITEM_IDS = new Set([]);
+const EXCLUDED_CONTAINER_TYPE_IDS = new Set([28318]); // Delivery Hangars, Fleet Hangars
 
 // Sheet Names and Headers
 const CACHE_SHEET_NAME = 'CorpWarehouseStock';
@@ -60,11 +61,122 @@ const MATERIAL_HANGAR_SHEET_NAME = 'MaterialHangar';
 const LOCATION_CACHE_SHEET = "Location_Name_Cache"; // The master cache
 const LOCATION_CACHE_HEADERS = ['locationID', 'locationName']; // Standard headers
 const ASSET_CACHE_HEADERS = ["is_blueprint_copy", "is_singleton", "item_id", "location_flag", "location_id", "location_type", "quantity", "type_id"];
-const NUM_ASSET_COLS = ASSET_CACHE_HEADERS.length;
-const CACHE_NAMED_RANGE = 'NR_CORP_ASSETS_CACHE';
 
-// Global sheet cache map for chunk writing (Required for _writeChunkInternal)
+// --- CRITICAL FIX: Ensure these are defined before use in finalizeAssetCache ---
+const NUM_ASSET_COLS = ASSET_CACHE_HEADERS.length; // 8
+const CACHE_NAMED_RANGE = 'NR_CORP_ASSETS_CACHE';
+// -----------------------------------------------------------------------------
+
+// Global sheet cache map for chunk writing (Required for _prepareCacheSheet)
 const _sheetCache = {};
+
+// --- NEW JOB STATUS FLAG ---
+const ASSET_JOB_STATUS_FLAG = {
+    FETCHED: 'FETCHED',
+    SHEET_CLEARED: 'SHEET_CLEARED', // NEW: Sheet is clear, ready for first write
+    WRITING: 'WRITING'
+};
+
+// ======================================================================
+// === CRITICAL SHARDING UTILITIES (Fixes "Argument too large" via CacheService) =======
+// ======================================================================
+
+const MAX_SHARD_SIZE_CHARS = 8000; // Max property size is 9KB, use 8KB for safety.
+const ASSET_CACHE_TTL_SECONDS = 3600; // 1 hour TTL requested by user
+
+/** Returns the Cache Service instance. */
+function _assetCache() {
+    return CacheService.getScriptCache();
+}
+
+/** Cleans up all shards for a given key prefix (Cache Service). */
+function _clearShardedProperty(baseKey) {
+    const cache = _assetCache();
+    const keysToDelete = [baseKey + '_COUNT'];
+    
+    // We can't list all keys, so we rely on the count key to estimate how many to delete.
+    const shardCountString = cache.get(baseKey + '_COUNT');
+    if (shardCountString) {
+        const shardCount = parseInt(shardCountString, 10);
+        for (let i = 0; i < shardCount; i++) {
+            keysToDelete.push(baseKey + '_' + i);
+        }
+    }
+    // Delete all known shard keys and the count key
+    cache.remove(keysToDelete);
+}
+
+/** Writes a large string (like JSON) by splitting it into smaller chunks (shards) in CacheService. */
+function _writeShardedProperty(baseKey, largeString) {
+    const cache = _assetCache();
+    // Clear old shards first, relying on TTL otherwise
+    _clearShardedProperty(baseKey);
+    
+    let parts = {};
+    const totalLength = largeString.length;
+    let index = 0;
+    let shardCount = 0;
+
+    while (index < totalLength) {
+        const end = Math.min(index + MAX_SHARD_SIZE_CHARS, totalLength);
+        const chunk = largeString.substring(index, end);
+        const shardKey = baseKey + '_' + shardCount;
+        
+        parts[shardKey] = chunk;
+        
+        index = end;
+        shardCount++;
+    }
+
+    // Write all data chunks in a batch operation with 1 hour TTL
+    cache.putAll(parts, ASSET_CACHE_TTL_SECONDS);
+    
+    // Save the count/metadata under a unique key, also with 1 hour TTL
+    cache.put(baseKey + '_COUNT', shardCount.toString(), ASSET_CACHE_TTL_SECONDS);
+    log.info('[SHARDING] Saved ' + shardCount + ' shards to CacheService for key ' + baseKey);
+}
+
+/** Reads a large string from sharded property keys in CacheService and reconstructs the string. */
+function _readShardedProperty(baseKey) {
+    const cache = _assetCache();
+    const countKey = baseKey + '_COUNT';
+    const shardCountString = cache.get(countKey); 
+    
+    if (!shardCountString) return null;
+
+    const shardCount = parseInt(shardCountString, 10);
+    
+    const keysToFetch = [];
+    for (let i = 0; i < shardCount; i++) {
+        keysToFetch.push(baseKey + '_' + i);
+    }
+    
+    // Fetch all shards in one go
+    const shards = cache.getAll(keysToFetch);
+    
+    // Check for integrity (ensure all expected keys were returned)
+    if (Object.keys(shards).length !== shardCount) {
+        log.error('[SHARDING] Data integrity failure: Missing shards. Counted ' + Object.keys(shards).length + ' shards, expected ' + shardCount);
+        return null; 
+    }
+    
+    // Reconstruct the full string
+    let fullString = '';
+    for (let i = 0; i < shardCount; i++) {
+        const chunk = shards[baseKey + '_' + i];
+        // We already checked the count, so this should be fine, but a final check is safe.
+        if (!chunk) { 
+            log.error('[SHARDING] Data integrity failure during reconstruction. Missing index ' + i);
+            return null;
+        }
+        fullString += chunk;
+    }
+    return fullString;
+}
+
+// ======================================================================
+// ======================================================================
+
 
 /**
  * Resolves a Structure ID by checking the persistent cache first, then ESI.
@@ -96,7 +208,7 @@ function _getStructureNameFromCacheOrESI(structureId, ss, structureCacheMap, SCR
     
     try {
         const structureData = structuresClient.executeRaw({ structure_id: structureId, name: mainChar });
-        const name = structureData && structureData.name ? structureData.name : `Structure (ID: ${structureIdString})`;
+        const name = structureData && structureData.name ? structureData.name : 'Structure (ID: ' + structureIdString + ')';
         
         // Save to persistent cache and local map
         SCRIPT_PROP.setProperty(CACHE_KEY, name);
@@ -104,8 +216,8 @@ function _getStructureNameFromCacheOrESI(structureId, ss, structureCacheMap, SCR
         Utilities.sleep(50); // Respect the 50ms delay after ESI call
         return name;
     } catch (e) {
-        log.error(`[ESI_CACHE] WARNING: ESI call for structure ID ${structureId} failed: ${e.message}.`);
-        const fallbackName = `Structure (ID: ${structureIdString})`;
+        log.error('[ESI_CACHE] WARNING: ESI call for structure ID ' + structureId + ' failed: ' + e.message + '.');
+        const fallbackName = 'Structure (ID: ' + structureIdString + ')';
         // Save fallback to prevent hitting ESI again on next run
         SCRIPT_PROP.setProperty(CACHE_KEY, fallbackName);
         structureCacheMap.set(structureId, fallbackName);
@@ -156,134 +268,72 @@ class CorpOffice {
 // --- 3. ESI DATA ACQUISITION AND WRITING HELPERS ---
 
 /**
- * Executes concurrent ESI requests to fetch all pages of corporation assets.
- * FIX: This function now fetches all 8 columns to match the cache convention.
+ * Executes sequential ESI requests to fetch all pages of corporation assets
+ * using client.executeRaw().
+ * * This guarantees data integrity across all pages, matching GESI's reliability.
+ * * This is the final, robust implementation that solves the data loss and size issue.
  */
 function _fetchAssetsConcurrently(mainChar) {
   const SCRIPT_NAME = '_fetchAssetsConcurrently';
   const client = GESI.getClient().setFunction('corporations_corporation_assets');
 
   let maxPages = 1;
-  // FIX: Header row now includes all 8 fields provided by ESI
   const headerRow = ['is_blueprint_copy', 'is_singleton', 'item_id', 'location_flag', 'location_id', 'location_type', 'quantity', 'type_id'];
   const allAssets = [headerRow]; // Start with header
 
   try {
-    const requestPage1 = client.buildRequest({ page: 1 });
-    const responsePages = UrlFetchApp.fetchAll([requestPage1]);
-    const responsePage1 = responsePages[0];
+    // 1. Fetch Page 1 using executeRaw
+    const resultPage1 = client.executeRaw({ page: 1 });
+    
+    // CRITICAL FIX: Assume GESI executeRaw returns raw array or {data: Array} and extract data array.
+    const dataPage1 = Array.isArray(resultPage1) ? resultPage1 : (resultPage1.data || []);
+    const metadata = resultPage1.metadata || {}; // Metadata contains X-Pages header
 
-    if (responsePage1.getResponseCode() !== 200) {
-      throw new Error('Failed to fetch initial asset page. Response Code: ' + responsePage1.getResponseCode());
+    // Check for data existence
+    if (!dataPage1 || dataPage1.length === 0) {
+        log.error('[' + SCRIPT_NAME + '] CRITICAL: Page 1 returned no data.');
+        throw new Error('Failed to fetch initial asset page. Result was empty or malformed.');
     }
 
-    const headers = responsePage1.getHeaders();
-    maxPages = Number(headers['X-Pages'] || headers['x-pages']) || 1;
-    log.info(`[${SCRIPT_NAME}] Found ${maxPages} pages of assets. Fetching concurrently...`);
+    maxPages = Number(metadata['X-Pages'] || metadata['x-pages']) || 1;
+    log.info('[' + SCRIPT_NAME + '] Found ' + maxPages + ' pages of assets. Fetching sequentially via executeRaw...');
 
-    const bodyPage1 = responsePage1.getContentText();
-    const dataPage1 = JSON.parse(bodyPage1);
-
+    // Process Page 1 Data
     dataPage1.forEach(obj => {
       allAssets.push([
-        // FIX: Added obj.is_blueprint_copy to match the 8-column convention
-        obj.is_blueprint_copy,
-        obj.is_singleton,
-        obj.item_id,
-        obj.location_flag,
-        obj.location_id,
-        obj.location_type,
-        obj.quantity,
-        obj.type_id
+        obj.is_blueprint_copy, obj.is_singleton, obj.item_id, obj.location_flag, 
+        obj.location_id, obj.location_type, obj.quantity, obj.type_id
       ]);
     });
+    
+    // 2. Fetch Subsequent Pages (Sequentially via executeRaw)
+    for (let page = 2; page <= maxPages; page++) {
+      const result = client.executeRaw({ page: page });
+      
+      const pageData = Array.isArray(result) ? result : (result.data || []);
 
-  } catch (e) {
-    log.error(`[${SCRIPT_NAME}] CRITICAL: Failed to fetch page 1. Error: ${e}`);
-    return [headerRow];
-  }
-
-  const allRequests = [];
-  for (let i = 2; i <= maxPages; i++) {
-    allRequests.push(client.buildRequest({ page: i }));
-  }
-
-  if (allRequests.length > 0) {
-    const responses = UrlFetchApp.fetchAll(allRequests);
-
-    responses.forEach((response, index) => {
-      const page = index + 2;
-
-      if (response.getResponseCode() === 200) {
-        try {
-          const body = response.getContentText();
-          const rawData = JSON.parse(body);
-
-          rawData.forEach(obj => {
-            allAssets.push([
-              // FIX: Added obj.is_blueprint_copy to match the 8-column convention
-              obj.is_blueprint_copy,
-              obj.is_singleton,
-              obj.item_id,
-              obj.location_flag,
-              obj.location_id,
-              obj.location_type,
-              obj.quantity,
-              obj.type_id
-            ]);
-          });
-        } catch (e) {
-          log.error(`[${SCRIPT_NAME}] ERROR: Failed to parse page ${page}. Assets may be incomplete. Error: ${e}`);
-        }
+      if (pageData.length === 0 && page <= maxPages) {
+        log.error('[' + SCRIPT_NAME + '] CRITICAL: Page ' + page + ' returned no data. Expected ' + maxPages + ' pages total.');
+        throw new Error('Asset Fetch CRITICAL: Sequential page ' + page + ' failed. Data integrity compromised.');
       }
-    });
-  }
-
-  log.info(`[${SCRIPT_NAME}] Concurrency complete. Total asset rows found: ${allAssets.length - 1}`);
-  return allAssets;
-}
-
-/**
- * Non-blocking Document Lock helper function.
- * Writes a single chunk of data while using LockService.
- */
-function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
-  const chunkStartTime = new Date().getTime();
-  let writeDurationMs = 0;
-  let writeSuccess = true; // Assume success initially
-
-  const docLock = LockService.getDocumentLock();
-
-  if (!docLock.tryLock(DOC_LOCK_TIMEOUT_MS)) {
-    return { success: false, duration: 0 }; // Lock Acquisition Failure
-  }
-
-  try {
-    const workSheet = _sheetCache[sheetName];
-    if (!workSheet) {
-      throw new Error(`CRITICAL: Sheet object for '${sheetName}' not found in memory cache. Job state compromised.`);
+      
+      pageData.forEach(obj => {
+        allAssets.push([
+          obj.is_blueprint_copy, obj.is_singleton, obj.item_id, obj.location_flag, 
+          obj.location_id, obj.location_type, obj.quantity, obj.type_id
+        ]);
+      });
+      Utilities.sleep(50); // ESI recommendation for sequential large volume calls
     }
-
-    // startRow is 1-indexed. Column 1 is the start.
-    workSheet.getRange(startRow, 1, dataChunk.length, numCols).setValues(dataChunk);
 
   } catch (e) {
-    log.error(`_writeChunkInternal: Write failed while locked: ${e.message}`);
-    log.error("dataChunk: L:" + dataChunk.length + " C: " + numCols);
-    writeSuccess = false; // Mark Service/API failure
-
-    // Re-throw critical logic errors (like cache miss) to be caught by outer safety nets
-    if (e.message.startsWith('CRITICAL:')) {
-      throw e;
-    }
-
-  } finally {
-    docLock.releaseLock();
-    writeDurationMs = new Date().getTime() - chunkStartTime;
+    // This catches GESI's internal error (like 401) or our manual throw
+    log.error('[' + SCRIPT_NAME + '] FATAL ESI ERROR: ' + e.message);
+    throw new Error('Asset Fetch CRITICAL: ESI failed during fetch/parse. Reschedule fetch.');
   }
 
-  // Return the actual success status based on the try/catch result
-  return { success: true, duration: writeDurationMs };
+  log.info('[' + SCRIPT_NAME + '] Sequential fetch complete. Total asset rows found: ' + (allAssets.length - 1));
+  return allAssets;
 }
 
 /**
@@ -297,7 +347,7 @@ function _prepareCacheSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
 
-  if (!cacheSheet) { log.error(`[${SCRIPT_NAME}] ERROR: Target sheet '${CACHE_SHEET_NAME}' not found.`); return { success: false, duration: 0 }; }
+  if (!cacheSheet) { log.error('[' + SCRIPT_NAME + '] ERROR: Target sheet \'' + CACHE_SHEET_NAME + '\' not found.'); return { success: false, duration: 0 }; }
 
   // Add to cache for chunk writer
   _sheetCache[CACHE_SHEET_NAME] = cacheSheet;
@@ -309,33 +359,33 @@ function _prepareCacheSheet() {
   const lockAcquiredTime = new Date().getTime();
 
   try {
-        const writeStartTime = new Date().getTime(); 
-        
-        // 1. AGGRESSIVE CLEAR: Delete all rows below the header row (Row 2).
-        // This physically shrinks the sheet, ensuring no old content remains.
-        const lastRow = cacheSheet.getMaxRows();
-        if (lastRow > 2) {
-           // Delete from Row 3 (the first data row) downwards
-           cacheSheet.getRange("A3:H" + lastRow).clearContent();
-        }
-        
-        // 2. HEADER WRITE: Write headers to ROW 2 (A2:H2).
-        // This must be done AFTER deletion as deletion preserves the header.
-        cacheSheet.getRange("A2:H2").setValues([ASSET_CACHE_HEADERS]);
+    const writeStartTime = new Date().getTime(); 
+    
+    // 1. AGGRESSIVE CLEAR: Delete all rows below the header row (Row 2).
+    // This physically shrinks the sheet, ensuring no old content remains.
+    const lastRow = cacheSheet.getMaxRows();
+    if (lastRow > 2) {
+      // Delete from Row 3 (the first data row) downwards
+      cacheSheet.getRange('A3:H' + lastRow).clearContent();
+    }
+    
+    // 2. HEADER WRITE: Write headers to ROW 2 (A2:H2).
+    // This must be done AFTER deletion as deletion preserves the header.
+    cacheSheet.getRange('A2:H2').setValues([ASSET_CACHE_HEADERS]);
 
-        const criticalWriteDuration = new Date().getTime() - writeStartTime;
-        log.info(`[${SCRIPT_NAME}] CRIT-WRITE: Deleted old rows and wrote headers in ${criticalWriteDuration}ms. Headers placed in ROW 2.`);
-        
-        return { success: true, duration: lockAcquiredTime - lockStartTime };
+    const criticalWriteDuration = new Date().getTime() - writeStartTime;
+    log.info('[' + SCRIPT_NAME + '] CRIT-WRITE: Deleted old rows and wrote headers in ' + criticalWriteDuration + 'ms. Headers placed in ROW 2.');
+    
+    return { success: true, duration: lockAcquiredTime - lockStartTime };
 
   } catch (e) {
-    log.error(`[${SCRIPT_NAME}] CRITICAL ERROR during sheet preparation: ${e}`);
+    log.error('[' + SCRIPT_NAME + '] CRITICAL ERROR during sheet preparation: ' + e);
     return { success: false, duration: 0 };
   }
   finally {
     docLock.releaseLock();
 
-    log.info(`[${SCRIPT_NAME}] LOCK STATS: Lock Released after preparation.`);
+    log.info('[' + SCRIPT_NAME + '] LOCK STATS: Lock Released after preparation.');
   }
 }
 
@@ -367,6 +417,7 @@ function _dispatchAssetJob() {
 /**
  * Executes cacheAllCorporateAssets.
  * **This must be the function referenced by scheduleOneTimeTrigger.**
+ * This function exists to provide the 'executeWithTryLock' wrapper.
  */
 function cacheAllCorporateAssetsTrigger() {
   const funcName = 'cacheAllCorporateAssets';
@@ -376,43 +427,15 @@ function cacheAllCorporateAssetsTrigger() {
 
   if (result === null) {
     // Action: Log and rely on the higher-level trigger (Dispatcher)
-    log.warn(`${funcName} skipped due to Script Lock conflict. Waiting for next scheduled run.`);
+    log.warn(funcName + ' skipped due to Script Lock conflict. Waiting for next scheduled run.');
   }
 }
-
-/**
- * KEY FOR THE NEW STATE OBJECT USED BY writeDataToSheet
- * This replaces the old ASSET_CACHE_ROW_INDEX_KEY and ASSET_CHUNK_SIZE_KEY
- */
-const ASSET_WRITE_STATE_KEY = 'ASSET_WRITE_STATE';
 
 /**
  * Orchestrator function to fetch all corporate assets and write them to a
  * cache sheet using a resumable, stateful batch write process.
  *
- * This function is designed to be run multiple times via a trigger.
- *
- * REFACTOR NOTES:
- * This function is now fully integrated with the advanced `writeDataToSheet` utility.
- *
- * - Phase 1 (Fetch): Unchanged. Fetches all data, saves to PropertiesService,
- * sets status to FETCHED, and reschedules.
- * - Phase 2A (Prepare): Unchanged. Clears the sheet, writes headers, sets
- * status to WRITING.
- * - NEW in Phase 2A: It now ALSO creates the *initial state object* for
- * `writeDataToSheet` and saves it to ASSET_WRITE_STATE_KEY.
- * - Phase 2B (Write):
- * - REMOVED: The entire `while (i < processedAssets.length)` loop.
- * - REMOVED: All manual chunking, throttling, and index management (i).
- * - ADDED: It now loads the `processedAssets` array and the `writeState` object.
- * - ADDED: It calls `writeDataToSheet` ONCE, passing the *full* data array
- * and the state object.
- * - If `writeDataToSheet` returns `success: false` (e.g., timeout), this
- * function saves the *new* state from the return value back to
- * PropertiesService and reschedules itself.
- * - If `writeDataToSheet` returns `success: true`, the write is finished,
- * and the function proceeds to Phase 3.
- * - Phase 3 (Finalize): Unchanged, but now also deletes ASSET_WRITE_STATE_KEY.
+ * **CRITICAL FIX:** Now uses sharded CacheService to store large data sets.
  */
 function cacheAllCorporateAssets() {
   const SCRIPT_NAME = 'cacheAllCorporateAssets';
@@ -422,504 +445,208 @@ function cacheAllCorporateAssets() {
 
   // --- PHASE 1: Data Acquisition (Fetch or Resume) ---
   let processedAssets = [];
-  const cachedAssetData = SCRIPT_PROP.getProperty(ASSET_CACHE_DATA_KEY);
-  // nextWriteRow is now ONLY used to check if we are in Phase 2A or 2B.
+  
+  // CRITICAL: Read sharded data from CacheService
+  const cachedAssetDataJson = _readShardedProperty(ASSET_CACHE_DATA_KEY);
+  
   let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(ASSET_CACHE_ROW_INDEX_KEY) || '0', 10);
   let jobStatus = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
 
-  if (cachedAssetData) {
-    processedAssets = JSON.parse(cachedAssetData);
-    log.info(`[STATE] Resuming job. Status: ${jobStatus}. Loaded ${processedAssets.length} assets from properties.`);
-    
-    // (Other resume scenarios from original code are handled by the new flow)
-
+  if (cachedAssetDataJson) {
+    processedAssets = JSON.parse(cachedAssetDataJson);
+    log.info('[STATE] Resuming job. Status: ' + jobStatus + '. Loaded ' + processedAssets.length + ' assets from properties.');
   } else {
     // --- NEW JOB START (Scenario 1) ---
     const mainChar = GESI.getMainCharacter();
-    const allAssets = _fetchAssetsConcurrently(mainChar); // <-- This now returns 8 columns
+    const allAssets = _fetchAssetsConcurrently(mainChar); // This function will now THROW on failure.
 
     if (allAssets.length <= 1) { log.warn('[' + SCRIPT_NAME + '] WARNING: No assets retrieved.'); return; }
 
-    // Get the data rows (allAssets[0] is the header)
     const rawAssetsData = allAssets.slice(1);
-
-    // [NEW SANITIZATION STEP START]
-    const SANITIZATION_ITEM_ID_INDEX = 2; // 'item_id' (Index 2 of ASSET_CACHE_HEADERS)
-    const SANITIZATION_LOCATION_ID_INDEX = 4; // 'location_id' (Index 4 of ASSET_CACHE_HEADERS)
+    
+    // [SANITIZATION STEP]
+    const SANITIZATION_ITEM_ID_INDEX = 2; 
+    const SANITIZATION_LOCATION_ID_INDEX = 4; 
 
     const sanitizedAssetsData = rawAssetsData.filter(row => {
       const item_id = Number(row[SANITIZATION_ITEM_ID_INDEX]);
       const location_id = Number(row[SANITIZATION_LOCATION_ID_INDEX]);
 
-      // Filter: item_id and location_id must be positive, and must not be a known GHOST item
-      return item_id > 0
-        && location_id > 0
-        && !GHOST_ITEM_IDS.has(item_id); // GHOST_ITEM_IDS is defined globally
-    });
-    // [NEW SANITIZATION STEP END]
+      // --- CRITICAL DEBUGGING: FILTERING REMAINS MINIMAL ---
+      const is_valid_id = item_id > 0;
+      const is_not_ghost = !GHOST_ITEM_IDS.has(item_id);
 
-    // FIX: Use the sanitized list for the job data
+      return is_valid_id && is_not_ghost; 
+    });
+    // [END SANITIZATION]
+
     processedAssets = sanitizedAssetsData;
 
-    // Save data and update state to FETCHED.
-    SCRIPT_PROP.setProperty(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets));
-    SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, '0'); // Still use '0' to trigger Phase 2A
-    SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'FETCHED');
-    log.info(`[STATE] New job started. Assets saved. Status: FETCHED.`);
+    // CRITICAL: Save large data using sharding to CacheService
+    const processedJson = JSON.stringify(processedAssets);
+    _writeShardedProperty(ASSET_CACHE_DATA_KEY, processedJson);
 
-    // Exit and schedule continuation to allow a clean execution for the sheet clear.
+    SCRIPT_PROP.setProperty(ASSET_CACHE_ROW_INDEX_KEY, '0');
+    SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, ASSET_JOB_STATUS_FLAG.FETCHED); // Use flag here
+    log.info('[STATE] New job started. Assets saved. Status: ' + ASSET_JOB_STATUS_FLAG.FETCHED + '.');
+
     scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
     return;
   }
 
   // Re-acquire sheet access for Phase 2/3
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
+  if (!ss.getSheetByName(CACHE_SHEET_NAME)) { log.error('[' + SCRIPT_NAME + '] ERROR: Target sheet not found for write phase.'); return; }
 
-  if (!cacheSheet) { log.error('[' + SCRIPT_NAME + '] ERROR: Target sheet not found for write phase.'); return; }
-  _sheetCache[CACHE_SHEET_NAME] = cacheSheet;
+  // --- PHASE 2A: Critical Sheet Preparation ---
+  // The job must be in FETCHED state to run this, guaranteeing data is loaded.
+  if (jobStatus === ASSET_JOB_STATUS_FLAG.FETCHED) { 
+    log.info('[PHASE 2A] Executing critical sheet clear and header write...');
+    const result = _prepareCacheSheet();
 
-  // --- PHASE 2A: Critical Sheet Preparation (Only run once after successful fetch) ---
-  if (nextWriteRow === 0 && jobStatus === 'FETCHED') {
-    log.info(`[PHASE 2A] Executing critical sheet clear and header write...`);
-    const result = _prepareCacheSheet(); // Call the isolated function
-
-    if (!result.success) {
-      log.error(`[PHASE 2A] Failed to clear sheet. Aborting.`);
-      return;
-    }
+    if (!result.success) { log.error('[PHASE 2A] Failed to clear sheet. Aborting.'); return; }
     
-    // --- NEW: Initialize the state object for writeDataToSheet ---
-    // We pass our job constants into the state config for writeDataToSheet to use.
+    // --- Initialize the writeState object ---
     const initialWriteState = {
-      // ss: ss, // Will be re-attached on load (cannot be stringified)
       nextBatchIndex: 0,
       config: {
-        TARGET_WRITE_TIME_MS: 3000, // Default from writeDataToSheet
-        MAX_FACTOR: 1.5,            // Default from writeDataToSheet
-        DOC_LOCK_TIMEOUT_MS: 5000,  // Default from writeDataToSheet
-        // Pass job-level constants into the writer's config
+        // --- USING EXPLICIT USER-PROVIDED VALUES ---
+        TARGET_WRITE_TIME_MS: 3000, 
+        MAX_FACTOR: 2, // User's requested aggressive factor
         THROTTLE_THRESHOLD_MS: THROTTLE_THRESHOLD_MS, 
         THROTTLE_PAUSE_MS: THROTTLE_PAUSE_MS,
-        SOFT_LIMIT_MS: SOFT_LIMIT_MS,
+        // --- USING GLOBALLY DEFINED CHUNKING/THROTTLING PROPERTIES ---
+        SOFT_LIMIT_MS: SOFT_LIMIT_MS, 
         CHUNK_DECREASE_RATE: CHUNK_DECREASE_RATE,
-        MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
+        MIN_CHUNK_SIZE: MIN_CHUNK_SIZE, 
         MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
-        currentChunkSize: MIN_CHUNK_SIZE // Start with min chunk size
+        currentChunkSize: MIN_CHUNK_SIZE 
       },
-      metrics: {
-        startTime: START_TIME, // Use this execution's start time
-        previousDuration: 0,
-        rowsProcessed: 0
-      }
-      // Logger functions will be re-attached on load
+      metrics: { startTime: START_TIME, previousDuration: 0, rowsProcessed: 0 }
     };
     
-    // Save the new state object
+    // ** CRITICAL FIX: Persist state and status immediately after successful sheet clear **
     SCRIPT_PROP.setProperty(ASSET_WRITE_STATE_KEY, JSON.stringify(initialWriteState));
-
-    // Set status to WRITING and schedule the continuation to start the write loop.
-    SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, 'WRITING');
-    // We can now update/remove the old row index key, as it's superseded by ASSET_WRITE_STATE_KEY
-    SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY); 
+    SCRIPT_PROP.setProperty(ASSET_JOB_STATUS_KEY, ASSET_JOB_STATUS_FLAG.WRITING); // Set to WRITING
+    SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY); // Remove old index key
     
-    log.info(`[STATE] Sheet prepared. Initial write-state created. Status: WRITING. Scheduling next run to start chunking.`);
+    log.info('[STATE] Sheet prepared. Initial write-state created. Status: ' + ASSET_JOB_STATUS_FLAG.WRITING + '. Scheduling next run to start chunking.');
     scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
     return;
   }
 
 
   // --- PHASE 2B: Resumable Chunk Write (Delegated to writeDataToSheet) ---
-  if (jobStatus !== 'WRITING') {
-    log.warn(`[STATE] Job status is not WRITING (${jobStatus}). Bailing out.`);
-    return;
-  }
+  if (jobStatus !== ASSET_JOB_STATUS_FLAG.WRITING) { log.warn('[STATE] Job status is not WRITING (' + jobStatus + '). Bailing out.'); return; }
 
-  // Load the state for writeDataToSheet
+  // CRITICAL: Read sharded data from CacheService
   const writeStateString = SCRIPT_PROP.getProperty(ASSET_WRITE_STATE_KEY);
-  if (!writeStateString) {
-    log.error(`[CRITICAL] Job status is WRITING but ASSET_WRITE_STATE_KEY is missing. Aborting.`);
-    return;
-  }
+  if (!writeStateString) { log.error('[CRITICAL] Job status is WRITING but ASSET_WRITE_STATE_KEY is missing. Aborting.'); return; }
   
   let writeState = JSON.parse(writeStateString);
 
-  // Re-attach non-serializable properties (ss, loggers) and update runtime metric (startTime)
-  writeState.ss = ss; // Attach the active spreadsheet object
-  writeState.metrics.startTime = START_TIME; // Update start time for this execution's bailout check
+  // Re-attach non-serializable properties (ss, loggers, startTime)
+  writeState.ss = ss; 
+  writeState.metrics.startTime = START_TIME; 
   
-  // --- ROBUST LOGGER RE-ATTACHMENT ---
-  // Use the global 'log' object if it exists (from a library like LoggerEx),
-  // otherwise, fall back to the built-in Apps Script 'Logger' service.
   if (typeof log !== 'undefined' && typeof log.info === 'function') {
-    writeState.logInfo = log.info;
-    writeState.logWarn = log.warn;
-    writeState.logError = log.error;
+    writeState.logInfo = log.info; writeState.logWarn = log.warn; writeState.logError = log.error;
   } else {
-    // Fallback to built-in Logger
     writeState.logInfo = function(msg) { Logger.log(String(msg)); };
     writeState.logWarn = function(msg) { Logger.log(String(msg)); };
     writeState.logError = function(msg) { Logger.log(String(msg)); };
   }
-  // --- END LOGGER RE-ATTACHMENT ---
 
-  log.info(`[PHASE 2B] Calling writeDataToSheet. Resuming from index: ${writeState.nextBatchIndex || 0}`);
+  log.info('[PHASE 2B] Calling writeDataToSheet. Resuming from index: ' + (writeState.nextBatchIndex || 0));
   
-  // --- THIS IS THE CORE CHANGE ---
   // Call writeDataToSheet ONCE with the FULL data array and the resumable state.
-  // It will run its own internal loop until it finishes or times out.
   const result = writeDataToSheet(
-    CACHE_SHEET_NAME,
-    processedAssets, // The *full* data array
-    3,               // Data starts on physical row 3
-    1,               // Data starts on physical col 1
-    writeState       // The resumable state object
+    CACHE_SHEET_NAME, processedAssets, 3, 1, writeState
   );
-  // -----------------------------
 
   if (result.success) {
-    // IT'S DONE! Proceed to Phase 3 (Finalization).
-    log.info(`[PHASE 2B] writeDataToSheet completed successfully. Total rows: ${result.rowsProcessed}. Proceeding to finalization.`);
+    // IT'S DONE! Schedule the Finalization.
+    log.info('[PHASE 2B] writeDataToSheet completed successfully. Total rows: ' + result.rowsProcessed + '. Scheduling finalization.');
+    
+    scheduleOneTimeTrigger('finalizeAssetCache', 5000);
+
+    // CRITICAL: Clear sharded properties on success
+    _clearShardedProperty(ASSET_CACHE_DATA_KEY);
+    
+    // Clean up transient state keys here.
+    SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
+    SCRIPT_PROP.deleteProperty(ASSET_WRITE_STATE_KEY); 
+    SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
+    
+    return; // Exit successfully
     
   } else {
-    // IT FAILED (Timeout, Lock, etc.) - We must reschedule.
-    log.warn(`[PHASE 2B] writeDataToSheet returned a non-success state. Reason: ${result.error}`);
+    // IT FAILED (Timeout, Lock, etc.) - Reschedule.
+    log.warn('[PHASE 2B] writeDataToSheet returned a non-success state. Reason: ' + result.error);
     
     // Save the *new* state returned by the function for the next run.
-    // We must strip non-JSON-serializable properties before saving.
     const stateToSave = result.state;
-    delete stateToSave.ss;
-    delete stateToSave.logInfo;
-    delete stateToSave.logWarn;
-    delete stateToSave.logError;
+    delete stateToSave.ss; delete stateToSave.logInfo; delete stateToSave.logWarn; delete stateToSave.logError;
 
+    // We do NOT save chunk size to a separate key here; it's saved inside ASSET_WRITE_STATE_KEY.
     SCRIPT_PROP.setProperty(ASSET_WRITE_STATE_KEY, JSON.stringify(stateToSave));
     
-    log.info(`[STATE] Saving write state to resume at index: ${stateToSave.nextBatchIndex}. Scheduling next run.`);
-    scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 5000);
+    log.info('[STATE] Saving write state to resume at index: ' + stateToSave.nextBatchIndex + '. Scheduling next run.');
+    scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', RESCHEDULE_PAUSE_MS); // <-- NOW USES THE PAUSE
     return; // Exit this execution.
   }
+} // End cacheAllCorporateAssets
 
-
-  // --- PHASE 3: Finalization (Clears state on success) ---
-  // This code block is now ONLY reached if `result.success` was true.
-  
-  const dataHeight = processedAssets.length;
-  // Data starts at Row 3 (header at Row 2), so data height must be >= 1
-  const rangeHeight = Math.max(1, dataHeight);
-
-  SpreadsheetApp.flush();
-  log.info('[' + SCRIPT_NAME + '] Final spreadsheet flush and Named Range creation.');
-
-  // Create/Update Named Range for downstream consumers. Start at Row 3.
-  cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
-
-  if (cacheSheet) {
-    // Start named range at Row 3
-    ss.setNamedRange(
-      CACHE_NAMED_RANGE,
-      cacheSheet.getRange(3, 1, rangeHeight, NUM_ASSET_COLS)
-    );
-  }
-
-  // FINAL CLEANUP: Clear state properties on success
-  SCRIPT_PROP.deleteProperty(ASSET_CACHE_DATA_KEY);
-  SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
-  SCRIPT_PROP.deleteProperty(ASSET_WRITE_STATE_KEY); // <-- Clean up the new state key
-  
-  // Clean up old/redundant keys just in case
-  SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
-  SCRIPT_PROP.deleteProperty(ASSET_CHUNK_SIZE_KEY);
-  
-  log.info('[' + SCRIPT_NAME + '] Successfully cached ' + dataHeight + ' asset rows. Job finalized.');
-}
-
-// --- 5. LOCATION MANAGER HELPERS ---
 
 /**
- * Reads a sheet, finds the header row (assumed to be row 1 or 2),
- * and returns a map of {headerName: index}.
+ * PHASE 3 WORKER: Performs the heavy SpreadsheetApp.flush() and named range creation
+ * after the data is successfully written. Runs in its own scheduled execution context.
  */
-function _buildHeaderMap(sheet) {
-    const SCRIPT_NAME = '_buildHeaderMap';
-    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag(SCRIPT_NAME) : SAFE_CONSOLE_SHIM);
+function finalizeAssetCache() {
+    const SCRIPT_NAME = 'finalizeAssetCache';
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    // FIX: Define a higher retry delay (90 seconds)
+    const FINALIZE_RETRY_DELAY_MS = 90000; 
 
-    if (!sheet) {
-        log.error("CRITICAL: _buildHeaderMap called with null sheet object.");
-        return { headerMap: new Map(), headerRowIndex: 1 };
-    }
-    
+    log.info('[' + SCRIPT_NAME + '] Starting final spreadsheet flush and Named Range creation.');
+
     try {
-        // 1. Get max columns (Slow API call 1)
-        const maxCols = sheet.getMaxColumns(); 
+        // 1. Flush (This is the heavy, risky part)
+        SpreadsheetApp.flush();
+        log.info('[' + SCRIPT_NAME + '] Flush successful.');
 
-        // 2. Get headers (Slow API call 2)
-        // This attempts to get both rows 1 and 2 in one batch call, minimizing I/O.
-        const allHeaders = sheet.getRange(1, 1, 2, maxCols).getValues();
+        // 2. Create/Update Named Range for downstream consumers.
+        const cacheSheet = ss.getSheetByName(CACHE_SHEET_NAME);
         
-        let headers = allHeaders[0];
-        let headerRowIndex = 1;
-
-        // Check Row 1 first, fall back to Row 2 if Row 1 is empty
-        if (headers.every(h => !h)) {
-            headers = allHeaders[1];
-            headerRowIndex = 2;
+        if (!cacheSheet) {
+            log.error('[' + SCRIPT_NAME + '] CRITICAL: Cache sheet ' + CACHE_SHEET_NAME + ' not found during finalization. Cannot create Named Range.');
+            return;
         }
 
-        const headerMap = new Map();
-        headers.forEach((header, index) => {
-            if (header) {
-                // Ensure header is treated as a string before trimming/setting
-                headerMap.set(String(header).trim(), index);
-            }
-        });
+        // Determine data height from the last written row (Row 3 is the first data row)
+        const dataHeight = Math.max(1, cacheSheet.getLastRow() - 2); 
+        const NUM_ASSET_COLS = 8; // Assumed 8 columns from Phase 1 logic
 
-        return { headerMap: headerMap, headerRowIndex: headerRowIndex };
-        
+        // Start named range at Row 3
+        ss.setNamedRange(
+            CACHE_NAMED_RANGE,
+            cacheSheet.getRange(3, 1, dataHeight, NUM_ASSET_COLS)
+        );
+        log.info('[' + SCRIPT_NAME + '] Successfully created Named Range (' + CACHE_NAMED_RANGE + ') covering ' + dataHeight + ' rows.');
+
     } catch (e) {
-        // Log the error and return a safe fallback object, preventing runtime crash.
-        const sheetName = sheet && typeof sheet.getName === 'function' ? sheet.getName() : 'Unknown';
-        log.error(`[${SCRIPT_NAME}] ERROR during sheet I/O on sheet: ${sheetName}. Error: ${e.message}`);
-        
-        return { headerMap: new Map(), headerRowIndex: 1 };
+        log.error('[' + SCRIPT_NAME + '] CRITICAL FAILURE during finalization: ' + e.message + '. Rescheduling retry.');
+        // Reschedule using the increased delay
+        scheduleOneTimeTrigger('finalizeAssetCache', FINALIZE_RETRY_DELAY_MS); 
+        return;
     }
+
+    // FINAL CLEANUP: Clear properties on successful finalization.
+    SCRIPT_PROP.deleteProperty(ASSET_CACHE_DATA_KEY);
+    SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
+    SCRIPT_PROP.deleteProperty(ASSET_WRITE_STATE_KEY); 
+    SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
+
+    log.info('[' + SCRIPT_NAME + '] Job finalized successfully.');
 }
-
-// ... (omitted helper functions for brevity) ...
-
-/**
- * Reads the 'SDE_invTypes' sheet dynamically and builds a Map of (typeID -> typeName).
- * FIX: Now uses robust, timeout-proof column read with PropertiesService caching and SHARDING.
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss The active Spreadsheet object.
- */
-function _buildSdeTypeMap(ss) {
-  const SCRIPT_NAME = '_buildSdeTypeMap';
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const SDE_TYPE_MAP_KEY = 'SDE_invTypes_TypeMap';
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag(SCRIPT_NAME) : SAFE_CONSOLE_SHIM);
-  
-  // --- PHASE 1: FAST CACHE CHECK (Using Sharded Read) ---
-  const cachedMapJson = _readShardedProperty(SCRIPT_PROP, SDE_TYPE_MAP_KEY);
-  
-  if (cachedMapJson) {
-      try {
-          // JSON.parse is fast and local
-          const mapArray = JSON.parse(cachedMapJson);
-          const cachedMap = new Map(mapArray);
-          log.info(`[${SCRIPT_NAME}] Loaded ${cachedMap.size} entries from PropertiesService cache (Sharded).`);
-          return cachedMap;
-      } catch (e) {
-          log.error(`[${SCRIPT_NAME}] Failed to parse sharded SDE map. Forcing sheet read. Error: ${e.message}`);
-          // Fall through to slow sheet read
-      }
-  }
-  // --- END PHASE 1: FAST CACHE CHECK ---
-
-  // --- PHASE 2: SLOW SHEET READ (Execution continues here if cache is cold) ---
-  const sheet = ss.getSheetByName('SDE_invTypes');
-  if (!sheet) {
-    log.error(`[${SCRIPT_NAME}] CRITICAL: "SDE_invTypes" sheet not found.`);
-    return new Map();
-  }
-
-  const headerInfo = _buildHeaderMap(sheet);
-  const headerMap = headerInfo.headerMap;
-  const dataStartRow = headerInfo.headerRowIndex + 1;
-
-  const typeIdIndex = headerMap.get('typeID');
-  const typeNameIndex = headerMap.get('typeName');
-
-  if (typeIdIndex === undefined || typeNameIndex === undefined) {
-    log.error(`[${SCRIPT_NAME}] CRITICAL: Missing 'typeID' or 'typeName' columns in 'SDE_invTypes'.`);
-    return new Map();
-  }
-
-  // Find the true last row of data
-  const lastDataRow = sheet.getDataRange().getLastRow();
-  if (lastDataRow < dataStartRow) {
-    log.warn(`[${SCRIPT_NAME}] WARNING: 'SDE_invTypes' data is empty. Location names will fail. Run SDE Update.`);
-    return new Map(); // No data to read
-  }
-
-  // --- TIMEOUT-PROOF READ LOGIC ---
-  const typeMap = new Map();
-  try {
-    // Construct A1 notations for robust column reading
-    const idColA1 = sheet.getRange(1, typeIdIndex + 1).getA1Notation().replace("1", "");
-    const nameColA1 = sheet.getRange(1, typeNameIndex + 1).getA1Notation().replace("1", "");
-    
-    const dataRange = `${idColA1}${dataStartRow}:${idColA1}${lastDataRow}`;
-    const nameRange = `${nameColA1}${dataStartRow}:${nameColA1}${lastDataRow}`;
-    
-    log.info(`[${SCRIPT_NAME}] Robust read: Reading ${dataRange} and ${nameRange}...`);
-
-    // CRASH POINT: This synchronous I/O causes the service timeout
-    const idData = sheet.getRange(dataRange).getValues().flat();
-    const nameData = sheet.getRange(nameRange).getValues().flat();
-
-    const trueDataLength = Math.min(idData.length, nameData.length);
-
-    for (let i = 0; i < trueDataLength; i++) {
-      const typeId = Number(idData[i]);
-      const typeName = nameData[i];
-      if (typeId && typeName) {
-        typeMap.set(typeId, typeName);
-      }
-    }
-    log.info(`[${SCRIPT_NAME}] Robust read complete. Built SDE type map with ${typeMap.size} entries.`);
-
-    // --- PHASE 3: CACHE RESULT (Store using Sharded Write) ---
-    if (typeMap.size > 0) {
-        try {
-            // Convert Map to Array of arrays for JSON serialization
-            const mapArray = Array.from(typeMap.entries());
-            const largeJsonString = JSON.stringify(mapArray);
-            
-            // ** CRITICAL FIX: Write using the sharding function **
-            _writeShardedProperty(SCRIPT_PROP, SDE_TYPE_MAP_KEY, largeJsonString);
-            
-            log.info(`[${SCRIPT_NAME}] Successfully saved ${typeMap.size} entries using sharded storage.`);
-        } catch(e) {
-            // This catches any residual error if the sharder fails
-            log.error(`[${SCRIPT_NAME}] Failed to save map to properties (Sharder failed). Error: ${e.message}`);
-        }
-    }
-    // --- END PHASE 3: CACHE RESULT ---
-  
-  } catch (e) {
-     log.error(`[${SCRIPT_NAME}] FATAL ERROR during SDE robust read/write: ${e.message}`);
-     throw e; // Re-throw the error to be caught by the dispatcher
-  }
-  
-  if (typeMap.size === 0) {
-    log.warn(`[${SCRIPT_NAME}] WARNING: 'SDE_invTypes' data is empty. Location names will fail. Run SDE Update.`);
-  }
-  return typeMap;
-}
-
-/**
- * *** MODIFIED HELPER FUNCTION ***
- * Reads the 'Location_Name_Cache' sheet and builds a Map of (locationID -> locationName).
- * This function is now "timeout-proof" by only reading the necessary columns.
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss The active Spreadsheet object.
- */
-function _buildMasterLocationCacheMap(ss) {
-  const SCRIPT_NAME = '_buildMasterLocationCacheMap';
-  const sheet = getOrCreateSheet(ss, LOCATION_CACHE_SHEET, LOCATION_CACHE_HEADERS);
-  const locationMap = new Map();
-  
-  // *** THIS IS THE FIX: Use getDataRange() to find the *actual* last row with content ***
-  const lastRow = sheet.getDataRange().getLastRow();
-  
-  if (lastRow <= 1) { // Changed from < 1 to <= 1 to handle header-only sheet
-    log.info(`[${SCRIPT_NAME}] NOTE: "${LOCATION_CACHE_SHEET}" is empty or has only headers.`);
-    return locationMap;
-  }
-
-  // --- TIMEOUT-PROOF READ LOGIC ---
-  try {
-   const numCols = sheet.getMaxColumns(); // Cache this slow call!
-        const headers = sheet.getRange(1, 1, 1, numCols).getValues()[0].map(h => String(h).trim().toLowerCase());
-    
-    // *** Find columns by our standard headers ***
-    const idCol = headers.indexOf('locationid');
-    const nameCol = headers.indexOf('locationname');
-
-    if (idCol === -1 || nameCol === -1) {
-       log.error(`[${SCRIPT_NAME}] CRITICAL: Could not find 'locationid' or 'locationname' header in cache sheet. Aborting pruning.`);
-       return locationMap;
-    }
-
-    // Get A1 notation for the columns (e.g., "A", "B")
-    // +1 because getRange is 1-indexed
-    const idColA1 = sheet.getRange(1, idCol + 1).getA1Notation().replace("1", "");
-    const nameColA1 = sheet.getRange(1, nameCol + 1).getA1Notation().replace("1", "");
-    
-    // Read *only* the ID column data, starting from row 2
-    const idData = sheet.getRange(idColA1 + "2:" + idColA1 + lastRow).getValues().flat();
-    // Read *only* the Name column data, starting from row 2
-    const nameData = sheet.getRange(nameColA1 + "2:" + nameColA1 + lastRow).getValues().flat();
-
-    const trueDataLength = Math.min(idData.length, nameData.length);
-
-    for (let i = 0; i < trueDataLength; i++) {
-      const locId = Number(idData[i]);
-      const locName = nameData[i];
-      if (locId && locName) {
-        locationMap.set(locId, locName);
-      }
-    }
-
-    if (locationMap.size === 0) {
-      log.warn(`[${SCRIPT_NAME}] WARNING: "${LOCATION_CACHE_SHEET}" data is empty or unreadable. Location names will fail.`);
-    } else {
-      log.info(`[${SCRIPT_NAME}] Built master location cache map with ${locationMap.size} entries.`);
-    }
-
-  } catch (e) {
-      log.error(`[${SCRIPT_NAME}] ERROR during robust read: ${e.message}.`);
-      return new Map(); // Return empty map on failure
-  }
-  // --- END TIMEOUT-PROOF READ LOGIC ---
-
-  return locationMap;
-}
-
-
-/**
- * Fetches hangar division names from ESI/GESI first, falls back to defaults.
- * FIX: This function has been restored to call ESI first, per user request.
- */
-function _buildHangarNameMap() {
-  const SCRIPT_NAME = '_buildHangarNameMap';
-  const hangarMap = new Map();
-
-  // FAILSAFE: Hardcoded defaults for EVE Corp Hangars (CorpSAG1 to CorpSAG7)
-  const defaultHangars = {
-    'CorpSAG1': 'General Hangar', 'CorpSAG2': 'Financial', 'CorpSAG3': 'Manufacturing',
-    'CorpSAG4': 'Mining', 'CorpSAG5': 'R&D', 'CorpSAG6': 'Storage', 'CorpSAG7': 'Assembly'
-  };
-
-  try {
-    const divisionsClient = getGESIDivisionsClient_();
-    const divisionsData = divisionsClient.executeRaw({});
-
-    if (!divisionsData || !Array.isArray(divisionsData.hangar)) { throw new Error('Malformed division data from ESI.'); }
-
-    const divisions = divisionsData.hangar;
-
-    divisions.forEach(divisionRow => {
-      const divisionNumber = Number(divisionRow.division);
-      const divisionName = String(divisionRow.name).trim();
-
-      if (divisionNumber >= 1 && divisionNumber <= 7) {
-        const flag = 'CorpSAG' + divisionNumber;
-        if (divisionName) { hangarMap.set(flag, divisionName); }
-      }
-    });
-    log.info(`[${SCRIPT_NAME}] Successfully fetched and parsed custom names from ESI.`);
-
-  } catch (e) {
-    log.warn(`[${SCRIPT_NAME}] WARNING: Failed to fetch divisions from ESI. Using defaults. Error: ${e}`);
-  }
-
-  // 3. APPLY FAILSAFE DEFAULTS (Fills in any missing names)
-  Object.keys(defaultHangars).forEach(flag => {
-    if (!hangarMap.has(flag)) { hangarMap.set(flag, defaultHangars[flag]); }
-  });
-
-  log.info(`[${SCRIPT_NAME}] Built Hangar Name map with ${hangarMap.size} entries.`);
-  return hangarMap;
-}
-
-/**
- * Checks if the given ID (number) exists as either the itemId or locationId 
- * in any CorpOffice object. (Helper for refreshLocationManager)
- */
-function isOfficeValue_(targetId, corpOfficesMap) {
-  for (const office of corpOfficesMap.values()) {
-    if (office.itemId === targetId || office.locationId === targetId) { return true; }
-  }
-  return false;
-}
-

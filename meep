@@ -36,3 +36,6 @@ LET(
 
   HSTACK(medianROI, marginLive)
 )))
+
+
+=If(Utility!D3 = 1, IF(setting_corp = False, "", corporations_corporation_assets(setting_director)) , 0)
