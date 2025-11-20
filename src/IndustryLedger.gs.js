@@ -22,8 +22,7 @@ const SOFT_TIME_LIMIT_MS = 280000; // 4 minutes 40 seconds soft limit
 // --- CACHE SHARDING CONSTANTS ---
 const BPO_RAW_CACHE_KEY = 'BPO_RAW_INVENTORY_V1';
 const BPO_RAW_CACHE_TTL = 3600; // 1 hour TTL
-const MAX_CACHE_CHUNK_SIZE = 90000; // Max chars per chunk (staying below 100KB limit)
-const CHUNK_INDEX_SUFFIX = ':IDX';
+
 
 const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('IndustryLedger') : console);
 
