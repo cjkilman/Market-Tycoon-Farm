@@ -184,7 +184,7 @@ function runAllSimpleCacheJobs() {
 
   // 1. Run the Asset Cache Update (Resilient Job)
   Logger.log('[' + SCRIPT_NAME + '] Dispatching Asset Cache Update...');
-  if (typeof cacheAllCorporateAssets === 'function') {
+  if (typeof cacheAllCorporateAssetsWorker === 'function') {
     // CALLING WORKER DIRECTLY TO AVOID LOCK CONFLICT
     Logger.warn('[' + SCRIPT_NAME + '] cacheAllCorporateAssets Disabled')
    // cacheAllCorporateAssets();
@@ -532,7 +532,7 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS, FULL_RUN_RESCHEDULE_MS]
-    = [5000, 500, 285000, 10000, 60000];
+    = [4000, 500, 285000, 10000, 60000];
 
   const tempSheetName = 'Market_Data_Temp';
   const COLUMN_COUNT = 9;
@@ -616,9 +616,8 @@ function _updateMarketDataSheetWorker() {
   // --- Phase 2: WRITE (The Resumable Phase) ---
   if (currentStep === 'PROCESSING' || currentStep === 'WRITE') {
 
-    // Re-acquire stable SS context before data fetch
-    const ss_stable = SpreadsheetApp.getActiveSpreadsheet();
-    const masterRequests_stable = getMasterBatchFromControlTable(ss_stable);
+
+    const masterRequests_stable = getMasterBatchFromControlTable(ss);
 
     let allRowsToWrite = [];
 
@@ -657,16 +656,18 @@ function _updateMarketDataSheetWorker() {
     }
 
     console.log(`State: WRITE. Total rows prepared for resumable write: ${allRowsToWrite.length}.`);
-
-    // 2. Prepare Write State
+    // Re-acquire stable SS context before data fetch
+    const ss_stable = SpreadsheetApp.getActiveSpreadsheet();
+   // 2. Prepare Write State
     let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
       nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
       ss: ss_stable,
       metrics: { startTime: START_TIME },
       config: {
+        MAX_CELLS_PER_CHUNK: 25000,
         TARGET_WRITE_TIME_MS: 3000,
-        MAX_FACTOR: 2,
+        MAX_FACTOR : 2,
         THROTTLE_THRESHOLD_MS: 800,
         THROTTLE_PAUSE_MS: 200,
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || MIN_CHUNK_SIZE.toString()),

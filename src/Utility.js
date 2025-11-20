@@ -368,210 +368,219 @@ function withSheetLock(fn, timeoutMs = 5000) {
 /**
  * Safely writes a large 2D array of data to a sheet in throttled batches, integrating LockService resilience.
  * This function performs the dynamic chunk size adjustment and checks for the overall job time limit.
- * * NOTE: This utility no longer performs structural clearing or chunk size re-initialization 
- * on its own, relying entirely on the Orchestrator for those steps.
- * * @param {string} sheetName The name of the sheet to write to.
+ * * NOTE: This utility uses the total cell count (Rows * Columns) to prevent hitting 
+ * the Sheets API's hidden memory/resource limits, which cause the ServiceTimeoutFailure crash.
+ *
+ * @param {string} sheetName The name of the sheet to write to.
  * @param {Array<Array>} dataArray The 2D array of data to be written.
- * @param {number} startRow The row number where data begins (usually 2).
- * @param {number} startCol The column number where data begins (usually 1).
+ * @param {number} startRow The row number where data begins (1-indexed).
+ * @param {number} startCol The column number where data begins (1-indexed).
  * @param {Object} [stateObject] Optional object containing ss, config, and resume metrics.
  * @returns {Object} Status Object: {success: bool, rowsProcessed: num, duration: num, state: stateObject, error: string, bailout_reason: string}
  */
 function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject) {
-  // 1. DEFINE STATE AND CONFIG
-  var state = stateObject || {};
+    // 1. DEFINE STATE AND CONFIG
+    var state = stateObject || { config: {}, metrics: {} };
+    if (!state.config) state.config = {};
+    if (!state.metrics) state.metrics = {};
+    
+    // Micro-Optimization: Use state object's SS reference, fall back if not provided
+    var ss = state.ss || SpreadsheetApp.getActiveSpreadsheet();
+    var targetSheet;
 
-  // Micro-Optimization: Use state object's SS reference, fall back if not provided
-  var ss = state.ss || SpreadsheetApp.getActiveSpreadsheet();
+    // Define constants for the new logic (can be overridden in state.config)
+    const TARGET_WRITE_TIME_MS = Number(state.config.TARGET_WRITE_TIME_MS) || 100;
+    const MAX_FACTOR = Number(state.config.MAX_FACTOR) || 1.5; 
+    
+    // --- CRITICAL FIX: Harden variable initialization against null/undefined ---
+    const MAX_CELLS_PER_CHUNK = Number(state.config.MAX_CELLS_PER_CHUNK) || 25000; // New ceiling
+    var docLockTimeoutMs = Number(state.config.DOC_LOCK_TIMEOUT_MS) || 5000; 
+    var THROTTLE_THRESHOLD_MS = Number(state.config.THROTTLE_THRESHOLD_MS) || 800;
+    var THROTTLE_PAUSE_MS = Number(state.config.THROTTLE_PAUSE_MS) || 200;
+    var SOFT_LIMIT_MS = Number(state.config.SOFT_LIMIT_MS) || 280000;
 
-  var targetSheet;
+    // Fetch throttling constants for math
+    var CHUNK_DECREASE_RATE = Number(state.config.CHUNK_DECREASE_RATE) || 200;
+    var MIN_CHUNK_SIZE = Number(state.config.MIN_CHUNK_SIZE) || 50;
+    var MAX_CHUNK_SIZE = Number(state.config.MAX_CHUNK_SIZE) || 5000;
+    // --- END CRITICAL FIX ---
+    
+    // Fetch mutable metrics from state or initialize
+    var startTime = Number(state.metrics.startTime) || 0;
+    var currentChunkSize = Number(state.config.currentChunkSize) || MIN_CHUNK_SIZE;
+    var previousDuration = Number(state.metrics.previousDuration) || 0;
+    var i = Number(state.nextBatchIndex) || 0; // Resume point
+    var rowsProcessed = i; // Initial rows processed equals the start index 'i'
+    
+    // Ensure chunk size is within bounds on resume
+    currentChunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(MIN_CHUNK_SIZE, currentChunkSize));
 
-  // Define constants for the new logic (can be overridden in state.config)
-  const TARGET_WRITE_TIME_MS = state.config.TARGET_WRITE_TIME_MS || 3000;
-  const MAX_FACTOR = state.config.MAX_FACTOR || 1.5; // Cap the increase to 50% per step
+    var dataLength = dataArray.length;
+    var numCols = 0;
+    var docLock = LockService.getDocumentLock();
 
-  // --- CRITICAL FIX: Harden variable initialization against null/undefined ---
-  // Ensure non-numeric inputs (null, undefined) default to a safe number.
-  var docLockTimeoutMs = Number(state.config && state.config.DOC_LOCK_TIMEOUT_MS) || 5000; 
-  var THROTTLE_THRESHOLD_MS = Number(state.config && state.config.THROTTLE_THRESHOLD_MS) || 800;
-  var THROTTLE_PAUSE_MS = Number(state.config && state.config.THROTTLE_PAUSE_MS) || 200;
-  var SOFT_LIMIT_MS = Number(state.config && state.config.SOFT_LIMIT_MS) || 0;
-
-  // Fetch throttling constants for math
-  var CHUNK_DECREASE_RATE = Number(state.config && state.config.CHUNK_DECREASE_RATE) || 200;
-  var MIN_CHUNK_SIZE = Number(state.config && state.config.MIN_CHUNK_SIZE) || 50;
-  var MAX_CHUNK_SIZE = Number(state.config && state.config.MAX_CHUNK_SIZE) || 5000;
-  // --- END CRITICAL FIX ---
-  
-  // Fetch mutable metrics from state or initialize
-  var startTime = state.metrics && state.metrics.startTime || 0;
-  var currentChunkSize = state.config && state.config.currentChunkSize || MIN_CHUNK_SIZE;
-  var previousDuration = state.metrics && state.metrics.previousDuration || 0;
-  var rowsProcessed = state.metrics && state.metrics.rowsProcessed || 0;
-  var i = state.nextBatchIndex || 0; // Resume point
-
-  // * Conflicting chunk size initialization removed *
-
-  var dataLength = dataArray.length;
-  var numCols = 0;
-  var docLock = LockService.getDocumentLock();
-
-  try {
-    targetSheet = ss.getSheetByName(sheetName);
-    if (!targetSheet) {
-      throw new Error("Sheet not found: " + sheetName);
-    }
-
-    numCols = dataLength > 0 ? dataArray[0].length : 0;
-    if (numCols === 0 && dataLength > 0) {
-      throw new Error("Data array is corrupted (zero columns).");
-    }
-
-    // * Structural clearing logic removed *
-
-    if (state.logInfo) state.logInfo("Starting batch write. Rows: " + dataLength + ", Resume Index: " + i);
-
-    // REDUNDANT CHUNK SIZE INITIALIZATION BLOCK REMOVED.
-
-    // --- START RESILIENT BATCH WRITE LOOP (while loop) ---
-    while (i < dataLength) {
-
-      // 2. PREDICTIVE BAILOUT CHECK (Logic commented out for hard timeout resilience)
-      // ...
-
-      // 3. DYNAMIC THROTTLING CHECK & ADJUSTMENT
-      if (previousDuration > THROTTLE_THRESHOLD_MS) {
-        // Throttle Down (The crash-avoidance math)
-        currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
-
-        if (state.logInfo) state.logInfo("[THROTTLE] Pausing for " + THROTTLE_PAUSE_MS + "ms to yield execution.");
-        Utilities.sleep(THROTTLE_PAUSE_MS);
-        previousDuration = 0; // Reset duration after pause
-      }
-
-      var chunkStartTime = new Date().getTime();
-      var batch = dataArray.slice(i, i + currentChunkSize);
-      var numRows = batch.length; // Actual number of rows being written
-      var targetRow = startRow + i;
-
-      // --- ATOMIC CHUNK WRITE LOGIC (Lock/Release/Yank) ---
-      if (!docLock.tryLock(docLockTimeoutMs)) {
-        // If lock acquisition fails in the middle of a job, signal a bailout to worker.
-        return {
-          success: false,
-          rowsProcessed: rowsProcessed,
-          duration: previousDuration,
-          state: state,
-          error: "LockAcquisitionFailure: Could not acquire Document Lock.",
-          bailout_reason: "LOCK_CONFLICT"
-        };
-      }
-
-      // 2. PREDICTIVE BAILOUT CHECK (Check total elapsed time for job limit)
-      if (startTime && SOFT_LIMIT_MS > 0 && (new Date().getTime() - startTime > SOFT_LIMIT_MS)) {
-        var bailoutMsg = "Job reached predictive soft time limit. Reschedule required.";
-        if (state.logWarn) state.logWarn(bailoutMsg);
-
-        // Return failure, providing the last duration for worker to assess speed on resume
-        // and including the CRITICAL TAG for the Orchestrator to detect.
-        return {
-          success: false,
-          rowsProcessed: rowsProcessed,
-          duration: previousDuration, // Provide last known speed
-          state: state,
-          error: bailoutMsg,
-          bailout_reason: "PREDICTIVE_BAILOUT" // CRITICAL TAG
-        };
-
-      }
-
-      try {
-
-        // The actual sheet write call
-        targetSheet
-          .getRange(targetRow, startCol, numRows, numCols)
-          .setValues(batch);
-
-        // --- SUCCESS PATH ---
-        docLock.releaseLock();
-        previousDuration = new Date().getTime() - chunkStartTime;
-
-        // --- DYNAMIC CHUNK SIZE ADJUSTMENT (New Logic) ---
-        // Throttle Up (The acceleration math)
-        if (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0) {
-          const adjustmentFactor = TARGET_WRITE_TIME_MS / previousDuration;
-          const limitedFactor = Math.min(adjustmentFactor, MAX_FACTOR);
-
-          // Adjust the size for the NEXT chunk
-          currentChunkSize = Math.round(currentChunkSize * limitedFactor);
-
-          // Enforce Min/Max bounds
-          currentChunkSize = Math.min(MAX_CHUNK_SIZE, currentChunkSize);
+    try {
+        targetSheet = ss.getSheetByName(sheetName);
+        if (!targetSheet) {
+            throw new Error("Sheet not found: " + sheetName);
         }
 
-        // Update metrics in the memory state object
-        rowsProcessed += numRows;
-        state.metrics.rowsProcessed = rowsProcessed;
-
-        // CRITICAL FIX: Manually advance index 'i' by the actual number of rows written (numRows).
-        i += numRows;
-
-        state.nextBatchIndex = i;
-        state.config.currentChunkSize = currentChunkSize; // Save new chunk size
-
-      } catch (e) {
-        // Service Timeout or other write error (The "Yank" operation)
-
-        docLock.releaseLock();
-        var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + targetRow + ". Error: " + e.message;
-        state.logError(errorMessage);
-
-        // --- CRITICAL FIX: Ensure final state is saved before returning failure ---
-        // The index 'i' holds the starting index of the failed batch (the correct checkpoint).
-        state.nextBatchIndex = rowsProcessed;
-        state.config.currentChunkSize = currentChunkSize;
-        // --------------------------------------------------------------------------
+        numCols = dataLength > 0 ? dataArray[0].length : 0;
+        if (numCols === 0) {
+            if (dataLength > 0) throw new Error("Data array is corrupted (zero columns).");
+            if (state.logInfo) state.logInfo("Write SUCCESS. Data array is empty.");
+            return { success: true, rowsProcessed: 0, duration: 0, state: state, error: "" };
+        }
+        
+        // --- NEW: Calculate Max Rows allowed by Column Count (Prevents Crash) ---
+        const MAX_ROWS_BY_COLUMNS = Math.floor(MAX_CELLS_PER_CHUNK / numCols);
+        currentChunkSize = Math.min(currentChunkSize, MAX_ROWS_BY_COLUMNS);
 
 
-        // FAILURE STATUS OBJECT: Returns the final memory state and failure data
+        if (state.logInfo) state.logInfo("Starting batch write. Total Rows: " + dataLength + ", Resume Index: " + i + ". Max Safe Rows: " + MAX_ROWS_BY_COLUMNS);
+
+        // --- START RESILIENT BATCH WRITE LOOP (while loop) ---
+        while (i < dataLength) {
+
+            // 3. DYNAMIC THROTTLING CHECK & ADJUSTMENT (Throttle Down)
+            if (previousDuration > THROTTLE_THRESHOLD_MS) {
+                currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
+
+                if (state.logInfo) state.logInfo("[THROTTLE] Pausing for " + THROTTLE_PAUSE_MS + "ms to yield execution.");
+                Utilities.sleep(THROTTLE_PAUSE_MS);
+                previousDuration = 0; // Reset duration after pause
+            }
+
+            // --- CRITICAL FIX: Cap currentChunkSize by the Column-based Limit ---
+            currentChunkSize = Math.min(currentChunkSize, MAX_ROWS_BY_COLUMNS);
+            currentChunkSize = Math.max(currentChunkSize, MIN_CHUNK_SIZE); // Ensure it respects the minimum floor
+
+            var chunkStartTime = new Date().getTime();
+            var chunkSizeToUse = Math.min(currentChunkSize, dataLength - i);
+            var batch = dataArray.slice(i, i + chunkSizeToUse);
+            var numRows = batch.length; // Actual number of rows being written
+            var targetRow = startRow + i;
+
+            // --- ATOMIC CHUNK WRITE LOGIC (Lock/Release/Yank) ---
+            if (!docLock.tryLock(docLockTimeoutMs)) {
+                // Lock acquisition failure: bail out, checkpoint is current index 'i'.
+                var lockError = "LockAcquisitionFailure: Could not acquire Document Lock.";
+                if (state.logWarn) state.logWarn(lockError + " Index: " + i);
+                
+                state.nextBatchIndex = i; // Save checkpoint (start of failed batch)
+                state.config.currentChunkSize = currentChunkSize;
+                
+                return {
+                    success: false,
+                    rowsProcessed: i, 
+                    duration: 0, 
+                    state: state,
+                    error: lockError,
+                    bailout_reason: "LOCK_CONFLICT"
+                };
+            }
+
+            // 2. PREDICTIVE BAILOUT CHECK (Inside Lock)
+            if (startTime && SOFT_LIMIT_MS > 0 && (new Date().getTime() - startTime > SOFT_LIMIT_MS)) {
+                docLock.releaseLock();
+                var bailoutMsg = "Job reached predictive soft time limit. Reschedule required. Index: " + i;
+                if (state.logWarn) state.logWarn(bailoutMsg);
+
+                state.nextBatchIndex = i; // Save checkpoint
+                state.config.currentChunkSize = currentChunkSize;
+
+                return {
+                    success: false,
+                    rowsProcessed: i, 
+                    duration: previousDuration, 
+                    state: state,
+                    error: bailoutMsg,
+                    bailout_reason: "PREDICTIVE_BAILOUT"
+                };
+            }
+
+            try {
+                // The actual sheet write call
+                targetSheet
+                    .getRange(targetRow, startCol, numRows, numCols)
+                    .setValues(batch);
+
+                // --- SUCCESS PATH ---
+                docLock.releaseLock();
+                previousDuration = new Date().getTime() - chunkStartTime;
+                
+                // --- DYNAMIC CHUNK SIZE ADJUSTMENT (Throttle Up/Acceleration) ---
+                if (previousDuration <= THROTTLE_THRESHOLD_MS && previousDuration > 0) {
+                    const adjustmentFactor = TARGET_WRITE_TIME_MS / previousDuration;
+                    const limitedFactor = Math.min(adjustmentFactor, MAX_FACTOR);
+
+                    // Adjust the size for the NEXT chunk
+                    currentChunkSize = Math.round(currentChunkSize * limitedFactor);
+                    
+                    // The enforcement against MAX_ROWS_BY_COLUMNS happens at the top of the next loop.
+                }
+
+                // Update metrics and advance index
+                i += numRows; // CRITICAL: Advance index for the next loop iteration
+                rowsProcessed = i; // Update the official processed count
+                
+                // Save transient state to the object (for the caller to persist)
+                state.nextBatchIndex = i; 
+                state.config.currentChunkSize = currentChunkSize; 
+                state.metrics.previousDuration = previousDuration;
+
+            } catch (e) {
+                // Service Timeout/Write Error (The "Yank" operation)
+                docLock.releaseLock();
+                var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + targetRow + ". Error: " + e.message;
+                if (state.logError) state.logError(errorMessage);
+                
+                // Aggressive Chunk Size Reduction
+                currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+                
+                // Checkpoint remains at 'i' (start of the failed batch)
+                state.nextBatchIndex = i; 
+                state.config.currentChunkSize = currentChunkSize;
+                
+                // FAILURE STATUS OBJECT: Signal a schedule for retry
+                return {
+                    success: false,
+                    rowsProcessed: i, 
+                    duration: previousDuration,
+                    state: state,
+                    error: errorMessage,
+                    bailout_reason: "SERVICE_FAILURE"
+                };
+            }
+        }
+        // --- END RESILIENT BATCH WRITE LOOP ---
+
+        if (state.logInfo) state.logInfo("Write SUCCESS. Total Rows Written: " + i);
+
+        // SUCCESS STATUS OBJECT: Clear index on completion
+        state.nextBatchIndex = 0; // Signal completion
         return {
-          success: false,
-          rowsProcessed: rowsProcessed,
-          duration: previousDuration,
-          state: state,
-          error: errorMessage
+            success: true,
+            rowsProcessed: i,
+            duration: previousDuration,
+            state: state,
+            error: ""
         };
-      }
+
+    } catch (e) {
+        // CATASTROPHIC FAILURE
+        var finalErrorMsg = "CRITICAL FAILURE in writeDataToSheet. Error: " + e.message;
+        if (state.logError) state.logError(finalErrorMsg);
+
+        return {
+            success: false,
+            rowsProcessed: i, // Last known safe checkpoint (or 0)
+            duration: 0,
+            state: state,
+            error: finalErrorMsg,
+            bailout_reason: "CATASTROPHIC_FAILURE"
+        };
     }
-    // --- END RESILIENT BATCH WRITE LOOP ---
-
-    // Final success return
-    if (state.logInfo) state.logInfo("Write SUCCESS. Total Rows Written: " + rowsProcessed);
-
-    // SUCCESS STATUS OBJECT: Returns the final memory memory state and success data
-    return {
-      success: true,
-      rowsProcessed: rowsProcessed,
-      duration: previousDuration,
-      state: state,
-      error: ""
-    };
-
-  } catch (e) {
-    // Catches: Sheet Not Found, LockAcquisitionFailure (Uncaught)
-    var finalErrorMsg = e.message;
-
-    if (state.logError) state.logError("CRITICAL FAILURE in writeDataToSheet. Error: " + finalErrorMsg);
-
-    // CATASTROPHIC FAILURE STATUS OBJECT: Returns the final memory state before the crash
-    return {
-      success: false,
-      rowsProcessed: rowsProcessed,
-      duration: 0,
-      state: state,
-      error: finalErrorMsg
-    };
-  }
 }
 
 const CONDITIONAL_FLUSH_THRESHOLD_MS = 5000; // 5 seconds: Threshold to trigger flush
