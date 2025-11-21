@@ -39,7 +39,7 @@ const ASSET_CACHE_TTL = 3600;
 
 // --- CONFIGURATION ---
 const STARTING_CHUNK_SIZE = 5000; // Start fast
-const NEW_MIN_CHUNK_SIZE = 250;   // Floor
+const NEW_MIN_CHUNK_SIZE = 500;   // Floor
 const NEW_MAX_CHUNK_SIZE = 8000;  // Cap
 const NEW_SOFT_LIMIT_MS = 275000; // 4m 35s
 const CRIT_LOCK_WAIT_MS = 60000;
@@ -185,6 +185,7 @@ function _fetchAssetsConcurrently(authName) {
 
 function _prepareCacheSheet(ss) {
     const SCRIPT_NAME = '_prepareCacheSheet';
+    // Uses guardedSheetTransaction from Utility.js
     const transactionResult = guardedSheetTransaction(() => {
         let cacheSheet = ss.getSheetByName(TEMP_SHEET_NAME);
         if (!cacheSheet) { 
@@ -216,6 +217,8 @@ function cacheAllCorporateAssetsWorker() {
     currentChunkSize = Math.max(NEW_MIN_CHUNK_SIZE, currentChunkSize);
     
     let processedAssets = [];
+    
+    // Uses _getAndDechunk from Utility.js
     const cachedAssetDataJson = _getAndDechunk(ASSET_CACHE_DATA_KEY); 
     let nextBatchIndex = parseInt(SCRIPT_PROP.getProperty(ASSET_CACHE_ROW_INDEX_KEY) || '0', 10);
     let jobStatus = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
@@ -231,6 +234,7 @@ function cacheAllCorporateAssetsWorker() {
         try {
             processedAssets = JSON.parse(cachedAssetDataJson);
         } catch (e) {
+             // Uses _deleteShardedData from Utility.js
              _deleteShardedData(ASSET_CACHE_DATA_KEY);
              processedAssets = [];
         }
@@ -265,6 +269,7 @@ function cacheAllCorporateAssetsWorker() {
         
         processedAssets = sanitizedAssetsData;
 
+        // Uses _chunkAndPut from Utility.js
         const saved = _chunkAndPut(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets), ASSET_CACHE_TTL);
         if (!saved) return; 
         
@@ -290,9 +295,6 @@ function cacheAllCorporateAssetsWorker() {
     if (jobStatus === 'WRITING') {
         const ss_stable = SpreadsheetApp.getActiveSpreadsheet();
         
-        // *** FIX: Removed the logic that forces start size at index 0 ***
-        // We trust the 'currentChunkSize' loaded from properties at the top.
-        
         log.info(`[Worker] Writing to '${TEMP_SHEET_NAME}' (Index: ${nextBatchIndex}, Chunk: ${currentChunkSize}).`);
 
         const dynamicConfig = { ...WRITE_CONFIG, currentChunkSize: currentChunkSize };
@@ -304,6 +306,7 @@ function cacheAllCorporateAssetsWorker() {
             config: dynamicConfig
         };
 
+        // Uses writeDataToSheet from Utility.js
         const writeResult = writeDataToSheet(
             TEMP_SHEET_NAME, 
             processedAssets, 
@@ -345,6 +348,7 @@ function finalizeAssetCacheJob() {
         log.info('[Finalizer] Performing ATOMIC SWAP.');
         const ssDoc = SpreadsheetApp.getActiveSpreadsheet();
 
+        // Uses atomicSwapAndFlush from Utility.js
         const swapResult = atomicSwapAndFlush(ssDoc, CACHE_SHEET_NAME, TEMP_SHEET_NAME);
 
         if (!swapResult.success) {
@@ -363,6 +367,7 @@ function finalizeAssetCacheJob() {
             );
         }
         
+        // Uses _deleteShardedData from Utility.js
         _deleteShardedData(ASSET_CACHE_DATA_KEY);
         SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
         SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);

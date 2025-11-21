@@ -25,7 +25,7 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
- * Zero-Downtime "Value Swap".
+ * Zero-Downtime "Value Swap" with Hard Trimming.
  */
 function atomicSwapAndFlush(ss, targetName, tempName) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
@@ -144,7 +144,8 @@ function _deleteShardedData(key) {
 }
 
 /**
- * Writes data to sheet with UNLOCKED Nitro performance.
+ * Writes data to sheet with SMART S-CURVE THROTTLING.
+ * Includes cleaner "while loop" time check.
  */
 function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject) {
     var state = stateObject || { config: {}, metrics: {} };
@@ -157,10 +158,6 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     var MAX_CHUNK_SIZE = state.config.MAX_CHUNK_SIZE || 2000;
     var SOFT_LIMIT_MS = state.config.SOFT_LIMIT_MS || 280000;
     
-    // --- NEW: Use config parameters for acceleration ---
-    var MAX_FACTOR = state.config.MAX_FACTOR || 1.2; // Default to 1.2 if not set
-    var THROTTLE_THRESHOLD_MS = state.config.THROTTLE_THRESHOLD_MS || (TARGET_WRITE_TIME_MS * 0.8);
-
     var i = state.nextBatchIndex || 0;
     var currentChunkSize = state.config.currentChunkSize || MIN_CHUNK_SIZE;
     var startTime = state.metrics.startTime || new Date().getTime();
@@ -175,14 +172,9 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     currentChunkSize = Math.min(currentChunkSize, maxRowsByCols);
 
     try {
-        while (i < dataArray.length) {
-            if (new Date().getTime() - startTime > SOFT_LIMIT_MS) {
-                return { 
-                    success: false, 
-                    bailout_reason: "PREDICTIVE_BAILOUT",
-                    state: { ...state, nextBatchIndex: i, config: { ...state.config, currentChunkSize } }
-                };
-            }
+        // --- THE CLEANER LOOP ---
+        // Run while we have data AND time on the clock (Using < logic)
+        while (i < dataArray.length && (new Date().getTime() - startTime) < SOFT_LIMIT_MS) {
 
             var chunkSize = Math.min(currentChunkSize, dataArray.length - i);
             var batch = dataArray.slice(i, i + chunkSize);
@@ -194,16 +186,24 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
                 
                 var duration = new Date().getTime() - chunkStart;
                 var oldChunk = currentChunkSize;
+                var ratio = duration / TARGET_WRITE_TIME_MS;
                 
-                // --- UNLOCKED NITRO LOGIC ---
-                if (duration < THROTTLE_THRESHOLD_MS) {
-                    // Super Fast? Accelerate by MAX_FACTOR (e.g., 2.0x)
-                    currentChunkSize = Math.min(MAX_CHUNK_SIZE, Math.ceil(currentChunkSize * MAX_FACTOR));
-                } else if (duration > TARGET_WRITE_TIME_MS) {
-                    // Too slow? Pump the brakes
-                    currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(currentChunkSize * 0.8));
+                // --- TUNED S-CURVE LOGIC ---
+                if (ratio < 0.5) {
+                    var factor = (currentChunkSize < 1000) ? 2.0 : 1.2;
+                    currentChunkSize = Math.ceil(currentChunkSize * factor);
+                } 
+                else if (ratio < 0.8) { 
+                    var factor = 1.05;
+                    currentChunkSize = Math.ceil(currentChunkSize * factor);
+                } 
+                else if (ratio > 1.2) { 
+                    currentChunkSize = Math.floor(currentChunkSize * 0.6);
+                } 
+                else if (ratio > 1.0) {
+                    currentChunkSize = Math.floor(currentChunkSize * 0.8);
                 }
-                // Else: In the sweet spot, maintain speed.
+                currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(currentChunkSize, MAX_CHUNK_SIZE));
 
                 logInfo(`[Write] Batch: ${batch.length} rows | Time: ${duration}ms | Chunk: ${oldChunk} -> ${currentChunkSize}`);
                 
@@ -220,7 +220,19 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
                 };
             }
         }
+
+        // --- CHECK: Why did the loop stop? ---
+        // If data left, it must be time.
+        if (i < dataArray.length) {
+            return { 
+                success: false, 
+                bailout_reason: "PREDICTIVE_BAILOUT",
+                state: { ...state, nextBatchIndex: i, config: { ...state.config, currentChunkSize } }
+            };
+        }
+
         return { success: true, rowsProcessed: i, state: { ...state, nextBatchIndex: 0 } };
+
     } catch (e) {
         return { success: false, error: e.message };
     }
@@ -235,3 +247,18 @@ function guardedSheetTransaction(fn, timeoutMs) {
 }
 
 function withSheetLock(fn, timeoutMs) { return guardedSheetTransaction(fn, timeoutMs).state; }
+
+var Utility = (function () {
+  function median(values, opts) {
+    opts = opts || {};
+    var ignoreNonPositive = opts.ignoreNonPositive !== false;
+    if (!values || !values.length) return '';
+    var nums = values.map(function (v) { return (typeof v === 'number' ? v : Number(v)); })
+      .filter(function (v) { return Number.isFinite(v) && (!ignoreNonPositive || v > 0); })
+      .sort(function (a, b) { return a - b; });
+    if (!nums.length) return '';
+    var mid = Math.floor(nums.length / 2);
+    return (nums.length % 2) ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
+  }
+  return { median: median };
+})();
