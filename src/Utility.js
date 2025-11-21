@@ -53,11 +53,13 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
- * Zero-Downtime "Value Swap" - PURE DATA ONLY.
- * Removed Trimming logic to prevent timeouts.
+ * Zero-Downtime "Value Swap" with MICRO-CHUNKS.
+ * FIX: Removes inner flush() to prevent timeouts.
  */
 function atomicSwapAndFlush(ss, targetName, tempName) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
+  const swStart = new Date().getTime();
+  
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const docLock = LockService.getDocumentLock();
 
@@ -66,6 +68,8 @@ function atomicSwapAndFlush(ss, targetName, tempName) {
   }
 
   try {
+    log.info(`[Swap] Lock Acquired. Time: ${new Date().getTime() - swStart}ms`);
+    
     const targetSheet = ss.getSheetByName(targetName);
     const tempSheet = ss.getSheetByName(tempName);
 
@@ -73,68 +77,48 @@ function atomicSwapAndFlush(ss, targetName, tempName) {
 
     if (!targetSheet) {
       tempSheet.setName(targetName);
-      log.info(`Target '${targetName}' missing. Renamed temp.`);
+      log.info(`Target '${targetName}' missing. Renamed temp. Done.`);
     } else {
+      // 1. READ
+      const tRead = new Date().getTime();
       const tempRange = tempSheet.getDataRange();
       const newValues = tempRange.getValues();
       const newRows = newValues.length;
       const newCols = newValues[0].length;
+      log.info(`[Swap] Data Read (${newRows}x${newCols}). Time: ${new Date().getTime() - tRead}ms`);
       
       
-      // 2. OVERWRITE (Chunked for safety)
+      // 3. OVERWRITE (Micro-Chunked 100, NO FLUSH)
       if (newRows > 0) {
-          const SWAP_CHUNK_SIZE = 2000; // Increased back to 2000 since we removed the heavy Trim
+          // *** FIX: 100 rows per batch. No Inner Flush. ***
+          const SWAP_CHUNK_SIZE = 1500; 
+          const tWriteStart = new Date().getTime();
+          
           for (let i = 0; i < newRows; i += SWAP_CHUNK_SIZE) {
               const chunk = newValues.slice(i, Math.min(i + SWAP_CHUNK_SIZE, newRows));
+              
               if (chunk.length > 0) {
                   targetSheet.getRange(1 + i, 1, chunk.length, newCols).setValues(chunk);
-                  // No inner flush needed
+                  // Removed SpreadsheetApp.flush() to stop hammering the API
               }
           }
+          log.info(`[Swap] Write Queued. Total Time: ${new Date().getTime() - tWriteStart}ms`);
       }
 
-      // 3. DELETE TEMP (Done)
+      
       ss.deleteSheet(tempSheet);
-      log.info(`Swapped '${targetName}': ${newRows} rows (No Trim).`);
+      
+      const totalTime = new Date().getTime() - swStart;
+      log.info(`[Swap] SUCCESS. Total Duration: ${totalTime}ms`);
     }
 
-  //  SpreadsheetApp.flush(); SetValues() should be enough. If not.. the Calling Function can Use it.
     return { success: true, errorMessage: null };
   } catch (e) {
-    log.error(`Swap Failed: ${e.message}`);
+    log.error(`[Swap] CRASH: ${e.message}`);
     return { success: false, errorMessage: e.message };
   } finally {
     docLock.releaseLock();
   }
-}
-
-/**
- * [THE JANITOR] - Separate function to trim empty rows/cols.
- * Call this from Maintenance jobs, NOT critical path.
- */
-function trimSheetDimensions(ss, sheetName) {
-    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Janitor') : console);
-    if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sheet = ss.getSheetByName(sheetName);
-    if (!sheet) return;
-
-    const maxRows = sheet.getMaxRows();
-    const maxCols = sheet.getMaxColumns();
-    const lastRow = sheet.getLastRow();
-    const lastCol = sheet.getLastColumn();
-
-    try {
-        if (maxRows > lastRow) {
-            sheet.deleteRows(lastRow + 1, maxRows - lastRow);
-            log.info(`Trimmed ${maxRows - lastRow} rows from ${sheetName}`);
-        }
-        if (maxCols > lastCol) {
-            sheet.deleteColumns(lastCol + 1, maxCols - lastCol);
-            log.info(`Trimmed ${maxCols - lastCol} cols from ${sheetName}`);
-        }
-    } catch (e) {
-        log.warn(`Trim failed for ${sheetName}: ${e.message}`);
-    }
 }
 
 // --- SHARED CACHE SHARDING ---
