@@ -19,7 +19,9 @@ const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
 
 // --- TIME GATING CONSTANTS ---
 const HOURLY_RUN_INTERVAL_MS = 60 * 60 * 1000; 
+const JOURNAL_RUN_INTERVAL_MS = 10 * 60 * 1000; 
 const PROP_KEY_LAST_RUN_TS = 'MAINTENANCE_LAST_RUN_TS_'; 
+const PROP_KEY_HISTORY_DONE = 'HISTORY_PULL_COMPLETED_DATE';
 
 if (typeof GLOBAL_STATE_KEY === 'undefined') {
   var GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
@@ -222,7 +224,6 @@ function masterOrchestrator() {
 
   // --- PRIORITY 3: MAINTENANCE ---
   console.log(`Orchestrator: Market Data Idle. Attempting Maintenance.`);
-  // ** FIX: Switched back to the standard runMaintenanceJobs **
   executeWithTryLock(runMaintenanceJobs, 'runMaintenanceJobs');
 }
 
@@ -236,8 +237,7 @@ function runMaintenanceJobs() {
   const JOB_QUEUE = [
     'cacheAllCorporateAssetsTrigger', 
     'runLootAndJournalSync',          
-    'runContractSync',                
-    'runIndustrySync'                 
+    'runContractSync'
   ];
   
   // Don't run heavy maintenance if Market Data is in critical phase
@@ -291,6 +291,65 @@ function forceReleaseStuckScriptLock() {
 }
 
 /**
+ * TURBO MAINTENANCE WORKER
+ * UPDATED: Increased Soft Limit to 4.5 minutes.
+ */
+function runHourlyJobQueue() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
+  const START_TIME = new Date().getTime();
+  
+  // --- TUNED LIMIT: 4.5 Minutes ---
+  const SOFT_LIMIT_MS = 270000; 
+
+  const JOB_QUEUE = [
+    'cacheAllCorporateAssetsTrigger', 
+    'runContractSync',                
+    'runIndustrySync'                 
+  ];
+
+  let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
+  if (currentIndex >= JOB_QUEUE.length) currentIndex = 0;
+
+  let jobsChecked = 0;
+  while (jobsChecked < JOB_QUEUE.length && (new Date().getTime() - START_TIME) < SOFT_LIMIT_MS) {
+      
+      const jobName = JOB_QUEUE[currentIndex];
+      const lastRunKey = PROP_KEY_LAST_RUN_TS + jobName;
+      const lastRun = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
+      const NOW_MS = new Date().getTime();
+      
+      // RESCUE LOGIC: Check for stuck Asset Cache
+      let forceRun = false;
+      if (jobName === 'cacheAllCorporateAssetsTrigger') {
+          const assetResumeIndex = SCRIPT_PROP.getProperty('AssetCache_NextRow');
+          if (assetResumeIndex && parseInt(assetResumeIndex) > 0) {
+              console.warn(`[Maintenance] RESCUING stuck Asset Cache job at index ${assetResumeIndex}.`);
+              forceRun = true;
+          }
+      }
+
+      if (forceRun || (NOW_MS - lastRun) > HOURLY_RUN_INTERVAL_MS) {
+          console.log(`[Maintenance] Running: ${jobName}`);
+          
+          try {
+             const fn = this[jobName];
+             if (typeof fn === 'function') fn();
+             SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+          } catch(e) {
+             console.error(`Job ${jobName} Failed: ${e.message}`);
+          }
+      } else {
+          console.log(`[Maintenance] Skipping ${jobName}: Cooldown active.`);
+      }
+      
+      currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
+      jobsChecked++;
+  }
+  SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, currentIndex.toString());
+}
+
+/**
  * Market Data Worker (Nitro Edition - TUNED)
  */
 function _updateMarketDataSheetWorker() {
@@ -302,8 +361,9 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
   
   // --- NITRO CONFIGURATION ---
+  // UPDATED: Increased Soft Limit to 4.5 Minutes (270000)
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 500, 210000, 10000]; 
+    = [8000, 500, 270000, 10000]; 
 
   const tempSheetName = 'Market_Data_Temp';
   const COLUMN_COUNT = 9;
@@ -420,12 +480,17 @@ function _updateMarketDataSheetWorker() {
       SCRIPT_PROP.deleteProperty(PROP_KEY_WRITE_INDEX);
       scheduleOneTimeTrigger('finalizeMarketDataUpdate', RESCHEDULE_DELAY_MS);
     }
+    // *** FIXED LOGIC: Catch Bailouts and Timeouts ***
     else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" || 
-             writeResult.error.includes("ServiceTimeoutFailure") || 
-             writeResult.error.includes("Service timed out") ||
-             writeResult.error.includes("Exceeded maximum execution time")) {
+             (writeResult.error && (
+               writeResult.error.includes("ServiceTimeoutFailure") || 
+               writeResult.error.includes("Service timed out") ||
+               writeResult.error.includes("Exceeded maximum execution time")
+             ))) {
       
-      console.warn(`Write phase hit limit/timeout. Rescheduling. Error: ${writeResult.error}`);
+      // Clean Log Message
+      const reason = writeResult.error ? writeResult.error : "Soft Time Limit Reached (Predictive)";
+      console.warn(`Write phase interrupted. Reason: ${reason}. Rescheduling.`);
       
       const nextIndex = writeResult.state.nextBatchIndex.toString();
       const nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(writeResult.state.config.currentChunkSize / 2)).toString();
@@ -502,13 +567,6 @@ function runContractSync() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   try { runContractLedgerPhase(ss); } 
   catch (e) { log.error('Contract Sync failed', e); }
-}
-
-function runIndustrySync() {
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  try { runIndustryLedgerPhase(ss); } 
-  catch (e) { log.error('Industry Ledger Phase failed', e); }
 }
 
 function setupStaggeredTriggers() {
