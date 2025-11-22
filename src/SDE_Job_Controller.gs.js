@@ -15,9 +15,6 @@
 
 // --- Safely define global constants with 'var' ---
 // NOTE: Google Apps Script requires 'var' for true global scope across files
-if (typeof SCRIPT_PROPS === 'undefined') {
-  var SCRIPT_PROPS = PropertiesService.getScriptProperties();
-}
 if (typeof KEY_JOB_RUNNING === 'undefined') {
   var KEY_JOB_RUNNING = 'SDE_JOB_RUNNING';
 }

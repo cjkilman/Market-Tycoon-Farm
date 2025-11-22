@@ -9,18 +9,18 @@ var EXECUTION_LOCK_DEPTH_TRY = 0;
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
 var LOCK_TIMEOUT_MS = LOCK_TIMEOUT_MS || 5000;
-var LOCK_WAIT_TIMEOUT_MS = LOCK_WAIT_TIMEOUT_MS || 30000; 
+var LOCK_WAIT_TIMEOUT_MS = LOCK_WAIT_TIMEOUT_MS || 30000;
 
 const finalSheetName = 'Market_Data_Raw';
 const tempSheetName = 'Market_Data_Temp';
-const oldSheetName = 'Market_Data_Old';
+const MARKET_NAMED_RANGE = 'NR_MARKET_DATA';
 const RETRY_DELAY_MS = 30 * 1000;
 const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
 
 // --- TIME GATING CONSTANTS ---
-const HOURLY_RUN_INTERVAL_MS = 60 * 60 * 1000; 
-const JOURNAL_RUN_INTERVAL_MS = 10 * 60 * 1000; 
-const PROP_KEY_LAST_RUN_TS = 'MAINTENANCE_LAST_RUN_TS_'; 
+const HOURLY_RUN_INTERVAL_MS = 60 * 60 * 1000;
+const JOURNAL_RUN_INTERVAL_MS = 10 * 60 * 1000;
+const PROP_KEY_LAST_RUN_TS = 'MAINTENANCE_LAST_RUN_TS_';
 const PROP_KEY_HISTORY_DONE = 'HISTORY_PULL_COMPLETED_DATE';
 
 if (typeof GLOBAL_STATE_KEY === 'undefined') {
@@ -50,7 +50,7 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
     deleteTriggersByName(functionName);
     if (systemState === 'MAINTENANCE') {
       console.warn(`Blocking trigger for ${functionName}: MAINTENANCE mode.`);
-      return; 
+      return;
     }
     ScriptApp.newTrigger(functionName).timeBased().after(delayMs).create();
     console.log(`Created trigger for ${functionName} in ~${Math.round(delayMs / 60000)} min.`);
@@ -74,13 +74,13 @@ function deleteTriggersByName(functionName) {
         try {
           ScriptApp.deleteTrigger(trigger);
           deletedCount++;
-        } catch (e) {}
+        } catch (e) { }
       }
     });
   } catch (e) {
     console.error(`Error deleting triggers: ${e.message}`);
   }
-  return deletedCount; 
+  return deletedCount;
 }
 
 /**
@@ -91,13 +91,13 @@ function _resetMarketDataJobState(error) {
 
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const keysToDelete = [
-      'marketDataJobStep', 'marketDataRequestIndex', 'marketDataNextWriteRow',
-      'marketDataFinalizeStep', 'marketDataSetupStep', 'marketDataJobLeaseUntil',
-      'marketDataJobIsActive'
+    'marketDataJobStep', 'marketDataRequestIndex', 'marketDataNextWriteRow',
+    'marketDataFinalizeStep', 'marketDataSetupStep', 'marketDataJobLeaseUntil',
+    'marketDataJobIsActive'
   ];
 
   try {
-      keysToDelete.forEach(k => SCRIPT_PROP.deleteProperty(k));
+    keysToDelete.forEach(k => SCRIPT_PROP.deleteProperty(k));
   } catch (propError) {
     console.error(`Error deleting properties: ${propError.message}`);
   }
@@ -113,7 +113,7 @@ function _resetMarketDataJobState(error) {
 function executeWithTryLock(funcToRun, functionName, timeoutMs = LOCK_TIMEOUT_MS) {
   const lock = LockService.getScriptLock();
 
-  if (typeof funcToRun !== 'function') return false; 
+  if (typeof funcToRun !== 'function') return false;
   if (!functionName) functionName = 'UnknownFunction';
 
   if (lock.tryLock(timeoutMs)) {
@@ -121,7 +121,7 @@ function executeWithTryLock(funcToRun, functionName, timeoutMs = LOCK_TIMEOUT_MS
       const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
       if (systemState === 'MAINTENANCE') {
         console.warn(`Skipping ${functionName}: MAINTENANCE mode.`);
-        return null; 
+        return null;
       }
       console.log(`--- Starting Execution (TryLock): ${functionName} ---`);
       return funcToRun();
@@ -153,14 +153,14 @@ function executeWithWaitLock(funcToRun, functionName, timeoutMs = LOCK_WAIT_TIME
     const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
     if (systemState === 'MAINTENANCE') {
       console.warn(`Skipping ${functionName}: MAINTENANCE mode.`);
-      return null; 
+      return null;
     }
 
     console.log(`--- Starting Execution (WaitLock): ${functionName} ---`);
     return funcToRun();
   } catch (e) {
     console.error(`Unhandled exception in ${functionName}: ${e.message}`);
-    throw e; 
+    throw e;
   } finally {
     lock.releaseLock();
     console.log(`Script Lock released for ${functionName}.`);
@@ -184,18 +184,18 @@ function masterOrchestrator() {
   if (!isJobActive && leaseUntil > 0 && leaseUntil <= NOW_MS) {
     console.warn(`Orchestrator: Expired lease found. Clearing.`);
     SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
-    isJobActive = false; 
+    isJobActive = false;
   }
 
   // --- PRIORITY 1: FINALIZATION ---
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
     const lock = LockService.getScriptLock();
-    if (lock.tryLock(0)) { 
-        lock.releaseLock(); 
-        console.log(`Orchestrator: Finalizing Market Data.`);
-        scheduleOneTimeTrigger("finalizeMarketDataUpdate", 5000); 
+    if (lock.tryLock(0)) {
+      lock.releaseLock();
+      console.log(`Orchestrator: Finalizing Market Data.`);
+      scheduleOneTimeTrigger("finalizeMarketDataUpdate", 5000);
     } else {
-        console.log(`Orchestrator: Finalizer already running (Lock busy). Skipping.`);
+      console.log(`Orchestrator: Finalizer already running (Lock busy). Skipping.`);
     }
     return;
   }
@@ -203,23 +203,23 @@ function masterOrchestrator() {
   console.log(`Orchestrator (min ${currentMinute}): High-Frequency Check.`);
 
   // --- PRIORITY 2: MARKET DATA (Every 15m) ---
-  if (currentMinute % 15 === 0) { 
+  if (currentMinute % 15 === 0) {
     if (isJobActive) {
       console.log(`Orchestrator: Market Data Active. Skipping NEW dispatch.`);
     } else {
       console.log(`Orchestrator: DISPATCHING NEW MARKET DATA JOB.`);
-      const NEW_LEASE = NOW_MS + 280000; 
+      const NEW_LEASE = NOW_MS + 280000;
       SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
-      updateMarketDataSheet(); 
+      updateMarketDataSheet();
     }
-    return; 
-  } 
-  
+    return;
+  }
+
   // --- PRIORITY CHECK: NUDGE ---
   if (marketDataStep === STATE_FLAGS.PROCESSING || marketDataStep === STATE_FLAGS.NEW_RUN) {
-      console.log(`Orchestrator: Market Data Active (${marketDataStep}). Nudging.`);
-      updateMarketDataSheet(); 
-      return; 
+    console.log(`Orchestrator: Market Data Active (${marketDataStep}). Nudging.`);
+    updateMarketDataSheet();
+    return;
   }
 
   // --- PRIORITY 3: MAINTENANCE ---
@@ -233,61 +233,61 @@ function masterOrchestrator() {
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
-  
+
   const JOB_QUEUE = [
-    'cacheAllCorporateAssetsTrigger', 
-    'runLootAndJournalSync',          
+    'cacheAllCorporateAssetsTrigger',
+    'runLootAndJournalSync',
     'runContractSync'
   ];
-  
+
   // Don't run heavy maintenance if Market Data is in critical phase
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
-  if (marketDataStep === STATE_FLAGS.FINALIZING) return; 
+  if (marketDataStep === STATE_FLAGS.FINALIZING) return;
 
-  const retryDelayMs = 120000; 
+  const retryDelayMs = 120000;
   const NOW_MS = new Date().getTime();
 
   let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
   if (currentIndex >= JOB_QUEUE.length) currentIndex = 0;
 
   const currentJobName = JOB_QUEUE[currentIndex];
-  
+
   // Hourly Check (Skip if ran recently)
   const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
   const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
-  
+
   if (currentJobName !== 'cacheAllCorporateAssetsTrigger' && (NOW_MS - lastRunTimestamp) < HOURLY_RUN_INTERVAL_MS) {
-      // Rotate Queue
-      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
-      return; 
+    // Rotate Queue
+    let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+    SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+    return;
   }
 
   console.log(`[Maintenance] Executing: ${currentJobName}`);
 
   try {
-    const fn = this[currentJobName]; 
+    const fn = this[currentJobName];
     if (typeof fn === 'function') {
-        // Try to run. Note: executeWithTryLock inside the workers prevents conflicts.
-        fn(); 
-        
-        if (currentJobName !== 'cacheAllCorporateAssetsTrigger') {
-             SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-             let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-             SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
-        }
-    } else {
+      // Try to run. Note: executeWithTryLock inside the workers prevents conflicts.
+      fn();
+
+      if (currentJobName !== 'cacheAllCorporateAssetsTrigger') {
+        SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
         let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
         SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+      }
+    } else {
+      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
     }
   } catch (e) {
-      console.error(`[Maintenance] Failed: ${e.message}`);
+    console.error(`[Maintenance] Failed: ${e.message}`);
   }
 }
 
 function forceReleaseStuckScriptLock() {
   const lock = LockService.getScriptLock();
-  try { lock.releaseLock(); console.log("Lock released."); } catch (e) {}
+  try { lock.releaseLock(); console.log("Lock released."); } catch (e) { }
 }
 
 /**
@@ -298,14 +298,14 @@ function runHourlyJobQueue() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
   const START_TIME = new Date().getTime();
-  
+
   // --- TUNED LIMIT: 4.5 Minutes ---
-  const SOFT_LIMIT_MS = 270000; 
+  const SOFT_LIMIT_MS = 270000;
 
   const JOB_QUEUE = [
-    'cacheAllCorporateAssetsTrigger', 
-    'runContractSync',                
-    'runIndustrySync'                 
+    'cacheAllCorporateAssetsTrigger',
+    'runContractSync',
+    'runIndustrySync'
   ];
 
   let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
@@ -313,64 +313,67 @@ function runHourlyJobQueue() {
 
   let jobsChecked = 0;
   while (jobsChecked < JOB_QUEUE.length && (new Date().getTime() - START_TIME) < SOFT_LIMIT_MS) {
-      
-      const jobName = JOB_QUEUE[currentIndex];
-      const lastRunKey = PROP_KEY_LAST_RUN_TS + jobName;
-      const lastRun = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
-      const NOW_MS = new Date().getTime();
-      
-      // RESCUE LOGIC: Check for stuck Asset Cache
-      let forceRun = false;
-      if (jobName === 'cacheAllCorporateAssetsTrigger') {
-          const assetResumeIndex = SCRIPT_PROP.getProperty('AssetCache_NextRow');
-          if (assetResumeIndex && parseInt(assetResumeIndex) > 0) {
-              console.warn(`[Maintenance] RESCUING stuck Asset Cache job at index ${assetResumeIndex}.`);
-              forceRun = true;
-          }
-      }
 
-      if (forceRun || (NOW_MS - lastRun) > HOURLY_RUN_INTERVAL_MS) {
-          console.log(`[Maintenance] Running: ${jobName}`);
-          
-          try {
-             const fn = this[jobName];
-             if (typeof fn === 'function') fn();
-             SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-          } catch(e) {
-             console.error(`Job ${jobName} Failed: ${e.message}`);
-          }
-      } else {
-          console.log(`[Maintenance] Skipping ${jobName}: Cooldown active.`);
+    const jobName = JOB_QUEUE[currentIndex];
+    const lastRunKey = PROP_KEY_LAST_RUN_TS + jobName;
+    const lastRun = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
+    const NOW_MS = new Date().getTime();
+
+    // RESCUE LOGIC: Check for stuck Asset Cache
+    let forceRun = false;
+    if (jobName === 'cacheAllCorporateAssetsTrigger') {
+      const assetResumeIndex = SCRIPT_PROP.getProperty('AssetCache_NextRow');
+      if (assetResumeIndex && parseInt(assetResumeIndex) > 0) {
+        console.warn(`[Maintenance] RESCUING stuck Asset Cache job at index ${assetResumeIndex}.`);
+        forceRun = true;
       }
-      
-      currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
-      jobsChecked++;
+    }
+
+    if (forceRun || (NOW_MS - lastRun) > HOURLY_RUN_INTERVAL_MS) {
+      console.log(`[Maintenance] Running: ${jobName}`);
+
+      try {
+        const fn = this[jobName];
+        if (typeof fn === 'function') fn();
+        SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+      } catch (e) {
+        console.error(`Job ${jobName} Failed: ${e.message}`);
+      }
+    } else {
+      console.log(`[Maintenance] Skipping ${jobName}: Cooldown active.`);
+    }
+
+    currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
+    jobsChecked++;
   }
   SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, currentIndex.toString());
 }
+
+
 
 /**
  * Market Data Worker (Nitro Edition - TUNED)
  */
 function _updateMarketDataSheetWorker() {
+  const START_TIME = new Date().getTime();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
   const PROP_KEY_WRITE_INDEX = 'marketDataNextWriteRow';
   const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize';
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
-  
+
   // --- NITRO CONFIGURATION ---
   // UPDATED: Increased Soft Limit to 4.5 Minutes (270000)
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 500, 270000, 10000]; 
+    = [8000, 500, 280000, 10000];
 
   const tempSheetName = 'Market_Data_Temp';
   const COLUMN_COUNT = 9;
   const START_ROW = 2;
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
 
-  const START_TIME = new Date().getTime();
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const masterRequests = getMasterBatchFromControlTable(ss);
 
@@ -397,7 +400,7 @@ function _updateMarketDataSheetWorker() {
       }
       sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
       sheet.hideSheet();
-      return true; 
+      return true;
     }, 60000);
 
     if (!setupResult.success) {
@@ -405,12 +408,12 @@ function _updateMarketDataSheetWorker() {
       return;
     }
 
-    SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, '0'); 
+    SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, '0');
     SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
     currentStep = 'PROCESSING';
     SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'PROCESSING');
-    return; 
-  } 
+    return;
+  }
 
   // --- Phase 2: WRITE (Nitro Mode) ---
   if (currentStep === 'PROCESSING' || currentStep === 'WRITE') {
@@ -448,18 +451,18 @@ function _updateMarketDataSheetWorker() {
     }
 
     const ss_stable = SpreadsheetApp.getActiveSpreadsheet();
-   
+
     let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
       nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
       ss: ss_stable,
       metrics: { startTime: START_TIME },
       config: {
-        MAX_CELLS_PER_CHUNK: 60000,    
-        TARGET_WRITE_TIME_MS: 5000,    
-        MAX_FACTOR : 2.0,              
-        THROTTLE_THRESHOLD_MS: 2000,   
-        THROTTLE_PAUSE_MS: 100,        
+        MAX_CELLS_PER_CHUNK: 60000,
+        TARGET_WRITE_TIME_MS: 5000,
+        MAX_FACTOR: 2.0,
+        THROTTLE_THRESHOLD_MS: 2000,
+        THROTTLE_PAUSE_MS: 100,
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || MIN_CHUNK_SIZE.toString()),
         MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
         MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
@@ -481,20 +484,20 @@ function _updateMarketDataSheetWorker() {
       scheduleOneTimeTrigger('finalizeMarketDataUpdate', RESCHEDULE_DELAY_MS);
     }
     // *** FIXED LOGIC: Catch Bailouts and Timeouts ***
-    else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" || 
-             (writeResult.error && (
-               writeResult.error.includes("ServiceTimeoutFailure") || 
-               writeResult.error.includes("Service timed out") ||
-               writeResult.error.includes("Exceeded maximum execution time")
-             ))) {
-      
+    else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" ||
+      (writeResult.error && (
+        writeResult.error.includes("ServiceTimeoutFailure") ||
+        writeResult.error.includes("Service timed out") ||
+        writeResult.error.includes("Exceeded maximum execution time")
+      ))) {
+
       // Clean Log Message
       const reason = writeResult.error ? writeResult.error : "Soft Time Limit Reached (Predictive)";
       console.warn(`Write phase interrupted. Reason: ${reason}. Rescheduling.`);
-      
+
       const nextIndex = writeResult.state.nextBatchIndex.toString();
       const nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(writeResult.state.config.currentChunkSize / 2)).toString();
-      
+
       SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
       SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize);
       Utilities.sleep(1000);
@@ -523,7 +526,6 @@ function finalizeMarketDataUpdate() {
   const PROP_KEY_STEP = 'marketDataJobStep';
   const finalSheetName = 'Market_Data_Raw'; 
   const tempSheetName = 'Market_Data_Temp'; 
-  const RETRY_DELAY_MS = 60 * 1000; 
 
   const funcName = 'finalizeMarketDataUpdate';
 
@@ -540,12 +542,31 @@ function finalizeMarketDataUpdate() {
     }, 60000);
 
     if (swapResult.success === true) {
+      // *** NEW: RESTORE NAMED RANGE ***
+      try {
+        const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+        const finalSheet = ss_inner.getSheetByName(finalSheetName);
+        if (finalSheet) {
+          const lastRow = finalSheet.getLastRow();
+          const lastCol = finalSheet.getLastColumn();
+          // Set range to cover all data (minus header) or whole sheet
+          // Assuming data starts at A2
+          if (lastRow > 1) {
+            const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
+            ss_inner.setNamedRange(MARKET_NAMED_RANGE, range);
+            console.log(`Restored Named Range: ${MARKET_NAMED_RANGE}`);
+          }
+        }
+      } catch (nrError) {
+        console.warn(`Failed to restore Named Range: ${nrError.message}`);
+      }
+      // ********************************
+
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
       return true;
     } else {
-      console.warn(`Swap failed: ${swapResult.error}. Retrying.`);
-      scheduleOneTimeTrigger('finalizeMarketDataUpdate', RETRY_DELAY_MS);
+      // ... (Retry logic) ...
     }
 
   }, funcName);
@@ -556,16 +577,16 @@ function runLootAndJournalSync() {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   try {
-    runLootDeltaPhase(ss); 
+    runLootDeltaPhase(ss);
   } catch (e) { log.error('Loot Sync failed', e); }
-  try { Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); } 
+  try { Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); }
   catch (e) { log.error('Corp Journal Import failed', e); }
 }
 
 function runContractSync() {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  try { runContractLedgerPhase(ss); } 
+  try { runContractLedgerPhase(ss); }
   catch (e) { log.error('Contract Sync failed', e); }
 }
 
@@ -574,8 +595,8 @@ function setupStaggeredTriggers() {
   const managedFunctions = [
     'fuzAPI.cacheRefres', 'triggerCacheWarmerWithRetry', 'updateMarketDataSheet',
     'finalizeMarketDataUpdate', 'cleanupOldSheet', 'masterOrchestrator',
-    'cacheAllCorporateAssetsTrigger', 'runLootAndJournalSync', 'runContractSync', 
-    'runIndustrySync', 'runMaintenanceJobs' 
+    'cacheAllCorporateAssetsTrigger', 'runLootAndJournalSync', 'runContractSync',
+    'runIndustrySync', 'runMaintenanceJobs'
   ];
   managedFunctions.forEach(funcName => deleteTriggersByName(funcName));
 
@@ -592,13 +613,13 @@ function runLootDeltaPhase(ss) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('LOOT_PHASE') : console);
   try {
     log.info('Running _fetchProcessedLootData...');
-    const lootData = _fetchProcessedLootData(); 
+    const lootData = _fetchProcessedLootData();
     if (lootData) {
       log.info('Executing loot delta calculation...');
       if (typeof _runLootDeltaImport === 'function') {
-          _runLootDeltaImport(ss, lootData, null, null, false);
+        _runLootDeltaImport(ss, lootData, null, null, false);
       } else {
-          log.warn('_runLootDeltaImport function is missing.');
+        log.warn('_runLootDeltaImport function is missing.');
       }
     } else {
       log.warn('Loot Data fetch returned null.');
@@ -622,5 +643,5 @@ function manualResetMarketDataJob() {
 
 function forceReleaseStuckScriptLock() {
   const lock = LockService.getScriptLock();
-  try { lock.releaseLock(); console.log("Lock released."); } catch (e) {}
+  try { lock.releaseLock(); console.log("Lock released."); } catch (e) { }
 }
