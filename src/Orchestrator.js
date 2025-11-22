@@ -366,7 +366,7 @@ function _updateMarketDataSheetWorker() {
   // --- NITRO CONFIGURATION ---
   // UPDATED: Increased Soft Limit to 4.5 Minutes (270000)
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 500, 280000, 10000];
+    = [8000, 500, 270000, 10000];
 
   const tempSheetName = 'Market_Data_Temp';
   const COLUMN_COUNT = 9;
