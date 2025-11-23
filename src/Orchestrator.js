@@ -529,44 +529,80 @@ function finalizeMarketDataUpdate() {
 
   const funcName = 'finalizeMarketDataUpdate';
 
-  const result = executeWithTryLock(() => {
+  executeWithTryLock(() => { // <--- Removed 'result =' as we handle it inside
 
     if (SCRIPT_PROP.getProperty(PROP_KEY_STEP) !== STATE_FLAGS.FINALIZING) {
       _resetMarketDataJobState(new Error(`Wrong state.`));
       return;
     }
 
-    const swapResult = guardedSheetTransaction(() => {
+    // 1. DEFINE REPAIR MAP (Critical for Self-Healing)
+    // Assuming your market data typically covers specific columns. 
+    // Use an open-ended range starting at Row 2 (headers are likely Row 1).
+    const repairMap = {
+        [MARKET_NAMED_RANGE]: 'A2:G' // <--- Adjust 'G' to your actual last column
+    };
+
+    // 2. RUN TRANSACTION
+    const transactionResult = guardedSheetTransaction(() => {
       const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
-      return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName);
+      // PASS THE MAP HERE
+      return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
     }, 60000);
 
-    if (swapResult.success === true) {
-      // *** NEW: RESTORE NAMED RANGE ***
+    // 3. UNWRAP RESULT (Fixing the Silent Failure Bug)
+    let swapSuccess = false;
+    let swapError = null;
+
+    if (transactionResult.success) {
+        // Wrapper succeeded, check the inner function result
+        swapSuccess = transactionResult.state.success;
+        swapError = transactionResult.state.errorMessage;
+    } else {
+        // Wrapper failed (Timeout/Exception)
+        swapSuccess = false;
+        swapError = transactionResult.error;
+    }
+
+    // 4. CHECK LOGIC
+    if (swapSuccess) {
+      
+      // *** POST-SWAP RESIZE (Your code was good here) ***
       try {
         const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
         const finalSheet = ss_inner.getSheetByName(finalSheetName);
         if (finalSheet) {
           const lastRow = finalSheet.getLastRow();
           const lastCol = finalSheet.getLastColumn();
-          // Set range to cover all data (minus header) or whole sheet
-          // Assuming data starts at A2
+          
           if (lastRow > 1) {
+            // Re-define range to hug the new data exactly
             const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
             ss_inner.setNamedRange(MARKET_NAMED_RANGE, range);
-            console.log(`Restored Named Range: ${MARKET_NAMED_RANGE}`);
+            console.log(`[Finalizer] Resized Named Range: ${MARKET_NAMED_RANGE}`);
           }
         }
       } catch (nrError) {
-        console.warn(`Failed to restore Named Range: ${nrError.message}`);
+        console.warn(`[Finalizer] Range Resize Warning: ${nrError.message}`);
       }
-      // ********************************
+      // **************************************************
 
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
-      return true;
+
     } else {
-      // ... (Retry logic) ...
+      // 5. FAILURE HANDLING
+      console.warn(`[Finalizer] Swap Failed: ${swapError}`);
+      
+      // If sheet missing, fatal error
+      if (swapError && swapError.includes("not found")) {
+           _resetMarketDataJobState(new Error("Fatal: Temp sheet missing."));
+           return;
+      }
+
+      // Otherwise retry
+      // Ensure you have a trigger handler for this specific job if you want retries
+      // scheduleOneTimeTrigger('finalizeMarketDataTrigger', 120000); 
     }
 
   }, funcName);

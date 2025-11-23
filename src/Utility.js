@@ -53,13 +53,17 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
- * Zero-Downtime "True Sheet Swap".
- * 1. Deletes the Old Sheet (Instant).
- * 2. Renames the Temp Sheet to Live (Instant).
- * * WARNING: This breaks standard formulas like '=Sheet!A1'. 
- * * You MUST use Named Ranges or INDIRECT() in your dashboard.
+ * Performs a Safe Atomic Swap.
+ * 1. Locks the script.
+ * 2. Pauses Calculations.
+ * 3. Rewires Named Ranges (Healing broken ones if a map is provided).
+ * 4. Deletes Old -> Renames New.
+ * * @param {Spreadsheet} ss - The spreadsheet object.
+ * @param {string} targetName - The name of the LIVE sheet (e.g. 'CorpWarehouseStock').
+ * @param {string} tempName - The name of the TEMP sheet (e.g. 'CorpWarehouseStock_TEMP').
+ * @param {Object} repairMap - (Optional) Key/Value map for fixing broken ranges. {'RangeName': 'A:A'}
  */
-function atomicSwapAndFlush(ss, targetName, tempName) {
+function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
   const swStart = new Date().getTime();
 
@@ -67,99 +71,111 @@ function atomicSwapAndFlush(ss, targetName, tempName) {
   const docLock = LockService.getDocumentLock();
 
   if (!docLock.tryLock(30000)) {
-    return { success: false, errorMessage: "Could not acquire Document Lock for Swap." };
+    return { success: false, errorMessage: "Could not acquire Document Lock." };
   }
 
-  try {
-    log.info(`[Swap] Lock Acquired. Time: ${new Date().getTime() - swStart}ms`);
+  // Initialize strictly to null so 'finally' doesn't crash if we fail early
+  let originalCalcMode = null;
 
+  try {
     const targetSheet = ss.getSheetByName(targetName);
     const tempSheet = ss.getSheetByName(tempName);
 
     if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
 
-    // 1. DELETE OLD (The "Drop" Phase)
-    if (targetSheet) {
-      // Safety: Don't delete if it's the only sheet (rare edge case)
-      if (ss.getNumSheets() === 1) {
-        ss.insertSheet(); // Create a dummy so we can delete the target
-      }
-      try {
-        ss.deleteSheet(targetSheet);
-        log.info(`[Swap] Deleted old '${targetName}'.`);
-      } catch (delError) {
-        log.error(`[Swap] Failed to delete target: ${delError.message}`);
-        return { success: false, errorMessage: delError.message };
-      }
+// --- PHASE 1: PAUSE ENGINE (Strict Mode) ---
+    // If we cannot silence the engine, we MUST NOT attempt the surgery.
+    if (SpreadsheetApp.CalculationMode) {
+        originalCalcMode = ss.getCalculationMode();
+        ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
+        log.info("[Swap] Engine silenced (MANUAL mode).");
+    } else {
+        // STOP HERE. Do not continue.
+        throw new Error("[Swap] ABORT: Cannot access CalculationMode Enum. Retrying execution.");
     }
 
-    // 2. RENAME NEW (The "Swap" Phase)
+    // --- PHASE 2: REWIRE & HEAL NAMED RANGES ---
+    if (targetSheet) {
+      const namedRanges = ss.getNamedRanges();
+      const targetID = targetSheet.getSheetId();
+      let rewiredCount = 0;
+      let stitchedCount = 0;
+
+      namedRanges.forEach(nr => {
+        const name = nr.getName();
+        try {
+          const range = nr.getRange(); 
+          if (range.getSheet().getSheetId() === targetID) {
+            nr.setRange(tempSheet.getRange(range.getA1Notation()));
+            rewiredCount++;
+          }
+        } catch (e) {
+          // Fix #REF! ranges using the Repair Map
+          if (repairMap && repairMap[name]) {
+            try {
+              const fixRange = tempSheet.getRange(repairMap[name]);
+              nr.setRange(fixRange);
+              stitchedCount++;
+              log.info(`[Stitch] Healed '${name}' -> '${tempName}!${repairMap[name]}'`);
+            } catch (stitchError) {
+               log.warn(`[Stitch Fail] Could not heal '${name}': ${stitchError.message}`);
+            }
+          }
+        }
+      });
+      
+      if (rewiredCount > 0 || stitchedCount > 0) {
+        log.info(`[Swap] Rewired: ${rewiredCount} | Stitched: ${stitchedCount}`);
+        SpreadsheetApp.flush();
+      }
+
+      // --- PHASE 3: DELETE OLD ---
+      if (ss.getNumSheets() === 1) ss.insertSheet();
+      ss.deleteSheet(targetSheet);
+    }
+
+    // --- PHASE 4: RENAME NEW ---
     tempSheet.setName(targetName);
-    log.info(`[Swap] Renamed temp to '${targetName}'.`);
-
-    const totalTime = new Date().getTime() - swStart;
-    log.info(`[Swap] SUCCESS. Total Duration: ${totalTime}ms`);
-
+    
+    log.info(`[Swap] SUCCESS. Duration: ${new Date().getTime() - swStart}ms`);
     return { success: true, errorMessage: null };
+
   } catch (e) {
     log.error(`[Swap] CRASH: ${e.message}`);
     return { success: false, errorMessage: e.message };
+
   } finally {
+    // Restore Calc Mode (Only if we successfully paused it)
+    if (originalCalcMode && SpreadsheetApp.CalculationMode) {
+        try {
+            ss.setCalculationMode(originalCalcMode);
+        } catch (ignored) {
+            console.warn("Failed to restore calculation mode.");
+        }
+    }
     docLock.releaseLock();
   }
 }
 
-// --- SHARED CACHE SHARDING ---
-function _chunkAndPut(key, largeString, ttl = 21600) {
-  const cache = CacheService.getScriptCache();
-  if (!largeString || largeString.length === 0) return false;
-  const chunks = [];
-  const numChunks = Math.ceil(largeString.length / MAX_CACHE_CHUNK_SIZE);
-  for (let i = 0; i < numChunks; i++) {
-    const start = i * MAX_CACHE_CHUNK_SIZE;
-    const end = start + MAX_CACHE_CHUNK_SIZE;
-    chunks.push(largeString.substring(start, end));
-  }
-  const keysToWrite = {};
-  for (let i = 0; i < chunks.length; i++) {
-    keysToWrite[key + ':' + i] = chunks[i];
-  }
-  keysToWrite[key + CHUNK_INDEX_SUFFIX] = String(numChunks);
-  try {
-    cache.putAll(keysToWrite, ttl);
-    return true;
-  } catch (e) {
-    console.error(`Cache Write Failed: ${e.message}`);
-    return false;
-  }
-}
+function forceManualMode_Emergency() {
+  // 1. Open the specific sheet by ID (from your logs)
+  const id = '12qPMhsLkbuvs4QtJD_YR4dVKHpTYtCdybrbprh9DoCs';
+  console.log("Connecting to spreadsheet...");
+  const ss = SpreadsheetApp.openById(id);
 
-function _getAndDechunk(key) {
-  const cache = CacheService.getScriptCache();
-  const numChunksRaw = cache.get(key + CHUNK_INDEX_SUFFIX);
-  if (!numChunksRaw) return null;
-  const numChunks = parseInt(numChunksRaw, 10);
-  const keysToGet = [];
-  for (let i = 0; i < numChunks; i++) keysToGet.push(key + ':' + i);
-  const chunks = cache.getAll(keysToGet);
-  const result = [];
-  for (let i = 0; i < numChunks; i++) {
-    const chunk = chunks[key + ':' + i];
-    if (chunk == null) return null;
-    result.push(chunk);
+  // 2. DEBUG: Check if the Enum actually exists in this context
+  console.log("Enum Check: " + typeof SpreadsheetApp.CalculationMode);
+  
+  if (!SpreadsheetApp.CalculationMode) {
+      throw new Error("CRITICAL: SpreadsheetApp.CalculationMode is undefined. The V8 runtime might be glitching.");
   }
-  return result.join('');
-}
 
-function _deleteShardedData(key) {
-  const cache = CacheService.getScriptCache();
-  const numChunksRaw = cache.get(key + CHUNK_INDEX_SUFFIX);
-  if (numChunksRaw) {
-    const num = parseInt(numChunksRaw, 10);
-    const keys = [key + CHUNK_INDEX_SUFFIX];
-    for (let i = 0; i < num; i++) keys.push(key + ':' + i);
-    cache.removeAll(keys);
-  }
+  // 3. FORCE MANUAL MODE
+  // This might take 30-60s if the sheet is lagging, but it should eventually push through.
+  ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
+  
+  console.log("SUCCESS: Calculation Mode forced to MANUAL.");
+  console.log("You may now retry the Finalizer job.");
 }
 
 // --- SMART WRITER ---
