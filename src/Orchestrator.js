@@ -8,8 +8,8 @@ runLootLedgerDelta, Ledger_Import_CorpJournal, syncContracts, runIndustryLedgerP
 var EXECUTION_LOCK_DEPTH_TRY = 0;
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
-var LOCK_TIMEOUT_MS = LOCK_TIMEOUT_MS || 5000;
-var LOCK_WAIT_TIMEOUT_MS = LOCK_WAIT_TIMEOUT_MS || 30000;
+var LOCK_TIMEOUT_MS = 5000;
+var LOCK_WAIT_TIMEOUT_MS = 30000;
 
 const finalSheetName = 'Market_Data_Raw';
 const tempSheetName = 'Market_Data_Temp';
@@ -256,7 +256,9 @@ function runMaintenanceJobs() {
   const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
   const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
 
-  if (currentJobName !== 'cacheAllCorporateAssetsTrigger' && (NOW_MS - lastRunTimestamp) < HOURLY_RUN_INTERVAL_MS) {
+  // *** FIXED: Removed Exclusion for Asset Cache ***
+  // Now applies 1-hour check to ALL jobs, including Asset Cache
+  if ((NOW_MS - lastRunTimestamp) < HOURLY_RUN_INTERVAL_MS) {
     // Rotate Queue
     let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
     SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
@@ -271,11 +273,13 @@ function runMaintenanceJobs() {
       // Try to run. Note: executeWithTryLock inside the workers prevents conflicts.
       fn();
 
-      if (currentJobName !== 'cacheAllCorporateAssetsTrigger') {
-        SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-        let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-        SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
-      }
+      // *** FIXED: Removed Exclusion for Asset Cache ***
+      // Now saves timestamp for ALL jobs
+      SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+      
+      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+      
     } else {
       let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
       SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
