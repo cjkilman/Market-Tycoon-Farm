@@ -489,7 +489,7 @@ function _updateMarketDataSheetWorker() {
         MAX_CELLS_PER_CHUNK: 50000,
         TARGET_WRITE_TIME_MS: 1000,
         MAX_FACTOR: 1.8,
-        THROTTLE_THRESHOLD_MS: 2000,
+        THROTTLE_THRESHOLD_MS: 180,
         THROTTLE_PAUSE_MS: 1000,
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || MIN_CHUNK_SIZE.toString()),
         MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
