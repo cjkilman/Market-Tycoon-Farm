@@ -376,7 +376,7 @@ function runHourlyJobQueue() {
 function _updateMarketDataSheetWorker() {
   const START_TIME = new Date().getTime();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  
+
   const PROP_KEY_STEP = 'marketDataJobStep';
   const PROP_KEY_WRITE_INDEX = 'marketDataNextWriteRow';
   const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize';
@@ -399,9 +399,9 @@ function _updateMarketDataSheetWorker() {
   const COLUMN_COUNT = 9;
   const START_ROW = 2;
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
-var ss = [];
-   ss = SpreadsheetApp.getActiveSpreadsheet();
-  const masterRequests = getMasterBatchFromControlTable(ss);
+  var ss_anchor = []; //Anchor the main reference Headers.apply. Then refresh and pass Shallow copies
+  ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+  const masterRequests = getMasterBatchFromControlTable(ss_anchor);
 
   let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
 
@@ -415,8 +415,8 @@ var ss = [];
     }
 
     const setupResult = guardedSheetTransaction(() => {
-      ss = SpreadsheetApp.getActiveSpreadsheet();
-      const ss_inner = {...ss};
+      ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+      const ss_inner = { ...ss_anchor };
       let sheet = ss_inner.getSheetByName(tempSheetName);
 
       if (sheet) {
@@ -439,16 +439,16 @@ var ss = [];
     SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
     currentStep = 'PROCESSING';
     SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'PROCESSING');
-    
+
     // [OPTIMIZATION] Instant Dispatch - Start writing immediately
-    scheduleOneTimeTrigger('updateMarketDataSheet', 1000); 
+    scheduleOneTimeTrigger('updateMarketDataSheet', 1000);
     return;
   }
 
   // --- Phase 2: WRITE (Nitro Mode) ---
   if (currentStep === 'PROCESSING' || currentStep === 'WRITE') {
 
-    const masterRequests_stable = getMasterBatchFromControlTable(ss);
+    const masterRequests_stable = getMasterBatchFromControlTable(ss_anchor);
     let allRowsToWrite = [];
 
     try {
@@ -479,8 +479,8 @@ var ss = [];
       scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2);
       return;
     }
-ss=SpreadsheetApp.getActiveSpreadsheet();
-    const ss_stable = {...ss};
+    ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+    const ss_stable = { ...ss_anchor };
 
     let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
@@ -489,10 +489,10 @@ ss=SpreadsheetApp.getActiveSpreadsheet();
       metrics: { startTime: START_TIME },
       config: {
         MAX_CELLS_PER_CHUNK: 50000,
-        TARGET_WRITE_TIME_MS: 5000,
-        MAX_FACTOR: 2.0,
+        TARGET_WRITE_TIME_MS: 1000,
+        MAX_FACTOR: 1.8,
         THROTTLE_THRESHOLD_MS: 2000,
-        THROTTLE_PAUSE_MS: 100,
+        THROTTLE_PAUSE_MS: 1000,
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || MIN_CHUNK_SIZE.toString()),
         MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
         MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
@@ -526,11 +526,11 @@ ss=SpreadsheetApp.getActiveSpreadsheet();
       console.warn(`Write phase interrupted. Reason: ${reason}. Rescheduling.`);
 
       const nextIndex = writeResult.state.nextBatchIndex.toString();
-      
+
       // Halve the chunk size on error to prevent death spiral
       let nextChunkSize = writeResult.state.config.currentChunkSize;
       if (writeResult.error) {
-          nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(nextChunkSize / 2));
+        nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(nextChunkSize / 2));
       }
 
       SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
