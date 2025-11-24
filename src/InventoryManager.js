@@ -387,6 +387,8 @@ function cacheAllCorporateAssetsWorker() {
     }
 }
 
+// ... (Existing code) ...
+
 function finalizeAssetCacheJob() {
     const funcName = 'finalizeAssetCacheJob';
     executeWithTryLock(() => {
@@ -400,66 +402,50 @@ function finalizeAssetCacheJob() {
 
         log.info('[Finalizer] Performing ATOMIC SWAP.');
 
-        // 1. DEFINE REPAIR MAP (The "Cure" for #REF ranges)
-        // If the range is broken or deleted, this tells the swap where it belongs.
-        // We use A3 notation (Open ended or specific columns) to match your logic.
+        // 1. DEFINE REPAIR MAP
         const repairMap = {
-             // Dynamic Key : Value
-             [CACHE_NAMED_RANGE]: `A3:E` // <--- UPDATE THIS to match your actual columns (e.g., A to E)
+             [CACHE_NAMED_RANGE]: `A3:H` // Ensuring it covers all columns
         };
 
         // 2. EXECUTE GUARDED SWAP
         const transactionResult = guardedSheetTransaction(() => {
-            const ss_inner = SpreadsheetApp.getActiveSpreadsheet(); // <--- CRITICAL: Fresh Instance
-            
-            // Pass the repairMap as the 4th argument!
+            const ss_inner = SpreadsheetApp.getActiveSpreadsheet(); 
             return atomicSwapAndFlush(ss_inner, CACHE_SHEET_NAME, TEMP_SHEET_NAME, repairMap);
-            
-        }, 60000); // 60s Timeout
+        }, 60000);
 
-        // 3. UNWRAP RESULTS
-        // guardedSheetTransaction returns { success: boolean, state: any, error: string }
-        // atomicSwapAndFlush returns { success: boolean, errorMessage: string }
+        // ... (Existing result handling logic) ...
+        
         let swapResult;
-
         if (!transactionResult.success) {
-            // The Transaction Wrapper failed (Timeout or hard crash)
             swapResult = { success: false, errorMessage: transactionResult.error };
         } else {
-            // The Transaction ran, now we check the Swap Logic result
             swapResult = transactionResult.state;
         }
 
         // 4. HANDLE FAILURE
         if (!swapResult.success) {
-            // CASE A: Missing Sheet (Fatal - Do not retry)
             if (swapResult.errorMessage && swapResult.errorMessage.includes("not found")) {
                 log.error(`[Finalizer] CRITICAL: Temp sheet missing. Clearing state to reset.`);
+                // Clean up even on fatal error
                 _deleteShardedData(ASSET_CACHE_DATA_KEY);
                 SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
                 SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
                 SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
+                deleteTriggersByName('cacheAllCorporateAssetsTrigger'); // [FIX]
                 return;
             }
-
-            // CASE B: Timeout/Lock (Retry)
             log.warn(`[Finalizer] Swap Failed: ${swapResult.errorMessage}. Retrying in 120s.`);
             scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 120000);
             return;
         }
 
-        // 5. POST-SWAP RESIZE (Optional but Recommended)
-        // The Atomic Swap preserves the *Previous* dimensions. 
-        // If you want the Named Range to hug the new data perfectly (e.g. Row 5000 -> 6000), 
-        // this block is still useful to "Trim" the range.
+        // 5. POST-SWAP RESIZE
         try {
             const ss_fresh = SpreadsheetApp.getActiveSpreadsheet();
             const finalSheet = ss_fresh.getSheetByName(CACHE_SHEET_NAME);
             if (finalSheet) {
                 const lastRow = finalSheet.getLastRow();
-                // Ensure we don't have negative height if sheet is empty
                 const rangeHeight = Math.max(1, lastRow - 2); 
-                
                 ss_fresh.setNamedRange(
                     CACHE_NAMED_RANGE,
                     finalSheet.getRange(3, 1, rangeHeight, NUM_ASSET_COLS)
@@ -475,6 +461,11 @@ function finalizeAssetCacheJob() {
         SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
         SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
         SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
+
+        // --- [CRITICAL FIX] KILL ZOMBIE TRIGGERS ---
+        // This prevents pending retry triggers from starting a NEW_RUN immediately after we finish.
+        deleteTriggersByName('cacheAllCorporateAssetsTrigger'); 
+        // -------------------------------------------
 
         log.info(`[Finalizer] Job Complete. Swap successful.`);
 

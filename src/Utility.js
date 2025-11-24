@@ -82,19 +82,19 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
 
     if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
 
-    // --- PHASE 1: PAUSE ENGINE (GLITCH PROOF) ---
-    // If the Enum is missing, we assume the user set it manually in UI and PROCEED.
-    if (SpreadsheetApp.CalculationMode) {
-        try {
-            originalCalcMode = ss.getCalculationMode();
+    // --- [CRITICAL FIX] PHASE 1: FORCE PAUSE ENGINE ---
+    // We removed the "if (SpreadsheetApp.CalculationMode)" check because it was 
+    // causing false negatives. Now we just TRY to set it.
+    try {
+        originalCalcMode = ss.getCalculationMode();
+        if (originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
             ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
             log.info("[Swap] Engine silenced (MANUAL mode).");
-        } catch (e) {
-            log.warn(`[Swap] Failed to set MANUAL mode: ${e.message}. Proceeding.`);
         }
-    } else {
-        log.warn("[Swap] Environment Glitch (Missing Enum). Skipping auto-optimization. Proceeding...");
+    } catch (e) {
+        log.warn(`[Swap] Failed to set MANUAL mode: ${e.message}. Proceeding at risk.`);
     }
+    // --------------------------------------------------
 
     // --- PHASE 2: REWIRE & HEAL NAMED RANGES ---
     if (targetSheet) {
@@ -147,7 +147,7 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
 
   } finally {
     // --- PHASE 5: CLEANUP ---
-    if (originalCalcMode && SpreadsheetApp.CalculationMode) {
+    if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
         try {
             ss.setCalculationMode(originalCalcMode);
         } catch (ignored) { }

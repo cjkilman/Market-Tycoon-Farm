@@ -173,6 +173,11 @@ function executeWithWaitLock(funcToRun, functionName, timeoutMs = LOCK_WAIT_TIME
 function masterOrchestrator() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
+
+  // [CHANGE 1] Get the stored timestamp of the last successful dispatch
+  const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS';
+  const lastMarketRun = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_MARKET_LAST_RUN) || '0', 10);
+
   const currentMinute = new Date().getMinutes();
   const NOW_MS = new Date().getTime();
 
@@ -202,14 +207,24 @@ function masterOrchestrator() {
 
   console.log(`Orchestrator (min ${currentMinute}): High-Frequency Check.`);
 
-  // --- PRIORITY 2: MARKET DATA (Every 15m) ---
-  if (currentMinute % 15 === 0) {
+  // --- [CHANGE 2] PRIORITY 2: MARKET DATA (Robust 30m Cycle) ---
+  // Logic: If job is inactive AND it has been > 28 minutes since last run
+  const timeSinceLastRun = NOW_MS - lastMarketRun;
+  const RUN_INTERVAL_MS = 28 * 60 * 1000; // 28 mins (buffer for 30m cycle)
+
+  if (timeSinceLastRun > RUN_INTERVAL_MS) {
     if (isJobActive) {
       console.log(`Orchestrator: Market Data Active. Skipping NEW dispatch.`);
     } else {
-      console.log(`Orchestrator: DISPATCHING NEW MARKET DATA JOB.`);
-      const NEW_LEASE = NOW_MS + 280000;
+      console.log(`Orchestrator: DISPATCHING NEW MARKET DATA JOB (30m Cycle).`);
+
+      // 1. Set Lease
+      const NEW_LEASE = NOW_MS + 300000;
       SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
+
+      // 2. Update Last Run Timestamp (CRITICAL)
+      SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, NOW_MS.toString());
+
       updateMarketDataSheet();
     }
     return;
@@ -276,10 +291,10 @@ function runMaintenanceJobs() {
       // *** FIXED: Removed Exclusion for Asset Cache ***
       // Now saves timestamp for ALL jobs
       SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-      
+
       let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
       SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
-      
+
     } else {
       let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
       SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
@@ -361,24 +376,31 @@ function runHourlyJobQueue() {
 function _updateMarketDataSheetWorker() {
   const START_TIME = new Date().getTime();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  
   const PROP_KEY_STEP = 'marketDataJobStep';
   const PROP_KEY_WRITE_INDEX = 'marketDataNextWriteRow';
   const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize';
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
-  const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
+  const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS'; // [ADDED]
 
   // --- NITRO CONFIGURATION ---
-  // UPDATED: Increased Soft Limit to 4.5 Minutes (270000)
+  // Tuned to prevent Service Timeouts
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 500, 270000, 10000];
+    = [2000, 500, 240000, 10000];
+
+  // --- [CRITICAL FIX] HEARTBEAT TIMESTAMP ---
+  // Update the timestamp IMMEDIATELY. 
+  // This confirms we hold the lock and are active.
+  // It forces the Orchestrator to back off for another 30 mins.
+  SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
+  // ------------------------------------------
 
   const tempSheetName = 'Market_Data_Temp';
   const COLUMN_COUNT = 9;
   const START_ROW = 2;
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
-
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+var ss = [];
+   ss = SpreadsheetApp.getActiveSpreadsheet();
   const masterRequests = getMasterBatchFromControlTable(ss);
 
   let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
@@ -393,7 +415,8 @@ function _updateMarketDataSheetWorker() {
     }
 
     const setupResult = guardedSheetTransaction(() => {
-      const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+      ss = SpreadsheetApp.getActiveSpreadsheet();
+      const ss_inner = {...ss};
       let sheet = ss_inner.getSheetByName(tempSheetName);
 
       if (sheet) {
@@ -416,6 +439,9 @@ function _updateMarketDataSheetWorker() {
     SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
     currentStep = 'PROCESSING';
     SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'PROCESSING');
+    
+    // [OPTIMIZATION] Instant Dispatch - Start writing immediately
+    scheduleOneTimeTrigger('updateMarketDataSheet', 1000); 
     return;
   }
 
@@ -453,8 +479,8 @@ function _updateMarketDataSheetWorker() {
       scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2);
       return;
     }
-
-    const ss_stable = SpreadsheetApp.getActiveSpreadsheet();
+ss=SpreadsheetApp.getActiveSpreadsheet();
+    const ss_stable = {...ss};
 
     let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
@@ -462,7 +488,7 @@ function _updateMarketDataSheetWorker() {
       ss: ss_stable,
       metrics: { startTime: START_TIME },
       config: {
-        MAX_CELLS_PER_CHUNK: 60000,
+        MAX_CELLS_PER_CHUNK: 50000,
         TARGET_WRITE_TIME_MS: 5000,
         MAX_FACTOR: 2.0,
         THROTTLE_THRESHOLD_MS: 2000,
@@ -500,10 +526,15 @@ function _updateMarketDataSheetWorker() {
       console.warn(`Write phase interrupted. Reason: ${reason}. Rescheduling.`);
 
       const nextIndex = writeResult.state.nextBatchIndex.toString();
-      const nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(writeResult.state.config.currentChunkSize / 2)).toString();
+      
+      // Halve the chunk size on error to prevent death spiral
+      let nextChunkSize = writeResult.state.config.currentChunkSize;
+      if (writeResult.error) {
+          nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(nextChunkSize / 2));
+      }
 
       SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
-      SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize);
+      SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize.toString());
       Utilities.sleep(1000);
       scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
     }
@@ -528,8 +559,8 @@ function manualResetMarketDataJobAndDispatch() {
 function finalizeMarketDataUpdate() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
-  const finalSheetName = 'Market_Data_Raw'; 
-  const tempSheetName = 'Market_Data_Temp'; 
+  const finalSheetName = 'Market_Data_Raw';
+  const tempSheetName = 'Market_Data_Temp';
 
   const funcName = 'finalizeMarketDataUpdate';
 
@@ -544,7 +575,7 @@ function finalizeMarketDataUpdate() {
     // Assuming your market data typically covers specific columns. 
     // Use an open-ended range starting at Row 2 (headers are likely Row 1).
     const repairMap = {
-        [MARKET_NAMED_RANGE]: 'A2:G' // <--- Adjust 'G' to your actual last column
+      [MARKET_NAMED_RANGE]: 'A2:G' // <--- Adjust 'G' to your actual last column
     };
 
     // 2. RUN TRANSACTION
@@ -559,18 +590,18 @@ function finalizeMarketDataUpdate() {
     let swapError = null;
 
     if (transactionResult.success) {
-        // Wrapper succeeded, check the inner function result
-        swapSuccess = transactionResult.state.success;
-        swapError = transactionResult.state.errorMessage;
+      // Wrapper succeeded, check the inner function result
+      swapSuccess = transactionResult.state.success;
+      swapError = transactionResult.state.errorMessage;
     } else {
-        // Wrapper failed (Timeout/Exception)
-        swapSuccess = false;
-        swapError = transactionResult.error;
+      // Wrapper failed (Timeout/Exception)
+      swapSuccess = false;
+      swapError = transactionResult.error;
     }
 
     // 4. CHECK LOGIC
     if (swapSuccess) {
-      
+
       // *** POST-SWAP RESIZE (Your code was good here) ***
       try {
         const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
@@ -578,7 +609,7 @@ function finalizeMarketDataUpdate() {
         if (finalSheet) {
           const lastRow = finalSheet.getLastRow();
           const lastCol = finalSheet.getLastColumn();
-          
+
           if (lastRow > 1) {
             // Re-define range to hug the new data exactly
             const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
@@ -597,11 +628,11 @@ function finalizeMarketDataUpdate() {
     } else {
       // 5. FAILURE HANDLING
       console.warn(`[Finalizer] Swap Failed: ${swapError}`);
-      
+
       // If sheet missing, fatal error
       if (swapError && swapError.includes("not found")) {
-           _resetMarketDataJobState(new Error("Fatal: Temp sheet missing."));
-           return;
+        _resetMarketDataJobState(new Error("Fatal: Temp sheet missing."));
+        return;
       }
 
       // Otherwise retry
