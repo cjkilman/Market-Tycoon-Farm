@@ -383,10 +383,8 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS'; // [ADDED]
 
-  // --- NITRO CONFIGURATION ---
-  // Tuned to prevent Service Timeouts
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [2000, 500, 240000, 10000];
+    = [8000, 1000, 280000, 10000];
 
   // --- [CRITICAL FIX] HEARTBEAT TIMESTAMP ---
   // Update the timestamp IMMEDIATELY. 

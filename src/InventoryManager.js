@@ -38,8 +38,8 @@ const ASSET_CHUNK_SIZE_KEY = 'AssetCache_ChunkSize';
 const ASSET_CACHE_TTL = 21600;
 
 // --- CONFIGURATION ---
-const STARTING_CHUNK_SIZE = 1000; // Start fast
-const NEW_MIN_CHUNK_SIZE = 500;   // Floor
+const STARTING_CHUNK_SIZE = 1500; // Start fast
+const NEW_MIN_CHUNK_SIZE = 1000;   // Floor
 const NEW_MAX_CHUNK_SIZE = 8000;  // Cap
 const NEW_SOFT_LIMIT_MS = 280000; // 4m 35s
 const CRIT_LOCK_WAIT_MS = 60000;
@@ -48,7 +48,7 @@ const CRIT_LOCK_WAIT_MS = 60000;
 const WRITE_CONFIG = {
     MAX_CELLS_PER_CHUNK: 60000,       // 60k cells per batch (Nitro)
     TARGET_WRITE_TIME_MS: 2500,       // 2.5s target
-    MAX_FACTOR: 2.0,
+    MAX_FACTOR: 1.8,
     THROTTLE_THRESHOLD_MS: 2000,
     THROTTLE_PAUSE_MS: 100,
     MAX_CHUNK_SIZE: NEW_MAX_CHUNK_SIZE,
