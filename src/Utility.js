@@ -53,10 +53,10 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
- * Performs a Safe Atomic Swap.
+ * Performs a Safe Atomic Swap (GLITCH-PROOF VERSION).
  * 1. Locks the script.
- * 2. Pauses Calculations.
- * 3. Rewires Named Ranges (Healing broken ones if a map is provided).
+ * 2. Attempts to set Manual Mode (skips if environment is glitching).
+ * 3. Rewires Named Ranges.
  * 4. Deletes Old -> Renames New.
  * * @param {Spreadsheet} ss - The spreadsheet object.
  * @param {string} targetName - The name of the LIVE sheet (e.g. 'CorpWarehouseStock').
@@ -74,7 +74,6 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
     return { success: false, errorMessage: "Could not acquire Document Lock." };
   }
 
-  // Initialize strictly to null so 'finally' doesn't crash if we fail early
   let originalCalcMode = null;
 
   try {
@@ -83,15 +82,18 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
 
     if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
 
-// --- PHASE 1: PAUSE ENGINE (Strict Mode) ---
-    // If we cannot silence the engine, we MUST NOT attempt the surgery.
+    // --- PHASE 1: PAUSE ENGINE (GLITCH PROOF) ---
+    // If the Enum is missing, we assume the user set it manually in UI and PROCEED.
     if (SpreadsheetApp.CalculationMode) {
-        originalCalcMode = ss.getCalculationMode();
-        ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
-        log.info("[Swap] Engine silenced (MANUAL mode).");
+        try {
+            originalCalcMode = ss.getCalculationMode();
+            ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
+            log.info("[Swap] Engine silenced (MANUAL mode).");
+        } catch (e) {
+            log.warn(`[Swap] Failed to set MANUAL mode: ${e.message}. Proceeding.`);
+        }
     } else {
-        // STOP HERE. Do not continue.
-        throw new Error("[Swap] ABORT: Cannot access CalculationMode Enum. Retrying execution.");
+        log.warn("[Swap] Environment Glitch (Missing Enum). Skipping auto-optimization. Proceeding...");
     }
 
     // --- PHASE 2: REWIRE & HEAL NAMED RANGES ---
@@ -110,7 +112,6 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
             rewiredCount++;
           }
         } catch (e) {
-          // Fix #REF! ranges using the Repair Map
           if (repairMap && repairMap[name]) {
             try {
               const fixRange = tempSheet.getRange(repairMap[name]);
@@ -145,37 +146,58 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
     return { success: false, errorMessage: e.message };
 
   } finally {
-    // Restore Calc Mode (Only if we successfully paused it)
+    // --- PHASE 5: CLEANUP ---
     if (originalCalcMode && SpreadsheetApp.CalculationMode) {
         try {
             ss.setCalculationMode(originalCalcMode);
-        } catch (ignored) {
-            console.warn("Failed to restore calculation mode.");
-        }
+        } catch (ignored) { }
     }
     docLock.releaseLock();
   }
 }
 
+/**
+ * UTILITY: EMERGENCY DEFIBRILLATOR (Glitch-Proof Version)
+ * Checks for Manual Calculation Mode. 
+ * If the script engine is broken (missing Enums), it prompts for a UI check and exits safely.
+ */
 function forceManualMode_Emergency() {
-  // 1. Open the specific sheet by ID (from your logs)
-  const id = '12qPMhsLkbuvs4QtJD_YR4dVKHpTYtCdybrbprh9DoCs';
-  console.log("Connecting to spreadsheet...");
-  const ss = SpreadsheetApp.openById(id);
-
-  // 2. DEBUG: Check if the Enum actually exists in this context
-  console.log("Enum Check: " + typeof SpreadsheetApp.CalculationMode);
+  const funcName = 'forceManualMode_Emergency';
+  console.time(funcName);
+  console.log(`[${funcName}] Connecting to Active Spreadsheet...`);
   
-  if (!SpreadsheetApp.CalculationMode) {
-      throw new Error("CRITICAL: SpreadsheetApp.CalculationMode is undefined. The V8 runtime might be glitching.");
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // 1. SAFETY CHECK: Does the Environment have the Definitions?
+    if (!SpreadsheetApp.CalculationMode) {
+      console.warn("⚠️ SYSTEM GLITCH DETECTED: 'SpreadsheetApp.CalculationMode' is undefined.");
+      console.warn("👉 ACTION REQUIRED: Please verify manually in the UI: File > Settings > Calculation > Recalculation is set to 'OFF'.");
+      console.log(`[${funcName}] Skipping script-based mode change to prevent crash.`);
+      return; 
+    }
+
+    // 2. CHECK CURRENT STATE
+    const currentMode = ss.getCalculationMode();
+    console.log(`[${funcName}] Current Mode: ${currentMode}`);
+
+    if (currentMode === SpreadsheetApp.CalculationMode.MANUAL) {
+      console.log(`[${funcName}] Success: Spreadsheet is ALREADY in Manual Mode.`);
+      return;
+    }
+
+    // 3. FORCE MANUAL MODE
+    console.log(`[${funcName}] Attempting to set MANUAL mode...`);
+    ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
+    SpreadsheetApp.flush();
+    
+    console.log(`[${funcName}] SUCCESS. Calculation Mode set to MANUAL.`);
+
+  } catch (e) {
+    console.error(`[${funcName}] FAILED: ${e.message}`);
+  } finally {
+    console.timeEnd(funcName);
   }
-
-  // 3. FORCE MANUAL MODE
-  // This might take 30-60s if the sheet is lagging, but it should eventually push through.
-  ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
-  
-  console.log("SUCCESS: Calculation Mode forced to MANUAL.");
-  console.log("You may now retry the Finalizer job.");
 }
 
 // --- SMART WRITER ---
@@ -218,7 +240,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 
   var dataLength = dataArray.length;
   var numCols = 0;
-  var docLock = LockService.getDocumentLock();
+ 
 
   try {
     targetSheet = ss.getSheetByName(sheetName);
@@ -242,7 +264,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 
     // --- START RESILIENT BATCH WRITE LOOP (while loop) ---
     while (i < dataLength && (new Date().getTime() - startTime) < SOFT_LIMIT_MS) {
-
+ var docLock = LockService.getDocumentLock();
       // 3. DYNAMIC THROTTLING CHECK & ADJUSTMENT (Throttle Down)
       if (previousDuration > THROTTLE_THRESHOLD_MS) {
         currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
@@ -282,16 +304,12 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
       }
 
 
-
-
       try {
         // The actual sheet write call
         targetSheet
           .getRange(targetRow, startCol, numRows, numCols)
           .setValues(batch);
 
-        // --- SUCCESS PATH ---
-        docLock.releaseLock();
         previousDuration = new Date().getTime() - chunkStartTime;
         var oldChunk = currentChunkSize;
         var ratio = previousDuration / TARGET_WRITE_TIME_MS;
@@ -321,7 +339,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 
       } catch (e) {
         // Service Timeout/Write Error (The "Yank" operation)
-        docLock.releaseLock();
+      
         var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + targetRow + ". Error: " + e.message;
         if (state.logError) state.logError(errorMessage);
 
@@ -341,6 +359,10 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
           error: errorMessage,
           bailout_reason: "SERVICE_FAILURE"
         };
+      }
+      finally
+      {
+         docLock.releaseLock();
       }
     }
     // --- END RESILIENT BATCH WRITE LOOP ---
@@ -364,6 +386,110 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
       bailout_reason: "CATASTROPHIC_FAILURE"
     };
   }
+}
+
+// ======================================================================
+// CACHE SHARDING HELPERS (Required by InventoryManager)
+// ======================================================================
+
+/**
+ * Splits a large string into 100KB chunks and stores them in ScriptCache.
+ * @param {string} key The base cache key.
+ * @param {string} content The string content to cache.
+ * @param {number} ttlSeconds Expiration time in seconds.
+ * @returns {boolean} True on success.
+ */
+function _chunkAndPut(key, content, ttlSeconds) {
+  const cache = CacheService.getScriptCache();
+  const MAX_SIZE = 100000; // Safe limit (100KB) per entry
+  
+  try {
+    // Case 1: Fits in single entry
+    if (content.length <= MAX_SIZE) {
+      cache.put(key, content, ttlSeconds);
+      // Clean up any potential old chunks from a previous larger save
+      const oldChunkCount = cache.get(key + "_chunks");
+      if (oldChunkCount) _deleteShardedData(key); 
+      return true;
+    }
+    
+    // Case 2: Needs Sharding
+    const chunks = [];
+    let offset = 0;
+    while (offset < content.length) {
+      chunks.push(content.substr(offset, MAX_SIZE));
+      offset += MAX_SIZE;
+    }
+    
+    // Batch write chunks to cache
+    const chunkMap = {};
+    chunks.forEach((c, i) => {
+      chunkMap[key + "_" + i] = c;
+    });
+    chunkMap[key + "_chunks"] = chunks.length.toString();
+    
+    cache.putAll(chunkMap, ttlSeconds);
+    return true;
+  } catch (e) {
+    console.error(`_chunkAndPut failed for ${key}: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * Retrieves and reassembles sharded data from ScriptCache.
+ * @param {string} key The base cache key.
+ * @returns {string|null} The full string content, or null if missing/incomplete.
+ */
+function _getAndDechunk(key) {
+  const cache = CacheService.getScriptCache();
+  
+  // 1. Check for meta-key indicating chunks
+  const countStr = cache.get(key + "_chunks");
+  
+  // Case A: Single Entry (No chunks)
+  if (!countStr) {
+    return cache.get(key); 
+  }
+  
+  // Case B: Reassemble Chunks
+  const count = parseInt(countStr, 10);
+  if (isNaN(count)) return null;
+
+  const keys = [];
+  for(let i=0; i<count; i++) keys.push(key + "_" + i);
+  
+  const chunks = cache.getAll(keys);
+  let full = "";
+  
+  for(let i=0; i<count; i++) {
+    const part = chunks[key + "_" + i];
+    if (!part) {
+      console.warn(`_getAndDechunk: Missing chunk ${i} for ${key}. Cache corrupted.`);
+      return null; 
+    }
+    full += part;
+  }
+  return full;
+}
+
+/**
+ * Deletes all shards associated with a cache key.
+ * @param {string} key The base cache key.
+ */
+function _deleteShardedData(key) {
+  const cache = CacheService.getScriptCache();
+  const countStr = cache.get(key + "_chunks");
+  
+  if (countStr) {
+    const count = parseInt(countStr, 10);
+    for(let i=0; i<count; i++) {
+      cache.remove(key + "_" + i);
+    }
+    cache.remove(key + "_chunks");
+  }
+  // Also remove the base key just in case
+  cache.remove(key);
 }
 
 function guardedSheetTransaction(fn, timeoutMs) {

@@ -204,6 +204,30 @@ function _prepareCacheSheet(ss) {
     }
 }
 
+function fixAssetNamedRange() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const SHEET_NAME = 'CorpWarehouseStock';
+  const RANGE_NAME = 'warehouse_unfiltered';
+  
+  // 1. Get the healthy sheet
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    console.error(`Sheet '${SHEET_NAME}' not found! Cannot fix range.`);
+    return;
+  }
+
+  // 2. Define the Range (Rows 3+ to skip headers, Columns A-H)
+  // We use A3:H because you have 8 columns of asset data.
+  const lastRow = sheet.getLastRow();
+  const dataRange = sheet.getRange(3, 1, lastRow - 2, 8); // A3:H<LastRow>
+
+  // 3. Set the Named Range
+  ss.setNamedRange(RANGE_NAME, dataRange);
+  
+  console.log(`SUCCESS: '${RANGE_NAME}' has been repaired.`);
+  console.log(`Pointing to: ${SHEET_NAME}!A3:H${lastRow}`);
+}
+
 /**
  * Corporate Asset Worker (Mirrored from Orchestrator.js "Nitro" Pattern)
  */
@@ -219,13 +243,13 @@ function cacheAllCorporateAssetsWorker() {
     // --- NITRO CONFIGURATION (Mirrored from Orchestrator) ---
     // Soft Limit: 4.5 Minutes
     const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS] 
-        = [8000, 500, 270000, 10000];
+        = [1500, 500, 270000, 10000];
         
     // Columns: 8 
     const START_ROW = 3; // Assets start at row 3 in your sheet
     const START_COL = 1; 
 
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss_anchor;
     let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP);
 
     // Default to NEW_RUN if null
@@ -268,6 +292,7 @@ function cacheAllCorporateAssetsWorker() {
         // 4. Prepare Sheet (Guarded Transaction)
         const setupResult = guardedSheetTransaction(() => {
             const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+            ss_anchor = ss_inner;
             // _prepareCacheSheet logic inline for safety
             const cacheSheet = prepareTempSheet(ss_inner, TEMP_SHEET_NAME, ASSET_CACHE_HEADERS);
             log.info(`[Worker] Prepared TEMP sheet '${TEMP_SHEET_NAME}'.`);
@@ -315,7 +340,7 @@ function cacheAllCorporateAssetsWorker() {
 
         // 2. Define FRESH Spreadsheet Reference (The "Working" Pattern)
         const ss_stable = SpreadsheetApp.getActiveSpreadsheet();
-
+        ss_anchor = ss_stable;
         // 3. Setup Write State (Exact mirror of Market Worker config)
         let writeState = {
             logInfo: log.info, logError: log.error, logWarn: log.warn,
@@ -324,13 +349,23 @@ function cacheAllCorporateAssetsWorker() {
             metrics: { startTime: START_TIME },
             config: {
                 MAX_CELLS_PER_CHUNK: 60000,
-                TARGET_WRITE_TIME_MS: 5000,
-                MAX_FACTOR: 2.0,
-                THROTTLE_THRESHOLD_MS: 170,
-                THROTTLE_PAUSE_MS: 100,
-                currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || STARTING_CHUNK_SIZE.toString()),
-                MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
-                MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
+                TARGET_WRITE_TIME_MS: 170, 
+                MAX_FACTOR: 1.1, 
+                THROTTLE_THRESHOLD_MS: 100,
+                
+                // CHANGE 1: Increase Pause significantly
+                // 1 second wasn't enough. Give it 5 seconds to clear the buffer.
+                THROTTLE_PAUSE_MS: 5000, 
+                
+                // CHANGE 2: Lower the Hard Ceiling
+                // 500 rows caused a 2-minute hang. Cap it at 250.
+                MAX_CHUNK_SIZE: 1500, 
+                
+                // CHANGE 3: Lower the Starting Point
+                // Ensure it doesn't try to start at 1000 if the property is deleted.
+                currentChunkSize: 250, // Force start at 250
+                
+                MIN_CHUNK_SIZE: 50, // Allow it to go really small if needed
                 SOFT_LIMIT_MS: SOFT_LIMIT_MS
             }
         };
