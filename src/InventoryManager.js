@@ -224,8 +224,8 @@ function cacheAllCorporateAssetsWorker() {
     // Columns: 8 
     const START_ROW = 3; // Assets start at row 3 in your sheet
     const START_COL = 1; 
-
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = {};
+    
     let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP);
 
     // Default to NEW_RUN if null
@@ -267,7 +267,8 @@ function cacheAllCorporateAssetsWorker() {
 
         // 4. Prepare Sheet (Guarded Transaction)
         const setupResult = guardedSheetTransaction(() => {
-            const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+            ss = SpreadsheetApp.getActiveSpreadsheet();
+            const ss_inner ={...ss};
             // _prepareCacheSheet logic inline for safety
             const cacheSheet = prepareTempSheet(ss_inner, TEMP_SHEET_NAME, ASSET_CACHE_HEADERS);
             log.info(`[Worker] Prepared TEMP sheet '${TEMP_SHEET_NAME}'.`);
@@ -314,7 +315,8 @@ function cacheAllCorporateAssetsWorker() {
         }
 
         // 2. Define FRESH Spreadsheet Reference (The "Working" Pattern)
-        const ss_stable = SpreadsheetApp.getActiveSpreadsheet();
+            ss = SpreadsheetApp.getActiveSpreadsheet();
+            const ss_stable ={...ss};
 
         // 3. Setup Write State (Exact mirror of Market Worker config)
         let writeState = {
