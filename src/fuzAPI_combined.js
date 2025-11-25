@@ -155,11 +155,6 @@ const fuzAPI = (() => {
     return requests;
   }
 
-  /**
-   * Fetches data, prepares positive and negative cache entries.
-   * @param {Array<Object>} tasksToFetch - Array of request objects {type_id, market_id, market_type}
-   * @returns {Object} { newlyFetchedData: Array<Object>, dataToCache: Object }
-   */
   function _executeFetchAll(tasksToFetch) {
     if (!tasksToFetch || tasksToFetch.length === 0) {
       console.log("_executeFetchAll: No tasks to fetch.");
@@ -196,11 +191,11 @@ const fuzAPI = (() => {
       // 2. DO NOT NEGATIVE CACHE
       console.warn(`API Unreachable. Aborting batch without poisoning cache.`);
       
-      // [CORRECTION]: Return empty object literal {}, NOT the undefined variable 'dataToCache'
+      // [CRITICAL FIX] Return empty object {}, NOT the undefined variable
       return { newlyFetchedData: [], dataToCache: {} }; 
     }
 
-    const dataToCache = {}; // Will contain both positive (JSON string) and negative ("null") entries
+    const dataToCache = {}; 
     const processedDataByLocation = {};
     let positiveCacheCount = 0;
     let negativeCacheCount = 0;
@@ -208,7 +203,6 @@ const fuzAPI = (() => {
     responses.forEach((response, index) => {
       const originalRequestContext = fetchRequests[index].fuz_context;
       if (!originalRequestContext) {
-        console.error(`_executeFetchAll: Could not retrieve context for response index ${index}. Skipping.`);
         return; 
       }
       const { locationId, locationType, requestedIds } = originalRequestContext; 
