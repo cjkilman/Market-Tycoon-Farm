@@ -60,16 +60,17 @@ function getOrCreateSheet(ss, name, headers) {
  * 4. If Manual Mode worked -> Deletes Old.
  * 5. If Manual Mode failed -> Renames Old (Prevents Timeout).
  */
+/**
+ * Performs a Safe Atomic Swap (Clean Version).
+ * Tries Manual Mode. If it fails, forces Delete (May timeout, but no Trash).
+ */
 function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
-  const swStart = new Date().getTime();
-
   const docLock = LockService.getDocumentLock();
 
   if (!docLock.tryLock(30000)) return { success: false, errorMessage: "Could not acquire Document Lock." };
 
   let originalCalcMode = null;
-  let manualModeActive = false; // <--- Track if we successfully silenced the engine
 
   try {
     const targetSheet = ss.getSheetByName(targetName);
@@ -77,18 +78,17 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
 
     if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
 
-    // --- PHASE 1: FORCE MANUAL MODE ---
+    // --- PHASE 1: ANESTHESIA (Manual Mode) ---
     try {
-      originalCalcMode = ss.getCalculationMode();
-      if (originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-        ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
-        log.info("[Swap] Engine silenced (MANUAL mode).");
+      if (ss.getCalculationMode) {
+        originalCalcMode = ss.getCalculationMode();
+        if (originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
+          ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
+          log.info("[Swap] Engine silenced (MANUAL mode).");
+        }
       }
-      manualModeActive = true; // Success!
-    } catch (e) {
-      // If this fails, we are in DANGER of a timeout during delete.
-      log.warn(`[Swap] Manual Mode Failed (${e.message}). Engaging Safety Valve.`);
-      manualModeActive = false; 
+    } catch (glitch) {
+      log.warn(`[Swap] V8 Glitch - Manual Mode Failed. Proceeding with Risk of Timeout.`);
     }
 
     // --- PHASE 2: REWIRE ---
@@ -103,24 +103,13 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
             nr.setRange(tempSheet.getRange(nr.getRange().getA1Notation()));
             rewired++;
           }
-        } catch (e) { /* Optional repair logic here */ }
+        } catch (e) { /* Optional repair logic */ }
       });
       if (rewired > 0) SpreadsheetApp.flush();
 
-      // --- PHASE 3: SWAP EXECUTION (Hybrid Strategy) ---
-      if (manualModeActive) {
-          // PLAN A: Clean Delete (Preferred)
-          if (ss.getNumSheets() === 1) ss.insertSheet();
-          ss.deleteSheet(targetSheet);
-      } else {
-          // PLAN B: Safety Rename (Prevents Timeout Crash)
-          // We rename it to TRASH so the job finishes successfully.
-          const timestamp = new Date().getTime();
-          const trashName = `TRASH_${targetName.substring(0,10)}_${timestamp}`;
-          targetSheet.setName(trashName);
-          targetSheet.hideSheet();
-          log.warn(`[Swap] Timeout Protection: Old sheet renamed to '${trashName}' instead of deleting.`);
-      }
+      // --- PHASE 3: EXECUTION (Strict Delete) ---
+      if (ss.getNumSheets() === 1) ss.insertSheet();
+      ss.deleteSheet(targetSheet);
     }
 
     // --- PHASE 4: RENAME NEW ---
@@ -130,6 +119,7 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
   } catch (e) {
     return { success: false, errorMessage: e.message };
   } finally {
+    // --- RESTORE STATE ---
     if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
         try { ss.setCalculationMode(originalCalcMode); } catch (e) {}
     }

@@ -391,7 +391,7 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS'; // [ADDED]
 
 const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 1000, 190000, 10000];
+    = [8000, 1000, 270000, 10000];
 
   // --- [CRITICAL FIX] HEARTBEAT TIMESTAMP ---
   // Update the timestamp IMMEDIATELY. 
@@ -484,36 +484,36 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
     }
     ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
-       let writeState = {
+           let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
       nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
       ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
-        // --- TUNING: "STABLE CRUISER" (Guaranteed Delivery) ---
+        // --- TUNING: "PACED NITRO" (Fast but Polite) ---
         
         MAX_CELLS_PER_CHUNK: 50000, 
-        MAX_CHUNK_SIZE: 500, // Cap at 500 rows to prevent Deep Sheet Timeouts
+        MAX_CHUNK_SIZE: 1000, // Keep at 1000
         
         // 1. DISABLE ACCELERATION
-        MAX_FACTOR: 1.0, 
+        MAX_FACTOR: 1.1, 
 
         // 2. FORCE PAUSES
         THROTTLE_THRESHOLD_MS: -1, 
 
         // 3. THE BREATHER
-        // 2 seconds is usually enough for 500 rows.
+        // Wait 2 seconds after every write.
         THROTTLE_PAUSE_MS: 2000, 
 
-        currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '500'),
-        MIN_CHUNK_SIZE: 250,
+        currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000'),
+        MIN_CHUNK_SIZE: 500,
         TARGET_WRITE_TIME_MS: 1000, 
         SOFT_LIMIT_MS: SOFT_LIMIT_MS
       }
     };
 
     // Enforce safety start
-    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 500;
+    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 1000;
 
     // 4. Execute Write
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
@@ -573,84 +573,66 @@ function manualResetMarketDataJobAndDispatch() {
 function finalizeMarketDataUpdate() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
-  var ss_anchor = {};
+  const finalSheetName = 'Market_Data_Raw'; // <--- RESTORED: Back to Market_Data_Raw
+  const tempSheetName = 'Market_Data_Temp';
+  var ss_inner = {};
   const funcName = 'finalizeMarketDataUpdate';
 
-  executeWithTryLock(() => { // <--- Removed 'result =' as we handle it inside
+  executeWithTryLock(() => { 
 
-    if (SCRIPT_PROP.getProperty(PROP_KEY_STEP) !== STATE_FLAGS.FINALIZING) {
+    if (SCRIPT_PROP.getProperty(PROP_KEY_STEP) !== 'FINALIZING') {
       _resetMarketDataJobState(new Error(`Wrong state.`));
       return;
     }
 
-    // 1. DEFINE REPAIR MAP (Critical for Self-Healing)
-    // Assuming your market data typically covers specific columns. 
-    // Use an open-ended range starting at Row 2 (headers are likely Row 1).
     const repairMap = {
-      [MARKET_NAMED_RANGE]: 'A2:I' // <--- Adjust 'G' to your actual last column
+      ['NR_MARKET_DATA']: 'A2:G' 
     };
 
-    // 2. RUN TRANSACTION
     const transactionResult = guardedSheetTransaction(() => {
-      ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
-
-      // PASS THE MAP HERE
-      return atomicSwapAndFlush(ss_anchor, finalSheetName, tempSheetName, repairMap);
+      ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+      return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
     }, 60000);
 
-    // 3. UNWRAP RESULT (Fixing the Silent Failure Bug)
     let swapSuccess = false;
     let swapError = null;
 
     if (transactionResult.success) {
-      // Wrapper succeeded, check the inner function result
       swapSuccess = transactionResult.state.success;
       swapError = transactionResult.state.errorMessage;
     } else {
-      // Wrapper failed (Timeout/Exception)
       swapSuccess = false;
       swapError = transactionResult.error;
     }
 
-    // 4. CHECK LOGIC
     if (swapSuccess) {
-
-      // *** POST-SWAP RESIZE (Your code was good here) ***
       try {
-        ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
-        const finalSheet = ss_anchor.getSheetByName(finalSheetName);
+        ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+        const finalSheet = ss_inner.getSheetByName(finalSheetName);
         if (finalSheet) {
           const lastRow = finalSheet.getLastRow();
           const lastCol = finalSheet.getLastColumn();
 
           if (lastRow > 1) {
-            // Re-define range to hug the new data exactly
             const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
-            ss_anchor.setNamedRange(MARKET_NAMED_RANGE, range);
-            console.log(`[Finalizer] Resized Named Range: ${MARKET_NAMED_RANGE}`);
+            ss_inner.setNamedRange('NR_MARKET_DATA', range);
+            console.log(`[Finalizer] Resized Named Range: NR_MARKET_DATA`);
           }
         }
       } catch (nrError) {
         console.warn(`[Finalizer] Range Resize Warning: ${nrError.message}`);
       }
-      // **************************************************
 
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
 
     } else {
-      // 5. FAILURE HANDLING
       console.warn(`[Finalizer] Swap Failed: ${swapError}`);
 
-      // If sheet missing, fatal error
       if (swapError && swapError.includes("not found")) {
         _resetMarketDataJobState(new Error("Fatal: Temp sheet missing."));
         return;
       }
-
-      // Otherwise retry
-      // Ensure you have a trigger handler for this specific job if you want retries
-      // scheduleOneTimeTrigger('finalizeMarketDataTrigger', 120000); 
     }
 
   }, funcName);
