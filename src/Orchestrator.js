@@ -391,7 +391,7 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS'; // [ADDED]
 
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 1000, 270000, 10000];
+    = [8000, 1000, 190000, 10000];
 
   // --- [CRITICAL FIX] HEARTBEAT TIMESTAMP ---
   // Update the timestamp IMMEDIATELY. 
@@ -491,21 +491,33 @@ function _updateMarketDataSheetWorker() {
       ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
-        MAX_CELLS_PER_CHUNK: 50000,
-        TARGET_WRITE_TIME_MS: 1000,
-        MAX_FACTOR: 1.5,
-        THROTTLE_THRESHOLD_MS: 150,
-        THROTTLE_PAUSE_MS: 800,
-        currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || MIN_CHUNK_SIZE.toString()),
-        MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
-        MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
+        // --- TUNING: "THE BIG GULP" (Finish Strong) ---
+
+        // 1. FORCE LARGER BATCHES
+        // Writing 100 rows triggers a resize every time. 
+        // Writing 2000 rows triggers ONE resize. This is safer/faster.
+        MAX_CHUNK_SIZE: 2000,
+        MIN_CHUNK_SIZE: 1000, // Don't let it drop below 1000
+
+        // 2. REASONABLE REST
+        THROTTLE_PAUSE_MS: 3000, // 3 seconds
+
+        // 3. SAFETY LIMITS
+        MAX_CELLS_PER_CHUNK: 20000,
+        currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '2000'),
+
+        // Unused but required params
+        MAX_FACTOR: 1.0,
+        TARGET_WRITE_TIME_MS: 2000,
+        THROTTLE_THRESHOLD_MS: 300,
         SOFT_LIMIT_MS: SOFT_LIMIT_MS
       }
     };
 
-    const STRICT_MIN_CHUNK = 500;
-    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = STRICT_MIN_CHUNK;
+    // Force the large start size
+    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 2000;
 
+    // 4. Execute Write
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
 
     if (writeResult.success) {
