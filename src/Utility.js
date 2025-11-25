@@ -53,6 +53,35 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
+ * [NEW] Separate trigger to turn calculation back on.
+ * If this times out, it's fine. The data is already safe.
+ */
+function wakeUpSheet(ss) {
+  console.log("[WakeUp] Restoring Calculation Mode...");
+  try {
+    if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+    ss.setCalculationMode(SpreadsheetApp.CalculationMode.ON_CHANGE);
+    console.log("[WakeUp] Calculation Mode Restored.");
+  } catch (e) {
+    console.error("[WakeUp] Failed: " + e.message);
+  }
+}
+
+function pauseSheet(ss)
+{
+  var needsWakeUp = false;
+    if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+    try {
+      if (ss.getCalculationMode() !== SpreadsheetApp.CalculationMode.MANUAL) {
+        ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
+        console.log("[Finalizer] Set Manual Mode (Pre-Swap).");
+        needsWakeUp = true;
+      }
+    } catch (e) { console.warn("Could not set Manual Mode: " + e.message); }
+    return needsWakeUp;
+}
+
+/**
  * Performs a Safe Atomic Swap (Clean Version).
  * Tries Manual Mode. If it fails, forces Delete (May timeout, but no Trash).
  * 1. Locks the script.
@@ -76,17 +105,7 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
     if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
 
     // --- PHASE 1: ANESTHESIA (Manual Mode) ---
-    try {
-      if (ss.getCalculationMode) {
-        originalCalcMode = ss.getCalculationMode();
-        if (originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-          ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
-          log.info("[Swap] Engine silenced (MANUAL mode).");
-        }
-      }
-    } catch (glitch) {
-      log.warn(`[Swap] V8 Glitch - Manual Mode Failed. Proceeding with Risk of Timeout.`);
-    }
+    // Moved Externally and now used in the callers
 
     // --- PHASE 2: REWIRE ---
     if (targetSheet) {
@@ -116,10 +135,7 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
   } catch (e) {
     return { success: false, errorMessage: e.message };
   } finally {
-    // --- RESTORE STATE ---
-    if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-      try { ss.setCalculationMode(originalCalcMode); } catch (e) { }
-    }
+
     docLock.releaseLock();
   }
 }
@@ -237,18 +253,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     }
 
     // --- 2. ENGAGE ANESTHESIA (Manual Mode) ---
-    var originalCalcMode = null;
-    try {
-      if (ss.getCalculationMode) {
-        originalCalcMode = ss.getCalculationMode();
-        if (originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-          ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
-          if (state.logInfo) state.logInfo("[Writer] Manual Mode engaged.");
-        }
-      }
-    } catch (glitch) {
-      if (state.logWarn) state.logWarn(`[Writer] Manual Mode Glitch: ${glitch.message}. Proceeding in Auto.`);
-    }
+// Moved to external Usage, Callers Now handle this.
 
     try {
       // --- 3. BATCH LOOP ---
@@ -311,10 +316,6 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
       state.config.currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
       return { success: false, rowsProcessed: i, state: state, error: errorMessage, bailout_reason: "SERVICE_FAILURE" };
     } finally {
-      // --- 4. WAKE UP & UNLOCK ---
-      if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-        try { ss.setCalculationMode(originalCalcMode); } catch (e) { }
-      }
       docLock.releaseLock();
     }
 

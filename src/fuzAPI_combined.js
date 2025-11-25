@@ -185,14 +185,19 @@ const fuzAPI = (() => {
       // -------------------------------
     } catch (e) {
       console.error(`_executeFetchAll failed after multiple retries: ${e.message}`);
-      // On total failure, we can still negatively cache all items that were attempted
-      const dataToCache = {};
-      tasksToFetch.forEach(req => {
-        const cacheKey = _fuzKey(req.market_type, req.market_id, req.type_id);
-        dataToCache[cacheKey] = "null"; // Negative cache all on total fetch failure
-      });
-      console.warn(`Marking all ${tasksToFetch.length} requested items as negative cache due to fetchAll failure.`);
-      return { newlyFetchedData: [], dataToCache };
+
+      // --- [FIXED] NETWORK ERROR HANDLING ---
+
+      // 1. Trip the Circuit Breaker
+      if (typeof _tripCircuit === 'function') {
+          _tripCircuit(e.message);
+      }
+
+      // 2. DO NOT NEGATIVE CACHE
+      console.warn(`API Unreachable. Aborting batch without poisoning cache.`);
+      
+      // [CORRECTION]: Return empty object literal {}, NOT the undefined variable 'dataToCache'
+      return { newlyFetchedData: [], dataToCache: {} }; 
     }
 
     const dataToCache = {}; // Will contain both positive (JSON string) and negative ("null") entries
@@ -204,53 +209,49 @@ const fuzAPI = (() => {
       const originalRequestContext = fetchRequests[index].fuz_context;
       if (!originalRequestContext) {
         console.error(`_executeFetchAll: Could not retrieve context for response index ${index}. Skipping.`);
-        return; // Skip processing this response
+        return; 
       }
-      const { locationId, locationType, requestedIds } = originalRequestContext; // requestedIds is a Set
+      const { locationId, locationType, requestedIds } = originalRequestContext; 
 
       if (response.getResponseCode() === 200) {
-        const parsed = JSON.parse(response.getContentText() || "{}"); // Ensure valid JSON
+        const parsed = JSON.parse(response.getContentText() || "{}"); 
         const locationKey = `${locationType}_${locationId}`;
-        // Get type_ids returned by the API, converting keys to numbers
         const receivedIds = new Set(Object.keys(parsed).map(Number));
 
         if (!processedDataByLocation[locationKey]) {
           processedDataByLocation[locationKey] = { market_type: locationType, market_id: locationId, fuzObjects: [] };
         }
 
-        // --- Process Received Data (Positive Cache) ---
+        // --- Positive Cache ---
         receivedIds.forEach(typeIdNum => {
-          const rawItemData = parsed[String(typeIdNum)]; // Access object using string key
-          const dataObject = new FuzDataObject(typeIdNum, rawItemData); // Use Helper class
+          const rawItemData = parsed[String(typeIdNum)]; 
+          const dataObject = new FuzDataObject(typeIdNum, rawItemData); 
           processedDataByLocation[locationKey].fuzObjects.push(dataObject);
 
           const cacheKey = _fuzKey(locationType, locationId, typeIdNum);
-          dataToCache[cacheKey] = JSON.stringify(dataObject); // Store the processed object
+          dataToCache[cacheKey] = JSON.stringify(dataObject); 
           positiveCacheCount++;
         });
 
-        // --- Identify Missing Items (Negative Cache) ---
-        // For each ID we requested...
+        // --- Negative Cache ---
         requestedIds.forEach(requestedIdNum => {
-          // If the API did *not* include it in the response...
           if (!receivedIds.has(requestedIdNum)) {
-            // Store "null" as the cache value
             const cacheKey = _fuzKey(locationType, locationId, requestedIdNum);
-            dataToCache[cacheKey] = "null"; // Mark for negative caching
+            dataToCache[cacheKey] = "null"; 
             negativeCacheCount++;
           }
         });
 
       } else {
-        // --- Handle API Errors (Negative Cache All Requested for this batch) ---
+        // --- API Errors (Negative Cache) ---
         console.error(`API Error: Status ${response.getResponseCode()} for ${locationType}:${locationId}. Marking ${requestedIds.size} items as negative.`);
         requestedIds.forEach(requestedIdNum => {
           const cacheKey = _fuzKey(locationType, locationId, requestedIdNum);
-          dataToCache[cacheKey] = "null"; // Negative cache on API error
+          dataToCache[cacheKey] = "null"; 
           negativeCacheCount++;
         });
       }
-    }); // End responses.forEach
+    }); 
 
     console.log(`Fetch complete. Positive items to cache: ${positiveCacheCount}. Negative items to cache: ${negativeCacheCount}.`);
     return { newlyFetchedData: Object.values(processedDataByLocation), dataToCache };

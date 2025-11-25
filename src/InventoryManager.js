@@ -339,12 +339,18 @@ function cacheAllCorporateAssetsWorker() {
         if (writeState.nextBatchIndex === 0) {
              writeState.config.currentChunkSize = STARTING_CHUNK_SIZE;
         }
-
+    // 1. PAUSE (Anesthesia) - Using ss_inner
+    var needsWakeUp = pauseSheet(ss_anchor); 
         log.info(`[Worker] Writing to '${TEMP_SHEET_NAME}' (Index: ${writeState.nextBatchIndex}, Chunk: ${writeState.config.currentChunkSize}).`);
 
         // 4. Execute Write
         const writeResult = writeDataToSheet(TEMP_SHEET_NAME, allRowsToWrite, START_ROW, START_COL, writeState);
-
+      // 2. SCHEDULE WAKE UP
+      // The trigger will run 'wakeUpSheet' in 30s. It will fetch its own 'ss' instance.
+      if (needsWakeUp) {
+         console.log("[Finalizer] Scheduling 'wakeUpSheet' to restore calculation.");
+         scheduleOneTimeTrigger('wakeUpSheet', 30000); 
+      }
         // 5. Handle Result (The "Working" Logic)
         if (writeResult.success) {
             log.info("Write SUCCESS. Transitioning to FINALIZING.");
@@ -390,6 +396,10 @@ function cacheAllCorporateAssetsWorker() {
 
 function finalizeAssetCacheJob() {
     const funcName = 'finalizeAssetCacheJob';
+    
+    // [1] Initialize ss_anchor immediately so we can pass it to pauseSheet
+    var ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+
     executeWithTryLock(() => {
         const SCRIPT_PROP = PropertiesService.getScriptProperties();
         const status = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
@@ -399,21 +409,21 @@ function finalizeAssetCacheJob() {
             return;
         }
 
+        // [2] PAUSE (Anesthesia) - Using your helper
+        var needsWakeUp = pauseSheet(ss_anchor);
+
         log.info('[Finalizer] Performing ATOMIC SWAP.');
 
-        // 1. DEFINE REPAIR MAP
         const repairMap = {
-             [CACHE_NAMED_RANGE]: `A3:H` // Ensuring it covers all columns
+             [CACHE_NAMED_RANGE]: `A3:H` 
         };
 
-        // 2. EXECUTE GUARDED SWAP
         const transactionResult = guardedSheetTransaction(() => {
-            const ss_inner = SpreadsheetApp.getActiveSpreadsheet(); 
-            return atomicSwapAndFlush(ss_inner, CACHE_SHEET_NAME, TEMP_SHEET_NAME, repairMap);
+            // Refresh reference inside lock for safety
+            ss_anchor = SpreadsheetApp.getActiveSpreadsheet(); 
+            return atomicSwapAndFlush(ss_anchor, CACHE_SHEET_NAME, TEMP_SHEET_NAME, repairMap);
         }, 60000);
 
-        // ... (Existing result handling logic) ...
-        
         let swapResult;
         if (!transactionResult.success) {
             swapResult = { success: false, errorMessage: transactionResult.error };
@@ -423,14 +433,16 @@ function finalizeAssetCacheJob() {
 
         // 4. HANDLE FAILURE
         if (!swapResult.success) {
+            // [3] IMMEDIATE WAKE UP ON FAILURE
+            if (needsWakeUp) wakeUpSheet(ss_anchor);
+
             if (swapResult.errorMessage && swapResult.errorMessage.includes("not found")) {
                 log.error(`[Finalizer] CRITICAL: Temp sheet missing. Clearing state to reset.`);
-                // Clean up even on fatal error
                 _deleteShardedData(ASSET_CACHE_DATA_KEY);
                 SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
                 SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
                 SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
-                deleteTriggersByName('cacheAllCorporateAssetsTrigger'); // [FIX]
+                deleteTriggersByName('cacheAllCorporateAssetsTrigger');
                 return;
             }
             log.warn(`[Finalizer] Swap Failed: ${swapResult.errorMessage}. Retrying in 120s.`);
@@ -440,12 +452,12 @@ function finalizeAssetCacheJob() {
 
         // 5. POST-SWAP RESIZE
         try {
-            const ss_fresh = SpreadsheetApp.getActiveSpreadsheet();
-            const finalSheet = ss_fresh.getSheetByName(CACHE_SHEET_NAME);
+            ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+            const finalSheet = ss_anchor.getSheetByName(CACHE_SHEET_NAME);
             if (finalSheet) {
                 const lastRow = finalSheet.getLastRow();
                 const rangeHeight = Math.max(1, lastRow - 2); 
-                ss_fresh.setNamedRange(
+                ss_anchor.setNamedRange(
                     CACHE_NAMED_RANGE,
                     finalSheet.getRange(3, 1, rangeHeight, NUM_ASSET_COLS)
                 );
@@ -461,12 +473,15 @@ function finalizeAssetCacheJob() {
         SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
         SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
 
-        // --- [CRITICAL FIX] KILL ZOMBIE TRIGGERS ---
-        // This prevents pending retry triggers from starting a NEW_RUN immediately after we finish.
         deleteTriggersByName('cacheAllCorporateAssetsTrigger'); 
-        // -------------------------------------------
 
         log.info(`[Finalizer] Job Complete. Swap successful.`);
+
+        // [4] SCHEDULE WAKE UP (Success Case)
+        if (needsWakeUp) {
+             log.info("[Finalizer] Scheduling 'wakeUpSheet' to restore calculation.");
+             scheduleOneTimeTrigger('wakeUpSheet', 30000);
+        }
 
     }, funcName);
 }

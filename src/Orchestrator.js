@@ -524,11 +524,21 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
       }
     };
 
+    // 1. PAUSE (Anesthesia) - Using ss_inner
+    var needsWakeUp = pauseSheet(ss_anchor); 
+
     // Enforce safety start
     if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 1000;
 
     // 4. Execute Write
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
+
+      // 2. SCHEDULE WAKE UP
+      // The trigger will run 'wakeUpSheet' in 30s. It will fetch its own 'ss' instance.
+      if (needsWakeUp) {
+         console.log("[Finalizer] Scheduling 'wakeUpSheet' to restore calculation.");
+         scheduleOneTimeTrigger('wakeUpSheet', 30000); 
+      }
 
     if (writeResult.success) {
       console.log("Write SUCCESS. Transitioning to FINALIZING.");
@@ -585,9 +595,11 @@ function manualResetMarketDataJobAndDispatch() {
 function finalizeMarketDataUpdate() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
-  const finalSheetName = 'Market_Data_Raw'; // <--- RESTORED: Back to Market_Data_Raw
+  const finalSheetName = 'Market_Data_Raw'; 
   const tempSheetName = 'Market_Data_Temp';
-  var ss_inner = {};
+  
+  // [CORRECTION] Initialize ss_inner immediately so we can use it for Pre-Flight Anesthesia
+  var ss_inner = SpreadsheetApp.getActiveSpreadsheet();
   const funcName = 'finalizeMarketDataUpdate';
 
   executeWithTryLock(() => { 
@@ -597,54 +609,46 @@ function finalizeMarketDataUpdate() {
       return;
     }
 
-    const repairMap = {
-      ['NR_MARKET_DATA']: 'A2:G' 
-    };
+    // 1. PAUSE (Anesthesia) - Using ss_inner
+    var needsWakeUp = pauseSheet(ss_inner); 
+
+    const repairMap = { ['NR_MARKET_DATA']: 'A2:G' };
 
     const transactionResult = guardedSheetTransaction(() => {
-      ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+      // Refresh reference inside lock to be safe, but update the same variable
+      ss_inner = SpreadsheetApp.getActiveSpreadsheet(); 
       return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
     }, 60000);
 
-    let swapSuccess = false;
-    let swapError = null;
-
-    if (transactionResult.success) {
-      swapSuccess = transactionResult.state.success;
-      swapError = transactionResult.state.errorMessage;
-    } else {
-      swapSuccess = false;
-      swapError = transactionResult.error;
-    }
-
+    let swapSuccess = (transactionResult.success && transactionResult.state.success);
+    
     if (swapSuccess) {
       try {
+        // Refresh again for post-processing
         ss_inner = SpreadsheetApp.getActiveSpreadsheet();
         const finalSheet = ss_inner.getSheetByName(finalSheetName);
-        if (finalSheet) {
-          const lastRow = finalSheet.getLastRow();
-          const lastCol = finalSheet.getLastColumn();
-
-          if (lastRow > 1) {
-            const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
-            ss_inner.setNamedRange('NR_MARKET_DATA', range);
-            console.log(`[Finalizer] Resized Named Range: NR_MARKET_DATA`);
-          }
+        if (finalSheet && finalSheet.getLastRow() > 1) {
+          const range = finalSheet.getRange(2, 1, finalSheet.getLastRow() - 1, finalSheet.getLastColumn());
+          ss_inner.setNamedRange('NR_MARKET_DATA', range);
         }
-      } catch (nrError) {
-        console.warn(`[Finalizer] Range Resize Warning: ${nrError.message}`);
-      }
+      } catch (e) {}
 
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
 
-    } else {
-      console.warn(`[Finalizer] Swap Failed: ${swapError}`);
-
-      if (swapError && swapError.includes("not found")) {
-        _resetMarketDataJobState(new Error("Fatal: Temp sheet missing."));
-        return;
+      // 2. SCHEDULE WAKE UP
+      // The trigger will run 'wakeUpSheet' in 30s. It will fetch its own 'ss' instance.
+      if (needsWakeUp) {
+         console.log("[Finalizer] Scheduling 'wakeUpSheet' to restore calculation.");
+         scheduleOneTimeTrigger('wakeUpSheet', 30000); 
       }
+
+    } else {
+      console.warn(`[Finalizer] Swap Failed: ${transactionResult.error || transactionResult.state.errorMessage}`);
+      
+      // 3. IMMEDIATE WAKE UP (Failure Case)
+      // Pass the existing ss_inner reference to restore mode immediately
+      if (needsWakeUp) wakeUpSheet(ss_inner);
     }
 
   }, funcName);
