@@ -390,7 +390,7 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS'; // [ADDED]
 
-  const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
+const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
     = [8000, 1000, 190000, 10000];
 
   // --- [CRITICAL FIX] HEARTBEAT TIMESTAMP ---
@@ -485,37 +485,36 @@ function _updateMarketDataSheetWorker() {
     }
     ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
-    let writeState = {
+       let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
       nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
       ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
-        // --- TUNING: "THE BIG GULP" (Finish Strong) ---
+        // --- TUNING: "STABLE CRUISER" (Guaranteed Delivery) ---
+        
+        MAX_CELLS_PER_CHUNK: 50000, 
+        MAX_CHUNK_SIZE: 500, // Cap at 500 rows to prevent Deep Sheet Timeouts
+        
+        // 1. DISABLE ACCELERATION
+        MAX_FACTOR: 1.0, 
 
-        // 1. FORCE LARGER BATCHES
-        // Writing 100 rows triggers a resize every time. 
-        // Writing 2000 rows triggers ONE resize. This is safer/faster.
-        MAX_CHUNK_SIZE: 2000,
-        MIN_CHUNK_SIZE: 1000, // Don't let it drop below 1000
+        // 2. FORCE PAUSES
+        THROTTLE_THRESHOLD_MS: -1, 
 
-        // 2. REASONABLE REST
-        THROTTLE_PAUSE_MS: 3000, // 3 seconds
+        // 3. THE BREATHER
+        // 2 seconds is usually enough for 500 rows.
+        THROTTLE_PAUSE_MS: 2000, 
 
-        // 3. SAFETY LIMITS
-        MAX_CELLS_PER_CHUNK: 20000,
-        currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '2000'),
-
-        // Unused but required params
-        MAX_FACTOR: 1.0,
-        TARGET_WRITE_TIME_MS: 2000,
-        THROTTLE_THRESHOLD_MS: 300,
+        currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '500'),
+        MIN_CHUNK_SIZE: 250,
+        TARGET_WRITE_TIME_MS: 1000, 
         SOFT_LIMIT_MS: SOFT_LIMIT_MS
       }
     };
 
-    // Force the large start size
-    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 2000;
+    // Enforce safety start
+    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 500;
 
     // 4. Execute Write
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);

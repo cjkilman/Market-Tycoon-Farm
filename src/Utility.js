@@ -181,9 +181,6 @@ function forceManualMode_Emergency() {
   }
 }
 
-// --- SMART WRITER ---
-// --- SMART WRITER (Lock-Once Edition) ---
-// --- SMART WRITER (Self-Contained Anesthesia Edition) ---
 // --- SMART WRITER (Self-Contained Anesthesia Edition) ---
 function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject) {
   // 1. DEFINE STATE AND CONFIG
