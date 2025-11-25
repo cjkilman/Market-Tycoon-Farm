@@ -400,7 +400,6 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
   SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
   // ------------------------------------------
 
-  const tempSheetName = 'Market_Data_Temp';
   const COLUMN_COUNT = 9;
   const START_ROW = 2;
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
@@ -574,8 +573,6 @@ function manualResetMarketDataJobAndDispatch() {
 function finalizeMarketDataUpdate() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
-  const finalSheetName = 'Market_Data_Raw';
-  const tempSheetName = 'Market_Data_Temp';
   var ss_anchor = {};
   const funcName = 'finalizeMarketDataUpdate';
 
