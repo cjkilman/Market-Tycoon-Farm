@@ -377,6 +377,97 @@ function forceResetMarketTimer() {
   console.log("Timer reset. Market Data will run on next heartbeat.");
 }
 
+
+
+function updateMarketDataSheet() {
+  const funcName = 'updateMarketDataSheet';
+  const result = executeWithTryLock(_updateMarketDataSheetWorker, funcName);
+  if (result === null) console.warn(`${funcName} skipped (Lock).`);
+  return result; // <--- ADD THIS LINE
+}
+
+function manualResetMarketDataJobAndDispatch() {
+  _resetMarketDataJobState(new Error("Manual reset"));
+  scheduleOneTimeTrigger('updateMarketDataSheet', 5000);
+  console.log("RESET & DISPATCHED.");
+}
+
+
+
+// --- WORKER FUNCTIONS ---
+function runLootAndJournalSync() {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  try {
+    runLootDeltaPhase(ss);
+  } catch (e) { log.error('Loot Sync failed', e); }
+  try { Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); }
+  catch (e) { log.error('Corp Journal Import failed', e); }
+}
+
+function runContractSync() {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  try { runContractLedgerPhase(ss); }
+  catch (e) { log.error('Contract Sync failed', e); }
+}
+
+function setupStaggeredTriggers() {
+  console.log("Setting up 5-MIN TRIGGER...");
+  const managedFunctions = [
+    'fuzAPI.cacheRefres', 'triggerCacheWarmerWithRetry', 'updateMarketDataSheet',
+    'finalizeMarketDataUpdate', 'cleanupOldSheet', 'masterOrchestrator',
+    'cacheAllCorporateAssetsTrigger', 'runLootAndJournalSync', 'runContractSync',
+    'runIndustrySync', 'runMaintenanceJobs'
+  ];
+  managedFunctions.forEach(funcName => deleteTriggersByName(funcName));
+
+  try {
+    ScriptApp.newTrigger('masterOrchestrator')
+      .timeBased().everyMinutes(5).create();
+    console.log('SUCCESS: Created 5-minute trigger for masterOrchestrator.');
+  } catch (e) {
+    console.error(`Failed to create triggers: ${e.message}.`);
+  }
+}
+
+function runLootDeltaPhase(ss) {
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('LOOT_PHASE') : console);
+  try {
+    log.info('Running _fetchProcessedLootData...');
+    const lootData = _fetchProcessedLootData();
+    if (lootData) {
+      log.info('Executing loot delta calculation...');
+      if (typeof _runLootDeltaImport === 'function') {
+        _runLootDeltaImport(ss, lootData, null, null, false);
+      } else {
+        log.warn('_runLootDeltaImport function is missing.');
+      }
+    } else {
+      log.warn('Loot Data fetch returned null.');
+    }
+  } catch (e) {
+    log.error('Loot Delta Phase Failed', e);
+    throw e;
+  }
+}
+
+function bumpMarketDataJob() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
+  SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
+  scheduleOneTimeTrigger('updateMarketDataSheet', 5000);
+}
+
+function manualResetMarketDataJob() {
+  _resetMarketDataJobState(new Error("Manual reset"));
+}
+
+function forceReleaseStuckScriptLock() {
+  const lock = LockService.getScriptLock();
+  try { lock.releaseLock(); console.log("Lock released."); } catch (e) { }
+}
+
 /**
  * Market Data Worker (Nitro Edition - TUNED)
  */
@@ -390,21 +481,16 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS'; // [ADDED]
 
-const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
+  const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
     = [8000, 1000, 270000, 10000];
 
   // --- [CRITICAL FIX] HEARTBEAT TIMESTAMP ---
-  // Update the timestamp IMMEDIATELY. 
-  // This confirms we hold the lock and are active.
-  // It forces the Orchestrator to back off for another 30 mins.
   SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
-  // ------------------------------------------
 
   const COLUMN_COUNT = 9;
   const START_ROW = 2;
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
-  var ss_anchor = []; //Anchor the main reference Headers.apply. Then refresh 
-  ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+  var ss_anchor = SpreadsheetApp.getActiveSpreadsheet(); 
   const masterRequests = getMasterBatchFromControlTable(ss_anchor);
 
   let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
@@ -484,42 +570,21 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
     }
     ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
-           let writeState = {
+    let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
       nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
       ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
-        // --- TUNING: "SAFE NITRO" (Big Batches, Strict Time Limits) ---
-        
         MAX_CELLS_PER_CHUNK: 50000, 
-        
-        // [KEEPING IT BIG]
         MAX_CHUNK_SIZE: 1000, 
-        
-        // 1. STEADY PACE (Prevent runaway acceleration)
         MAX_FACTOR: 1.0, 
-
-        // 2. FORCE PAUSES (Disabled)
         THROTTLE_THRESHOLD_MS: -1, 
-
-        // 3. THE BREATHER
-        // 5 seconds allows the sheet to "cool down" after swallowing 1000 rows.
         THROTTLE_PAUSE_MS: 5000, 
-
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000'),
-        
-        // Allow dropping only if necessary to survive
         MIN_CHUNK_SIZE: 100,
-        
         TARGET_WRITE_TIME_MS: 1000, 
-
-        // [CRITICAL CHANGE] Lower Soft Limit to 4 Minutes
-        // We stop EARLY to ensure we save our progress.
         SOFT_LIMIT_MS: 240000,
-
-        // [NEW] The Circuit Breaker
-        // If a batch hits this limit, we mark it but keep moving.
         LAG_SPIKE_THRESHOLD_MS: 60000
       }
     };
@@ -533,12 +598,11 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
     // 4. Execute Write
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
 
-      // 2. SCHEDULE WAKE UP
-      // The trigger will run 'wakeUpSheet' in 30s. It will fetch its own 'ss' instance.
-      if (needsWakeUp) {
-         console.log("[Finalizer] Scheduling 'wakeUpSheet' to restore calculation.");
-         scheduleOneTimeTrigger('wakeUpSheet', 30000); 
-      }
+    // 2. SCHEDULE WAKE UP
+    if (needsWakeUp) {
+       console.log("[Finalizer] Scheduling 'wakeUpSheet' to restore calculation.");
+       scheduleOneTimeTrigger('wakeUpSheet', 30000); 
+    }
 
     if (writeResult.success) {
       console.log("Write SUCCESS. Transitioning to FINALIZING.");
@@ -548,7 +612,6 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
       SCRIPT_PROP.deleteProperty(PROP_KEY_WRITE_INDEX);
       scheduleOneTimeTrigger('finalizeMarketDataUpdate', RESCHEDULE_DELAY_MS);
     }
-    // *** FIXED LOGIC: Catch Bailouts and Timeouts ***
     else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" ||
       (writeResult.error && (
         writeResult.error.includes("ServiceTimeoutFailure") ||
@@ -556,13 +619,10 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
         writeResult.error.includes("Exceeded maximum execution time")
       ))) {
 
-      // Clean Log Message
       const reason = writeResult.error ? writeResult.error : "Soft Time Limit Reached (Predictive)";
       console.warn(`Write phase interrupted. Reason: ${reason}. Rescheduling.`);
 
       const nextIndex = writeResult.state.nextBatchIndex.toString();
-
-      // Halve the chunk size on error to prevent death spiral
       let nextChunkSize = writeResult.state.config.currentChunkSize;
       if (writeResult.error) {
         nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(nextChunkSize / 2));
@@ -579,26 +639,12 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
   }
 }
 
-function updateMarketDataSheet() {
-  const funcName = 'updateMarketDataSheet';
-  const result = executeWithTryLock(_updateMarketDataSheetWorker, funcName);
-  if (result === null) console.warn(`${funcName} skipped (Lock).`);
-  return result; // <--- ADD THIS LINE
-}
-
-function manualResetMarketDataJobAndDispatch() {
-  _resetMarketDataJobState(new Error("Manual reset"));
-  scheduleOneTimeTrigger('updateMarketDataSheet', 5000);
-  console.log("RESET & DISPATCHED.");
-}
-
 function finalizeMarketDataUpdate() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
   const finalSheetName = 'Market_Data_Raw'; 
   const tempSheetName = 'Market_Data_Temp';
   
-  // [CORRECTION] Initialize ss_inner immediately so we can use it for Pre-Flight Anesthesia
   var ss_inner = SpreadsheetApp.getActiveSpreadsheet();
   const funcName = 'finalizeMarketDataUpdate';
 
@@ -615,7 +661,6 @@ function finalizeMarketDataUpdate() {
     const repairMap = { ['NR_MARKET_DATA']: 'A2:G' };
 
     const transactionResult = guardedSheetTransaction(() => {
-      // Refresh reference inside lock to be safe, but update the same variable
       ss_inner = SpreadsheetApp.getActiveSpreadsheet(); 
       return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
     }, 60000);
@@ -624,7 +669,6 @@ function finalizeMarketDataUpdate() {
     
     if (swapSuccess) {
       try {
-        // Refresh again for post-processing
         ss_inner = SpreadsheetApp.getActiveSpreadsheet();
         const finalSheet = ss_inner.getSheetByName(finalSheetName);
         if (finalSheet && finalSheet.getLastRow() > 1) {
@@ -637,7 +681,6 @@ function finalizeMarketDataUpdate() {
       console.log("SUCCESS: Finalization complete.");
 
       // 2. SCHEDULE WAKE UP
-      // The trigger will run 'wakeUpSheet' in 30s. It will fetch its own 'ss' instance.
       if (needsWakeUp) {
          console.log("[Finalizer] Scheduling 'wakeUpSheet' to restore calculation.");
          scheduleOneTimeTrigger('wakeUpSheet', 30000); 
@@ -645,85 +688,9 @@ function finalizeMarketDataUpdate() {
 
     } else {
       console.warn(`[Finalizer] Swap Failed: ${transactionResult.error || transactionResult.state.errorMessage}`);
-      
       // 3. IMMEDIATE WAKE UP (Failure Case)
-      // Pass the existing ss_inner reference to restore mode immediately
       if (needsWakeUp) wakeUpSheet(ss_inner);
     }
 
   }, funcName);
-}
-
-// --- WORKER FUNCTIONS ---
-function runLootAndJournalSync() {
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  try {
-    runLootDeltaPhase(ss);
-  } catch (e) { log.error('Loot Sync failed', e); }
-  try { Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 }); }
-  catch (e) { log.error('Corp Journal Import failed', e); }
-}
-
-function runContractSync() {
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MASTER_SYNC') : console);
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  try { runContractLedgerPhase(ss); }
-  catch (e) { log.error('Contract Sync failed', e); }
-}
-
-function setupStaggeredTriggers() {
-  console.log("Setting up 5-MIN TRIGGER...");
-  const managedFunctions = [
-    'fuzAPI.cacheRefres', 'triggerCacheWarmerWithRetry', 'updateMarketDataSheet',
-    'finalizeMarketDataUpdate', 'cleanupOldSheet', 'masterOrchestrator',
-    'cacheAllCorporateAssetsTrigger', 'runLootAndJournalSync', 'runContractSync',
-    'runIndustrySync', 'runMaintenanceJobs'
-  ];
-  managedFunctions.forEach(funcName => deleteTriggersByName(funcName));
-
-  try {
-    ScriptApp.newTrigger('masterOrchestrator')
-      .timeBased().everyMinutes(5).create();
-    console.log('SUCCESS: Created 5-minute trigger for masterOrchestrator.');
-  } catch (e) {
-    console.error(`Failed to create triggers: ${e.message}.`);
-  }
-}
-
-function runLootDeltaPhase(ss) {
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('LOOT_PHASE') : console);
-  try {
-    log.info('Running _fetchProcessedLootData...');
-    const lootData = _fetchProcessedLootData();
-    if (lootData) {
-      log.info('Executing loot delta calculation...');
-      if (typeof _runLootDeltaImport === 'function') {
-        _runLootDeltaImport(ss, lootData, null, null, false);
-      } else {
-        log.warn('_runLootDeltaImport function is missing.');
-      }
-    } else {
-      log.warn('Loot Data fetch returned null.');
-    }
-  } catch (e) {
-    log.error('Loot Delta Phase Failed', e);
-    throw e;
-  }
-}
-
-function bumpMarketDataJob() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
-  SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
-  scheduleOneTimeTrigger('updateMarketDataSheet', 5000);
-}
-
-function manualResetMarketDataJob() {
-  _resetMarketDataJobState(new Error("Manual reset"));
-}
-
-function forceReleaseStuckScriptLock() {
-  const lock = LockService.getScriptLock();
-  try { lock.releaseLock(); console.log("Lock released."); } catch (e) { }
 }

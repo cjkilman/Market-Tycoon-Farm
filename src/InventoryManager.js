@@ -212,33 +212,30 @@ function _prepareCacheSheet(ss) {
  * Mirrors the logic of the Market Data worker for robust, resumable execution.
  */
 function cacheAllCorporateAssetsWorker() {
+    // ... (No changes to this function from previous turn) ...
     const START_TIME = new Date().getTime();
     const SCRIPT_PROP = PropertiesService.getScriptProperties();
     const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('ASSET_WORKER') : console);
     
     // State Keys
-    // Ensure these constants are defined globally or replaced with string literals if not
     const PROP_KEY_STEP = 'AssetCache_JobStatus'; 
     const PROP_KEY_WRITE_INDEX = 'AssetCache_RowIndex';
     const PROP_KEY_CHUNK_SIZE = 'AssetCache_ChunkSize';
     const ASSET_CACHE_DATA_KEY = 'AssetCache_Data_Shard';
     
     // --- NITRO CONFIGURATION ---
-    // Soft Limit: 4.5 Minutes (270s)
     const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS] 
         = [8000, 500, 270000, 10000];
         
-    const START_ROW = 3; // Assets start at row 3
+    const START_ROW = 3; 
     const START_COL = 1; 
-    const TEMP_SHEET_NAME = 'CorpWarehouseStock_Temp'; // Defined temp sheet name
-    // Headers for the asset sheet
+    const TEMP_SHEET_NAME = 'CorpWarehouseStock_Temp'; 
     const ASSET_CACHE_HEADERS = [["is_blueprint_copy", "is_singleton", "item_id", "location_flag", "location_id", "location_type", "quantity", "type_id"]];
 
     var ss_anchor = {};
     
     let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP);
 
-    // Default to NEW_RUN if null
     if (!currentStep) currentStep = 'NEW_RUN';
 
     // ==========================================================================
@@ -247,16 +244,12 @@ function cacheAllCorporateAssetsWorker() {
     if (currentStep === 'NEW_RUN' || currentStep === 'FETCHED') {
         log.info(`[Worker] State: ${currentStep}. Starting Fetch & Prep.`);
 
-        // 1. Auth & Fetch
-        // Assuming getCorpAuthChar is a global helper function
         const authName = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar() : null;
         
         if (!authName) {
             log.warn('[Worker] No authorized character found (getCorpAuthChar). checking GESI main.');
-             // Fallback or abort
         }
         
-        // _fetchAssetsConcurrently needs to be available
         if (typeof _fetchAssetsConcurrently !== 'function') {
              log.error('[Worker] _fetchAssetsConcurrently function missing.');
              return;
@@ -275,18 +268,11 @@ function cacheAllCorporateAssetsWorker() {
             return;
         }
 
-        // 2. Sanitize Data (Remove headers if present in fetch result, filter invalid)
-        // Assuming row index 2 is location_id and 4 is quantity based on your CSV structure?
-        // Adjust indices based on actual API response structure. 
-        // GESI usually returns: [is_singleton, item_id, location_flag, location_id, location_type, quantity, type_id, is_blueprint_copy]
-        // Let's assume standard GESI output order.
-        const rawAssetsData = allAssets.slice(1); // Skip header
+        const rawAssetsData = allAssets.slice(1); 
         const processedAssets = rawAssetsData; 
 
-        // 3. Save to Cache (Persistence)
-        // _chunkAndPut needs to be available (from Utility.js or similar)
         if (typeof _chunkAndPut === 'function') {
-            const saved = _chunkAndPut(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets), 21600); // 6 hours TTL
+            const saved = _chunkAndPut(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets), 21600); 
             if (!saved) {
                 log.error('[Worker] Failed to cache asset data. Aborting.');
                 return;
@@ -296,7 +282,6 @@ function cacheAllCorporateAssetsWorker() {
              return;
         }
 
-        // 4. Prepare Sheet (Guarded Transaction)
         const setupResult = guardedSheetTransaction(() => {
             ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
             let sheet = ss_anchor.getSheetByName(TEMP_SHEET_NAME);
@@ -317,13 +302,12 @@ function cacheAllCorporateAssetsWorker() {
             return;
         }
 
-        // 5. Transition State
         SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, '0');
         SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
         SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'WRITING');
         
         log.info(`[Worker] Fetch Success (${processedAssets.length} rows). Transitioning to WRITING.`);
-        scheduleOneTimeTrigger('cacheAllCorporateAssetsWorker', 1000); // Instant dispatch
+        scheduleOneTimeTrigger('cacheAllCorporateAssetsWorker', 1000); 
         return;
     }
 
@@ -332,7 +316,6 @@ function cacheAllCorporateAssetsWorker() {
     // ==========================================================================
     if (currentStep === 'WRITING') {
         
-        // 1. Load Data from Cache
         let cachedJson = null;
         if (typeof _getAndDechunk === 'function') {
              cachedJson = _getAndDechunk(ASSET_CACHE_DATA_KEY);
@@ -354,10 +337,8 @@ function cacheAllCorporateAssetsWorker() {
             return;
         }
 
-        // 2. Define FRESH Spreadsheet Reference
         ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
-        // 3. Setup Write State
         let writeState = {
             logInfo: log.info, logError: log.error, logWarn: log.warn,
             nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
@@ -368,21 +349,19 @@ function cacheAllCorporateAssetsWorker() {
                 TARGET_WRITE_TIME_MS: 1000,
                 MAX_FACTOR: 1.0,
                 THROTTLE_THRESHOLD_MS: -1,
-                THROTTLE_PAUSE_MS: 5000, // 5s Breather
+                THROTTLE_PAUSE_MS: 5000, 
                 currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000'),
                 MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
                 MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
                 SOFT_LIMIT_MS: SOFT_LIMIT_MS,
-                LAG_SPIKE_THRESHOLD_MS: 60000 // Circuit Breaker
+                LAG_SPIKE_THRESHOLD_MS: 60000 
             }
         };
         
-        // Initial chunk enforcement
         if (writeState.nextBatchIndex === 0) {
              writeState.config.currentChunkSize = 1000;
         }
 
-        // 1. PAUSE (Anesthesia)
         var needsWakeUp = false;
         if (typeof pauseSheet === 'function') {
              needsWakeUp = pauseSheet(ss_anchor);
@@ -390,22 +369,18 @@ function cacheAllCorporateAssetsWorker() {
 
         log.info(`[Worker] Writing to '${TEMP_SHEET_NAME}' (Index: ${writeState.nextBatchIndex}).`);
 
-        // 4. Execute Write
         const writeResult = writeDataToSheet(TEMP_SHEET_NAME, allRowsToWrite, START_ROW, START_COL, writeState);
 
-        // 2. SCHEDULE WAKE UP
         if (needsWakeUp) {
            console.log("[Worker] Scheduling 'wakeUpSheet' to restore calculation.");
            scheduleOneTimeTrigger('wakeUpSheet', 30000); 
         }
 
-        // 5. Handle Result
         if (writeResult.success) {
             log.info("Write SUCCESS. Transitioning to FINALIZING.");
             SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'FINALIZING');
             SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
             SCRIPT_PROP.deleteProperty(PROP_KEY_WRITE_INDEX);
-            // Trigger the finalizer (finalizeAssetCacheJob)
             scheduleOneTimeTrigger('finalizeAssetCacheJob', RESCHEDULE_DELAY_MS);
         }
         else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" ||
@@ -437,15 +412,25 @@ function cacheAllCorporateAssetsWorker() {
     }
 }
 
-
 function finalizeAssetCacheJob() {
     const funcName = 'finalizeAssetCacheJob';
+    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('ASSET_FINALIZER') : console);
     
-    // [1] Initialize ss_anchor immediately so we can pass it to pauseSheet
+    // [FIX 1] Initialize ss_anchor immediately so we can pass it to pauseSheet
     var ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
     executeWithTryLock(() => {
         const SCRIPT_PROP = PropertiesService.getScriptProperties();
+        // Ensure constants match those in cacheAllCorporateAssetsWorker
+        const ASSET_JOB_STATUS_KEY = 'AssetCache_JobStatus';
+        const CACHE_NAMED_RANGE = 'NR_CORP_ASSETS'; // Or your specific range name
+        const CACHE_SHEET_NAME = 'CorpWarehouseStock'; // Or your specific sheet name
+        const TEMP_SHEET_NAME = 'CorpWarehouseStock_Temp';
+        const ASSET_CACHE_DATA_KEY = 'AssetCache_Data_Shard';
+        const ASSET_CACHE_ROW_INDEX_KEY = 'AssetCache_RowIndex';
+        const PROP_KEY_CHUNK_SIZE = 'AssetCache_ChunkSize';
+        const NUM_ASSET_COLS = 8; 
+
         const status = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
 
         if (status !== 'FINALIZING') {
@@ -453,7 +438,7 @@ function finalizeAssetCacheJob() {
             return;
         }
 
-        // [2] PAUSE (Anesthesia) - Using your helper
+        // [2] PAUSE (Anesthesia) - Using your helper, passing ss_anchor
         var needsWakeUp = pauseSheet(ss_anchor);
 
         log.info('[Finalizer] Performing ATOMIC SWAP.');
@@ -477,20 +462,24 @@ function finalizeAssetCacheJob() {
 
         // 4. HANDLE FAILURE
         if (!swapResult.success) {
-            // [3] IMMEDIATE WAKE UP ON FAILURE
+            // [3] IMMEDIATE WAKE UP ON FAILURE using ss_anchor
             if (needsWakeUp) wakeUpSheet(ss_anchor);
 
             if (swapResult.errorMessage && swapResult.errorMessage.includes("not found")) {
                 log.error(`[Finalizer] CRITICAL: Temp sheet missing. Clearing state to reset.`);
-                _deleteShardedData(ASSET_CACHE_DATA_KEY);
+                if (typeof _deleteShardedData === 'function') _deleteShardedData(ASSET_CACHE_DATA_KEY);
                 SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
                 SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
                 SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
-                deleteTriggersByName('cacheAllCorporateAssetsTrigger');
+                deleteTriggersByName('cacheAllCorporateAssetsWorker');
                 return;
             }
             log.warn(`[Finalizer] Swap Failed: ${swapResult.errorMessage}. Retrying in 120s.`);
-            scheduleOneTimeTrigger('cacheAllCorporateAssetsTrigger', 120000);
+            scheduleOneTimeTrigger('cacheAllCorporateAssetsWorker', 120000); // Or trigger the finalizer again? Usually retrying the finalizer is safer
+            // However, your logic triggers the worker. If the worker sees 'FINALIZING', it should call the finalizer again.
+            // But cacheAllCorporateAssetsWorker doesn't handle 'FINALIZING' state explicitly (it falls through).
+            // Better to trigger finalizeAssetCacheJob directly.
+            scheduleOneTimeTrigger('finalizeAssetCacheJob', 120000);
             return;
         }
 
@@ -512,12 +501,13 @@ function finalizeAssetCacheJob() {
         }
 
         // 6. CLEANUP & SUCCESS
-        _deleteShardedData(ASSET_CACHE_DATA_KEY);
+        if (typeof _deleteShardedData === 'function') _deleteShardedData(ASSET_CACHE_DATA_KEY);
         SCRIPT_PROP.deleteProperty(ASSET_CACHE_ROW_INDEX_KEY);
         SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
         SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
 
-        deleteTriggersByName('cacheAllCorporateAssetsTrigger'); 
+        deleteTriggersByName('cacheAllCorporateAssetsWorker'); 
+        deleteTriggersByName('finalizeAssetCacheJob');
 
         log.info(`[Finalizer] Job Complete. Swap successful.`);
 
