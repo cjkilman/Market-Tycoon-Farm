@@ -490,25 +490,37 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
       ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
-        // --- TUNING: "PACED NITRO" (Fast but Polite) ---
+        // --- TUNING: "SAFE NITRO" (Big Batches, Strict Time Limits) ---
         
         MAX_CELLS_PER_CHUNK: 50000, 
-        MAX_CHUNK_SIZE: 1000, // Keep at 1000
         
-        // 1. DISABLE ACCELERATION
-        MAX_FACTOR: 1.1, 
+        // [KEEPING IT BIG]
+        MAX_CHUNK_SIZE: 1000, 
+        
+        // 1. STEADY PACE (Prevent runaway acceleration)
+        MAX_FACTOR: 1.0, 
 
-        // 2. FORCE PAUSES
+        // 2. FORCE PAUSES (Disabled)
         THROTTLE_THRESHOLD_MS: -1, 
 
         // 3. THE BREATHER
-        // Wait 2 seconds after every write.
-        THROTTLE_PAUSE_MS: 2000, 
+        // 5 seconds allows the sheet to "cool down" after swallowing 1000 rows.
+        THROTTLE_PAUSE_MS: 5000, 
 
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000'),
-        MIN_CHUNK_SIZE: 500,
+        
+        // Allow dropping only if necessary to survive
+        MIN_CHUNK_SIZE: 100,
+        
         TARGET_WRITE_TIME_MS: 1000, 
-        SOFT_LIMIT_MS: SOFT_LIMIT_MS
+
+        // [CRITICAL CHANGE] Lower Soft Limit to 4 Minutes
+        // We stop EARLY to ensure we save our progress.
+        SOFT_LIMIT_MS: 240000,
+
+        // [NEW] The Circuit Breaker
+        // If a batch hits this limit, we mark it but keep moving.
+        LAG_SPIKE_THRESHOLD_MS: 60000
       }
     };
 

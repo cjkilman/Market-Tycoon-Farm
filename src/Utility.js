@@ -53,16 +53,13 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
- * Performs a Safe Atomic Swap (Hybrid Safety Version).
+ * Performs a Safe Atomic Swap (Clean Version).
+ * Tries Manual Mode. If it fails, forces Delete (May timeout, but no Trash).
  * 1. Locks the script.
  * 2. Attempts to set Manual Mode.
  * 3. Rewires Named Ranges.
  * 4. If Manual Mode worked -> Deletes Old.
  * 5. If Manual Mode failed -> Renames Old (Prevents Timeout).
- */
-/**
- * Performs a Safe Atomic Swap (Clean Version).
- * Tries Manual Mode. If it fails, forces Delete (May timeout, but no Trash).
  */
 function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
@@ -121,7 +118,7 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
   } finally {
     // --- RESTORE STATE ---
     if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-        try { ss.setCalculationMode(originalCalcMode); } catch (e) {}
+      try { ss.setCalculationMode(originalCalcMode); } catch (e) { }
     }
     docLock.releaseLock();
   }
@@ -136,16 +133,16 @@ function forceManualMode_Emergency() {
   const funcName = 'forceManualMode_Emergency';
   console.time(funcName);
   console.log(`[${funcName}] Connecting to Active Spreadsheet...`);
-  
+
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    
+
     // 1. SAFETY CHECK: Does the Environment have the Definitions?
     if (!SpreadsheetApp.CalculationMode) {
       console.warn("⚠️ SYSTEM GLITCH DETECTED: 'SpreadsheetApp.CalculationMode' is undefined.");
       console.warn("👉 ACTION REQUIRED: Please verify manually in the UI: File > Settings > Calculation > Recalculation is set to 'OFF'.");
       console.log(`[${funcName}] Skipping script-based mode change to prevent crash.`);
-      return; 
+      return;
     }
 
     // 2. CHECK CURRENT STATE
@@ -161,7 +158,7 @@ function forceManualMode_Emergency() {
     console.log(`[${funcName}] Attempting to set MANUAL mode...`);
     ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
     SpreadsheetApp.flush();
-    
+
     console.log(`[${funcName}] SUCCESS. Calculation Mode set to MANUAL.`);
 
   } catch (e) {
@@ -183,13 +180,15 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 
   // Defaults
   const TARGET_WRITE_TIME_MS = Number(state.config.TARGET_WRITE_TIME_MS) || 1000;
+  const LAG_SPIKE_THRESHOLD_MS = Number(state.config.LAG_SPIKE_THRESHOLD_MS) || 60000;
   const MAX_FACTOR = Number(state.config.MAX_FACTOR) || 1.5;
   const MAX_CELLS_PER_CHUNK = Number(state.config.MAX_CELLS_PER_CHUNK) || 25000;
-  
+
   var docLockTimeoutMs = Number(state.config.DOC_LOCK_TIMEOUT_MS) || 30000;
   var THROTTLE_THRESHOLD_MS = Number(state.config.THROTTLE_THRESHOLD_MS) || 800;
   var THROTTLE_PAUSE_MS = Number(state.config.THROTTLE_PAUSE_MS) || 200;
   var SOFT_LIMIT_MS = Number(state.config.SOFT_LIMIT_MS) || 280000;
+
 
   var CHUNK_DECREASE_RATE = Number(state.config.CHUNK_DECREASE_RATE) || 200;
   var MIN_CHUNK_SIZE = Number(state.config.MIN_CHUNK_SIZE) || 50;
@@ -199,11 +198,26 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
   var currentChunkSize = Number(state.config.currentChunkSize) || MIN_CHUNK_SIZE;
   var previousDuration = Number(state.metrics.previousDuration) || 0;
   var i = Number(state.nextBatchIndex) || 0;
-  
+
   currentChunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(MIN_CHUNK_SIZE, currentChunkSize));
 
   var dataLength = dataArray.length;
   var numCols = (dataLength > 0) ? dataArray[0].length : 0;
+
+  // --- [NEW] TIME SANITY CHECK ---
+  var nowCheck = new Date().getTime();
+  var elapsedSoFar = nowCheck - startTime;
+  var timeRemaining = SOFT_LIMIT_MS - elapsedSoFar;
+
+  if (state.logWarn) {
+    state.logWarn(`[TIME CHECK] Writer Start. 
+      > Global Start: ${startTime} 
+      > Current Time: ${nowCheck} 
+      > Elapsed Pre-Write: ${elapsedSoFar}ms 
+      > Budget: ${SOFT_LIMIT_MS}ms 
+      > Remaining: ${timeRemaining}ms`);
+  }
+
 
   // --- PRE-FLIGHT ---
   try {
@@ -219,7 +233,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     // --- 1. ACQUIRE LOCK (Once) ---
     var docLock = LockService.getDocumentLock();
     if (!docLock.tryLock(docLockTimeoutMs)) {
-       return { success: false, rowsProcessed: i, state: state, error: "Lock Failed", bailout_reason: "LOCK_CONFLICT" };
+      return { success: false, rowsProcessed: i, state: state, error: "Lock Failed", bailout_reason: "LOCK_CONFLICT" };
     }
 
     // --- 2. ENGAGE ANESTHESIA (Manual Mode) ---
@@ -243,7 +257,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 
         if (previousDuration > THROTTLE_THRESHOLD_MS) {
           currentChunkSize = Math.max(MIN_CHUNK_SIZE, currentChunkSize - CHUNK_DECREASE_RATE);
-          Utilities.sleep(THROTTLE_PAUSE_MS); 
+          Utilities.sleep(THROTTLE_PAUSE_MS);
           previousDuration = 0;
         }
 
@@ -259,34 +273,49 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
         targetSheet.getRange(targetRow, startCol, numRows, numCols).setValues(batch);
 
         previousDuration = new Date().getTime() - chunkStartTime;
+
+        // --- [NEW] CIRCUIT BREAKER TRIPPED? ---
+        if (previousDuration > LAG_SPIKE_THRESHOLD_MS) {
+          if (state.logWarn) state.logWarn(`[CRITICAL] Lag Spike Detected (${previousDuration}ms). Bailing out.`);
+
+          // 1. Advance the index because THIS batch did finish (eventually)
+          state.nextBatchIndex = i + numRows;
+
+          // 2. Tank the chunk size for the NEXT run to ensure safe startup
+          state.config.currentChunkSize = MIN_CHUNK_SIZE;
+
+          // 3. Return PREDICTIVE_BAILOUT so Orchestrator saves state and restarts cleanly
+          return { success: false, bailout_reason: "PREDICTIVE_BAILOUT", state: state };
+        }
+
         var ratio = previousDuration / TARGET_WRITE_TIME_MS;
 
         if (ratio < 0.5) currentChunkSize = Math.ceil(currentChunkSize * ((currentChunkSize < 1000) ? 2.0 : MAX_FACTOR));
         else if (ratio < 0.8) currentChunkSize = Math.ceil(currentChunkSize * 1.05);
         else if (ratio > 1.2) currentChunkSize = Math.floor(currentChunkSize * 0.6);
-        
+
         currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(currentChunkSize, MAX_CHUNK_SIZE));
-        
+
         if (state.logInfo) state.logInfo(`[Write] Batch: ${numRows} | Time: ${previousDuration}ms | Next: ${currentChunkSize}`);
 
         i += numRows;
-        
+
         state.nextBatchIndex = i;
         state.config.currentChunkSize = currentChunkSize;
         state.metrics.previousDuration = previousDuration;
       }
 
     } catch (loopError) {
-       var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + (startRow + i) + ". Error: " + loopError.message;
-       if (state.logError) state.logError(errorMessage);
-       state.config.currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
-       return { success: false, rowsProcessed: i, state: state, error: errorMessage, bailout_reason: "SERVICE_FAILURE" };
+      var errorMessage = "ServiceTimeoutFailure: Batch Write failed at row " + (startRow + i) + ". Error: " + loopError.message;
+      if (state.logError) state.logError(errorMessage);
+      state.config.currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
+      return { success: false, rowsProcessed: i, state: state, error: errorMessage, bailout_reason: "SERVICE_FAILURE" };
     } finally {
-       // --- 4. WAKE UP & UNLOCK ---
-       if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-          try { ss.setCalculationMode(originalCalcMode); } catch (e) {}
-       }
-       docLock.releaseLock();
+      // --- 4. WAKE UP & UNLOCK ---
+      if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
+        try { ss.setCalculationMode(originalCalcMode); } catch (e) { }
+      }
+      docLock.releaseLock();
     }
 
     if (i < dataArray.length) {
@@ -314,17 +343,17 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
 function _chunkAndPut(key, content, ttlSeconds) {
   const cache = CacheService.getScriptCache();
   const MAX_SIZE = 100000; // Safe limit (100KB) per entry
-  
+
   try {
     // Case 1: Fits in single entry
     if (content.length <= MAX_SIZE) {
       cache.put(key, content, ttlSeconds);
       // Clean up any potential old chunks from a previous larger save
       const oldChunkCount = cache.get(key + "_chunks");
-      if (oldChunkCount) _deleteShardedData(key); 
+      if (oldChunkCount) _deleteShardedData(key);
       return true;
     }
-    
+
     // Case 2: Needs Sharding
     const chunks = [];
     let offset = 0;
@@ -332,14 +361,14 @@ function _chunkAndPut(key, content, ttlSeconds) {
       chunks.push(content.substr(offset, MAX_SIZE));
       offset += MAX_SIZE;
     }
-    
+
     // Batch write chunks to cache
     const chunkMap = {};
     chunks.forEach((c, i) => {
       chunkMap[key + "_" + i] = c;
     });
     chunkMap[key + "_chunks"] = chunks.length.toString();
-    
+
     cache.putAll(chunkMap, ttlSeconds);
     return true;
   } catch (e) {
@@ -355,30 +384,30 @@ function _chunkAndPut(key, content, ttlSeconds) {
  */
 function _getAndDechunk(key) {
   const cache = CacheService.getScriptCache();
-  
+
   // 1. Check for meta-key indicating chunks
   const countStr = cache.get(key + "_chunks");
-  
+
   // Case A: Single Entry (No chunks)
   if (!countStr) {
-    return cache.get(key); 
+    return cache.get(key);
   }
-  
+
   // Case B: Reassemble Chunks
   const count = parseInt(countStr, 10);
   if (isNaN(count)) return null;
 
   const keys = [];
-  for(let i=0; i<count; i++) keys.push(key + "_" + i);
-  
+  for (let i = 0; i < count; i++) keys.push(key + "_" + i);
+
   const chunks = cache.getAll(keys);
   let full = "";
-  
-  for(let i=0; i<count; i++) {
+
+  for (let i = 0; i < count; i++) {
     const part = chunks[key + "_" + i];
     if (!part) {
       console.warn(`_getAndDechunk: Missing chunk ${i} for ${key}. Cache corrupted.`);
-      return null; 
+      return null;
     }
     full += part;
   }
@@ -392,10 +421,10 @@ function _getAndDechunk(key) {
 function _deleteShardedData(key) {
   const cache = CacheService.getScriptCache();
   const countStr = cache.get(key + "_chunks");
-  
+
   if (countStr) {
     const count = parseInt(countStr, 10);
-    for(let i=0; i<count; i++) {
+    for (let i = 0; i < count; i++) {
       cache.remove(key + "_" + i);
     }
     cache.remove(key + "_chunks");
