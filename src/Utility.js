@@ -67,12 +67,9 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
   const swStart = new Date().getTime();
 
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const docLock = LockService.getDocumentLock();
 
-  if (!docLock.tryLock(30000)) {
-    return { success: false, errorMessage: "Could not acquire Document Lock." };
-  }
+  if (!docLock.tryLock(30000)) return { success: false, errorMessage: "Could not acquire Document Lock." };
 
   let originalCalcMode = null;
 
@@ -82,75 +79,47 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
 
     if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
 
-    // --- [CRITICAL FIX] PHASE 1: FORCE PAUSE ENGINE ---
-    // We removed the "if (SpreadsheetApp.CalculationMode)" check because it was 
-    // causing false negatives. Now we just TRY to set it.
+    // --- PHASE 1: FORCE MANUAL MODE ---
     try {
-        originalCalcMode = ss.getCalculationMode();
-        if (originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-            ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
-            log.info("[Swap] Engine silenced (MANUAL mode).");
-        }
+      originalCalcMode = ss.getCalculationMode();
+      if (originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
+        ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
+        log.info("[Swap] Engine silenced (MANUAL mode).");
+      }
     } catch (e) {
-        log.warn(`[Swap] Failed to set MANUAL mode: ${e.message}. Proceeding at risk.`);
+      log.warn(`[Swap] Manual Mode Warning: ${e.message}`);
     }
-    // --------------------------------------------------
 
-    // --- PHASE 2: REWIRE & HEAL NAMED RANGES ---
+    // --- PHASE 2: REWIRE ---
     if (targetSheet) {
       const namedRanges = ss.getNamedRanges();
       const targetID = targetSheet.getSheetId();
-      let rewiredCount = 0;
-      let stitchedCount = 0;
+      let rewired = 0;
 
       namedRanges.forEach(nr => {
-        const name = nr.getName();
         try {
-          const range = nr.getRange(); 
-          if (range.getSheet().getSheetId() === targetID) {
-            nr.setRange(tempSheet.getRange(range.getA1Notation()));
-            rewiredCount++;
+          if (nr.getRange().getSheet().getSheetId() === targetID) {
+            nr.setRange(tempSheet.getRange(nr.getRange().getA1Notation()));
+            rewired++;
           }
-        } catch (e) {
-          if (repairMap && repairMap[name]) {
-            try {
-              const fixRange = tempSheet.getRange(repairMap[name]);
-              nr.setRange(fixRange);
-              stitchedCount++;
-              log.info(`[Stitch] Healed '${name}' -> '${tempName}!${repairMap[name]}'`);
-            } catch (stitchError) {
-               log.warn(`[Stitch Fail] Could not heal '${name}': ${stitchError.message}`);
-            }
-          }
-        }
+        } catch (e) { /* Optional repair logic here */ }
       });
-      
-      if (rewiredCount > 0 || stitchedCount > 0) {
-        log.info(`[Swap] Rewired: ${rewiredCount} | Stitched: ${stitchedCount}`);
-        SpreadsheetApp.flush();
-      }
+      if (rewired > 0) SpreadsheetApp.flush();
 
-      // --- PHASE 3: DELETE OLD ---
+      // --- PHASE 3: DELETE ---
       if (ss.getNumSheets() === 1) ss.insertSheet();
       ss.deleteSheet(targetSheet);
     }
 
-    // --- PHASE 4: RENAME NEW ---
+    // --- PHASE 4: RENAME ---
     tempSheet.setName(targetName);
-    
-    log.info(`[Swap] SUCCESS. Duration: ${new Date().getTime() - swStart}ms`);
     return { success: true, errorMessage: null };
 
   } catch (e) {
-    log.error(`[Swap] CRASH: ${e.message}`);
     return { success: false, errorMessage: e.message };
-
   } finally {
-    // --- PHASE 5: CLEANUP ---
     if (originalCalcMode && originalCalcMode !== SpreadsheetApp.CalculationMode.MANUAL) {
-        try {
-            ss.setCalculationMode(originalCalcMode);
-        } catch (ignored) { }
+        try { ss.setCalculationMode(originalCalcMode); } catch (e) {}
     }
     docLock.releaseLock();
   }

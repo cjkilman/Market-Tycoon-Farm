@@ -208,7 +208,6 @@ function masterOrchestrator() {
   console.log(`Orchestrator (min ${currentMinute}): High-Frequency Check.`);
 
   // --- [CHANGE 2] PRIORITY 2: MARKET DATA (Robust 30m Cycle) ---
-  // Logic: If job is inactive AND it has been > 28 minutes since last run
   const timeSinceLastRun = NOW_MS - lastMarketRun;
   const RUN_INTERVAL_MS = 28 * 60 * 1000; // 28 mins (buffer for 30m cycle)
 
@@ -218,14 +217,19 @@ function masterOrchestrator() {
     } else {
       console.log(`Orchestrator: DISPATCHING NEW MARKET DATA JOB (30m Cycle).`);
 
-      // 1. Set Lease
-      const NEW_LEASE = NOW_MS + 300000;
-      SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
+      // 1. Attempt Execution FIRST
+      const launchResult = updateMarketDataSheet();
 
-      // 2. Update Last Run Timestamp (CRITICAL)
-      SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, NOW_MS.toString());
-
-      updateMarketDataSheet();
+      // 2. Only Set Lease if Lock was Acquired (launchResult is not null)
+      if (launchResult !== null) {
+        const NEW_LEASE = NOW_MS + 300000;
+        SCRIPT_PROP.setProperty(PROP_KEY_LEASE, NEW_LEASE.toString());
+        console.log("Orchestrator: Lock acquired. Lease set.");
+      } else {
+        console.warn("Orchestrator: Lock BUSY. Dispatch aborted (will retry in 5m).");
+        // We do NOT set the lease here. 
+        // This ensures the next 5-min heartbeat sees "Job Inactive" and retries immediately.
+      }
     }
     return;
   }
@@ -368,7 +372,10 @@ function runHourlyJobQueue() {
   SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, currentIndex.toString());
 }
 
-
+function forceResetMarketTimer() {
+  PropertiesService.getScriptProperties().deleteProperty('MARKET_DATA_LAST_RUN_TS');
+  console.log("Timer reset. Market Data will run on next heartbeat.");
+}
 
 /**
  * Market Data Worker (Nitro Edition - TUNED)
@@ -384,7 +391,7 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS'; // [ADDED]
 
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 1000, 280000, 10000];
+    = [8000, 1000, 270000, 10000];
 
   // --- [CRITICAL FIX] HEARTBEAT TIMESTAMP ---
   // Update the timestamp IMMEDIATELY. 
@@ -397,7 +404,7 @@ function _updateMarketDataSheetWorker() {
   const COLUMN_COUNT = 9;
   const START_ROW = 2;
   const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
-  var ss_anchor = []; //Anchor the main reference Headers.apply. Then refresh and pass Shallow copies
+  var ss_anchor = []; //Anchor the main reference Headers.apply. Then refresh 
   ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
   const masterRequests = getMasterBatchFromControlTable(ss_anchor);
 
@@ -414,14 +421,13 @@ function _updateMarketDataSheetWorker() {
 
     const setupResult = guardedSheetTransaction(() => {
       ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
-      const ss_inner = { ...ss_anchor };
-      let sheet = ss_inner.getSheetByName(tempSheetName);
+      let sheet = ss_anchor.getSheetByName(tempSheetName);
 
       if (sheet) {
         const lastRow = sheet.getMaxRows();
         if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).clearContent();
       } else {
-        sheet = ss_inner.insertSheet(tempSheetName);
+        sheet = ss_anchor.insertSheet(tempSheetName);
       }
       sheet.getRange(1, 1, 1, COLUMN_COUNT).setValues([DATA_SHEET_HEADERS]);
       sheet.hideSheet();
@@ -478,19 +484,18 @@ function _updateMarketDataSheetWorker() {
       return;
     }
     ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
-    const ss_stable = { ...ss_anchor };
 
     let writeState = {
       logInfo: console.log, logError: console.error, logWarn: console.warn,
       nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
-      ss: ss_stable,
+      ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
         MAX_CELLS_PER_CHUNK: 50000,
         TARGET_WRITE_TIME_MS: 1000,
-        MAX_FACTOR: 1.8,
-        THROTTLE_THRESHOLD_MS: 180,
-        THROTTLE_PAUSE_MS: 1000,
+        MAX_FACTOR: 1.5,
+        THROTTLE_THRESHOLD_MS: 150,
+        THROTTLE_PAUSE_MS: 800,
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || MIN_CHUNK_SIZE.toString()),
         MAX_CHUNK_SIZE: MAX_CHUNK_SIZE,
         MIN_CHUNK_SIZE: MIN_CHUNK_SIZE,
@@ -546,6 +551,7 @@ function updateMarketDataSheet() {
   const funcName = 'updateMarketDataSheet';
   const result = executeWithTryLock(_updateMarketDataSheetWorker, funcName);
   if (result === null) console.warn(`${funcName} skipped (Lock).`);
+  return result; // <--- ADD THIS LINE
 }
 
 function manualResetMarketDataJobAndDispatch() {
@@ -559,7 +565,7 @@ function finalizeMarketDataUpdate() {
   const PROP_KEY_STEP = 'marketDataJobStep';
   const finalSheetName = 'Market_Data_Raw';
   const tempSheetName = 'Market_Data_Temp';
-
+  var ss_anchor = {};
   const funcName = 'finalizeMarketDataUpdate';
 
   executeWithTryLock(() => { // <--- Removed 'result =' as we handle it inside
@@ -573,14 +579,15 @@ function finalizeMarketDataUpdate() {
     // Assuming your market data typically covers specific columns. 
     // Use an open-ended range starting at Row 2 (headers are likely Row 1).
     const repairMap = {
-      [MARKET_NAMED_RANGE]: 'A2:G' // <--- Adjust 'G' to your actual last column
+      [MARKET_NAMED_RANGE]: 'A2:I' // <--- Adjust 'G' to your actual last column
     };
 
     // 2. RUN TRANSACTION
     const transactionResult = guardedSheetTransaction(() => {
-      const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+      ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+
       // PASS THE MAP HERE
-      return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
+      return atomicSwapAndFlush(ss_anchor, finalSheetName, tempSheetName, repairMap);
     }, 60000);
 
     // 3. UNWRAP RESULT (Fixing the Silent Failure Bug)
@@ -602,8 +609,8 @@ function finalizeMarketDataUpdate() {
 
       // *** POST-SWAP RESIZE (Your code was good here) ***
       try {
-        const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
-        const finalSheet = ss_inner.getSheetByName(finalSheetName);
+        ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+        const finalSheet = ss_anchor.getSheetByName(finalSheetName);
         if (finalSheet) {
           const lastRow = finalSheet.getLastRow();
           const lastCol = finalSheet.getLastColumn();
@@ -611,7 +618,7 @@ function finalizeMarketDataUpdate() {
           if (lastRow > 1) {
             // Re-define range to hug the new data exactly
             const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
-            ss_inner.setNamedRange(MARKET_NAMED_RANGE, range);
+            ss_anchor.setNamedRange(MARKET_NAMED_RANGE, range);
             console.log(`[Finalizer] Resized Named Range: ${MARKET_NAMED_RANGE}`);
           }
         }
