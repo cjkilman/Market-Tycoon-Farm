@@ -21,8 +21,8 @@ function cacheAllCorporateAssetsTrigger() {
         log.info("Trigger: Job is in FINALIZING state. Dispatching finalizer.");
         finalizeAssetCacheJob();
         return; // [FIX] Stop here! Do not run the worker.
-    } 
-    
+    }
+
     // Only run the worker if NOT finalizing
     const funcName = 'cacheAllCorporateAssetsWorker';
     executeWithTryLock(cacheAllCorporateAssetsWorker, funcName);
@@ -182,22 +182,20 @@ function cacheAllCorporateAssetsWorker() {
     // Use the global log instance or create a specific one, ensure consistency
     const workerLog = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('ASSET_WORKER') : console);
 
-    const PROP_KEY_STEP = 'AssetCache_JobStatus'; 
+    const PROP_KEY_STEP = 'AssetCache_JobStatus';
     const PROP_KEY_WRITE_INDEX = 'AssetCache_RowIndex';
     const PROP_KEY_CHUNK_SIZE = 'AssetCache_ChunkSize';
     const ASSET_CACHE_DATA_KEY = 'AssetCache_Data_Shard';
-    
-    // Config
-    const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS] 
-        = [8000, 500, 270000, 10000];
-    const START_ROW = 3; 
-    const START_COL = 1; 
-    const TEMP_SHEET_NAME = 'CorpWarehouseStock_Temp'; 
+
+
+    const START_ROW = 3;
+    const START_COL = 1;
+    const TEMP_SHEET_NAME = 'CorpWarehouseStock_Temp';
     const ASSET_CACHE_HEADERS = [["is_blueprint_copy", "is_singleton", "item_id", "location_flag", "location_id", "location_type", "quantity", "type_id"]];
 
     // Load State
     let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP);
-    
+
     // DEBUG: Log the state to diagnose silent exits
     if (!currentStep) {
         workerLog.info(`[Worker] No job state found. Defaulting to NEW_RUN.`);
@@ -216,15 +214,15 @@ function cacheAllCorporateAssetsWorker() {
 
         const authName = (typeof getCorpAuthChar === 'function') ? getCorpAuthChar() : null;
         if (!authName) workerLog.warn('[Worker] No authorized character found.');
-        
+
         // 1. Fetch Data (Live - No Pause yet)
         if (typeof _fetchAssetsConcurrently !== 'function') { workerLog.error('[Worker] missing _fetchAssetsConcurrently'); return; }
         let allAssets = [];
         try { allAssets = _fetchAssetsConcurrently(authName); } catch (e) { workerLog.error(`[Worker] Fetch failed: ${e.message}`); return; }
         if (!allAssets || allAssets.length <= 1) { workerLog.warn('[Worker] No assets retrieved. Aborting.'); return; }
-        
+
         const processedAssets = allAssets.slice(1);
-        if (typeof _chunkAndPut === 'function') _chunkAndPut(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets), 21600); 
+        if (typeof _chunkAndPut === 'function') _chunkAndPut(ASSET_CACHE_DATA_KEY, JSON.stringify(processedAssets), 21600);
 
         // 2. PAUSE (Crucial for Sheet Creation)
         var needsWakeUp = pauseSheet(ss_anchor);
@@ -232,12 +230,12 @@ function cacheAllCorporateAssetsWorker() {
         const setupResult = guardedSheetTransaction(() => {
             // prepareTempSheet now returns { success, state, error }
             const result = prepareTempSheet(ss_anchor, TEMP_SHEET_NAME, ASSET_CACHE_HEADERS[0]);
-            
+
             if (!result.success) {
                 throw new Error(result.error);
             }
             // Return the sheet object so the wrapper puts it in setupResult.state
-            return result.state; 
+            return result.state;
         }, 60000);
 
         // 3. WAKE UP IMMEDIATELY (Do not leave it paused for Phase 2)
@@ -255,9 +253,9 @@ function cacheAllCorporateAssetsWorker() {
         SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, '0');
         SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
         SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'WRITING');
-        
+
         workerLog.info(`[Worker] Prep Success. Transitioning to WRITING (Live Mode).`);
-        scheduleOneTimeTrigger('cacheAllCorporateAssetsWorker', 1000); 
+        scheduleOneTimeTrigger('cacheAllCorporateAssetsWorker', 1000);
         return;
     }
 
@@ -281,17 +279,16 @@ function cacheAllCorporateAssetsWorker() {
             ss: ss_anchor,
             metrics: { startTime: START_TIME },
             config: {
-                // Inherit Defaults
-                ...NITRO_CONFIG,
+                // Shared Settings
+                ...(typeof NITRO_CONFIG !== 'undefined' ? NITRO_CONFIG : {}),
 
-                // TUNING FOR LIVE MODE:
-                // Since we are NOT pausing, writing is harder. 
-                // We start smaller and allow the adaptive engine to find the speed limit.
-                MAX_CELLS_PER_CHUNK: 40000, // Reduced from 60k for safety
-                MAX_CHUNK_SIZE: 3000,       // Reduced Cap
-                MIN_CHUNK_SIZE: 250,        // Lower floor for lag spikes
-                
-                currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000')
+                // OVERRIDES FOR HEAVY ASSETS
+                MAX_CELLS_PER_CHUNK: 20000, // Reduced from standard
+                MAX_CHUNK_SIZE: 1000,       // Force smaller bites
+                SOFT_LIMIT_MS: 270000,      // 4.5 Minutes (BAIL EARLY)
+
+                // Dynamic State
+                currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '500')
             }
         };
 
@@ -311,24 +308,24 @@ function cacheAllCorporateAssetsWorker() {
             scheduleOneTimeTrigger('finalizeAssetCacheJob', RESCHEDULE_DELAY_MS);
         }
         else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" || (writeResult.error && writeResult.error.includes("timed out"))) {
-             const reason = writeResult.error ? writeResult.error : "Predictive Bailout";
-             workerLog.warn(`[Worker] Interrupted (${reason}). Rescheduling.`);
-             
-             const nextIndex = writeResult.state.nextBatchIndex.toString();
-             let nextChunkSize = writeResult.state.config.currentChunkSize;
-             if (writeResult.error) nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(nextChunkSize / 2));
+            const reason = writeResult.error ? writeResult.error : "Predictive Bailout";
+            workerLog.warn(`[Worker] Interrupted (${reason}). Rescheduling.`);
 
-             SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
-             SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize.toString());
-             
-             Utilities.sleep(1000);
-             scheduleOneTimeTrigger('cacheAllCorporateAssetsWorker', 30000);
+            const nextIndex = writeResult.state.nextBatchIndex.toString();
+            let nextChunkSize = writeResult.state.config.currentChunkSize;
+            if (writeResult.error) nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(nextChunkSize / 2));
+
+            SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
+            SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize.toString());
+
+            Utilities.sleep(1000);
+            scheduleOneTimeTrigger('cacheAllCorporateAssetsWorker', 30000);
         }
         else {
             workerLog.error(`[Worker] Fatal Write Failure: ${writeResult.error}`);
         }
     }
-    
+
     // Final fallback check
     if (currentStep !== 'NEW_RUN' && currentStep !== 'FETCHED' && currentStep !== 'WRITING') {
         workerLog.warn(`[Worker] Unhandled state encountered: '${currentStep}'. Job may be stuck.`);
@@ -338,7 +335,7 @@ function cacheAllCorporateAssetsWorker() {
 function finalizeAssetCacheJob() {
     const funcName = 'finalizeAssetCacheJob';
     const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('ASSET_FINALIZER') : console);
-    
+
     var ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
     // Attempt to acquire lock
@@ -352,13 +349,13 @@ function finalizeAssetCacheJob() {
     try {
         const SCRIPT_PROP = PropertiesService.getScriptProperties();
         const ASSET_JOB_STATUS_KEY = 'AssetCache_JobStatus';
-        const CACHE_NAMED_RANGE = 'warehouse_unfiltered'; 
-        const CACHE_SHEET_NAME = 'CorpWarehouseStock'; 
+        const CACHE_NAMED_RANGE = 'warehouse_unfiltered';
+        const CACHE_SHEET_NAME = 'CorpWarehouseStock';
         const TEMP_SHEET_NAME = 'CorpWarehouseStock_Temp';
         const ASSET_CACHE_DATA_KEY = 'AssetCache_Data_Shard';
         const ASSET_CACHE_ROW_INDEX_KEY = 'AssetCache_RowIndex';
         const PROP_KEY_CHUNK_SIZE = 'AssetCache_ChunkSize';
-        const NUM_ASSET_COLS = 8; 
+        const NUM_ASSET_COLS = 8;
 
         const status = SCRIPT_PROP.getProperty(ASSET_JOB_STATUS_KEY);
 
@@ -376,7 +373,7 @@ function finalizeAssetCacheJob() {
         log.info('[Finalizer] Performing ATOMIC SWAP.');
 
         const repairMap = {
-             [CACHE_NAMED_RANGE]: `A3:H` 
+            [CACHE_NAMED_RANGE]: `A3:H`
         };
 
         const transactionResult = guardedSheetTransaction(() => {
@@ -415,7 +412,7 @@ function finalizeAssetCacheJob() {
         SCRIPT_PROP.deleteProperty(ASSET_JOB_STATUS_KEY);
         SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
 
-        deleteTriggersByName('cacheAllCorporateAssetsWorker'); 
+        deleteTriggersByName('cacheAllCorporateAssetsWorker');
         deleteTriggersByName('finalizeAssetCacheJob');
 
         log.info(`[Finalizer] Job Complete. Swap successful.`);

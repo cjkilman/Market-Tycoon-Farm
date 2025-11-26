@@ -305,9 +305,7 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS';
 
-  // NITRO_CONFIG Fallback
-  const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 1000, 330000, 10000];
+
 
   SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
 

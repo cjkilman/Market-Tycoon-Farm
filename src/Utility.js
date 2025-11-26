@@ -8,6 +8,13 @@
 var MAX_CACHE_CHUNK_SIZE = 8000;
 var CHUNK_INDEX_SUFFIX = ':IDX';
 
+// NITRO_CONFIG TUNING FOR ASSETS
+// 1. Drop MAX_CHUNK_SIZE: Assets are complex, 8000 is too big. 
+// 2. Drop SOFT_LIMIT_MS: Bail out at 4.5 mins (270s) instead of 5.5 mins. 
+//    This reserves 90s for the "Ghost Gap" in the NEXT run.
+
+const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
+  = [1000, 100, 270000, 5000];
 /**
  * [NEW] SHARED NITRO CONFIGURATION
  * Centralized settings for high-volume sheet writes.
@@ -20,7 +27,7 @@ var NITRO_CONFIG = {
   THROTTLE_THRESHOLD_MS: -1,   // Disable standard throttling (rely on adaptive)
   THROTTLE_PAUSE_MS: 30000,     // Long pause if we hit a wall
   LAG_SPIKE_THRESHOLD_MS: 60000,
-  
+
   // --- Baseline Defaults (Override these in Worker if needed) ---
   MAX_CELLS_PER_CHUNK: 50000,
   SOFT_LIMIT_MS: 330000,       // 4.5 Minutes
@@ -41,7 +48,7 @@ var NITRO_CONFIG = {
 function prepareTempSheet(ss, sheetName, headers) {
   var success = true; // Assume success initially unless catch block flips it
   var errorMessage = null;
-  
+
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(sheetName);
 
@@ -53,14 +60,14 @@ function prepareTempSheet(ss, sheetName, headers) {
       // If clear fails, fallback to nuclear option
       errorMessage = `[prepareTempSheet] Clear failed: ${e.message}. Attempting nuclear delete/insert.`;
       console.warn(errorMessage);
-      try { 
-          ss.deleteSheet(sheet); 
-      } catch(e2) {
-          success = false;
-          errorMessage += ` | Delete failed: ${e2.message}`;
-          return { success: false, state: null, error: errorMessage };
+      try {
+        ss.deleteSheet(sheet);
+      } catch (e2) {
+        success = false;
+        errorMessage += ` | Delete failed: ${e2.message}`;
+        return { success: false, state: null, error: errorMessage };
       }
-      
+
       try {
         sheet = ss.insertSheet(sheetName);
       } catch (e3) {
@@ -71,25 +78,25 @@ function prepareTempSheet(ss, sheetName, headers) {
     }
   } else {
     try {
-        sheet = ss.insertSheet(sheetName);
+      sheet = ss.insertSheet(sheetName);
     } catch (e4) {
-        return { success: false, state: null, error: "Failed to insert new sheet: " + e4.message };
+      return { success: false, state: null, error: "Failed to insert new sheet: " + e4.message };
     }
   }
 
   // Set Headers
   if (headers && headers.length > 0) {
     try {
-        const headerRow = (Array.isArray(headers[0])) ? headers[0] : headers;
-        sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+      const headerRow = (Array.isArray(headers[0])) ? headers[0] : headers;
+      sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
     } catch (e5) {
-        console.warn("Header set failed: " + e5.message);
-        // Non-fatal, but worth noting
+      console.warn("Header set failed: " + e5.message);
+      // Non-fatal, but worth noting
     }
   }
-  
-  try { sheet.setFrozenRows(1); } catch(e) {}
-  
+
+  try { sheet.setFrozenRows(1); } catch (e) { }
+
   return { success: success, state: sheet, error: errorMessage };
 }
 
@@ -122,7 +129,7 @@ function getOrCreateSheet(ss, name, headers) {
 function pauseSheet(ss) {
   // Guard rail: Ensure we have a spreadsheet object
   if (!ss) {
-    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch(e) {}
+    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
     if (!ss) {
       console.warn("[pauseSheet] No Spreadsheet object found.");
       return false;
@@ -132,13 +139,13 @@ function pauseSheet(ss) {
   try {
     const sheet = ss.getSheetByName('Utility');
     if (sheet) {
-        // Set flags to 0 to STOP formulas (Main.js checks this)
-        sheet.getRange("B3:D3").setValues([[0,0,0]]);
-        SpreadsheetApp.flush();
-        console.log("[Anesthesia] Set Utility flags to 0 (Paused).");
-        return true;
+      // Set flags to 0 to STOP formulas (Main.js checks this)
+      sheet.getRange("B3:D3").setValues([[0, 0, 0]]);
+      SpreadsheetApp.flush();
+      console.log("[Anesthesia] Set Utility flags to 0 (Paused).");
+      return true;
     } else {
-        console.warn("[pauseSheet] 'Utility' sheet not found.");
+      console.warn("[pauseSheet] 'Utility' sheet not found.");
     }
   } catch (e) {
     console.warn("Failed to set Utility flags: " + e.message);
@@ -160,23 +167,23 @@ function wakeUpSheet(ss) {
   // If called by a trigger, 'ss' is an Event Object, which is not null but lacks methods.
   // We MUST check if it actually has the getSheetByName method.
   if (!ss || typeof ss.getSheetByName !== 'function') {
-    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch(e) {}
-    
+    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
+
     // If we still don't have a spreadsheet, we can't proceed.
     if (!ss) {
-        console.warn("[wakeUpSheet] Could not find Active Spreadsheet (Trigger context).");
-        return;
+      console.warn("[wakeUpSheet] Could not find Active Spreadsheet (Trigger context).");
+      return;
     }
   }
 
   try {
     const sheet = ss.getSheetByName('Utility');
     if (sheet) {
-        // Set flags to 1 to RESUME formulas
-        sheet.getRange("B3:D3").setValues([[1,1,1]]);
-        console.log("[Anesthesia] Set Utility flags to 1 (Resumed).");
+      // Set flags to 1 to RESUME formulas
+      sheet.getRange("B3:D3").setValues([[1, 1, 1]]);
+      console.log("[Anesthesia] Set Utility flags to 1 (Resumed).");
     } else {
-        console.warn("[wakeUpSheet] 'Utility' sheet not found.");
+      console.warn("[wakeUpSheet] 'Utility' sheet not found.");
     }
   } catch (e) {
     console.error("Failed to wake up sheet: " + e.message);
@@ -204,13 +211,13 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
     // 1. GET DATA from Temp
     const sourceRange = tempSheet.getDataRange();
     const sourceValues = sourceRange.getValues();
-    
+
     // 2. PREPARE Target (Create if missing)
     let finalSheet = targetSheet;
     if (!finalSheet) {
       finalSheet = ss.insertSheet(targetName);
     } else {
-      try { finalSheet.clear(); } catch(e) { finalSheet.clearContents(); }
+      try { finalSheet.clear(); } catch (e) { finalSheet.clearContents(); }
     }
 
     // 3. WRITE to Target
@@ -222,29 +229,29 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
     // Since we overwrote the target sheet (kept ID), most ranges persist.
     // However, if the data size changed drastically, we might need to resize them.
     if (repairMap && finalSheet) {
-        const lastRow = finalSheet.getLastRow();
-        const lastCol = finalSheet.getLastColumn();
-        
-        for (const [rangeName, a1Ref] of Object.entries(repairMap)) {
-            try {
-                // Logic to set named range to the full data extent minus header (usually)
-                // Defaulting to "Full Sheet Data" logic if specific logic isn't passed
-                if (lastRow > 1) {
-                    const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
-                    ss.setNamedRange(rangeName, range);
-                    console.log(`[AtomicSwap] Updated Named Range '${rangeName}'`);
-                }
-            } catch (e) {
-                console.warn(`[AtomicSwap] Failed to update Named Range '${rangeName}': ${e.message}`);
-            }
+      const lastRow = finalSheet.getLastRow();
+      const lastCol = finalSheet.getLastColumn();
+
+      for (const [rangeName, a1Ref] of Object.entries(repairMap)) {
+        try {
+          // Logic to set named range to the full data extent minus header (usually)
+          // Defaulting to "Full Sheet Data" logic if specific logic isn't passed
+          if (lastRow > 1) {
+            const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
+            ss.setNamedRange(rangeName, range);
+            console.log(`[AtomicSwap] Updated Named Range '${rangeName}'`);
+          }
+        } catch (e) {
+          console.warn(`[AtomicSwap] Failed to update Named Range '${rangeName}': ${e.message}`);
         }
+      }
     }
 
     // 5. CLEANUP Temp (Just Clear, Don't Delete)
-    try { 
-        tempSheet.clear(); 
-    } catch(e) { 
-        console.warn("Failed to clear temp sheet (non-fatal): " + e.message); 
+    try {
+      tempSheet.clear();
+    } catch (e) {
+      console.warn("Failed to clear temp sheet (non-fatal): " + e.message);
     }
 
     //SpreadsheetApp.flush(); // Thats Handled in pauseSheet
@@ -370,7 +377,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
     }
 
     // --- 2. ENGAGE ANESTHESIA (Manual Mode) ---
-// Moved to external Usage, Callers Now handle this.
+    // Moved to external Usage, Callers Now handle this.
 
     try {
       // --- 3. BATCH LOOP ---
