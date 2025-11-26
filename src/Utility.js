@@ -9,29 +9,55 @@ var MAX_CACHE_CHUNK_SIZE = 8000;
 var CHUNK_INDEX_SUFFIX = ':IDX';
 
 /**
+ * [NEW] SHARED NITRO CONFIGURATION
+ * Centralized settings for high-volume sheet writes.
+ * Workers can import this and override specific fields (like Chunk Sizes).
+ */
+var NITRO_CONFIG = {
+  // --- Shared Stability Settings ---
+  TARGET_WRITE_TIME_MS: 1000,
+  MAX_FACTOR: 1.2,             // Conservative growth (don't grow chunks too fast)
+  THROTTLE_THRESHOLD_MS: -1,   // Disable standard throttling (rely on adaptive)
+  THROTTLE_PAUSE_MS: 5000,     // Long pause if we hit a wall
+  LAG_SPIKE_THRESHOLD_MS: 60000,
+  
+  // --- Baseline Defaults (Override these in Worker if needed) ---
+  MAX_CELLS_PER_CHUNK: 50000,
+  SOFT_LIMIT_MS: 280000,       // 4.5 Minutes
+  MIN_CHUNK_SIZE: 500,
+  MAX_CHUNK_SIZE: 5000
+};
+
+/**
  * [THE RACER] - Destructive, Optimized Temp Sheet Creator.
+ * Uses Delete+Insert instead of Clear() to prevent timeouts on large sheets.
  */
 function prepareTempSheet(ss, sheetName, headers) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(sheetName);
 
+  // 1. Nuclear Option: Delete the old sheet entirely
+  // clear() times out on large sheets. deleteSheet() is instant.
   if (sheet) {
-    sheet.clear();
-    const currentCols = sheet.getMaxColumns();
-    if (currentCols > headers.length) {
-      sheet.deleteColumns(headers.length + 1, currentCols - headers.length);
-    }
-  } else {
-    sheet = ss.insertSheet(sheetName);
-    const currentCols = sheet.getMaxColumns();
-    if (currentCols > headers.length) {
-      sheet.deleteColumns(headers.length + 1, currentCols - headers.length);
+    try {
+      ss.deleteSheet(sheet);
+      SpreadsheetApp.flush(); 
+    } catch (e) {
+      console.warn("Could not delete sheet (might be last one): " + e.message);
+      try { sheet.clearContents(); } catch(e2) {} 
     }
   }
 
+  // 2. Create fresh
+  sheet = ss.insertSheet(sheetName);
+
+  // 3. Set Headers
   if (headers && headers.length > 0) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    // Handle both 1D and 2D header arrays
+    const headerRow = (Array.isArray(headers[0])) ? headers[0] : headers;
+    sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
   }
+  
   sheet.setFrozenRows(1);
   return sheet;
 }
@@ -56,29 +82,72 @@ function getOrCreateSheet(ss, name, headers) {
  * [NEW] Separate trigger to turn calculation back on.
  * If this times out, it's fine. The data is already safe.
  */
-function wakeUpSheet(ss) {
-  console.log("[WakeUp] Restoring Calculation Mode...");
-  try {
-    if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-    ss.setCalculationMode(SpreadsheetApp.CalculationMode.ON_CHANGE);
-    console.log("[WakeUp] Calculation Mode Restored.");
-  } catch (e) {
-    console.error("[WakeUp] Failed: " + e.message);
+/**
+ * [ANESTHESIA] - Pauses heavy formulas via Helper Cells.
+ * Toggles Utility!B3:D3 to 0.
+ */
+function pauseSheet(ss) {
+  // Guard rail: Ensure we have a spreadsheet object
+  if (!ss) {
+    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch(e) {}
+    if (!ss) {
+      console.warn("[pauseSheet] No Spreadsheet object found.");
+      return false;
+    }
   }
+
+  try {
+    const sheet = ss.getSheetByName('Utility');
+    if (sheet) {
+        // Set flags to 0 to STOP formulas (Main.js checks this)
+        sheet.getRange("B3:D3").setValues([[0,0,0]]);
+        SpreadsheetApp.flush();
+        console.log("[Anesthesia] Set Utility flags to 0 (Paused).");
+        return true;
+    } else {
+        console.warn("[pauseSheet] 'Utility' sheet not found.");
+    }
+  } catch (e) {
+    console.warn("Failed to set Utility flags: " + e.message);
+  }
+  return false;
 }
 
-function pauseSheet(ss)
-{
-  var needsWakeUp = false;
-    if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-    try {
-      if (ss.getCalculationMode() !== SpreadsheetApp.CalculationMode.MANUAL) {
-        ss.setCalculationMode(SpreadsheetApp.CalculationMode.MANUAL);
-        console.log("[Finalizer] Set Manual Mode (Pre-Swap).");
-        needsWakeUp = true;
-      }
-    } catch (e) { console.warn("Could not set Manual Mode: " + e.message); }
-    return needsWakeUp;
+/**
+ * [WAKE UP] - Resumes heavy formulas via Helper Cells.
+ * Toggles Utility!B3:D3 to 1.
+ */
+/**
+ * [WAKE UP] - Resumes heavy formulas via Helper Cells.
+ * Toggles Utility!B3:D3 to 1.
+ * UPDATED: Handles Trigger Event Object correctly.
+ */
+function wakeUpSheet(ss) {
+  // 1. Sanitize Input
+  // If called by a trigger, 'ss' is an Event Object, which is not null but lacks methods.
+  // We MUST check if it actually has the getSheetByName method.
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch(e) {}
+    
+    // If we still don't have a spreadsheet, we can't proceed.
+    if (!ss) {
+        console.warn("[wakeUpSheet] Could not find Active Spreadsheet (Trigger context).");
+        return;
+    }
+  }
+
+  try {
+    const sheet = ss.getSheetByName('Utility');
+    if (sheet) {
+        // Set flags to 1 to RESUME formulas
+        sheet.getRange("B3:D3").setValues([[1,1,1]]);
+        console.log("[Anesthesia] Set Utility flags to 1 (Resumed).");
+    } else {
+        console.warn("[wakeUpSheet] 'Utility' sheet not found.");
+    }
+  } catch (e) {
+    console.error("Failed to wake up sheet: " + e.message);
+  }
 }
 
 /**
