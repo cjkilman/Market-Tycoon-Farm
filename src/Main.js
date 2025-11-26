@@ -273,140 +273,150 @@ function getStructureNames(structureIDs) {
   return output;
 }
 
-
-
-/**
- * Rebuilds the 'Market_Control' sheet.
- */
 function updateControlSheet() {
   if (isSdeJobRunning()) { 
     Logger.log("updateControlSheet skipped: SDE Job is running.");
     return;
   }
 
+  // --- CONFIGURATION ---
+  const CONFIG = {
+    ITEM_SHEET_NAME: 'MarketOverviewData', 
+    LOCATION_SHEET_NAME: 'Location List',
+    CONTROL_SHEET_NAME: 'Market_Control',
+    SDE_SHEET_NAME: 'SDE_invTypes',
+    ITEM_NAME_HEADERS: ['Item Name', 'TypeName', 'Type Name', 'Name', 'Item'],
+    ITEM_ID_HEADERS: ['TypeID', 'Type ID', 'Item ID'], 
+    LOC_HEADERS: ['Station', 'System', 'Region'] 
+  };
+
   const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CONTROL_GEN') : console);
-  log.info('Starting Market_Control sheet rebuild with last_updated column...');
+  log.info(`Starting Rebuild with Sort & Dedupe. Source: ${CONFIG.ITEM_SHEET_NAME} & ${CONFIG.LOCATION_SHEET_NAME}`);
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const itemMasterSheetName = 'Item List';
-  const sdeSheetName = 'SDE_invTypes';
-  const locationListSheetName = 'Location List';
-  const controlSheetName = 'Market_Control';
+  const itemSheet = ss.getSheetByName(CONFIG.ITEM_SHEET_NAME);
+  const locationSheet = ss.getSheetByName(CONFIG.LOCATION_SHEET_NAME);
+  const controlSheet = ss.getSheetByName(CONFIG.CONTROL_SHEET_NAME);
+  const sdeSheet = ss.getSheetByName(CONFIG.SDE_SHEET_NAME);
 
-  const itemSheet = ss.getSheetByName(itemMasterSheetName);
-  const sdeSheet = ss.getSheetByName(sdeSheetName);
-  const locationSheet = ss.getSheetByName(locationListSheetName);
-  const controlSheet = ss.getSheetByName(controlSheetName);
+  if (!itemSheet || !locationSheet || !controlSheet) throw new Error("Missing required sheets.");
 
-  if (!itemSheet || !sdeSheet || !locationSheet || !controlSheet) {
-    throw new Error(`One or more required sheets are missing.`);
+  // =================================================================
+  // 1. READ ITEMS
+  // =================================================================
+  let uniqueItemIds = [];
+  const itemDataRaw = itemSheet.getDataRange().getValues();
+  if (itemDataRaw.length < 2) throw new Error("Item sheet is empty.");
+
+  let itemHeaderRowIdx = -1, nameColIdx = -1, idColIdx = -1;
+
+  for (let r = 0; r < Math.min(5, itemDataRaw.length); r++) {
+    const row = itemDataRaw[r].map(c => String(c).trim().toLowerCase());
+    CONFIG.ITEM_NAME_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { nameColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
+    CONFIG.ITEM_ID_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { idColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
+    if (itemHeaderRowIdx > -1) break;
   }
 
-  // 1. Create a lookup map from the SDE (typeName -> typeID)
-  const sdeData = sdeSheet.getRange('A2:C' + sdeSheet.getLastRow()).getValues();
-  const typeIdMap = new Map(sdeData.map(row => [String(row[2]).trim().toLowerCase(), row[0]]));
+  if (itemHeaderRowIdx === -1) throw new Error(`Could not find Item headers in '${CONFIG.ITEM_SHEET_NAME}'.`);
 
-  // 2. Read Item Names from the master 'Item List' sheet
-  // Ensure we have rows to read
-  const lastRow = itemSheet.getLastRow();
-  if (lastRow < 3) {
-      log.warn("Item List sheet appears empty (less than 3 rows). Skipping item read.");
-      return;
+  const rawItems = [];
+  if (idColIdx > -1) {
+    for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+      const val = itemDataRaw[i][idColIdx];
+      if (Number(val) > 0) rawItems.push(Number(val));
+    }
+  } else if (nameColIdx > -1 && sdeSheet) {
+    const sdeVals = sdeSheet.getRange('A2:C' + sdeSheet.getLastRow()).getValues();
+    const typeMap = new Map(sdeVals.map(r => [String(r[2]).trim().toLowerCase(), r[0]]));
+    for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+      const name = String(itemDataRaw[i][nameColIdx]).trim().toLowerCase();
+      if (name && typeMap.has(name)) rawItems.push(typeMap.get(name));
+    }
   }
-  const itemNamesRange = itemSheet.getRange('B3:B' + lastRow);
-  const itemIds = itemNamesRange.getValues()
-    .flat()
-    .map(name => name ? typeIdMap.get(name.trim().toLowerCase()) : null)
-    .filter(id => Number.isFinite(id) && id > 0);
 
-  const uniqueItemIds = Array.from(new Set(itemIds));
-  log.info(`Found ${uniqueItemIds.length} unique item IDs from '${itemMasterSheetName}'.`);
+  uniqueItemIds = Array.from(new Set(rawItems));
+  log.info(`Found ${uniqueItemIds.length} unique items.`);
 
-  // 3. Read and Deduplicate Location IDs
-  const locHeaders = locationSheet.getRange('B5:G5').getValues()[0];
-  const stationColIndex = locHeaders.indexOf('Station');
-  const systemColIndex = locHeaders.indexOf('System');
-  const regionColIndex = locHeaders.indexOf('Region');
+  // =================================================================
+  // 2. READ LOCATIONS
+  // =================================================================
+  const locHeaderRowIdx = 4; // Row 5
+  const locDataRaw = locationSheet.getDataRange().getValues();
+  if (locDataRaw.length <= locHeaderRowIdx) throw new Error("Location sheet too short.");
 
-  const locData = locationSheet.getRange(6, 1, locationSheet.getLastRow() - 5, locHeaders.length).getValues();
-  const uniqueLocationStrings = new Set();
-  locData.forEach(row => {
-    if (Number(row[stationColIndex]) > 0) uniqueLocationStrings.add(`station_${row[stationColIndex]}`);
-    if (Number(row[systemColIndex]) > 0) uniqueLocationStrings.add(`system_${row[systemColIndex]}`);
-    if (Number(row[regionColIndex]) > 0) uniqueLocationStrings.add(`region_${row[regionColIndex]}`);
+  const headerRow = locDataRaw[locHeaderRowIdx].map(c => String(c).trim().toLowerCase());
+  const colMap = {};
+  CONFIG.LOC_HEADERS.forEach(h => colMap[h] = headerRow.indexOf(h.toLowerCase()));
+
+  const locSet = new Set();
+  for (let i = locHeaderRowIdx + 1; i < locDataRaw.length; i++) {
+    const row = locDataRaw[i];
+    CONFIG.LOC_HEADERS.forEach(type => {
+      const idx = colMap[type];
+      if (idx > -1) {
+        const val = row[idx];
+        if (val && !isNaN(val) && Number(val) > 0) locSet.add(`${type}|${val}`);
+      }
+    });
+  }
+
+  const locations = Array.from(locSet).map(s => {
+    const parts = s.split('|');
+    return { type: parts[0], id: Number(parts[1]) };
   });
+  log.info(`Found ${locations.length} unique locations.`);
 
-  const locations = Array.from(uniqueLocationStrings).map(locString => {
-    const [type, id] = locString.split('_');
-    return { type, id: Number(id) };
-  });
-  log.info(`Found ${locations.length} unique market locations.`);
-
-  // 4. Generate and Write the Control Table Data
-  // Assuming withSheetLock is defined elsewhere (e.g., Orchestrator.gs.js)
+  // =================================================================
+  // 3. GENERATE, DEDUPE, & SORT
+  // =================================================================
   withSheetLock(function () {
     controlSheet.clear();
-    const headers = [['type_id', 'location_type', 'location_id']];
-    controlSheet.getRange(1, 1, 1, 3).setValues(headers);
+    const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
+    controlSheet.getRange(1, 1, 1, 4).setValues(headers);
 
-    const outputRows = [];
-
-    // REVERSED LOOP ORDER: Iterate over locations first, then items.
+    let output = [];
+    
+    // Generate Rows
     for (const loc of locations) {
-      for (const item_id of uniqueItemIds) {
-        outputRows.push([item_id, loc.type, loc.id]);
+      for (const itemId of uniqueItemIds) {
+        output.push([itemId, loc.type, loc.id, '']);
       }
     }
 
-    if (outputRows.length > 0) {
-      // Write data
-      controlSheet.getRange(2, 1, outputRows.length, 4).setValues(outputRows);
-      log.info(`Successfully wrote ${outputRows.length} control rows.`);
+    // --- DEDUPLICATION ---
+    const seen = new Set();
+    const dedupedOutput = [];
+    for (const row of output) {
+      const key = `${row[0]}_${row[1]}_${row[2]}`; // type_id_loctype_locid
+      if (!seen.has(key)) {
+        seen.add(key);
+        dedupedOutput.push(row);
+      }
+    }
+    
+    log.info(`Deduplication: Removed ${output.length - dedupedOutput.length} duplicates.`);
+
+    // --- SORTING ---
+    // 1. Type ID (Asc) -> 2. Location Type (Str Asc) -> 3. Location ID (Num Asc)
+    dedupedOutput.sort((a, b) => {
+      if (a[0] !== b[0]) return a[0] - b[0]; // Type ID
+      if (a[1] !== b[1]) return a[1].localeCompare(b[1]); // Location Type
+      return a[2] - b[2]; // Location ID
+    });
+
+    if (dedupedOutput.length > 0) {
+      controlSheet.getRange(2, 1, dedupedOutput.length, 4).setValues(dedupedOutput);
       
-      // --- TRIM BLANK ROWS ---
-      const lastDataRow = outputRows.length + 1; // Header is 1
       const maxRows = controlSheet.getMaxRows();
-      
-      if (maxRows > lastDataRow) {
-          const rowsToDelete = maxRows - lastDataRow;
-          // Optional buffer: keep 10 empty rows if you want
-          // If strict trimming is desired:
-          controlSheet.deleteRows(lastDataRow + 1, rowsToDelete);
-          log.info(`Trimmed ${rowsToDelete} blank rows from Market_Control.`);
+      if (maxRows > dedupedOutput.length + 1) {
+        controlSheet.deleteRows(dedupedOutput.length + 2, maxRows - (dedupedOutput.length + 1));
       }
     }
+    log.info(`Successfully wrote ${dedupedOutput.length} sorted rows.`);
   });
-  SpreadsheetApp.getUi().alert(`'${controlSheetName}' has been updated successfully.`);
+  
+  SpreadsheetApp.getUi().alert(`Done. Wrote ${uniqueItemIds.length * locations.length} rows (Sorted & Deduped).`);
 }
-
-/**
- * Function to run manually to force the authorization prompt.
- */
-function forceAuthorization() {
-  // This function runs a service that requires authorization (UrlFetchApp)
-  // and is accessible via the custom menu. Running it guarantees the prompt appears.
-  try {
-
-    // _deleteExistingTriggers(); // This function is in main.js from your other project, not this one.
-    // Let's call a similar function or just skip it if it's not defined.
-    if (typeof _deleteExistingTriggers === 'function') {
-      _deleteExistingTriggers();
-    }
-    UrlFetchApp.fetch("https://google.com");
-    SpreadsheetApp.getUi().alert('Authorization granted successfully!');
-  } catch (e) {
-    if (e.message.includes('Authorization is required')) {
-      SpreadsheetApp.getUi().alert('Authorization failed. Please follow the prompt in the editor after running this function.');
-    } else {
-      // Check if the script needs permissions beyond basic Spreadsheet access
-      const propertiesService = PropertiesService.getUserProperties();
-      propertiesService.setProperty('AUTH_CHECK', 'RUNNING');
-      propertiesService.deleteProperty('AUTH_CHECK');
-      SpreadsheetApp.getUi().alert('Authorization check failed. Please run this function again and check the console/editor for prompts.');
-    }
-  }
-}
-
 
 /**
  *Get Character Names from thier ID
@@ -505,113 +515,3 @@ function sqlFromHeaderNamesEx(rangeName, queryString, useColNums) {
   return rewritten;
 }
 
-function updateControlSheet() {
-    // Check master lock (assuming isSdeJobRunning is defined globally and works)
-    if (isSdeJobRunning()) { 
-        Logger.log("updateControlSheet skipped: SDE Job is running.");
-        return;
-    }
-    
-    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CONTROL_GEN') : console);
-    log.info('Starting Market_Control sheet rebuild with last_updated column...');
-
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    
-    // Define Sheet Names
-    const itemSourceSheetName = "MarketOverviewData"; 
-    const locationListSheetName = 'Location List';
-    const controlSheetName = 'Market_Control';
-
-    // Retrieve Sheets
-    const itemSheet = ss.getSheetByName(itemSourceSheetName); 
-    const locationSheet = ss.getSheetByName(locationListSheetName);
-    const controlSheet = ss.getSheetByName(controlSheetName);
-
-    if (!itemSheet || !locationSheet || !controlSheet) {
-        throw new Error(`One or more required sheets are missing (MarketOverviewData, Location List, Market_Control).`);
-    }
-
-    // 1. Read Item IDs directly from the new source sheet (MarketOverviewData!B4:B)
-    const itemIdsRange = itemSheet.getRange('B4:B' + itemSheet.getLastRow());
-    const uniqueItemIds = Array.from(new Set(
-        itemIdsRange.getValues()
-        .flat()
-        .map(Number) 
-        .filter(id => Number.isFinite(id) && id > 0)
-    ));
-    
-    log.info(`Found ${uniqueItemIds.length} unique item IDs from '${itemSourceSheetName}'.`);
-    
-    // 2. Read and Deduplicate Location IDs using DYNAMIC HEADERS
-    const locHeaders = locationSheet.getRange('A5:G5').getValues()[0];
-    
-    // Define the target headers (These match the sheet's column names)
-    const STATION_HEADER = 'Station';
-    const SYSTEM_HEADER = 'System';
-    const REGION_HEADER = 'Region';
-
-    const stationColIndex = locHeaders.indexOf(STATION_HEADER);
-    const systemColIndex = locHeaders.indexOf(SYSTEM_HEADER);
-    const regionColIndex = locHeaders.indexOf(REGION_HEADER);
-
-    const locData = locationSheet.getRange(6, 1, locationSheet.getLastRow() - 5, locHeaders.length).getValues();
-    const locationMap = new Map(); // Used to enforce uniqueness (type_id_number)
-    
-    // --- HIERARCHY-ENFORCED PROCESSING BLOCK (Fixed Logic) ---
-    locData.forEach(row => {
-        let type = '';
-        let id = 0;
-
-        // 1. Check for the most specific ID: STATION
-        if (stationColIndex !== -1 && Number(row[stationColIndex]) > 0) {
-            type = 'station';
-            id = Number(row[stationColIndex]);
-        
-        // 2. ONLY if no Station ID was found, check for the next most specific: SYSTEM
-        } else if (systemColIndex !== -1 && Number(row[systemColIndex]) > 0) {
-            type = 'system';
-            id = Number(row[systemColIndex]);
-        
-        // 3. ONLY if neither a Station nor a System ID was found, check for REGION
-        } else if (regionColIndex !== -1 && Number(row[regionColIndex]) > 0) {
-            type = 'region';
-            id = Number(row[regionColIndex]);
-        }
-        
-        // If a valid ID was found, store it in the Map.
-        if (id > 0) {
-            // Key is 'type_id' to guarantee uniqueness across types (e.g., station_60001 != system_60001)
-            locationMap.set(`${type}_${id}`, { type, id });
-        }
-    });
-    // --- END HIERARCHY-ENFORCED PROCESSING BLOCK ---
-
-    // Convert the Map values into the final array of objects
-    const locations = Array.from(locationMap.values());
-    log.info(`Found ${locations.length} unique market locations.`);
-
-    // 3. Generate and Write the Control Table Data
-    withSheetLock(function() {
-        controlSheet.clear();
-        const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
-        controlSheet.getRange(1, 1, 1, 4).setValues(headers);
-
-        const outputRows = [];
-        
-        // Generate all rows
-        for (const item_id of uniqueItemIds) {
-            for (const loc of locations) {
-                outputRows.push([item_id, loc.type, loc.id, '']);
-            }
-        }
-        
-        // Sort the entire outputRows array by Location ID (index 2)
-        outputRows.sort((a, b) => a[2] - b[2]);
-
-        if (outputRows.length > 0) {
-            controlSheet.getRange(2, 1, outputRows.length, 4).setValues(outputRows);
-            log.info(`Successfully wrote ${outputRows.length} control rows.`);
-        }
-    });
-    SpreadsheetApp.getUi().alert(`'${controlSheetName}' has been updated successfully.`);
-}
