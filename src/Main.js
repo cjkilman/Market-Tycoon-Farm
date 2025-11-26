@@ -307,7 +307,13 @@ function updateControlSheet() {
   const typeIdMap = new Map(sdeData.map(row => [String(row[2]).trim().toLowerCase(), row[0]]));
 
   // 2. Read Item Names from the master 'Item List' sheet
-  const itemNamesRange = itemSheet.getRange('B2:B' + itemSheet.getLastRow());
+  // Ensure we have rows to read
+  const lastRow = itemSheet.getLastRow();
+  if (lastRow < 3) {
+      log.warn("Item List sheet appears empty (less than 3 rows). Skipping item read.");
+      return;
+  }
+  const itemNamesRange = itemSheet.getRange('B3:B' + lastRow);
   const itemIds = itemNamesRange.getValues()
     .flat()
     .map(name => name ? typeIdMap.get(name.trim().toLowerCase()) : null)
@@ -317,7 +323,7 @@ function updateControlSheet() {
   log.info(`Found ${uniqueItemIds.length} unique item IDs from '${itemMasterSheetName}'.`);
 
   // 3. Read and Deduplicate Location IDs
-  const locHeaders = locationSheet.getRange('A5:G5').getValues()[0];
+  const locHeaders = locationSheet.getRange('B5:G5').getValues()[0];
   const stationColIndex = locHeaders.indexOf('Station');
   const systemColIndex = locHeaders.indexOf('System');
   const regionColIndex = locHeaders.indexOf('Region');
@@ -338,25 +344,36 @@ function updateControlSheet() {
 
   // 4. Generate and Write the Control Table Data
   // Assuming withSheetLock is defined elsewhere (e.g., Orchestrator.gs.js)
-  // If not, replace with: const docLock = LockService.getDocumentLock(); docLock.waitLock(30000); try { ... } finally { docLock.releaseLock(); }
   withSheetLock(function () {
     controlSheet.clear();
-    const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
-    controlSheet.getRange(1, 1, 1, 4).setValues(headers);
+    const headers = [['type_id', 'location_type', 'location_id']];
+    controlSheet.getRange(1, 1, 1, 3).setValues(headers);
 
     const outputRows = [];
 
     // REVERSED LOOP ORDER: Iterate over locations first, then items.
     for (const loc of locations) {
       for (const item_id of uniqueItemIds) {
-        // Add a blank placeholder for the 'last_updated' timestamp
-        outputRows.push([item_id, loc.type, loc.id, '']);
+        outputRows.push([item_id, loc.type, loc.id]);
       }
     }
 
     if (outputRows.length > 0) {
+      // Write data
       controlSheet.getRange(2, 1, outputRows.length, 4).setValues(outputRows);
       log.info(`Successfully wrote ${outputRows.length} control rows.`);
+      
+      // --- TRIM BLANK ROWS ---
+      const lastDataRow = outputRows.length + 1; // Header is 1
+      const maxRows = controlSheet.getMaxRows();
+      
+      if (maxRows > lastDataRow) {
+          const rowsToDelete = maxRows - lastDataRow;
+          // Optional buffer: keep 10 empty rows if you want
+          // If strict trimming is desired:
+          controlSheet.deleteRows(lastDataRow + 1, rowsToDelete);
+          log.info(`Trimmed ${rowsToDelete} blank rows from Market_Control.`);
+      }
     }
   });
   SpreadsheetApp.getUi().alert(`'${controlSheetName}' has been updated successfully.`);

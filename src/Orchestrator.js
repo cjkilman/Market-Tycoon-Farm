@@ -291,10 +291,9 @@ function updateMarketDataSheet() {
 }
 
 /**
- * Market Data Worker (Nitro Edition - TUNED)
- */
-/**
- * Market Data Worker (Nitro Edition - TUNED)
+ * Market Data Worker (Nitro Edition - HYBRID)
+ * Phase 1: Surgical Pause (Prevent creation crash)
+ * Phase 2: Live Write (No pause, allows dashboard use)
  */
 function _updateMarketDataSheetWorker() {
   const START_TIME = new Date().getTime();
@@ -306,8 +305,9 @@ function _updateMarketDataSheetWorker() {
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS';
 
+  // NITRO_CONFIG Fallback
   const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-    = [8000, 1000, 270000, 10000];
+    = [8000, 1000, 330000, 10000];
 
   SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
 
@@ -320,7 +320,7 @@ function _updateMarketDataSheetWorker() {
 
   let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
 
-  // --- Phase 1: NEW_RUN (No Anesthesia) ---
+  // --- Phase 1: NEW_RUN (SURGICAL PAUSE) ---
   if (currentStep === STATE_FLAGS.NEW_RUN || !masterRequests || masterRequests.length === 0) {
     console.log(`State: ${STATE_FLAGS.NEW_RUN}.`);
 
@@ -329,18 +329,36 @@ function _updateMarketDataSheetWorker() {
       return;
     }
 
-    // [ANESTHESIA]
+    // [PAUSE] Critical for safe sheet operations (Reuse/Clear)
     var needsWakeUp = pauseSheet(ss_anchor);
 
     const setupResult = guardedSheetTransaction(() => {
-      // Use Central Helper (Delete+Insert)
-      const sheet = prepareTempSheet(ss_anchor, tempSheetName, DATA_SHEET_HEADERS);
-      sheet.hideSheet();
-      return true;
+      // 1. Call Helper (Returns {success, state, error})
+      const result = prepareTempSheet(ss_anchor, tempSheetName, DATA_SHEET_HEADERS);
+      
+      // 2. Check Internal Result
+      if (!result.success) {
+          // Throwing here causes guardedSheetTransaction to catch it and return {success: false}
+          throw new Error(result.error || "Unknown Prep Failure");
+      }
+
+      // 3. Perform Sheet Ops (Safe to access .state now)
+      if (result.state) {
+          result.state.hideSheet();
+      }
+      
+      // 4. Return Success
+      return true; 
     }, 60000);
 
+    // [WAKE UP] Immediately for live mode
+    if (needsWakeUp) {
+        wakeUpSheet(ss_anchor);
+        console.log("[Worker] Surgical Pause complete. Sheet woken up for Write Phase.");
+    }
+
     if (!setupResult.success) {
-      if (needsWakeUp) scheduleOneTimeTrigger('wakeUpSheet', 30000);
+      console.warn(`[Worker] Sheet prep failed: ${setupResult.error}`);
       scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
       return;
     }
@@ -354,10 +372,8 @@ function _updateMarketDataSheetWorker() {
     return;
   }
 
-  // --- Phase 2: WRITE (Nitro Mode) - KEEPS Anesthesia ---
+  // --- Phase 2: WRITE (Nitro Mode - LIVE/UNPAUSED) ---
   if (currentStep === 'PROCESSING' || currentStep === 'WRITE') {
-    // ... [Write phase logic remains unchanged, keeping Anesthesia] ...
-    // (Keeping the rest of the function as it was in the previous correct version)
 
     const masterRequests_stable = getMasterBatchFromControlTable(ss_anchor);
     let allRowsToWrite = [];
@@ -391,6 +407,7 @@ function _updateMarketDataSheetWorker() {
       return;
     }
 
+    // Refresh SS reference
     ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
     let writeState = {
@@ -399,26 +416,25 @@ function _updateMarketDataSheetWorker() {
       ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
-        // 1. Inherit Shared Settings
-        ...NITRO_CONFIG,
+        // Inherit Shared Settings from Utility.js
+        ...(typeof NITRO_CONFIG !== 'undefined' ? NITRO_CONFIG : {}),
 
-        // 2. Apply Market Data Specific Overrides
-        MAX_CHUNK_SIZE: 1000,   // Stricter limit for Market Data
-        SOFT_LIMIT_MS: 240000,  // Slightly safer buffer (4m)
+        // LIVE MODE TUNING (Stricter because Calcs are ON):
+        MAX_CELLS_PER_CHUNK: 40000, 
+        MAX_CHUNK_SIZE: 2000,       
+      //  MIN_CHUNK_SIZE: 100, // Allow tiny chunks if lag is bad       
+       // SOFT_LIMIT_MS: 240000,
 
-        // 3. Dynamic State
+        // Dynamic State
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000')
       }
     };
 
-    // Keep Anesthesia Here
-    var needsWakeUp = pauseSheet(ss_anchor);
+   // if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 500;
 
-    if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 1000;
+    // [NO PAUSE HERE] - Writing Live to keep dashboard usable
 
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
-
-    if (needsWakeUp) scheduleOneTimeTrigger('wakeUpSheet', 30000);
 
     if (writeResult.success) {
       console.log("Write SUCCESS. Transitioning to FINALIZING.");
@@ -434,7 +450,11 @@ function _updateMarketDataSheetWorker() {
 
       const nextIndex = writeResult.state.nextBatchIndex.toString();
       let nextChunkSize = writeResult.state.config.currentChunkSize;
-      if (writeResult.error) nextChunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(nextChunkSize / 2));
+      
+      // Aggressive backoff on error
+      if (writeResult.error) {
+        nextChunkSize = Math.max(100, Math.floor(nextChunkSize / 2)); // Drop significantly
+      }
 
       SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
       SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize.toString());
@@ -450,51 +470,45 @@ function _updateMarketDataSheetWorker() {
 function finalizeMarketDataUpdate() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
-  const finalSheetName = 'Market_Data_Raw';
+  const finalSheetName = 'Market_Data_Raw'; 
   const tempSheetName = 'Market_Data_Temp';
-
+  
   const funcName = 'finalizeMarketDataUpdate';
 
-  executeWithTryLock(() => {
+  executeWithTryLock(() => { 
 
     if (SCRIPT_PROP.getProperty(PROP_KEY_STEP) !== 'FINALIZING') {
       _resetMarketDataJobState(new Error(`Wrong state.`));
       return;
     }
 
-    // [RESTORED] Standard access
     var ss_inner = SpreadsheetApp.getActiveSpreadsheet();
 
-    // [ANESTHESIA]
-    var needsWakeUp = pauseSheet(ss_inner);
+    // [PAUSE] This flush takes time (e.g. 3.5 minutes)
+    var needsWakeUp = pauseSheet(ss_inner); 
 
-    const repairMap = { ['NR_MARKET_DATA']: 'A2:G' };
+    // [CRITICAL FIX] REFRESH CONNECTION
+    // The previous 'ss_inner' is dead after the long flush. Get a new one.
+    ss_inner = SpreadsheetApp.getActiveSpreadsheet(); 
+
+    const repairMap = { ['NR_MARKET_DATA']: 'A:G' };
 
     const transactionResult = guardedSheetTransaction(() => {
+      // Uses the new "Hot Swap" (Overwrite) logic, now includes Named Range update
       return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
     }, 60000);
+
+    // [WAKE UP]
+    if (needsWakeUp) wakeUpSheet(ss_inner);
 
     let swapSuccess = (transactionResult.success && transactionResult.state.success);
 
     if (swapSuccess) {
-      try {
-        const finalSheet = ss_inner.getSheetByName(finalSheetName);
-        if (finalSheet && finalSheet.getLastRow() > 1) {
-          const range = finalSheet.getRange(2, 1, finalSheet.getLastRow() - 1, finalSheet.getLastColumn());
-          ss_inner.setNamedRange('NR_MARKET_DATA', range);
-        }
-      } catch (e) { }
-
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
 
-      if (needsWakeUp) {
-        scheduleOneTimeTrigger('wakeUpSheet', 30000);
-      }
-
     } else {
       console.warn(`[Finalizer] Swap Failed: ${transactionResult.error || transactionResult.state.errorMessage}`);
-      if (needsWakeUp) wakeUpSheet(ss_inner);
     }
 
   }, funcName);

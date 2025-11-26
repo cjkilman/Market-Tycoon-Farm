@@ -15,52 +15,85 @@ var CHUNK_INDEX_SUFFIX = ':IDX';
  */
 var NITRO_CONFIG = {
   // --- Shared Stability Settings ---
-  TARGET_WRITE_TIME_MS: 1000,
+  TARGET_WRITE_TIME_MS: 2000,
   MAX_FACTOR: 1.2,             // Conservative growth (don't grow chunks too fast)
   THROTTLE_THRESHOLD_MS: -1,   // Disable standard throttling (rely on adaptive)
-  THROTTLE_PAUSE_MS: 5000,     // Long pause if we hit a wall
+  THROTTLE_PAUSE_MS: 30000,     // Long pause if we hit a wall
   LAG_SPIKE_THRESHOLD_MS: 60000,
   
   // --- Baseline Defaults (Override these in Worker if needed) ---
   MAX_CELLS_PER_CHUNK: 50000,
-  SOFT_LIMIT_MS: 280000,       // 4.5 Minutes
+  SOFT_LIMIT_MS: 330000,       // 4.5 Minutes
   MIN_CHUNK_SIZE: 500,
   MAX_CHUNK_SIZE: 5000
 };
 
 /**
- * [THE RACER] - Destructive, Optimized Temp Sheet Creator.
- * Uses Delete+Insert instead of Clear() to prevent timeouts on large sheets.
+ * [THE RACER] - Reuse/Reset Strategy.
+ * Clears the sheet if it exists (Reuse). Creates if missing.
+ * Wraps clear() in a try/catch because it can be flaky on massive sheets.
+ */
+/**
+ * [THE RACER] - Reuse/Reset Strategy.
+ * Clears the sheet if it exists (Reuse). Creates if missing.
+ * Returns status object for consistent error handling.
  */
 function prepareTempSheet(ss, sheetName, headers) {
+  var success = true; // Assume success initially unless catch block flips it
+  var errorMessage = null;
+  
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(sheetName);
 
-  // 1. Nuclear Option: Delete the old sheet entirely
-  // clear() times out on large sheets. deleteSheet() is instant.
   if (sheet) {
     try {
-      ss.deleteSheet(sheet);
-      SpreadsheetApp.flush(); 
+      // Try to clear contents (Fastest reuse)
+      sheet.clear();
     } catch (e) {
-      console.warn("Could not delete sheet (might be last one): " + e.message);
-      try { sheet.clearContents(); } catch(e2) {} 
+      // If clear fails, fallback to nuclear option
+      errorMessage = `[prepareTempSheet] Clear failed: ${e.message}. Attempting nuclear delete/insert.`;
+      console.warn(errorMessage);
+      try { 
+          ss.deleteSheet(sheet); 
+      } catch(e2) {
+          success = false;
+          errorMessage += ` | Delete failed: ${e2.message}`;
+          return { success: false, state: null, error: errorMessage };
+      }
+      
+      try {
+        sheet = ss.insertSheet(sheetName);
+      } catch (e3) {
+        success = false;
+        errorMessage += ` | Insert failed: ${e3.message}`;
+        return { success: false, state: null, error: errorMessage };
+      }
+    }
+  } else {
+    try {
+        sheet = ss.insertSheet(sheetName);
+    } catch (e4) {
+        return { success: false, state: null, error: "Failed to insert new sheet: " + e4.message };
     }
   }
 
-  // 2. Create fresh
-  sheet = ss.insertSheet(sheetName);
-
-  // 3. Set Headers
+  // Set Headers
   if (headers && headers.length > 0) {
-    // Handle both 1D and 2D header arrays
-    const headerRow = (Array.isArray(headers[0])) ? headers[0] : headers;
-    sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+    try {
+        const headerRow = (Array.isArray(headers[0])) ? headers[0] : headers;
+        sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+    } catch (e5) {
+        console.warn("Header set failed: " + e5.message);
+        // Non-fatal, but worth noting
+    }
   }
   
-  sheet.setFrozenRows(1);
-  return sheet;
+  try { sheet.setFrozenRows(1); } catch(e) {}
+  
+  return { success: success, state: sheet, error: errorMessage };
 }
+
+
 
 /**
  * [THE BUILDER] - Safe, Non-Destructive Sheet Creator.
@@ -150,22 +183,17 @@ function wakeUpSheet(ss) {
   }
 }
 
+
 /**
- * Performs a Safe Atomic Swap (Clean Version).
- * Tries Manual Mode. If it fails, forces Delete (May timeout, but no Trash).
- * 1. Locks the script.
- * 2. Attempts to set Manual Mode.
- * 3. Rewires Named Ranges.
- * 4. If Manual Mode worked -> Deletes Old.
- * 5. If Manual Mode failed -> Renames Old (Prevents Timeout).
+ * Performs a Safe "Hot Swap" (Overwrite + Reuse).
+ * 1. Copies data from Temp -> Target (Preserves Target ID/Refs).
+ * 2. Clears Temp (Does NOT Delete).
+ * This prevents "Service timed out" because no sheets are destroyed.
+ * * [UPDATED] Handles Named Range repair logic internally if map provided.
  */
 function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('AtomicSwap') : console);
   const docLock = LockService.getDocumentLock();
-
   if (!docLock.tryLock(30000)) return { success: false, errorMessage: "Could not acquire Document Lock." };
-
-  let originalCalcMode = null;
 
   try {
     const targetSheet = ss.getSheetByName(targetName);
@@ -173,38 +201,58 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
 
     if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
 
-    // --- PHASE 1: ANESTHESIA (Manual Mode) ---
-    // Moved Externally and now used in the callers
-
-    // --- PHASE 2: REWIRE ---
-    if (targetSheet) {
-      const namedRanges = ss.getNamedRanges();
-      const targetID = targetSheet.getSheetId();
-      let rewired = 0;
-
-      namedRanges.forEach(nr => {
-        try {
-          if (nr.getRange().getSheet().getSheetId() === targetID) {
-            nr.setRange(tempSheet.getRange(nr.getRange().getA1Notation()));
-            rewired++;
-          }
-        } catch (e) { /* Optional repair logic */ }
-      });
-      if (rewired > 0) SpreadsheetApp.flush();
-
-      // --- PHASE 3: EXECUTION (Strict Delete) ---
-      if (ss.getNumSheets() === 1) ss.insertSheet();
-      ss.deleteSheet(targetSheet);
+    // 1. GET DATA from Temp
+    const sourceRange = tempSheet.getDataRange();
+    const sourceValues = sourceRange.getValues();
+    
+    // 2. PREPARE Target (Create if missing)
+    let finalSheet = targetSheet;
+    if (!finalSheet) {
+      finalSheet = ss.insertSheet(targetName);
+    } else {
+      try { finalSheet.clear(); } catch(e) { finalSheet.clearContents(); }
     }
 
-    // --- PHASE 4: RENAME NEW ---
-    tempSheet.setName(targetName);
+    // 3. WRITE to Target
+    if (sourceValues.length > 0) {
+      finalSheet.getRange(1, 1, sourceValues.length, sourceValues[0].length).setValues(sourceValues);
+    }
+
+    // 4. REWIRE NAMED RANGES (If map provided)
+    // Since we overwrote the target sheet (kept ID), most ranges persist.
+    // However, if the data size changed drastically, we might need to resize them.
+    if (repairMap && finalSheet) {
+        const lastRow = finalSheet.getLastRow();
+        const lastCol = finalSheet.getLastColumn();
+        
+        for (const [rangeName, a1Ref] of Object.entries(repairMap)) {
+            try {
+                // Logic to set named range to the full data extent minus header (usually)
+                // Defaulting to "Full Sheet Data" logic if specific logic isn't passed
+                if (lastRow > 1) {
+                    const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
+                    ss.setNamedRange(rangeName, range);
+                    console.log(`[AtomicSwap] Updated Named Range '${rangeName}'`);
+                }
+            } catch (e) {
+                console.warn(`[AtomicSwap] Failed to update Named Range '${rangeName}': ${e.message}`);
+            }
+        }
+    }
+
+    // 5. CLEANUP Temp (Just Clear, Don't Delete)
+    try { 
+        tempSheet.clear(); 
+    } catch(e) { 
+        console.warn("Failed to clear temp sheet (non-fatal): " + e.message); 
+    }
+
+    //SpreadsheetApp.flush(); // Thats Handled in pauseSheet
     return { success: true, errorMessage: null };
 
   } catch (e) {
     return { success: false, errorMessage: e.message };
   } finally {
-
     docLock.releaseLock();
   }
 }
