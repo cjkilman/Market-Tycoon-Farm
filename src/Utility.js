@@ -29,10 +29,10 @@ var NITRO_CONFIG = {
   LAG_SPIKE_THRESHOLD_MS: 60000,
 
   // --- Baseline Defaults (Override these in Worker if needed) ---
-  MAX_CELLS_PER_CHUNK: 50000,
-  SOFT_LIMIT_MS: 330000,       // 4.5 Minutes
+  MAX_CELLS_PER_CHUNK: 40000,
+  SOFT_LIMIT_MS: 270000,       // 4.5 Minutes
   MIN_CHUNK_SIZE: 500,
-  MAX_CHUNK_SIZE: 5000
+  MAX_CHUNK_SIZE: 4000
 };
 
 /**
@@ -340,7 +340,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
   var i = Number(state.nextBatchIndex) || 0;
 
   currentChunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(MIN_CHUNK_SIZE, currentChunkSize));
-
+var previousChunkSize = 0;
   var dataLength = dataArray.length;
   var numCols = (dataLength > 0) ? dataArray[0].length : 0;
 
@@ -389,7 +389,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
           Utilities.sleep(THROTTLE_PAUSE_MS);
           previousDuration = 0;
         }
-
+        
         currentChunkSize = Math.min(currentChunkSize, MAX_ROWS_BY_COLUMNS);
         currentChunkSize = Math.max(currentChunkSize, MIN_CHUNK_SIZE);
 
@@ -410,12 +410,14 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
           // 1. Advance the index because THIS batch did finish (eventually)
           state.nextBatchIndex = i + numRows;
 
-          // 2. Tank the chunk size for the NEXT run to ensure safe startup
-          state.config.currentChunkSize = MIN_CHUNK_SIZE;
+          // 2. set the Chunk Sixe to the last good run
+          state.config.currentChunkSize = previousChunkSize;
 
           // 3. Return PREDICTIVE_BAILOUT so Orchestrator saves state and restarts cleanly
           return { success: false, bailout_reason: "PREDICTIVE_BAILOUT", state: state };
         }
+        // save the good chunksize for the next job;
+        previousChunkSize = currentChunkSize;
 
         var ratio = previousDuration / TARGET_WRITE_TIME_MS;
 
@@ -430,6 +432,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
         i += numRows;
 
         state.nextBatchIndex = i;
+        
         state.config.currentChunkSize = currentChunkSize;
         state.metrics.previousDuration = previousDuration;
       }

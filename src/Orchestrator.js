@@ -244,7 +244,8 @@ function runMaintenanceJobs() {
   const JOB_QUEUE = [
     'cacheAllCorporateAssetsTrigger',
     'runLootAndJournalSync',
-    'runContractSync'
+    'runContractSync',
+    'runIndustryLedgerPhase' // <--- ADD THIS
   ];
 
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
