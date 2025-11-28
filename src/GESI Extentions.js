@@ -441,8 +441,8 @@ function _charIdMap(ss) {
     // 1. Get all member IDs for the corporation tied to the authenticated character.
     // FIX: Use GESI.invokeRaw with parameter object for robust script execution.
     const memberIdsRaw = GESI.invokeRaw(
-      'corporations_corporation_members', 
-      { name: authToon, show_column_headings: false, version: null } 
+      'corporations_corporation_members',
+      { name: authToon, show_column_headings: false, version: null }
     );
 
     const memberIds = Array.isArray(memberIdsRaw) ? memberIdsRaw.filter(Number.isFinite) : [];
@@ -450,7 +450,7 @@ function _charIdMap(ss) {
     if (memberIds.length === 0) {
       log.warn('No member IDs returned from GESI.corporations_corporation_members.');
       // Throw an error to ensure the subsequent fallback logic is executed
-      throw new Error("No ESI member IDs found."); 
+      throw new Error("No ESI member IDs found.");
     }
 
     // 2. Resolve those IDs to Names.
@@ -461,7 +461,7 @@ function _charIdMap(ss) {
         ids: [memberIds], // Implementing user's explicit instruction
         show_column_headings: false,
         version: null
-      } 
+      }
     );
 
     // 3. Build the final Name -> ID map
@@ -480,12 +480,12 @@ function _charIdMap(ss) {
     // CRITICAL STABILITY FALLBACK (to handle external API failures)
     const fallbackIdRaw = _getNamedOr_('CORP_AUTH_CHAR_ID', null);
     const fallbackId = parseInt(fallbackIdRaw, 10);
-    
+
     if (authToon && fallbackId && Number.isFinite(fallbackId)) {
-        charIdMap[authToon] = fallbackId;
-        log.warn(`[CHAR_MAP] ESI call failed. Using configured ID ${fallbackId} from Named Range 'CORP_AUTH_CHAR_ID' for ${authToon}.`);
+      charIdMap[authToon] = fallbackId;
+      log.warn(`[CHAR_MAP] ESI call failed. Using configured ID ${fallbackId} from Named Range 'CORP_AUTH_CHAR_ID' for ${authToon}.`);
     } else {
-        log.warn(`[CHAR_MAP] ESI call failed. No valid fallback ID found in Named Range 'CORP_AUTH_CHAR_ID'.`);
+      log.warn(`[CHAR_MAP] ESI call failed. No valid fallback ID found in Named Range 'CORP_AUTH_CHAR_ID'.`);
     }
 
     _cachedCharIdMap = charIdMap;
@@ -1013,13 +1013,13 @@ function runLootDeltaPhase(ss) {
  */
 function syncContracts(ss, charIdMap) {
   var log = LoggerEx.withTag('GESI');
-  
+
   // Headers are correctly defined by the original function's structure.
   var hdrC = ["char", "contract_id", "type", "status", "issuer_id", "acceptor_id", "date_issued", "date_expired", "price", "reward", "collateral", "volume", "title", "availability", "start_location_id", "end_location_id"];
   var hdrI = ["char", "contract_id", "type_id", "quantity", "is_included", "is_singleton"];
 
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  
+
   // Necessary variables for filtering/processing
   var MS_PER_DAY = 86400000;
   var lookbackDays = getLookbackDays(ss);
@@ -1027,26 +1027,26 @@ function syncContracts(ss, charIdMap) {
   var authToon = getCorpAuthChar(ss);
   var myCharId = charIdMap[authToon] || null; // CRITICAL: Get the ESI ID for sale/buy checks
   var allNames = getCharNamesFast();
-  
+
   // FINAL DATA ARRAYS (Combined and Segregated)
   var outC_Combined = []; // For writing to Contracts (RAW)
   var outI_Combined = []; // For writing to Contract Items (RAW)
   var outC_Buy = [];      // For Material Ledger
   var outC_Sale = [];     // For Sales Ledger
-  
-  const seenCids = new Set(); 
+
+  const seenCids = new Set();
 
   // ---------------- PHASE 1 & 2: MULTI-STATUS FETCH ----------------
   CONTRACT_STATUSES.forEach(status => {
-    
+
     // --- 1 & 2: Fetch Char & Corp Data ---
-    const allCharContractsRaw = []; 
+    const allCharContractsRaw = [];
     allNames.forEach(charName => {
-        const contracts = GESI.invokeRaw(EP_LIST_CHAR, { name: charName, status: status, show_column_headings: false, version: null });
-        if (contracts) allCharContractsRaw.push(contracts);
+      const contracts = GESI.invokeRaw(EP_LIST_CHAR, { name: charName, status: status, show_column_headings: false, version: null });
+      if (contracts) allCharContractsRaw.push(contracts);
     });
     const resCorp = GESI.invokeRaw(EP_LIST_CORP, { status: status, name: authToon, show_column_headings: false, version: null });
-    
+
     // --- 3. NORMALIZE & AGGREGATE RESULTS ---
     var tuplesChar = _normalizeCharContracts(allCharContractsRaw, allNames);
     var tuplesCorp = _normalizeCorpContracts(resCorp, authToon);
@@ -1054,44 +1054,44 @@ function syncContracts(ss, charIdMap) {
 
     // --- 4. FILTER and SEGREGATE DATA ---
     for (const tuple of allTuples) {
-        const c = tuple.c; 
-        const cid = _toIntOrNull(c.contract_id);
-        
-        if (!cid || seenCids.has(cid)) continue; 
-        
-        // --- Determine Buy or Sale Status ---
-        const isSale = (c.status === 'finished' || c.status === 'completed') && 
-                       (c.issuer_id === myCharId);
+      const c = tuple.c;
+      const cid = _toIntOrNull(c.contract_id);
 
-        // Standardized Contract Row (16 columns)
-        const contractRow = [
-            tuple.ch, cid, c.type || '', c.status || '', c.issuer_id || 0, c.acceptor_id || 0, 
-            _isoDate(c.date_issued), _isoDate(c.date_expired), c.price || 0, c.reward || 0, 
-            c.collateral || 0, c.volume || 0, c.title || '', c.availability || '', 
-            c.start_location_id || 0, c.end_location_id || 0
-        ];
-        
-        // Standardized Item Row (6 columns)
-        const isCorp = (tuple.ch === authToon);
-        const itemsRaw = getContractItemsCached(tuple.ch, cid, false, isCorp) || [];
-        const items = normalizeItemRows(itemsRaw);
+      if (!cid || seenCids.has(cid)) continue;
 
-        // --- PUSH TO SEGREGATED AND COMBINED ARRAYS ---
-        if (isSale) {
-            outC_Sale.push(contractRow);
-            // NOTE: Sales ledger is complex. We push the full row for later allocation.
-        } else {
-            // Assume the Material Ledger handles Buys (Item Exchange where we are acceptor)
-            outC_Buy.push(contractRow);
-        }
-        
-        // Push raw contract/item data to combined arrays for raw sheet overwrite
-        outC_Combined.push(contractRow); 
-        for (const item of items) {
-             outI_Combined.push([tuple.ch, cid, item.type_id || 0, item.quantity || 0, item.is_included ? 'TRUE' : 'FALSE', item.is_singleton ? 'TRUE' : 'FALSE']);
-        }
+      // --- Determine Buy or Sale Status ---
+      const isSale = (c.status === 'finished' || c.status === 'completed') &&
+        (c.issuer_id === myCharId);
 
-        seenCids.add(cid); 
+      // Standardized Contract Row (16 columns)
+      const contractRow = [
+        tuple.ch, cid, c.type || '', c.status || '', c.issuer_id || 0, c.acceptor_id || 0,
+        _isoDate(c.date_issued), _isoDate(c.date_expired), c.price || 0, c.reward || 0,
+        c.collateral || 0, c.volume || 0, c.title || '', c.availability || '',
+        c.start_location_id || 0, c.end_location_id || 0
+      ];
+
+      // Standardized Item Row (6 columns)
+      const isCorp = (tuple.ch === authToon);
+      const itemsRaw = getContractItemsCached(tuple.ch, cid, false, isCorp) || [];
+      const items = normalizeItemRows(itemsRaw);
+
+      // --- PUSH TO SEGREGATED AND COMBINED ARRAYS ---
+      if (isSale) {
+        outC_Sale.push(contractRow);
+        // NOTE: Sales ledger is complex. We push the full row for later allocation.
+      } else {
+        // Assume the Material Ledger handles Buys (Item Exchange where we are acceptor)
+        outC_Buy.push(contractRow);
+      }
+
+      // Push raw contract/item data to combined arrays for raw sheet overwrite
+      outC_Combined.push(contractRow);
+      for (const item of items) {
+        outI_Combined.push([tuple.ch, cid, item.type_id || 0, item.quantity || 0, item.is_included ? 'TRUE' : 'FALSE', item.is_singleton ? 'TRUE' : 'FALSE']);
+      }
+
+      seenCids.add(cid);
     }
   });
 
@@ -1100,12 +1100,12 @@ function syncContracts(ss, charIdMap) {
   const shI = getOrCreateSheet(ss, CONTRACT_ITEMS_RAW_SHEET, hdrI);
 
   // Dimension Safety Logic
-  const dataC = (outC_Combined.length > 0) ? outC_Combined : [Array(CONTRACT_RAW_COLUMNS).fill('')]; 
-  const dataI = (outI_Combined.length > 0) ? outI_Combined : [Array(ITEMS_RAW_COLUMNS).fill('')]; 
+  const dataC = (outC_Combined.length > 0) ? outC_Combined : [Array(CONTRACT_RAW_COLUMNS).fill('')];
+  const dataI = (outI_Combined.length > 0) ? outI_Combined : [Array(ITEMS_RAW_COLUMNS).fill('')];
 
-  _rewriteData_(shC, hdrC, dataC); 
-  _rewriteData_(shI, hdrI, dataI); 
-  
+  _rewriteData_(shC, hdrC, dataC);
+  _rewriteData_(shI, hdrI, dataI);
+
   log.log('syncContracts done', { total_synced: outC_Combined.length, buy_count: outC_Buy.length, sale_count: outC_Sale.length });
 
   // ---------------- FINAL RETURN (The Refactored Output) ----------------
@@ -1224,39 +1224,39 @@ function contractsToSalesLedger(ss, charIdMap) {
  * Reads the 'market price Tracker' sheet. (Resolves missing dependency)
  */
 function _buildRefPriceMap_(ss) {
-    const log = LoggerEx.withTag('CONTRACT_ALLOC');
-    const TRACKER_SHEET_NAME = 'market price Tracker';
-    const HEADERS = ['type_id_filtered', 'Median Buy', 'Median Sell'];
-    
-    // Assumes _getData_ is robust (returns {rows, h})
-    const dataObj = _getData_(ss, TRACKER_SHEET_NAME);
-    if (dataObj.rows.length === 0) {
-        log.warn(`[RefPrice] Tracker sheet is empty. Cannot allocate costs.`);
-        return new Map();
+  const log = LoggerEx.withTag('CONTRACT_ALLOC');
+  const TRACKER_SHEET_NAME = 'market price Tracker';
+  const HEADERS = ['type_id_filtered', 'Median Buy', 'Median Sell'];
+
+  // Assumes _getData_ is robust (returns {rows, h})
+  const dataObj = _getData_(ss, TRACKER_SHEET_NAME);
+  if (dataObj.rows.length === 0) {
+    log.warn(`[RefPrice] Tracker sheet is empty. Cannot allocate costs.`);
+    return new Map();
+  }
+
+  const h = dataObj.h;
+  const refMap = new Map();
+
+  const cTid = h[HEADERS[0]];
+  const cBuy = h[HEADERS[1]];
+  const cSell = h[HEADERS[2]];
+
+  dataObj.rows.forEach(row => {
+    const type_id = Number(row[cTid]);
+    const medianBuyStr = String(row[cBuy]).replace(/[^0-9.]/g, '');
+    const medianSellStr = String(row[cSell]).replace(/[^0-9.]/g, '');
+
+    const buy = parseFloat(medianBuyStr) || 0;
+    const sell = parseFloat(medianSellStr) || 0;
+
+    if (type_id > 0 && (buy > 0 || sell > 0)) {
+      refMap.set(type_id, { buy, sell });
     }
-    
-    const h = dataObj.h;
-    const refMap = new Map();
+  });
 
-    const cTid = h[HEADERS[0]];
-    const cBuy = h[HEADERS[1]];
-    const cSell = h[HEADERS[2]];
-    
-    dataObj.rows.forEach(row => {
-        const type_id = Number(row[cTid]);
-        const medianBuyStr = String(row[cBuy]).replace(/[^0-9.]/g, '');
-        const medianSellStr = String(row[cSell]).replace(/[^0-9.]/g, '');
-        
-        const buy = parseFloat(medianBuyStr) || 0;
-        const sell = parseFloat(medianSellStr) || 0;
-        
-        if (type_id > 0 && (buy > 0 || sell > 0)) {
-            refMap.set(type_id, { buy, sell });
-        }
-    });
-
-    log.info(`[RefPrice] Built price map for ${refMap.size} items.`);
-    return refMap;
+  log.info(`[RefPrice] Built price map for ${refMap.size} items.`);
+  return refMap;
 }
 
 /**
@@ -1264,39 +1264,39 @@ function _buildRefPriceMap_(ss) {
  * Reads the Contracts (RAW) sheet. (Resolves missing dependency)
  */
 function _buildContractPriceMap_(ss) {
-    const log = LoggerEx.withTag('CONTRACT_ALLOC');
-    const RAW_SHEET = "Contracts (RAW)";
-    const HEADERS = ['contract_id', 'price', 'collateral', 'reward', 'char'];
+  const log = LoggerEx.withTag('CONTRACT_ALLOC');
+  const RAW_SHEET = "Contracts (RAW)";
+  const HEADERS = ['contract_id', 'price', 'collateral', 'reward', 'char'];
 
-    const dataObj = _getData_(ss, RAW_SHEET);
-    if (dataObj.rows.length === 0) {
-        log.warn(`[PriceMap] Contracts RAW sheet is empty. Skipping.`);
-        return new Map();
+  const dataObj = _getData_(ss, RAW_SHEET);
+  if (dataObj.rows.length === 0) {
+    log.warn(`[PriceMap] Contracts RAW sheet is empty. Skipping.`);
+    return new Map();
+  }
+
+  const h = dataObj.h;
+  const priceMap = new Map();
+
+  const cContractId = h[HEADERS[0]];
+  const cPrice = h[HEADERS[1]];
+  const cCollateral = h[HEADERS[2]];
+  const cReward = h[HEADERS[3]];
+  const cChar = h[HEADERS[4]];
+
+  dataObj.rows.forEach(row => {
+    const contract_id = String(row[cContractId]);
+    const price = Number(String(row[cPrice]).replace(/[^\d.]/g, '')) || 0;
+    const collateral = Number(String(row[cCollateral]).replace(/[^\d.]/g, '')) || 0;
+    const reward = Number(String(row[cReward]).replace(/[^\d.]/g, '')) || 0;
+    const char = String(row[cChar]);
+
+    if (contract_id) {
+      priceMap.set(contract_id, { price, collateral, reward, char });
     }
-    
-    const h = dataObj.h;
-    const priceMap = new Map();
-    
-    const cContractId = h[HEADERS[0]];
-    const cPrice = h[HEADERS[1]];
-    const cCollateral = h[HEADERS[2]];
-    const cReward = h[HEADERS[3]];
-    const cChar = h[HEADERS[4]];
+  });
 
-    dataObj.rows.forEach(row => {
-        const contract_id = String(row[cContractId]);
-        const price = Number(String(row[cPrice]).replace(/[^\d.]/g, '')) || 0;
-        const collateral = Number(String(row[cCollateral]).replace(/[^\d.]/g, '')) || 0;
-        const reward = Number(String(row[cReward]).replace(/[^\d.]/g, '')) || 0;
-        const char = String(row[cChar]);
-        
-        if (contract_id) {
-            priceMap.set(contract_id, { price, collateral, reward, char });
-        }
-    });
-    
-    log.info(`[PriceMap] Built price map for ${priceMap.size} contracts.`);
-    return priceMap;
+  log.info(`[PriceMap] Built price map for ${priceMap.size} contracts.`);
+  return priceMap;
 }
 
 // ==========================================================================================
@@ -1308,99 +1308,99 @@ function _buildContractPriceMap_(ss) {
  * This is the final step in the COGS pipeline.
  */
 function rebuildContractUnitCosts(ss) {
-    ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-    const log = LoggerEx.withTag('CONTRACT_UNIT_COST');
-    const LEDGER_BUY_SHEET = 'Material_Ledger';
-    
-    // --- 1. BUILD REQUIRED LOOKUP MAPS ---
-    const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
-    const refMap = _buildRefPriceMap_(ss); 
-    const priceMap = _buildContractPriceMap_(ss); 
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const log = LoggerEx.withTag('CONTRACT_UNIT_COST');
+  const LEDGER_BUY_SHEET = 'Material_Ledger';
 
-    // --- 2. READ RAW DATA (Contract Items) ---
-    const ci = _getData_(ss, 'Contract Items (RAW)');
-    if (ci.rows.length === 0) { 
-        log.warn('rebuildContractUnitCosts: Skipping, RAW contract data is empty.'); 
-        return 0; 
+  // --- 1. BUILD REQUIRED LOOKUP MAPS ---
+  const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
+  const refMap = _buildRefPriceMap_(ss);
+  const priceMap = _buildContractPriceMap_(ss);
+
+  // --- 2. READ RAW DATA (Contract Items) ---
+  const ci = _getData_(ss, 'Contract Items (RAW)');
+  if (ci.rows.length === 0) {
+    log.warn('rebuildContractUnitCosts: Skipping, RAW contract data is empty.');
+    return 0;
+  }
+
+  // --- 3. ORGANIZE ITEMS BY CONTRACT ID ---
+  const itemsByCid = new Map();
+  const cICol = { contract_id: ci.h['contract_id'], type_id: ci.h['type_id'], quantity: ci.h['quantity'], is_included: ci.h['is_included'] };
+
+  ci.rows.forEach(row => {
+    const cid = String(row[cICol.contract_id]);
+    if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
+
+    const qty = Number(row[cICol.quantity] || 0);
+    if (String(row[cICol.is_included]).toUpperCase() === 'TRUE' && qty > 0) {
+      itemsByCid.get(cid).push({ tid: Number(row[cICol.type_id]), qty: qty });
+    }
+  });
+
+  // --- 4. CALCULATE UNIT COSTS (The Core Logic) ---
+  const outRows = [];
+  let processedItems = 0;
+
+  for (const [cid, items] of itemsByCid.entries()) {
+    const contractMeta = priceMap.get(cid);
+    if (!contractMeta) continue; // Skip if main contract details are missing
+
+    const totalContractValue = contractMeta.price + contractMeta.collateral - contractMeta.reward;
+
+    let totalReferenceValue = 0;
+
+    // Calculate total reference value for the allocation (needed for REF mode)
+    for (const { tid, qty } of items) {
+      const refPrice = refMap.get(tid);
+      // Use Buy price since this is the Material Ledger (COGS)
+      if (refPrice && refPrice.buy > 0) {
+        totalReferenceValue += refPrice.buy * qty;
+      }
     }
 
-    // --- 3. ORGANIZE ITEMS BY CONTRACT ID ---
-    const itemsByCid = new Map();
-    const cICol = { contract_id: ci.h['contract_id'], type_id: ci.h['type_id'], quantity: ci.h['quantity'], is_included: ci.h['is_included'] };
+    const pricePerRefUnit = (totalReferenceValue > 0) ? (totalContractValue / totalReferenceValue) : 0;
+    const simpleVolumeSplit = (items.length > 0) ? (totalContractValue / items.length) : 0;
 
-    ci.rows.forEach(row => {
-        const cid = String(row[cICol.contract_id]);
-        if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
-        
-        const qty = Number(row[cICol.quantity] || 0);
-        if (String(row[cICol.is_included]).toUpperCase() === 'TRUE' && qty > 0) {
-             itemsByCid.get(cid).push({ tid: Number(row[cICol.type_id]), qty: qty });
-        }
-    });
-    
-    // --- 4. CALCULATE UNIT COSTS (The Core Logic) ---
-    const outRows = [];
-    let processedItems = 0;
+    // Apply allocation logic
+    for (const { tid, qty } of items) {
+      let unitCost = 0;
 
-    for (const [cid, items] of itemsByCid.entries()) {
-        const contractMeta = priceMap.get(cid);
-        if (!contractMeta) continue; // Skip if main contract details are missing
+      if (ALLOC_MODE === 'REF' && totalReferenceValue > 0) {
+        // REF Mode: Cost = (Reference Price * Quantity) * Allocation Factor
+        const refPrice = refMap.get(tid)?.buy || 0;
+        unitCost = (refPrice > 0) ? (refPrice * pricePerRefUnit) : (simpleVolumeSplit / qty);
+      } else {
+        // FALLBACK/VOLUME Mode: Cost = TotalValue / TotalItems (Simple averaging)
+        unitCost = simpleVolumeSplit / qty;
+      }
 
-        const totalContractValue = contractMeta.price + contractMeta.collateral - contractMeta.reward;
-        
-        let totalReferenceValue = 0;
-
-        // Calculate total reference value for the allocation (needed for REF mode)
-        for (const { tid, qty } of items) {
-            const refPrice = refMap.get(tid);
-            // Use Buy price since this is the Material Ledger (COGS)
-            if (refPrice && refPrice.buy > 0) { 
-                 totalReferenceValue += refPrice.buy * qty; 
-            }
-        }
-        
-        const pricePerRefUnit = (totalReferenceValue > 0) ? (totalContractValue / totalReferenceValue) : 0;
-        const simpleVolumeSplit = (items.length > 0) ? (totalContractValue / items.length) : 0;
-
-        // Apply allocation logic
-        for (const { tid, qty } of items) {
-            let unitCost = 0;
-            
-            if (ALLOC_MODE === 'REF' && totalReferenceValue > 0) {
-                // REF Mode: Cost = (Reference Price * Quantity) * Allocation Factor
-                const refPrice = refMap.get(tid)?.buy || 0;
-                unitCost = (refPrice > 0) ? (refPrice * pricePerRefUnit) : (simpleVolumeSplit / qty);
-            } else {
-                // FALLBACK/VOLUME Mode: Cost = TotalValue / TotalItems (Simple averaging)
-                unitCost = simpleVolumeSplit / qty; 
-            }
-
-            // --- WRITE NEW LEDGER ROW OBJECT (for MaterialLedger.upsert) ---
-            outRows.push({
-                source: "CONTRACT", 
-                char: contractMeta.char, 
-                contract_id: cid,
-                type_id: tid,
-                unit_value_filled: unitCost, // The calculated allocated unit price
-            });
-            processedItems++;
-        }
+      // --- WRITE NEW LEDGER ROW OBJECT (for MaterialLedger.upsert) ---
+      outRows.push({
+        source: "CONTRACT",
+        char: contractMeta.char,
+        contract_id: cid,
+        type_id: tid,
+        unit_value_filled: unitCost, // The calculated allocated unit price
+      });
+      processedItems++;
     }
-    
-    if (processedItems === 0) { 
-        log.log('rebuildContractUnitCosts', { status: 'Skipped: No items found for costing.' }); 
-        return 0; 
-    }
+  }
 
-    // --- 5. SHEET WRITE OPERATION ---
-    const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
-    const keys = ['source', 'char', 'contract_id', 'type_id'];
-    
-    // CRITICAL: This upsert updates the 'unit_value_filled' column for existing rows
-    const count = MaterialLedger.upsert(keys, outRows); 
-    
-    log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
-    return count;
+  if (processedItems === 0) {
+    log.log('rebuildContractUnitCosts', { status: 'Skipped: No items found for costing.' });
+    return 0;
+  }
+
+  // --- 5. SHEET WRITE OPERATION ---
+  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
+  const keys = ['source', 'char', 'contract_id', 'type_id'];
+
+  // CRITICAL: This upsert updates the 'unit_value_filled' column for existing rows
+  const count = MaterialLedger.upsert(keys, outRows);
+
+  log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
+  return count;
 }
 
 /**
@@ -1408,56 +1408,56 @@ function rebuildContractUnitCosts(ss) {
  * Solves the timeout by skipping the unnecessary 2-minute sales write.
  */
 function runContractLedgerPhase(ss) {
-    const log = LoggerEx.withTag('MASTER_SYNC');
-    const charIdMap = _charIdMap(ss);
-    // --- STEP 1: SYNC RAW DATA AND SEGREGATE ---
-    log.info('Running syncContracts (Fetch RAW data and Segregate)...');
-    
-    // syncResult now contains segregated data: { contracts: N, buyData: {...}, saleData: {...} }
-    let syncResult = {};
-    try {
-      syncResult = syncContracts(ss, charIdMap);
-    } catch (e) {
-      log.error('syncContracts FAILED', e.message);
-      throw e; 
-    }
-    
-    const contractsWritten = syncResult.contracts;
-    
-    // --- STEP 2: TOTAL COUNT GUARD ---
-    if (contractsWritten === 0) {
-      log.info('Skipping contract ledger processing: No new contracts were synced.');
-      return;
-    }
+  const log = LoggerEx.withTag('MASTER_SYNC');
+  const charIdMap = _charIdMap(ss);
+  // --- STEP 1: SYNC RAW DATA AND SEGREGATE ---
+  log.info('Running syncContracts (Fetch RAW data and Segregate)...');
 
-    // --- STEP 3: POST BUY-SIDE LEDGER (ESSENTIAL) ---
-    // Runs ONLY if the BUY contracts array is non-empty.
-    if (syncResult.buyData.contracts.length > 0) {
-        log.info('Running contractsToMaterialLedger (Contract Buys)...');
-        contractsToMaterialLedger(ss, charIdMap); 
-    } else {
-        log.info('contractsToMaterialLedger skipped: No buy contracts found.');
-    }
-    
-    // --- STEP 4: POST SALES LEDGER (THE LENGTH GUARD) ---
-    // This runs ONLY if the SALES contracts array is non-empty. This saves the 2-minute load.
-    if (syncResult.saleData.contracts.length > 0) {
-        log.info('Running contractsToSalesLedger (Contract Sells)...');
-        contractsToSalesLedger(ss, charIdMap);
-    } else {
-        log.warn('contractsToSalesLedger skipped: No sales contracts found.');
-    }
+  // syncResult now contains segregated data: { contracts: N, buyData: {...}, saleData: {...} }
+  let syncResult = {};
+  try {
+    syncResult = syncContracts(ss, charIdMap);
+  } catch (e) {
+    log.error('syncContracts FAILED', e.message);
+    throw e;
+  }
 
-    // --- STEP 5: COST ALLOCATION (CRASH BYPASS) ---
-    try {
-      // NOTE: This remains commented out until the cost allocation code is complete
-      log.warn('rebuildContractUnitCosts skipped due to incomplete dependencies.');
-      // rebuildContractUnitCosts(ss); 
-    } catch (e) {
-      log.error('rebuildContractUnitCosts FAILED', e.message);
-    }
-    
-    log.info('Contract Ledger Phase Complete.');
+  const contractsWritten = syncResult.contracts;
+
+  // --- STEP 2: TOTAL COUNT GUARD ---
+  if (contractsWritten === 0) {
+    log.info('Skipping contract ledger processing: No new contracts were synced.');
+    return;
+  }
+
+  // --- STEP 3: POST BUY-SIDE LEDGER (ESSENTIAL) ---
+  // Runs ONLY if the BUY contracts array is non-empty.
+  if (syncResult.buyData.contracts.length > 0) {
+    log.info('Running contractsToMaterialLedger (Contract Buys)...');
+    contractsToMaterialLedger(ss, charIdMap);
+  } else {
+    log.info('contractsToMaterialLedger skipped: No buy contracts found.');
+  }
+
+  // --- STEP 4: POST SALES LEDGER (THE LENGTH GUARD) ---
+  // This runs ONLY if the SALES contracts array is non-empty. This saves the 2-minute load.
+  if (syncResult.saleData.contracts.length > 0) {
+    log.info('Running contractsToSalesLedger (Contract Sells)...');
+    contractsToSalesLedger(ss, charIdMap);
+  } else {
+    log.warn('contractsToSalesLedger skipped: No sales contracts found.');
+  }
+
+  // --- STEP 5: COST ALLOCATION (CRASH BYPASS) ---
+  try {
+    // NOTE: This remains commented out until the cost allocation code is complete
+    log.info('Running rebuildContractUnitCosts (Finalizing COGS)...');
+    rebuildContractUnitCosts(ss);
+  } catch (e) {
+    log.error('rebuildContractUnitCosts FAILED', e.message);
+  }
+
+  log.info('Contract Ledger Phase Complete.');
 }
 
 /**
