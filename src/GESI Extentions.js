@@ -1366,7 +1366,7 @@ function rebuildContractUnitCosts(ss) {
     for (const { tid, qty } of items) {
       let unitCost = 0;
 
-      if (ALLOC_MODE === 'REF' && totalReferenceValue > 0) {
+      if (allocMode === 'REF' && totalReferenceValue > 0) {
         // REF Mode: Cost = (Reference Price * Quantity) * Allocation Factor
         const refPrice = refMap.get(tid)?.buy || 0;
         unitCost = (refPrice > 0) ? (refPrice * pricePerRefUnit) : (simpleVolumeSplit / qty);
