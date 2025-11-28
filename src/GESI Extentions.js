@@ -418,16 +418,16 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
   }
 }
 
+
 /** Build Char name -> ID map (Implementation) */
-function _charIdMap(ss) { // ADDED ss ARGUMENT
+function _charIdMap(ss) {
   // --- IMPLEMENTATION OF NAME-TO-ID MAP (Based on Corp Members) ---
   if (_cachedCharIdMap) {
     return _cachedCharIdMap;
   }
 
   const log = LoggerEx.withTag('CHAR_MAP');
-  // NOTE: getCorpAuthChar must be defined before this line
-  const authToon = getCorpAuthChar(ss); // Get the authorized char name
+  const authToon = getCorpAuthChar(ss);
 
   if (!authToon) {
     log.warn('No authorized character found for building character map.');
@@ -439,29 +439,34 @@ function _charIdMap(ss) { // ADDED ss ARGUMENT
 
   try {
     // 1. Get all member IDs for the corporation tied to the authenticated character.
-    // Assumes GESI wraps this ESI call correctly and takes the authToon name.
-    // This returns an array of character IDs (numbers).
-    const memberIdsRaw = GESI.corporations_corporation_members([authToon]);
+    // FIX: Use GESI.invokeRaw with parameter object for robust script execution.
+    const memberIdsRaw = GESI.invokeRaw(
+      'corporations_corporation_members', 
+      { name: authToon, show_column_headings: false, version: null } 
+    );
 
     const memberIds = Array.isArray(memberIdsRaw) ? memberIdsRaw.filter(Number.isFinite) : [];
 
     if (memberIds.length === 0) {
       log.warn('No member IDs returned from GESI.corporations_corporation_members.');
-      _cachedCharIdMap = {};
-      return {};
+      // Throw an error to ensure the subsequent fallback logic is executed
+      throw new Error("No ESI member IDs found."); 
     }
 
     // 2. Resolve those IDs to Names.
-    // Using the generic ID-to-name lookup endpoint via GESI.
-    const ID_TO_NAME_ENDPOINT = 'universe_names_id_to_name';
-
-    // GESI handles batching for GESI.invoke
-    const nameResolutions = GESI.invoke(ID_TO_NAME_ENDPOINT, memberIds, { show_column_headings: false });
+    // FIX: Use GESI.invokeRaw with the standard 'universe_names' alias.
+    // IMPLEMENTING USER'S EXPLICIT INSTRUCTION: ids: [memberIds]
+    const nameResolutions = GESI.invokeRaw('universe_names',
+      {
+        ids: [memberIds], // Implementing user's explicit instruction
+        show_column_headings: false,
+        version: null
+      } 
+    );
 
     // 3. Build the final Name -> ID map
     if (Array.isArray(nameResolutions)) {
       for (const entry of nameResolutions) {
-        // Check for required properties and filter by category 'character'
         if (entry && entry.category === 'character' && entry.name && entry.id) {
           // The map is NAME -> ID
           charIdMap[entry.name] = entry.id;
@@ -470,9 +475,21 @@ function _charIdMap(ss) { // ADDED ss ARGUMENT
     }
 
   } catch (e) {
-    log.error('Error building character ID map:', e);
-    _cachedCharIdMap = {}; // Fail safe
-    return {};
+    log.error('Error building character ID map:', e.message);
+
+    // CRITICAL STABILITY FALLBACK (to handle external API failures)
+    const fallbackIdRaw = _getNamedOr_('CORP_AUTH_CHAR_ID', null);
+    const fallbackId = parseInt(fallbackIdRaw, 10);
+    
+    if (authToon && fallbackId && Number.isFinite(fallbackId)) {
+        charIdMap[authToon] = fallbackId;
+        log.warn(`[CHAR_MAP] ESI call failed. Using configured ID ${fallbackId} from Named Range 'CORP_AUTH_CHAR_ID' for ${authToon}.`);
+    } else {
+        log.warn(`[CHAR_MAP] ESI call failed. No valid fallback ID found in Named Range 'CORP_AUTH_CHAR_ID'.`);
+    }
+
+    _cachedCharIdMap = charIdMap;
+    return charIdMap;
   }
 
   log.info(`Built character ID map for ${Object.keys(charIdMap).length} members.`);
@@ -1392,7 +1409,7 @@ function rebuildContractUnitCosts(ss) {
  */
 function runContractLedgerPhase(ss) {
     const log = LoggerEx.withTag('MASTER_SYNC');
-    
+    const charIdMap = _charIdMap(ss);
     // --- STEP 1: SYNC RAW DATA AND SEGREGATE ---
     log.info('Running syncContracts (Fetch RAW data and Segregate)...');
     
