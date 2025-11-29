@@ -1129,51 +1129,92 @@ function syncContracts(ss, charIdMap) {
 }
 
 
+// File: cjkilman/market-tycoon-farm/Market-Tycoon-Farm-dev/src/GESI Extentions.js
+
 /**
- * New function: contractsToMaterialLedger
- * Assumes lock is held by caller.
+ * Refactored: processes segregated buy-side contract data into the Material_Ledger.
+ *
+ * @param {object} ss - Spreadsheet object.
+ * @param {object} charIdMap - Character ID lookup map.
+ * @param {object} buyData - { contracts: any[][], items: any[][] }
  */
-function contractsToMaterialLedger(ss, charIdMap) {
+function contractsToMaterialLedger(ss, charIdMap, buyData) { // CORRECTED SIGNATURE
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('GESI');
-  const charName = getCorpAuthChar(ss);
-  const myCharId = charIdMap[charName] || null;
   const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
 
-  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
-  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
-  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
-  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) { log.log('contracts->ledger', { status: 'Skipped: RAW sheets empty.' }); return 0; }
-
-  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(),
-    MAX_RAW_ROWS_TO_PROCESS + 1),
-    shC.getLastColumn()).getValues();
-  const hC = C.shift();
-  const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
-  const hI = I.shift();
-  if (C.length === 0 || I.length === 0) { log.log('contracts->ledger', { status: 'Skipped: No raw data found.' }); return 0; }
+  // Define header indices based on the column positions written by syncContracts
+  const hC_Names = ["char", "contract_id", "type", "status", "acceptor_id", "date_issued"]; 
+  const hI_Names = ["char", "contract_id", "type_id", "quantity", "is_included"]; 
 
   const ix = (arr, name) => arr.indexOf(name);
-  const colC = { char: ix(hC, "char"), contract_id: ix(hC, "contract_id"), type: ix(hC, "type"), status: ix(hC, "status"), acceptor_id: ix(hC, "acceptor_id"), date_issued: ix(hC, "date_issued") };
-  const colI = { contract_id: ix(hI, "contract_id"), type_id: ix(hI, "type_id"), quantity: ix(hI, "quantity"), is_included: ix(hI, "is_included") };
+  const colC = { char: ix(hC_Names, "char"), contract_id: ix(hC_Names, "contract_id"), date_issued: ix(hC_Names, "date_issued") };
+  // CRITICAL: Must use the header map from the RAW sheet to index the item rows
+  const colI = { contract_id: ix(hI_Names, "contract_id"), type_id: ix(hI_Names, "type_id"), quantity: ix(hI_Names, "quantity"), is_included: ix(hI_Names, "is_included") };
+  
+  // Input Check (replaces slow lastRow checks)
+  if (!buyData || !buyData.contracts || buyData.contracts.length === 0 || !buyData.items || buyData.items.length === 0) { 
+      log.log('contracts->ledger', { status: 'Skipped: In-memory data is empty.' }); 
+      return 0; 
+  }
 
+  // 1. Retrieve the list of ALL currently authenticated characters (the "Active Filter")
+  const LOGGED_IN_CHARS = new Set(getCharNamesFast()); 
+
+  // 2. Build map of all Buy Contract IDs from the in-memory contracts
+  const buyCids = new Set(buyData.contracts.map(c => c[colC.contract_id]));
+
+  // 3. Build map of Contract Items (filtering down to only BUY CIDs from the combined item list)
   const itemsByCid = {};
-  // ... (logic to populate itemsByCid remains the same) ...
-  for (let r = 0; r < I.length; r++) { const rowI = I[r]; const cid = rowI[colI.contract_id]; if (!itemsByCid[cid]) itemsByCid[cid] = []; itemsByCid[cid].push({ type_id: rowI[colI.type_id], qty: Number(rowI[colI.quantity] || 0), is_included: !!rowI[colI.is_included] }); }
-
+  for (const rowI of buyData.items) {
+    const cid = rowI[colI.contract_id];
+    
+    // Only include items belonging to the contracts we are processing (buyCids)
+    if (!buyCids.has(cid)) continue; 
+    
+    if (!itemsByCid[cid]) itemsByCid[cid] = [];
+    
+    // Note: Items were written as 'TRUE'/'FALSE' strings by syncContracts
+    itemsByCid[cid].push({ 
+        type_id: rowI[colI.type_id], 
+        qty: Number(rowI[colI.quantity] || 0), 
+        is_included: String(rowI[colI.is_included]).toUpperCase() === 'TRUE' 
+    });
+  }
 
   const outRows = [];
-  // ... (logic to populate outRows based on C and itemsByCid remains the same) ...
-  for (let q = 0; q < C.length; q++) { const rowC = C[q]; /* ... filtering logic ... */ const cid2 = rowC[colC.contract_id]; const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : ""; const items = itemsByCid[cid2] || []; for (const it of items) { if (!it.is_included || it.qty <= 0) continue; outRows.push({ date: issued, type_id: it.type_id, qty: it.qty, source: "CONTRACT", contract_id: cid2, char: rowC[colC.char] || "" }); } }
-
-
+  
+  // 4. Process Buy Contracts (C) and build ledger rows
+  for (const rowC of buyData.contracts) { 
+      const contractChar = String(rowC[colC.char] || "");
+      
+      // CRITICAL FILTER: Only process contracts belonging to a currently logged-in GESI user.
+      if (!LOGGED_IN_CHARS.has(contractChar)) continue; 
+      
+      const cid2 = rowC[colC.contract_id]; 
+      const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : ""; 
+      const items = itemsByCid[cid2] || [];
+      
+      for (const it of items) { 
+          if (!it.is_included || it.qty <= 0) continue; 
+          outRows.push({ 
+              date: issued, 
+              type_id: it.type_id, 
+              qty: it.qty, 
+              source: "CONTRACT", 
+              contract_id: cid2, 
+              char: contractChar 
+          }); 
+      } 
+  }
+  
   if (outRows.length === 0) { log.log('contracts->ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
 
-  // --- Code previously inside withSheetLock now runs directly ---
+  // --- Final Write Operation ---
   const keys = ['source', 'char', 'contract_id', 'type_id'];
   const count = MaterialLedger.upsert(keys, outRows);
   log.log('contracts->ledger', { appended_or_updated: count, processed_rows: outRows.length });
-  return count; // Return actual count
+  return count;
 }
 
 // --- REMOVED withSheetLock wrapper ---
@@ -1446,7 +1487,7 @@ function runContractLedgerPhase(ss) {
   // Runs ONLY if the BUY contracts array is non-empty.
   if (syncResult.buyData.contracts.length > 0) {
     log.info('Running contractsToMaterialLedger (Contract Buys)...');
-    contractsToMaterialLedger(ss, charIdMap);
+    contractsToMaterialLedger(ss, charIdMap, syncResult.buyData);
   } else {
     log.info('contractsToMaterialLedger skipped: No buy contracts found.');
   }

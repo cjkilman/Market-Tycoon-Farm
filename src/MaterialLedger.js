@@ -94,25 +94,55 @@ var ML = (function () {
 
     // The upsertBy function now uses the private 'sheetInst' variable.
     // CORRECTED: Includes Batching for sheet writes.
-    function upsertBy(keys, rows) {
+   function upsertBy(keys, rows) {
       if (!rows || !rows.length) return 0; // Exit if no rows to process
 
-      const WRITE_BATCH_SIZE = 1000; // Adjust as needed (500-2000 is usually safe)
-      const sh = sheetInst; // Use the sheet instance specific to this ledger
+      const WRITE_BATCH_SIZE = 1000;
+      const sh = sheetInst; 
 
-      // --- 1. Identify Key Columns and Read Existing Keys (remains the same) ---
-      // ... (Deduplication read logic remains the same) ...
+      // --- 1. Identify Key Columns ---
+      const keyIndices = keys.map(function (k) {
+        const idx = HEAD.indexOf(k); 
+        if (idx === -1) throw new Error('Unknown key column in HEAD: ' + k);
+        return idx;
+      });
+
+      // --- 2. Read Existing Keys (CRITICAL DEDUPLICATION READ) ---
       const last = sh.getLastRow();
       const existingKeys = new Set();
-      // ... (rest of the read logic for existingKeys) ...
-      
-      // --- 2. Filter for New Rows (remains the same) ---
-      const newRowsToWrite = [];
-      // ... (logic to build newRowsToWrite remains the same) ...
+      if (last >= 2) {
+        LOG.debug(`Reading existing ${last - 1} rows to check for duplicates...`);
+        
+        const range = sh.getRange(2, 1, last - 1, HEAD.length);
+        const allVals = range.getValues();
+        allVals.forEach(function (row) {
+          const key = keyIndices.map(function (headIdx) {
+            return String(row[headIdx] != null ? row[headIdx] : '');
+          }).join('\u0001'); 
+          existingKeys.add(key);
+        });
+        LOG.debug(`Found ${existingKeys.size} unique existing keys.`);
+      }
 
-      // --- 3. Batch Write New Rows (FAST COUNTER IMPLEMENTATION) ---
+      // --- 3. Filter for New Rows ---
+      const newRowsToWrite = [];
+      rows.forEach(function (obj) {
+        const outRow = normalizeRow_(obj); 
+        const key = keyIndices.map(function (headIdx) {
+          return String(outRow[headIdx] != null ? outRow[headIdx] : '');
+        }).join('\u0001');
+
+        // Only add if the key doesn't already exist
+        if (!existingKeys.has(key)) {
+          newRowsToWrite.push(outRow);
+          // Add the new key immediately to prevent duplicates *within the current batch*
+          existingKeys.add(key);
+        }
+      });
+
+      // --- 4. Batch Write New Rows (FAST COUNTER IMPLEMENTATION) ---
       const totalNewRows = newRowsToWrite.length;
-      let currentIndex = 0; // Index for reading from newRowsToWrite
+      let currentIndex = 0; 
       
       // CRITICAL FIX: Calculate starting row ONCE before the loop.
       let nextWriteRow = sh.getLastRow() + 1;
@@ -138,7 +168,7 @@ var ML = (function () {
               
               if (e.message.includes("Service timed out")) {
                  LOG.warn("Retrying batch write after timeout...");
-                 Utilities.sleep(1000); // Wait 1 second before retry
+                 Utilities.sleep(1000); 
                  try {
                      // Retry once (nextWriteRow has not advanced for this batch yet)
                      sh.getRange(startRow, 1, batch.length, HEAD.length).setValues(batch);
