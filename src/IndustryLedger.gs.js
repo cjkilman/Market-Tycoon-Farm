@@ -157,17 +157,36 @@ function _getAndDechunk(key) {
  * Utility function to dynamically find column indices by header name.
  */
 function _getColIndexMap(headers, requiredHeaders) {
-  const col = {};
-  const lowerCaseHeaders = headers.map(h => h.toLowerCase().trim());
-
-  for (const req of requiredHeaders) {
-    const index = lowerCaseHeaders.indexOf(req.toLowerCase().trim());
-    if (index === -1) {
-      throw new Error(`CRITICAL HEADER ERROR: Sheet is missing required column "${req}".`);
+    // 1. Input Validation for 'headers'
+    if (!headers || !Array.isArray(headers) || headers.length === 0) { 
+        throw new Error("Invalid argument: 'headers' must be a non-empty array.");
     }
-    col[req] = index;
-  }
-  return col;
+    
+    // 2. Input Validation for 'requiredHeaders'
+    if (!requiredHeaders || !Array.isArray(requiredHeaders) || requiredHeaders.length === 0) { 
+        throw new Error("Invalid argument: 'requiredHeaders' must be a non-empty array.");
+    }
+
+    const col = {};
+    
+    // 3. CRITICAL ROBUSTNESS FIX (The "Empty String Gate"): 
+    // Ensures 'h' is treated as a safe string ("") if it's null, undefined, or empty, 
+    // preventing the 'h.toLowerCase is not a function' crash.
+    const lowerCaseHeaders = headers.map(h => String(h || '').toLowerCase().trim());
+
+    for (const req of requiredHeaders) {
+        // Normalize and clean the required header name.
+        const cleanReq = String(req || '').toLowerCase().trim();
+        
+        if (cleanReq === '') continue; // Skip if the requirement itself is blank.
+
+        const index = lowerCaseHeaders.indexOf(cleanReq);
+        if (index === -1) {
+            throw new Error(`CRITICAL HEADER ERROR: Sheet is missing required column "${cleanReq}".`);
+        }
+        col[req] = index;
+    }
+    return col;
 }
 
 
@@ -1407,58 +1426,63 @@ function _getMarketDemandMap(ss) {
  * @returns {any[][]} Raw data from GESI call.
  * @customfunction
  */
-function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
-  // --- NEW: MAINTENANCE MODE CHECK ---
-  // Check if globals are defined before trying to access them
-  
-  if (!SCRIPT_PROPS) {
-    const systemState = SCRIPT_PROPS.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
-  }
+/**
+ * Custom function to fetch Corporation Industry Jobs with caching.
+ * Prevents continuous API calls during sheet recalculations.
+ * * @param {string} name Character name with ESI Corp Jobs scope.
+ * @param {boolean} [include_completed=false] Whether to include completed jobs.
+ * @returns {any[][]} Raw data from GESI call.
+ * @customfunction
+ */
+function GESI_CORP_JOBS_CACHED(name, include_completed) {
+    // NOTE: GLOBAL_STATE_KEY must be accessible. Assuming it's defined elsewhere.
+    const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
+    
+    // START LOGGING & PARAM CHECK
+    Logger.log(`[CIJ_SHEET] START: Name='${name}', Completed=${include_completed}`);
+
+    if (!name) {
+        Logger.log('[CIJ_SHEET] FAIL: Name is missing.');
+        return [['Error: Auth name required']];
+    }
+    
+    // ROBUST MAINTENANCE CHECK
+    const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+
     if (systemState === 'MAINTENANCE') {
-      return; // Return blank immediately
+        Logger.log(`[CIJ_SHEET] ABORT: System is in MAINTENANCE mode.`);
+        return [['MAINTENANCE_ACTIVE']];
     }
-  
-  // --- END: MAINTENANCE MODE CHECK ---
+    
+    // 1. Fetch data from the *shared* cache handled by _getCorporateJobsRaw.
+    // NOTE: We pass 'false' to force the helper to read from the cache only (no live API call).
+    const rawData = _getCorporateJobsRaw(false); 
 
-  // Use a short, unique key for the ESI endpoint
-  const CACHE_KEY_BASE = 'CorpIndJobsRaw';
-  const CACHE_TTL = 300; // 5 minutes
-
-  if (!name) return [['Error: Auth name required']];
-
-  // 1. Determine Cache Key
-  const key = CACHE_KEY_BASE + ':' + name + ':' + (include_completed ? 'C' : 'A');
-
-  // 2. Try in-memory memoization (optional, but faster for immediate reuse)
-  // NOTE: You would need to define a global map (e.g., _cijMemo) for this, 
-  // but for simplicity, we focus on the script-level CacheService.
-  const cache = CacheService.getUserCache();
-
-  // 3. Check CacheService
-  let jsonText = cache.get(key);
-  if (jsonText) {
-    // Return cached data
-    return JSON.parse(jsonText);
-  }
-
-  // 4. Live API Call (Cache Miss)
-  try {
-    // NOTE: This assumes a globally accessible GESI object
-    const rawData = GESI.corporations_corporation_industry_jobs(name, include_completed);
-
-    // 5. Store in CacheService
-    if (Array.isArray(rawData) && rawData.length > 0) {
-      jsonText = JSON.stringify(rawData);
-      cache.put(key, jsonText, CACHE_TTL);
+    if (!rawData || rawData.length === 0) {
+        Logger.log('[CIJ_SHEET] WARN: No data found in shared cache. Returning cache instruction.');
+        return [['DATA_NOT_CACHED'], ['Run Industry Ledger script to refresh cache.']];
     }
 
-    return rawData;
+    // 2. Format output for Google Sheets (array of objects -> array of arrays).
+    try {
+        const headerRow = Object.keys(rawData[0] || {});
+        
+        if (headerRow.length === 0) {
+            Logger.log('[CIJ_SHEET] ERROR: Raw data object structure is invalid (no headers).');
+            return [['ERROR: Invalid Data Structure']];
+        }
 
-  } catch (e) {
-    // Log error and return a message to prevent the whole sheet from failing
-    Logger.log(`ESI Corp Jobs GESI call failed: ${e.message}`);
-    return [['ERROR', e.message]];
-  }
+        // Map the array of objects to an array of arrays for sheet compatibility
+        const values = rawData.map(obj => headerRow.map(key => obj[key]));
+
+        Logger.log(`[CIJ_SHEET] SUCCESS: Returning ${values.length} jobs.`);
+
+        // Return the headers and the values
+        return [headerRow, ...values];
+    } catch (e) {
+        Logger.log(`[CIJ_SHEET] ERROR: Formatting failed: ${e.message}`);
+        return [['ERROR', `Formatting failed: ${e.message}`]];
+    }
 }
 
 // --- Add a new function similar to _getCorporateBlueprintsRaw ---
@@ -1469,22 +1493,24 @@ function CACHED_CORP_INDUSTRY_JOBS(name, include_completed) {
  */
 function _getCorporateJobsRaw(forceRefresh) {
   // NOTE: Assumes getCorpAuthChar() is available globally
-  const authToon = getCorpAuthChar(); // <--- REPLACE THIS LINE 
-  // const authToon = getCorpAuthChar(); // <-- Original line commented out
+  const authToon = getCorpAuthChar();
 
   const ENDPOINT = 'corporations_corporation_industry_jobs';
   const CACHE_KEY = 'CORP_JOBS_RAW_V1' + ':' + authToon;
-  const CACHE_TTL = 300; // 5 minutes TTL
+  const CACHE_TTL = 3600; // 60 minutes TTL (was 300)
 
   if (!authToon || authToon === 'YOUR_AUTHORIZED_CHARACTER_NAME') { // Check for accidental use of placeholder
     // This returns null, causing the "Data not available" error.
     return null;
   }
 
-  // 1. Attempt to read from cache (using de-chunking)
+// 1. Attempt to read from cache (using de-chunking)
   if (!forceRefresh) {
     const cachedJson = _getAndDechunk(CACHE_KEY);
     if (cachedJson) { return JSON.parse(cachedJson); }
+    
+    // FIX: Explicitly return null if cache is missed and we are only checking the cache.
+    return null; 
   }
 
   // 2. Live API Call
@@ -1576,22 +1602,4 @@ function TEST_ESI_AUTH_STATUS() {
 
 // --- Create a Custom Function for the ESI Corp Jobs sheet to use this raw data ---
 
-// Function GESI_CORP_JOBS_CACHED:
-function GESI_CORP_JOBS_CACHED(authCharName) {
 
-  // ⚠️ CRITICAL CHANGE: Force to ONLY read from cache (false)
-  // The live API call is now handled by the runIndustryLedgerPhase script.
-  const rawData = _getCorporateJobsRaw(false);
-
-  if (!rawData) {
-    // Change the error to tell the user what to run
-    return [['⚠️ DATA STALE: Run Ledger Script'], ['Data not found in cache.']];
-  }
-
-  // Convert array of objects to array of arrays (compatible with Sheet output)
-  const headerRow = Object.keys(rawData[0] || {});
-  const values = rawData.map(obj => headerRow.map(key => obj[key]));
-
-  // Return the headers and the values
-  return [headerRow, ...values];
-}

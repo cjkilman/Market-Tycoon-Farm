@@ -1042,10 +1042,20 @@ function syncContracts(ss, charIdMap) {
     // --- 1 & 2: Fetch Char & Corp Data ---
     const allCharContractsRaw = [];
     allNames.forEach(charName => {
-      const contracts = GESI.invokeRaw(EP_LIST_CHAR, { name: charName, status: status, show_column_headings: false, version: null });
-      if (contracts) allCharContractsRaw.push(contracts);
+      const contracts = GESI.invokeRaw(EP_LIST_CHAR, {
+        name: charName,
+        status: status,
+        show_column_headings: false,
+        version: null
+      });
+      if (contracts && contracts.length > 0) allCharContractsRaw.push(contracts);
     });
-    const resCorp = GESI.invokeRaw(EP_LIST_CORP, { status: status, name: authToon, show_column_headings: false, version: null });
+    const resCorp = GESI.invokeRaw(EP_LIST_CORP, {
+      status: status,
+      name: authToon,
+      show_column_headings: false,
+      version: null
+    });
 
     // --- 3. NORMALIZE & AGGREGATE RESULTS ---
     var tuplesChar = _normalizeCharContracts(allCharContractsRaw, allNames);
@@ -1135,7 +1145,9 @@ function contractsToMaterialLedger(ss, charIdMap) {
   if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
   if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) { log.log('contracts->ledger', { status: 'Skipped: RAW sheets empty.' }); return 0; }
 
-  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
+  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(),
+    MAX_RAW_ROWS_TO_PROCESS + 1),
+    shC.getLastColumn()).getValues();
   const hC = C.shift();
   const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
   const hI = I.shift();

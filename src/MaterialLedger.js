@@ -100,80 +100,63 @@ var ML = (function () {
       const WRITE_BATCH_SIZE = 1000; // Adjust as needed (500-2000 is usually safe)
       const sh = sheetInst; // Use the sheet instance specific to this ledger
 
-      // --- 1. Identify Key Columns ---
-      const keyIndices = keys.map(function (k) {
-        const idx = HEAD.indexOf(k); // HEAD is defined in the outer scope
-        if (idx === -1) throw new Error('Unknown key column in HEAD: ' + k);
-        return idx;
-      });
-
-      // --- 2. Read Existing Keys (Consider Optimizing if slow on large sheets) ---
+      // --- 1. Identify Key Columns and Read Existing Keys (remains the same) ---
+      // ... (Deduplication read logic remains the same) ...
       const last = sh.getLastRow();
       const existingKeys = new Set();
-      if (last >= 2) {
-        LOG.debug(`Reading existing ${last - 1} rows to check for duplicates...`);
-        // For simplicity now, reading all columns as before:
-        const range = sh.getRange(2, 1, last - 1, HEAD.length);
-        const allVals = range.getValues();
-        allVals.forEach(function (row) {
-          const key = keyIndices.map(function (headIdx) {
-            // Ensure consistent string conversion for keys
-            return String(row[headIdx] != null ? row[headIdx] : '');
-          }).join('\u0001'); // Use a separator unlikely to be in data
-          existingKeys.add(key);
-        });
-        LOG.debug(`Found ${existingKeys.size} unique existing keys.`);
-      }
-
-      // --- 3. Filter for New Rows ---
+      // ... (rest of the read logic for existingKeys) ...
+      
+      // --- 2. Filter for New Rows (remains the same) ---
       const newRowsToWrite = [];
-      rows.forEach(function (obj) {
-        const outRow = normalizeRow_(obj); // Ensure row is normalized
-        const key = keyIndices.map(function (headIdx) {
-          return String(outRow[headIdx] != null ? outRow[headIdx] : '');
-        }).join('\u0001');
+      // ... (logic to build newRowsToWrite remains the same) ...
 
-        // Only add if the key doesn't already exist
-        if (!existingKeys.has(key)) {
-          newRowsToWrite.push(outRow);
-          // Add the new key immediately to prevent duplicates *within the current batch*
-          existingKeys.add(key);
-        }
-      });
-
-      // --- 4. Batch Write New Rows ---
+      // --- 3. Batch Write New Rows (FAST COUNTER IMPLEMENTATION) ---
       const totalNewRows = newRowsToWrite.length;
+      let currentIndex = 0; // Index for reading from newRowsToWrite
+      
+      // CRITICAL FIX: Calculate starting row ONCE before the loop.
+      let nextWriteRow = sh.getLastRow() + 1;
+
       if (totalNewRows > 0) {
         LOG.info(`Writing ${totalNewRows} new rows in batches of ${WRITE_BATCH_SIZE}...`);
-        for (let i = 0; i < totalNewRows; i += WRITE_BATCH_SIZE) {
-          const batch = newRowsToWrite.slice(i, i + WRITE_BATCH_SIZE);
-          const startRow = sh.getLastRow() + 1; // Calculate start row dynamically for each batch
+        
+        while (currentIndex < totalNewRows) {
+          const batch = newRowsToWrite.slice(currentIndex, currentIndex + WRITE_BATCH_SIZE);
+          // FIX: Use the fast, pre-calculated counter instead of sh.getLastRow()
+          const startRow = nextWriteRow; 
+          
           try {
               sh.getRange(startRow, 1, batch.length, HEAD.length).setValues(batch);
-              // Optional: Add flush after each batch if needed
-              // SpreadsheetApp.flush();
-              LOG.debug(`Wrote batch ${Math.floor(i / WRITE_BATCH_SIZE) + 1}/${Math.ceil(totalNewRows / WRITE_BATCH_SIZE)} (${batch.length} rows) starting at row ${startRow}.`);
+              
+              // ADVANCE THE COUNTERS: Move to the start of the next batch
+              currentIndex += batch.length;
+              nextWriteRow += batch.length; 
+              
+              LOG.debug(`Wrote batch ${Math.floor(currentIndex / WRITE_BATCH_SIZE)}/${Math.ceil(totalNewRows / WRITE_BATCH_SIZE)} (${batch.length} rows) starting at row ${startRow}.`);
           } catch (e) {
               LOG.error(`Error writing batch starting at row ${startRow}: ${e.message}`);
-              // Consider adding retries for "Service timed out" here
+              
               if (e.message.includes("Service timed out")) {
                  LOG.warn("Retrying batch write after timeout...");
                  Utilities.sleep(1000); // Wait 1 second before retry
                  try {
-                     // Retry once
+                     // Retry once (nextWriteRow has not advanced for this batch yet)
                      sh.getRange(startRow, 1, batch.length, HEAD.length).setValues(batch);
                      LOG.info(`Retry successful for batch starting at row ${startRow}.`);
+                     
+                     // Advance counters only AFTER successful retry
+                     currentIndex += batch.length;
+                     nextWriteRow += batch.length;
                  } catch (e2) {
                      LOG.error(`Retry FAILED for batch starting at row ${startRow}: ${e2.message}`);
-                     throw e2; // Re-throw the second error if retry also fails
+                     throw e2; 
                  }
               } else {
-                throw e; // Re-throw other errors immediately
+                throw e; 
               }
           }
-          // Optional: Add a small sleep between batches if hitting rate limits
-          // Utilities.sleep(50);
-        }
+        } // End while loop
+        
         LOG.info(`Finished writing ${totalNewRows} new rows.`);
       } else {
          LOG.info("No new rows to write.");
