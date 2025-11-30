@@ -1485,8 +1485,6 @@ function GESI_CORP_JOBS_CACHED(name, include_completed) {
     }
 }
 
-// --- Add a new function similar to _getCorporateBlueprintsRaw ---
-
 /**
  * Fetches and Caches the raw array of corporate industry jobs,
  * using sharding to bypass the "Argument too large" limitation.

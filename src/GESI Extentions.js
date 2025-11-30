@@ -1313,6 +1313,117 @@ function _buildRefPriceMap_(ss) {
 }
 
 /**
+ * Reads the user's primary market configuration from the spreadsheet cells.
+ * Uses 'Location List'!C3 for Location ID and 'Market Overview'!C8 for Location Type.
+ */
+function _getPrimaryMarketConfig(ss) {
+  const log = LoggerEx.withTag('MARKET_CONFIG');
+  let locationId = 0;
+  let locationType = 'Region'; // Default safe assumption
+
+  try {
+    // 1. Location ID from 'Location List'!C3 
+    const locSheet = ss.getSheetByName('Location List');
+    if (locSheet) {
+      locationId = Number(locSheet.getRange('C3').getValue()); 
+    }
+
+    // 2. Location Type from 'Market Overview'!C8 
+    const marketSheet = ss.getSheetByName('Market Overview');
+    if (marketSheet) {
+      locationType = String(marketSheet.getRange('C8').getValue()).trim() || locationType; 
+    }
+
+    if (!locationId || isNaN(locationId)) {
+      // Fallback to Amarr Region ID if user's ID is missing (better than Jita)
+      locationId = 10000043; 
+      log.warn(`Location ID from 'Location List'!C3 was invalid. Defaulting to ${locationId}.`);
+    }
+
+  } catch (e) {
+    log.error(`Error reading market config: ${e.message}`);
+  }
+
+  return { locationId, locationType };
+}
+
+
+/**
+ * Helper to fetch prices for items missing from the initial _buildRefPriceMap_
+ * Checks Tier 2 (Tracker) and Tier 3 (Fuzzwork API, using dynamic location).
+ */
+function _getContractPriceFallbackMap(ss, missingTids) {
+    const log = LoggerEx.withTag('CONTRACT_FALLBACK');
+    const fallbackMap = new Map();
+
+    if (missingTids.length === 0) return fallbackMap;
+
+    // --- Tier 2: Read Local Market Tracker for Missing Items ---
+    const TRACKER_SHEET_NAME = "market price Tracker";
+    const ID_HEADER = 'type_id_filtered';
+    const BUY_HEADER = 'Median Buy'; 
+    const requiredTids = new Set(missingTids);
+    const tidsForFuzzwork = [];
+
+    try {
+        const allData = _getData_(ss, TRACKER_SHEET_NAME);
+        const h = allData.h;
+        const cTid = h[ID_HEADER];
+        const cBuy = h[BUY_HEADER];
+
+        if (cTid != null && cBuy != null) {
+            for (const row of allData.rows) {
+                const type_id = Number(row[cTid]);
+                
+                if (requiredTids.has(type_id)) {
+                    const priceStr = String(row[cBuy]).replace(/ISK/gi, '').replace(/,/g, '').trim();
+                    const buyPrice = Number(priceStr);
+
+                    if (type_id > 0 && buyPrice > 0) {
+                        fallbackMap.set(type_id, { buy: buyPrice, sell: 0 });
+                        requiredTids.delete(type_id);
+                    }
+                }
+            }
+        }
+        
+        // --- Tier 3: Prepare the remaining TIDs for API Call ---
+        requiredTids.forEach(tid => tidsForFuzzwork.push(tid));
+
+        if (tidsForFuzzwork.length > 0) {
+            log.info(`Attempting Tier 3 Fuzzwork fallback for ${tidsForFuzzwork.length} missing items.`);
+            
+            // FIX: Use the primary configured market location as the fallback source.
+            const { locationId, locationType } = _getPrimaryMarketConfig(ss); 
+
+            const rawFuzResults = fuzAPI.getDataForRequests([{ 
+                location_id: locationId, 
+                market_type: locationType, 
+                type_ids: tidsForFuzzwork 
+            }]);
+
+            // Process Fuzzwork results
+            rawFuzResults.forEach(crate => {
+                crate.fuzObjects.forEach(item => {
+                    const tid = item.type_id;
+                    const maxBuyPrice = item.buy?.max || 0; 
+                    
+                    if (tid > 0 && maxBuyPrice > 0) {
+                        fallbackMap.set(tid, { buy: maxBuyPrice, sell: 0 }); 
+                        log.debug(`Resolved Tier 3 cost for ${tid}: ${maxBuyPrice}`);
+                    }
+                });
+            });
+        }
+        
+    } catch (e) {
+        log.error(`Contract Price Fallback FAILED: ${e.message}`);
+    }
+
+    return fallbackMap;
+}
+
+/**
  * Helper to build a map of contract prices for allocation reference.
  * Reads the Contracts (RAW) sheet. (Resolves missing dependency)
  */
@@ -1356,104 +1467,123 @@ function _buildContractPriceMap_(ss) {
 // UNIT COST ALLOCATION FUNCTION
 // ==========================================================================================
 
+
 /**
  * Recalculates unit costs for contracts in the Material/Sales Ledger.
- * This is the final step in the COGS pipeline.
+ * This is the final step in the COGS pipeline, now using tiered fallbacks.
  */
 function rebuildContractUnitCosts(ss) {
-  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  const log = LoggerEx.withTag('CONTRACT_UNIT_COST');
-  const LEDGER_BUY_SHEET = 'Material_Ledger';
+    ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+    const log = LoggerEx.withTag('CONTRACT_UNIT_COST');
+    const LEDGER_BUY_SHEET = 'Material_Ledger';
+    
+    // --- 1. BUILD REQUIRED LOOKUP MAPS ---
+    const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
+    const refMap = _buildRefPriceMap_(ss); // Tier 1: Local Tracker Prices
+    const priceMap = _buildContractPriceMap_(ss); 
 
-  // --- 1. BUILD REQUIRED LOOKUP MAPS ---
-  const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
-  const refMap = _buildRefPriceMap_(ss);
-  const priceMap = _buildContractPriceMap_(ss);
-
-  // --- 2. READ RAW DATA (Contract Items) ---
-  const ci = _getData_(ss, 'Contract Items (RAW)');
-  if (ci.rows.length === 0) {
-    log.warn('rebuildContractUnitCosts: Skipping, RAW contract data is empty.');
-    return 0;
-  }
-
-  // --- 3. ORGANIZE ITEMS BY CONTRACT ID ---
-  const itemsByCid = new Map();
-  const cICol = { contract_id: ci.h['contract_id'], type_id: ci.h['type_id'], quantity: ci.h['quantity'], is_included: ci.h['is_included'] };
-
-  ci.rows.forEach(row => {
-    const cid = String(row[cICol.contract_id]);
-    if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
-
-    const qty = Number(row[cICol.quantity] || 0);
-    if (String(row[cICol.is_included]).toUpperCase() === 'TRUE' && qty > 0) {
-      itemsByCid.get(cid).push({ tid: Number(row[cICol.type_id]), qty: qty });
-    }
-  });
-
-  // --- 4. CALCULATE UNIT COSTS (The Core Logic) ---
-  const outRows = [];
-  let processedItems = 0;
-
-  for (const [cid, items] of itemsByCid.entries()) {
-    const contractMeta = priceMap.get(cid);
-    if (!contractMeta) continue; // Skip if main contract details are missing
-
-    const totalContractValue = contractMeta.price + contractMeta.collateral - contractMeta.reward;
-
-    let totalReferenceValue = 0;
-
-    // Calculate total reference value for the allocation (needed for REF mode)
-    for (const { tid, qty } of items) {
-      const refPrice = refMap.get(tid);
-      // Use Buy price since this is the Material Ledger (COGS)
-      if (refPrice && refPrice.buy > 0) {
-        totalReferenceValue += refPrice.buy * qty;
-      }
+    // --- 2. READ RAW DATA (Contract Items) & COLLECT ALL UNIQUE TIDS ---
+    const ci = _getData_(ss, 'Contract Items (RAW)');
+    if (ci.rows.length === 0) { 
+        log.warn('rebuildContractUnitCosts: Skipping, RAW contract data is empty.'); 
+        return 0; 
     }
 
-    const pricePerRefUnit = (totalReferenceValue > 0) ? (totalContractValue / totalReferenceValue) : 0;
-    const simpleVolumeSplit = (items.length > 0) ? (totalContractValue / items.length) : 0;
+    const itemsByCid = new Map();
+    const allUniqueContractTids = new Set();
+    const cICol = { contract_id: ci.h['contract_id'], type_id: ci.h['type_id'], quantity: ci.h['quantity'], is_included: ci.h['is_included'] };
 
-    // Apply allocation logic
-    for (const { tid, qty } of items) {
-      let unitCost = 0;
+    ci.rows.forEach(row => {
+        const cid = String(row[cICol.contract_id]);
+        if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
+        
+        const qty = Number(row[cICol.quantity] || 0);
+        if (String(row[cICol.is_included]).toUpperCase() === 'TRUE' && qty > 0) {
+             const tid = Number(row[cICol.type_id]);
+             itemsByCid.get(cid).push({ tid: tid, qty: qty });
+             allUniqueContractTids.add(tid); 
+        }
+    });
 
-      if (allocMode === 'REF' && totalReferenceValue > 0) {
-        // REF Mode: Cost = (Reference Price * Quantity) * Allocation Factor
-        const refPrice = refMap.get(tid)?.buy || 0;
-        unitCost = (refPrice > 0) ? (refPrice * pricePerRefUnit) : (simpleVolumeSplit / qty);
-      } else {
-        // FALLBACK/VOLUME Mode: Cost = TotalValue / TotalItems (Simple averaging)
-        unitCost = simpleVolumeSplit / qty;
-      }
+    // 3. Generate Fallback Map for Tids missing from Tier 1 (refMap)
+    const tidsMissingTier1 = Array.from(allUniqueContractTids).filter(tid => !refMap.has(tid));
+    const fallbackMap = _getContractPriceFallbackMap(ss, tidsMissingTier1);
 
-      // --- WRITE NEW LEDGER ROW OBJECT (for MaterialLedger.upsert) ---
-      outRows.push({
-        source: "CONTRACT",
-        char: contractMeta.char,
-        contract_id: cid,
-        type_id: tid,
-        unit_value_filled: unitCost, // The calculated allocated unit price
-      });
-      processedItems++;
+    
+    // --- 4. CALCULATE UNIT COSTS (The Core Logic) ---
+    const outRows = [];
+    let processedItems = 0;
+
+    for (const [cid, items] of itemsByCid.entries()) {
+        const contractMeta = priceMap.get(cid);
+        if (!contractMeta) continue;
+
+        const totalContractValue = contractMeta.price + contractMeta.collateral - contractMeta.reward;
+        let totalReferenceValue = 0;
+
+        // Pass 1: Calculate total reference value (needed for allocation factor)
+        for (const { tid, qty } of items) {
+            
+            // TIERED PRICING: Check Tier 1 (refMap) then Fallback Map
+            let refPriceObj = refMap.get(tid) || fallbackMap.get(tid); 
+            const refPrice = refPriceObj?.buy || 0;
+            
+            if (refPrice > 0) { 
+                 totalReferenceValue += refPrice * qty; 
+            }
+        }
+        
+        const pricePerRefUnit = (totalReferenceValue > 0) ? (totalContractValue / totalReferenceValue) : 0;
+        const simpleVolumeSplit = (items.length > 0) ? (totalContractValue / items.length) : 0;
+
+        // Pass 2: Apply allocation logic
+        for (const { tid, qty } of items) {
+            let unitCost = 0;
+            
+            // TIERED PRICING: Get the best available price for this item
+            let refPriceObj = refMap.get(tid) || fallbackMap.get(tid);
+            const refPrice = refPriceObj?.buy || 0;
+            
+            // FIX: Using local variable 'allocMode' consistently (was fixed from ALLOC_MODE)
+            if (allocMode === 'REF' && totalReferenceValue > 0) {
+                
+                if (refPrice > 0) {
+                    // Cost = Reference Price * Allocation Factor
+                    unitCost = refPrice * pricePerRefUnit;
+                } else {
+                    // Item was unpriced even with fallbacks; fall back to simple volume split.
+                    unitCost = simpleVolumeSplit / qty;
+                }
+            } else {
+                // FALLBACK/VOLUME Mode: Cost = TotalValue / TotalItems (Simple averaging)
+                unitCost = simpleVolumeSplit / qty; 
+            }
+
+            // --- WRITE NEW LEDGER ROW OBJECT (for MaterialLedger.upsert) ---
+            outRows.push({
+                source: "CONTRACT", 
+                char: contractMeta.char, 
+                contract_id: cid,
+                type_id: tid,
+                unit_value_filled: unitCost, 
+            });
+            processedItems++;
+        }
     }
-  }
+    
+    if (processedItems === 0) { 
+        log.log('rebuildContractUnitCosts', { status: 'Skipped: No items found for costing.' }); 
+        return 0; 
+    }
 
-  if (processedItems === 0) {
-    log.log('rebuildContractUnitCosts', { status: 'Skipped: No items found for costing.' });
-    return 0;
-  }
-
-  // --- 5. SHEET WRITE OPERATION ---
-  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
-  const keys = ['source', 'char', 'contract_id', 'type_id'];
-
-  // CRITICAL: This upsert updates the 'unit_value_filled' column for existing rows
-  const count = MaterialLedger.upsert(keys, outRows);
-
-  log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
-  return count;
+    // --- 5. SHEET WRITE OPERATION ---
+    const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
+    const keys = ['source', 'char', 'contract_id', 'type_id'];
+    
+    const count = MaterialLedger.upsert(keys, outRows); 
+    
+    log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
+    return count;
 }
 
 /**
