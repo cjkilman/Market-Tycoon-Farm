@@ -32,3 +32,61 @@ function test_SDE_invTypes() {
     sde_job_FINALIZE(); 
   }
 }
+
+/**
+ * TEST FUNCTION: Attempts a direct, uncached GESI call to corporate industry jobs.
+ * This function bypasses sheet lookups and caching to test ESI authorization directly.
+ * * Instructions: 
+ * 1. REPLACE "YOUR_AUTHORIZED_CHARACTER_NAME" with the exact name you used for GESI authorization.
+ * 2. Run this function (TEST_ESI_AUTH_STATUS) from the Apps Script editor.
+ * 3. Check the Logger (View -> Logs) for the result.
+ */
+function TEST_ESI_AUTH_STATUS() {
+
+  // ⚠️ MANDATORY: REPLACE THIS PLACEHOLDER WITH YOUR CHARACTER NAME
+  const authToon = "YOUR_AUTHORIZED_CHARACTER_NAME";
+
+  const ENDPOINT = 'corporations_corporation_industry_jobs';
+  const LOG = Logger;
+
+  if (authToon === "YOUR_AUTHORIZED_CHARACTER_NAME") {
+    LOG.log("ERROR: Please replace the placeholder character name in the function.");
+    return;
+  }
+
+  LOG.log(`--- Starting ESI Auth Test for: ${authToon} ---`);
+
+  try {
+    // Attempt the direct, raw ESI call
+    const rawObjects = GESI.invokeRaw(
+      ENDPOINT,
+      {
+        include_completed: true,
+        name: authToon,
+        show_column_headings: false,
+        version: null
+      }
+    );
+
+    if (Array.isArray(rawObjects) && rawObjects.length > 0) {
+      LOG.log(`✅ SUCCESS! Found ${rawObjects.length} jobs.`);
+      LOG.log("First job ID: " + rawObjects[0].job_id);
+    } else if (Array.isArray(rawObjects) && rawObjects.length === 0) {
+      LOG.log("✅ SUCCESS! The ESI call worked, but zero industry jobs were returned.");
+    } else {
+      LOG.log("❌ FAILURE: GESI returned data that was not an array (Check Logs for the actual error).");
+    }
+
+  } catch (e) {
+    LOG.log(`❌ ESI CALL FAILED: ${e.message}`);
+
+    if (e.message.includes("403")) {
+      LOG.log("ACTION: This is an Authorization (403 Forbidden) error. Token is invalid or missing ESI scopes.");
+      LOG.log("-> Go to GESI -> Authorize Character and re-authorize with ALL corporate scopes checked.");
+    } else if (e.message.includes("420")) {
+      LOG.log("ACTION: This is a Rate Limit (420) error. Wait 5 minutes before trying again.");
+    } else {
+      LOG.log("ACTION: The error is unknown. Check external network status.");
+    }
+  }
+}

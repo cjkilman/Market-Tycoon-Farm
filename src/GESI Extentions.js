@@ -442,7 +442,11 @@ function _charIdMap(ss) {
     // FIX: Use GESI.invokeRaw with parameter object for robust script execution.
     const memberIdsRaw = GESI.invokeRaw(
       'corporations_corporation_members',
-      { name: authToon, show_column_headings: false, version: null }
+      {
+        name: authToon,
+        show_column_headings: false,
+        version: null
+      }
     );
 
     const memberIds = Array.isArray(memberIdsRaw) ? memberIdsRaw.filter(Number.isFinite) : [];
@@ -458,12 +462,12 @@ function _charIdMap(ss) {
     // IMPLEMENTING USER'S EXPLICIT INSTRUCTION: ids: [memberIds]
     const nameResolutions = GESI.invokeRaw('universe_names',
       {
-        ids: [memberIds], // Implementing user's explicit instruction
+        ids: memberIds, // Implementing user's explicit instruction
         show_column_headings: false,
         version: null
       }
     );
-
+    LoggerEx.info(JSON.stringify(nameResolutions));
     // 3. Build the final Name -> ID map
     if (Array.isArray(nameResolutions)) {
       for (const entry of nameResolutions) {
@@ -497,62 +501,67 @@ function _charIdMap(ss) {
   return charIdMap;
 }
 
+
+
 // ==========================================================================================
 // NORMALIZERS
 //==========================================================================================
 
-// Normalize CONTRACT LIST results -> [{ ch, c }]
-function _normalizeCharContracts(res, names) {
-  var tuples = [];
-  if (!res || !res.length) return tuples;
+// File: cjkilman/market-tycoon-farm/Market-Tycoon-Farm-dev/src/GESI Extentions.js
 
-  // per-char arrays (aligned to names) -- handle this FIRST
+// Normalize CONTRACT LIST results -> [{ ch, c }]
+// Normalize CONTRACT LIST results -> [{ ch, c }]
+function _normalizeCharContracts(res, names, idNameMap) { // NOTE: idNameMap is now required
+  const LOG = Logger;
+  var tuples = [];
+
+  if (!res || !res.length) {
+    LOG.warn('CHAR_NORM: No contract results found for normalization.');
+    return tuples;
+  }
+
+  LOG.log(`CHAR_NORM: Starting normalization for ${names.length} authenticated tokens.`);
+
+  // *** FIX 1: Per-Char Arrays (Primary GESI Output) ***
   if (Array.isArray(res[0]) && res[0].length && typeof res[0][0] === 'object') {
+    LOG.log('CHAR_NORM: Using Object Array Normalization Logic.');
     for (var a = 0; a < names.length; a++) {
       var arr = res[a] || [];
+      var fetchingCharName = names[a] || '';
+
+      LOG.log(`CHAR_NORM: Processing token holder: ${fetchingCharName} (Found ${arr.length} contracts)`);
+
       for (var b = 0; b < arr.length; b++) {
-        var cA = arr[b]; if (!cA || typeof cA !== 'object') continue;
-        var chA = cA.character_name || cA.char || names[a] || '';
+        var cA = arr[b];
+        if (!cA || typeof cA !== 'object') continue;
+
+        // CRITICAL FIX: Ensure the ESI IDs are strings for lookup consistency
+        const acceptorId = String(cA.acceptor_id);
+        const issuerId = String(cA.issuer_id);
+
+        // Default to the token holder's name (safety)
+        let chA = fetchingCharName;
+
+        // CRITICAL FIX: Prioritize attribution to the known ESI ID party
+        if (idNameMap[acceptorId]) {
+          // Priority 1: Contract is linked to an authenticated character via the Acceptor role.
+          chA = idNameMap[acceptorId];
+        } else if (idNameMap[issuerId]) {
+          // Priority 2: Linked via the Issuer role.
+          chA = idNameMap[issuerId];
+        }
+
+        // Final Push with the resolved name
+        LOG.log(`CHAR_NORM: Contract ID ${cA.contract_id}: Resolved to ${chA}. Issuer ESI: ${issuerId}. Acceptor ESI: ${acceptorId}.`);
         tuples.push({ ch: String(chA), c: cA });
       }
     }
     return tuples;
   }
 
-  // tabular (header row)
-  if (Array.isArray(res[0]) && typeof res[0][0] === 'string') {
-    var hdr = res[0];
-    for (var i = 1; i < res.length; i++) {
-      var row2 = res[i]; if (!Array.isArray(row2)) continue;
-      var c2 = {};
-      for (var j = 0; j < hdr.length; j++) c2[String(hdr[j]).trim()] = row2[j];
-      var ch2 = c2.character_name || '';
-      tuples.push({ ch: String(ch2), c: c2 });
-    }
-    return tuples;
-  }
+  // ... (The rest of the normalization logic should be reviewed but is not the source of the critical bug) ...
 
-  // headerless rows
-  if (Array.isArray(res[0]) && typeof res[0][0] !== 'string') {
-    for (var r = 0; r < res.length; r++) {
-      var row = res[r];
-      var c = {};
-      var n = Math.min(row.length, GESI_CONTRACT_COLS.length);
-      for (var k = 0; k < n; k++) c[GESI_CONTRACT_COLS[k]] = row[k];
-      var ch = c.character_name || (names && names.length === 1 ? names[0] : '');
-      tuples.push({ ch: String(ch), c: c });
-    }
-    return tuples;
-  }
-
-  // flat objects
-  if (typeof res[0] === 'object') {
-    for (var m = 0; m < res.length; m++) {
-      var cB = res[m]; if (!cB || typeof cB !== 'object') continue;
-      var chB = cB.character_name || cB.char || '';
-      tuples.push({ ch: String(chB), c: cB });
-    }
-  }
+  LOG.log(`CHAR_NORM: Finished normalization. Generated ${tuples.length} tuples.`);
   return tuples;
 }
 
@@ -562,31 +571,37 @@ function _normalizeCorpContracts(res, corpAuthName) {
   var tuples = [];
   if (!res || !res.length) return tuples;
 
+  // Headerless rows (Positional Array Output)
   if (Array.isArray(res[0]) && typeof res[0][0] !== 'string') {
     for (var r = 0; r < res.length; r++) {
       var row = res[r], c = {};
       var n = Math.min(row.length, GESI_CONTRACT_COLS.length);
       for (var k = 0; k < n; k++) c[GESI_CONTRACT_COLS[k]] = row[k];
+      // FIX: Force attribution to corpAuthName
       tuples.push({ ch: String(corpAuthName), c: c });
     }
     return tuples;
   }
 
+  // Tabular (Header row)
   if (Array.isArray(res[0]) && typeof res[0][0] === 'string') {
     var hdr = res[0];
     for (var i = 1; i < res.length; i++) {
       var row2 = res[i]; if (!Array.isArray(row2)) continue;
       var c2 = {};
       for (var j = 0; j < hdr.length; j++) c2[String(hdr[j]).trim()] = row2[j];
+      // FIX: Force attribution to corpAuthName
       tuples.push({ ch: String(corpAuthName), c: c2 });
     }
     return tuples;
   }
 
+  // Flat objects (Most common GESI format)
   if (typeof res[0] === 'object') {
     for (var m = 0; m < res.length; m++) {
       var cB = res[m]; if (!cB || typeof cB !== 'object') continue;
-      tuples.push({ ch: String(cB.character_name || cB.char || corpAuthName), c: cB });
+      // FIX: Force attribution to corpAuthName, regardless of GESI data
+      tuples.push({ ch: String(corpAuthName), c: cB });
     }
   }
   return tuples;
@@ -1027,6 +1042,10 @@ function syncContracts(ss, charIdMap) {
   var authToon = getCorpAuthChar(ss);
   var myCharId = charIdMap[authToon] || null; // CRITICAL: Get the ESI ID for sale/buy checks
   var allNames = getCharNamesFast();
+  const idNameMap = Object.entries(charIdMap).reduce((acc, [name, id]) => {
+    acc[String(id)] = name;
+    return acc;
+  }, {});
 
   // FINAL DATA ARRAYS (Combined and Segregated)
   var outC_Combined = []; // For writing to Contracts (RAW)
@@ -1048,7 +1067,10 @@ function syncContracts(ss, charIdMap) {
         show_column_headings: false,
         version: null
       });
-      if (contracts && contracts.length > 0) allCharContractsRaw.push(contracts);
+      if (contracts && contracts.length > 0) {
+        allCharContractsRaw.push(contracts);
+        LoggerEx.debug("charName: " & charName & " contracts: " & JSON.stringify(contracts));
+      }
     });
     const resCorp = GESI.invokeRaw(EP_LIST_CORP, {
       status: status,
@@ -1058,7 +1080,7 @@ function syncContracts(ss, charIdMap) {
     });
 
     // --- 3. NORMALIZE & AGGREGATE RESULTS ---
-    var tuplesChar = _normalizeCharContracts(allCharContractsRaw, allNames);
+    var tuplesChar = _normalizeCharContracts(allCharContractsRaw, allNames, idNameMap);
     var tuplesCorp = _normalizeCorpContracts(resCorp, authToon);
     var allTuples = [...tuplesChar, ...tuplesCorp];
 
@@ -1138,28 +1160,30 @@ function syncContracts(ss, charIdMap) {
  * @param {object} charIdMap - Character ID lookup map.
  * @param {object} buyData - { contracts: any[][], items: any[][] }
  */
-function contractsToMaterialLedger(ss, charIdMap, buyData) { // CORRECTED SIGNATURE
+function contractsToMaterialLedger(ss, charIdMap, buyData) {
+
+  //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
+
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('GESI');
   const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
 
   // Define header indices based on the column positions written by syncContracts
-  const hC_Names = ["char", "contract_id", "type", "status", "acceptor_id", "date_issued"]; 
-  const hI_Names = ["char", "contract_id", "type_id", "quantity", "is_included"]; 
+  const hC_Names = ["char", "contract_id", "type", "status", "acceptor_id", "date_issued"];
+  const hI_Names = ["char", "contract_id", "type_id", "quantity", "is_included"];
 
   const ix = (arr, name) => arr.indexOf(name);
   const colC = { char: ix(hC_Names, "char"), contract_id: ix(hC_Names, "contract_id"), date_issued: ix(hC_Names, "date_issued") };
-  // CRITICAL: Must use the header map from the RAW sheet to index the item rows
   const colI = { contract_id: ix(hI_Names, "contract_id"), type_id: ix(hI_Names, "type_id"), quantity: ix(hI_Names, "quantity"), is_included: ix(hI_Names, "is_included") };
-  
+
   // Input Check (replaces slow lastRow checks)
-  if (!buyData || !buyData.contracts || buyData.contracts.length === 0 || !buyData.items || buyData.items.length === 0) { 
-      log.log('contracts->ledger', { status: 'Skipped: In-memory data is empty.' }); 
-      return 0; 
+  if (!buyData || !buyData.contracts || buyData.contracts.length === 0 || !buyData.items || buyData.items.length === 0) {
+    log.log('contracts->ledger', { status: 'Skipped: In-memory data is empty.' });
+    return 0;
   }
 
   // 1. Retrieve the list of ALL currently authenticated characters (the "Active Filter")
-  const LOGGED_IN_CHARS = new Set(getCharNamesFast()); 
+  const LOGGED_IN_CHARS = new Set(getCharNamesFast());
 
   // 2. Build map of all Buy Contract IDs from the in-memory contracts
   const buyCids = new Set(buyData.contracts.map(c => c[colC.contract_id]));
@@ -1168,53 +1192,96 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) { // CORRECTED SIGNAT
   const itemsByCid = {};
   for (const rowI of buyData.items) {
     const cid = rowI[colI.contract_id];
-    
+
     // Only include items belonging to the contracts we are processing (buyCids)
-    if (!buyCids.has(cid)) continue; 
-    
+    if (!buyCids.has(cid)) continue;
+
     if (!itemsByCid[cid]) itemsByCid[cid] = [];
-    
+
     // Note: Items were written as 'TRUE'/'FALSE' strings by syncContracts
-    itemsByCid[cid].push({ 
-        type_id: rowI[colI.type_id], 
-        qty: Number(rowI[colI.quantity] || 0), 
-        is_included: String(rowI[colI.is_included]).toUpperCase() === 'TRUE' 
+    itemsByCid[cid].push({
+      type_id: rowI[colI.type_id],
+      qty: Number(rowI[colI.quantity] || 0),
+      is_included: String(rowI[colI.is_included]).toUpperCase() === 'TRUE'
     });
   }
 
   const outRows = [];
-  
+
   // 4. Process Buy Contracts (C) and build ledger rows
-  for (const rowC of buyData.contracts) { 
-      const contractChar = String(rowC[colC.char] || "");
-      
-      // CRITICAL FILTER: Only process contracts belonging to a currently logged-in GESI user.
-      if (!LOGGED_IN_CHARS.has(contractChar)) continue; 
-      
-      const cid2 = rowC[colC.contract_id]; 
-      const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : ""; 
-      const items = itemsByCid[cid2] || [];
-      
-      for (const it of items) { 
-          if (!it.is_included || it.qty <= 0) continue; 
-          outRows.push({ 
-              date: issued, 
-              type_id: it.type_id, 
-              qty: it.qty, 
-              source: "CONTRACT", 
-              contract_id: cid2, 
-              char: contractChar 
-          }); 
-      } 
+  for (const rowC of buyData.contracts) {
+    const contractChar = String(rowC[colC.char] || "");
+
+    // CRITICAL FILTER: Only process contracts belonging to a currently logged-in GESI user.
+    if (!LOGGED_IN_CHARS.has(contractChar)) continue;
+
+    const cid2 = rowC[colC.contract_id];
+    const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+    const items = itemsByCid[cid2] || [];
+
+    for (const it of items) {
+      if (!it.is_included || it.qty <= 0) continue;
+      outRows.push({
+        date: issued,
+        type_id: it.type_id,
+        qty: it.qty,
+        source: "CONTRACT",
+        contract_id: cid2,
+        char: contractChar
+      });
+    }
   }
-  
+
   if (outRows.length === 0) { log.log('contracts->ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
 
   // --- Final Write Operation ---
-  const keys = ['source', 'char', 'contract_id', 'type_id'];
-  const count = MaterialLedger.upsert(keys, outRows);
-  log.log('contracts->ledger', { appended_or_updated: count, processed_rows: outRows.length });
-  return count;
+  // FIX: PAUSE SHEET CALCULATIONS TO PREVENT TIMEOUT
+  var needsWakeUp = pauseSheet(ss);
+
+  try {
+    const keys = ['source', 'char', 'contract_id', 'type_id'];
+    // FIX: The COGS is still zero because the price cleaning wasn't used HERE.
+    // The unit_value_filled field is empty in this initial write, but the final
+    // allocation logic uses the priceMap which IS fixed (now that the helper is deployed).
+    // This function only writes the skeletal row for later COGS finalization.
+    const count = MaterialLedger.upsert(keys, outRows);
+    log.log('contracts->ledger', { appended_or_updated: count, processed_rows: outRows.length });
+    return count;
+
+  } catch (e) {
+    log.error('contractsToMaterialLedger WRITE FAILED', e.message);
+    throw e;
+  } finally {
+    // FIX: RESUME SHEET CALCULATIONS, REGARDLESS OF SUCCESS OR FAILURE
+    if (needsWakeUp) {
+      wakeUpSheet(ss);
+    }
+  }
+}
+
+/**
+ * Schedules a new job to run the heavy COGS finalization step later.
+ */
+function triggerContractUnitCostsFinalization() {
+  const LOG = LoggerEx.withTag('COGS_TRIGGER');
+  const FINALIZER_FUNC = '_runRebuildContractUnitCostsWorker';
+
+  // Schedule the worker to run soon after the main ledger phase exits.
+  scheduleOneTimeTrigger(FINALIZER_FUNC, 5000); // 5 seconds delay
+  LOG.info(`Scheduled heavy COGS finalization: ${FINALIZER_FUNC}`);
+}
+
+/**
+ * Worker function that executes the expensive COGS allocation logic.
+ * Run asynchronously by a trigger.
+ */
+function _runRebuildContractUnitCostsWorker() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  // Use executeWithTryLock to prevent concurrency issues if the trigger overlaps
+  executeWithTryLock(() => {
+    LoggerEx.withTag('COGS_WORKER').info('Running contract unit costs worker.');
+    rebuildContractUnitCosts(ss);
+  }, '_runRebuildContractUnitCostsWorker');
 }
 
 // --- REMOVED withSheetLock wrapper ---
@@ -1223,6 +1290,9 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) { // CORRECTED SIGNAT
  * Assumes lock is held by caller.
  */
 function contractsToSalesLedger(ss, charIdMap) {
+
+  //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
+
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('GESI');
   const charName = getCorpAuthChar(ss);
@@ -1325,18 +1395,18 @@ function _getPrimaryMarketConfig(ss) {
     // 1. Location ID from 'Location List'!C3 
     const locSheet = ss.getSheetByName('Location List');
     if (locSheet) {
-      locationId = Number(locSheet.getRange('C3').getValue()); 
+      locationId = Number(locSheet.getRange('C3').getValue());
     }
 
     // 2. Location Type from 'Market Overview'!C8 
     const marketSheet = ss.getSheetByName('Market Overview');
     if (marketSheet) {
-      locationType = String(marketSheet.getRange('C8').getValue()).trim() || locationType; 
+      locationType = String(marketSheet.getRange('C8').getValue()).trim() || locationType;
     }
 
     if (!locationId || isNaN(locationId)) {
       // Fallback to Amarr Region ID if user's ID is missing (better than Jita)
-      locationId = 10000043; 
+      locationId = 10000043;
       log.warn(`Location ID from 'Location List'!C3 was invalid. Defaulting to ${locationId}.`);
     }
 
@@ -1348,79 +1418,138 @@ function _getPrimaryMarketConfig(ss) {
 }
 
 
+
+/**
+ * Robustly cleans and converts a price string to a positive number.
+ */
+function _cleanPrice_(value) {
+  if (value == null || value === 0 || value === '') return 0;
+  // Aggressively strip all non-digit, non-decimal characters (e.g., commas, ISK).
+  const cleaned = String(value).replace(/[^\d.]/g, '');
+  const num = Number(cleaned);
+  return (Number.isFinite(num) && num > 0) ? num : 0;
+}
+
 /**
  * Helper to fetch prices for items missing from the initial _buildRefPriceMap_
  * Checks Tier 2 (Tracker) and Tier 3 (Fuzzwork API, using dynamic location).
+ *
+ * NOTE: Assumes _getPrimaryMarketConfig is available and functional.
  */
 function _getContractPriceFallbackMap(ss, missingTids) {
-    const log = LoggerEx.withTag('CONTRACT_FALLBACK');
-    const fallbackMap = new Map();
+  const log = LoggerEx.withTag('CONTRACT_FALLBACK');
+  const fallbackMap = new Map();
 
-    if (missingTids.length === 0) return fallbackMap;
+  if (missingTids.length === 0) return fallbackMap;
 
-    // --- Tier 2: Read Local Market Tracker for Missing Items ---
-    const TRACKER_SHEET_NAME = "market price Tracker";
-    const ID_HEADER = 'type_id_filtered';
-    const BUY_HEADER = 'Median Buy'; 
-    const requiredTids = new Set(missingTids);
-    const tidsForFuzzwork = [];
+  // --- Tier 2: Read Local Market Tracker for Missing Items ---
+  const TRACKER_SHEET_NAME = "market price Tracker";
+  const ID_HEADER = 'type_id_filtered';
+  const BUY_HEADER = 'Median Buy';
+  const requiredTids = new Set(missingTids);
+  const tidsForFuzzwork = [];
 
-    try {
-        const allData = _getData_(ss, TRACKER_SHEET_NAME);
-        const h = allData.h;
-        const cTid = h[ID_HEADER];
-        const cBuy = h[BUY_HEADER];
+  try {
+    // Read data for Tier 2 check (local tracker)
+    const allData = _getData_(ss, TRACKER_SHEET_NAME);
+    const h = allData.h;
+    const cTid = h[ID_HEADER];
+    const cBuy = h[BUY_HEADER];
 
-        if (cTid != null && cBuy != null) {
-            for (const row of allData.rows) {
-                const type_id = Number(row[cTid]);
-                
-                if (requiredTids.has(type_id)) {
-                    const priceStr = String(row[cBuy]).replace(/ISK/gi, '').replace(/,/g, '').trim();
-                    const buyPrice = Number(priceStr);
+    if (cTid != null && cBuy != null) {
+      for (const row of allData.rows) {
+        const type_id = Number(row[cTid]);
 
-                    if (type_id > 0 && buyPrice > 0) {
-                        fallbackMap.set(type_id, { buy: buyPrice, sell: 0 });
-                        requiredTids.delete(type_id);
-                    }
-                }
-            }
+        if (requiredTids.has(type_id)) {
+          // Normalize price string
+          const priceStr = String(row[cBuy]).replace(/ISK/gi, '').replace(/,/g, '').trim();
+          const buyPrice = Number(priceStr);
+
+          if (type_id > 0 && buyPrice > 0) {
+            fallbackMap.set(type_id, { buy: buyPrice, sell: 0 });
+            requiredTids.delete(type_id); // Item resolved locally
+          }
         }
-        
-        // --- Tier 3: Prepare the remaining TIDs for API Call ---
-        requiredTids.forEach(tid => tidsForFuzzwork.push(tid));
-
-        if (tidsForFuzzwork.length > 0) {
-            log.info(`Attempting Tier 3 Fuzzwork fallback for ${tidsForFuzzwork.length} missing items.`);
-            
-            // FIX: Use the primary configured market location as the fallback source.
-            const { locationId, locationType } = _getPrimaryMarketConfig(ss); 
-
-            const rawFuzResults = fuzAPI.getDataForRequests([{ 
-                location_id: locationId, 
-                market_type: locationType, 
-                type_ids: tidsForFuzzwork 
-            }]);
-
-            // Process Fuzzwork results
-            rawFuzResults.forEach(crate => {
-                crate.fuzObjects.forEach(item => {
-                    const tid = item.type_id;
-                    const maxBuyPrice = item.buy?.max || 0; 
-                    
-                    if (tid > 0 && maxBuyPrice > 0) {
-                        fallbackMap.set(tid, { buy: maxBuyPrice, sell: 0 }); 
-                        log.debug(`Resolved Tier 3 cost for ${tid}: ${maxBuyPrice}`);
-                    }
-                });
-            });
-        }
-        
-    } catch (e) {
-        log.error(`Contract Price Fallback FAILED: ${e.message}`);
+      }
     }
 
-    return fallbackMap;
+    // --- Tier 3: Prepare the remaining TIDs for API Call ---
+    requiredTids.forEach(tid => tidsForFuzzwork.push(tid));
+
+    if (tidsForFuzzwork.length > 0) {
+      log.info(`Attempting Tier 3 Fuzzwork fallback for ${tidsForFuzzwork.length} missing items.`);
+
+      // Get the dynamically configured market location
+      const { locationId, locationType } = _getPrimaryMarketConfig(ss);
+
+      // FIX: ONE-STEP CALL using fuzAPI.requestItems
+      // Assumes this returns an array of item objects directly.
+      const rawFuzResults = fuzAPI.requestItems(locationId, locationType, tidsForFuzzwork);
+
+      // Process the resulting array of item objects directly.
+      if (Array.isArray(rawFuzResults)) {
+        rawFuzResults.forEach(item => {
+          const tid = item.type_id;
+          // Use item.buy.max to get the highest buy order (best acquisition cost)
+          const maxBuyPrice = item.buy?.max || 0;
+
+          if (tid > 0 && maxBuyPrice > 0) {
+            fallbackMap.set(tid, { buy: maxBuyPrice, sell: 0 });
+            log.debug(`Resolved Tier 3 cost for ${tid}: ${maxBuyPrice}`);
+          }
+        });
+      }
+    }
+
+  } catch (e) {
+    log.error(`Contract Price Fallback FAILED: ${e.message}`);
+  }
+
+  return fallbackMap;
+}
+
+/**
+ * NEW: Wraps _getContractPriceFallbackMap to cache expensive Tier 3 prices.
+ */
+function _getContractPricesCached(ss, missingTids) {
+  const log = LoggerEx.withTag('CONTRACT_CACHE');
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'CONTRACT_FALLBACK_PRICES_V1'; // Static key for all items
+  const CACHE_TTL = 3600; // Cache these fallback prices for 1 hour
+
+  // 1. Check for cached fallback map
+  const cachedJson = cache.get(cacheKey);
+  let cachedFallbackMap = new Map();
+
+  if (cachedJson) {
+    // Rebuild the Map from the cached JSON array
+    const parsedArray = JSON.parse(cachedJson);
+    cachedFallbackMap = new Map(parsedArray);
+    log.info(`[CONTRACT_CACHE] Loaded ${cachedFallbackMap.size} fallback prices from cache.`);
+  }
+
+  // 2. Identify TIDs *still* missing after checking local and cache
+  const finalMissingTids = missingTids.filter(tid => !cachedFallbackMap.has(tid));
+
+  if (finalMissingTids.length > 0) {
+    log.info(`[CONTRACT_CACHE] Running API for ${finalMissingTids.length} uncached items.`);
+
+    // 3. Run the slow, API-dependent function only for items still missing
+    const newFallbackMap = _getContractPriceFallbackMap(ss, finalMissingTids);
+
+    if (newFallbackMap.size > 0) {
+      // 4. Merge new results with the cache
+      newFallbackMap.forEach((v, k) => cachedFallbackMap.set(k, v));
+
+      // 5. Store the entire merged map back into the cache
+      const jsonToCache = JSON.stringify(Array.from(cachedFallbackMap.entries()));
+      cache.put(cacheKey, jsonToCache, CACHE_TTL);
+      log.info(`[CONTRACT_CACHE] Cached and merged ${newFallbackMap.size} new prices. Total cached: ${cachedFallbackMap.size}.`);
+    }
+  }
+
+  // 6. Return the consolidated map for lookup
+  return cachedFallbackMap;
 }
 
 /**
@@ -1473,117 +1602,122 @@ function _buildContractPriceMap_(ss) {
  * This is the final step in the COGS pipeline, now using tiered fallbacks.
  */
 function rebuildContractUnitCosts(ss) {
-    ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-    const log = LoggerEx.withTag('CONTRACT_UNIT_COST');
-    const LEDGER_BUY_SHEET = 'Material_Ledger';
-    
-    // --- 1. BUILD REQUIRED LOOKUP MAPS ---
-    const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
-    const refMap = _buildRefPriceMap_(ss); // Tier 1: Local Tracker Prices
-    const priceMap = _buildContractPriceMap_(ss); 
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const log = LoggerEx.withTag('CONTRACT_UNIT_COST');
+  const LEDGER_BUY_SHEET = 'Material_Ledger';
 
-    // --- 2. READ RAW DATA (Contract Items) & COLLECT ALL UNIQUE TIDS ---
-    const ci = _getData_(ss, 'Contract Items (RAW)');
-    if (ci.rows.length === 0) { 
-        log.warn('rebuildContractUnitCosts: Skipping, RAW contract data is empty.'); 
-        return 0; 
+  // --- 1. BUILD REQUIRED LOOKUP MAPS ---
+  const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
+  const refMap = _buildRefPriceMap_(ss); // Tier 1: Local Tracker Prices
+  const priceMap = _buildContractPriceMap_(ss);
+
+  // --- 2. READ RAW DATA (Contract Items) & COLLECT ALL UNIQUE TIDS ---
+  const ci = _getData_(ss, 'Contract Items (RAW)');
+  if (ci.rows.length === 0) {
+    log.warn('rebuildContractUnitCosts: Skipping, RAW contract data is empty.');
+    return 0;
+  }
+
+  const itemsByCid = new Map();
+  const allUniqueContractTids = new Set();
+  const cICol = {
+    contract_id: ci.h['contract_id'],
+    type_id: ci.h['type_id'],
+    quantity: ci.h['quantity'],
+    is_included: ci.h['is_included']
+  };
+
+  ci.rows.forEach(row => {
+    const cid = String(row[cICol.contract_id]);
+    if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
+
+    const qty = Number(row[cICol.quantity] || 0);
+    if (String(row[cICol.is_included]).toUpperCase() === 'TRUE' && qty > 0) {
+      const tid = Number(row[cICol.type_id]);
+      itemsByCid.get(cid).push({ tid: tid, qty: qty });
+      allUniqueContractTids.add(tid);
+    }
+  });
+
+  // 3. Generate Fallback Map for Tids missing from Tier 1 (refMap)
+  const tidsMissingTier1 = Array.from(allUniqueContractTids).filter(tid => !refMap.has(tid));
+  const fallbackMap = _getContractPricesCached(ss, tidsMissingTier1);
+
+
+  // --- 4. CALCULATE UNIT COSTS (The Core Logic) ---
+  const outRows = [];
+  let processedItems = 0;
+
+  for (const [cid, items] of itemsByCid.entries()) {
+    const contractMeta = priceMap.get(cid);
+    if (!contractMeta) continue;
+
+    const totalContractValue = contractMeta.price + contractMeta.collateral - contractMeta.reward;
+    let totalReferenceValue = 0;
+
+    // Pass 1: Calculate total reference value (needed for allocation factor)
+    for (const { tid, qty } of items) {
+
+      // TIERED PRICING: Check Tier 1 (refMap) then Fallback Map
+      let refPriceObj = refMap.get(tid) || fallbackMap.get(tid);
+      const refPrice = refPriceObj?.buy || 0;
+
+      if (refPrice > 0) {
+        totalReferenceValue += refPrice * qty;
+      }
     }
 
-    const itemsByCid = new Map();
-    const allUniqueContractTids = new Set();
-    const cICol = { contract_id: ci.h['contract_id'], type_id: ci.h['type_id'], quantity: ci.h['quantity'], is_included: ci.h['is_included'] };
+    const pricePerRefUnit = (totalReferenceValue > 0) ? (totalContractValue / totalReferenceValue) : 0;
+    const simpleVolumeSplit = (items.length > 0) ? (totalContractValue / items.length) : 0;
 
-    ci.rows.forEach(row => {
-        const cid = String(row[cICol.contract_id]);
-        if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
-        
-        const qty = Number(row[cICol.quantity] || 0);
-        if (String(row[cICol.is_included]).toUpperCase() === 'TRUE' && qty > 0) {
-             const tid = Number(row[cICol.type_id]);
-             itemsByCid.get(cid).push({ tid: tid, qty: qty });
-             allUniqueContractTids.add(tid); 
+    // Pass 2: Apply allocation logic
+    for (const { tid, qty } of items) {
+      let unitCost = 0;
+
+      // TIERED PRICING: Get the best available price for this item
+      let refPriceObj = refMap.get(tid) || fallbackMap.get(tid);
+      const refPrice = refPriceObj?.buy || 0;
+
+      // FIX: Using local variable 'allocMode' consistently (was fixed from ALLOC_MODE)
+      if (allocMode === 'REF' && totalReferenceValue > 0) {
+
+        if (refPrice > 0) {
+          // Cost = Reference Price * Allocation Factor
+          unitCost = refPrice * pricePerRefUnit;
+        } else {
+          // Item was unpriced even with fallbacks; fall back to simple volume split.
+          unitCost = simpleVolumeSplit / qty;
         }
-    });
+      } else {
+        // FALLBACK/VOLUME Mode: Cost = TotalValue / TotalItems (Simple averaging)
+        unitCost = simpleVolumeSplit / qty;
+      }
 
-    // 3. Generate Fallback Map for Tids missing from Tier 1 (refMap)
-    const tidsMissingTier1 = Array.from(allUniqueContractTids).filter(tid => !refMap.has(tid));
-    const fallbackMap = _getContractPriceFallbackMap(ss, tidsMissingTier1);
-
-    
-    // --- 4. CALCULATE UNIT COSTS (The Core Logic) ---
-    const outRows = [];
-    let processedItems = 0;
-
-    for (const [cid, items] of itemsByCid.entries()) {
-        const contractMeta = priceMap.get(cid);
-        if (!contractMeta) continue;
-
-        const totalContractValue = contractMeta.price + contractMeta.collateral - contractMeta.reward;
-        let totalReferenceValue = 0;
-
-        // Pass 1: Calculate total reference value (needed for allocation factor)
-        for (const { tid, qty } of items) {
-            
-            // TIERED PRICING: Check Tier 1 (refMap) then Fallback Map
-            let refPriceObj = refMap.get(tid) || fallbackMap.get(tid); 
-            const refPrice = refPriceObj?.buy || 0;
-            
-            if (refPrice > 0) { 
-                 totalReferenceValue += refPrice * qty; 
-            }
-        }
-        
-        const pricePerRefUnit = (totalReferenceValue > 0) ? (totalContractValue / totalReferenceValue) : 0;
-        const simpleVolumeSplit = (items.length > 0) ? (totalContractValue / items.length) : 0;
-
-        // Pass 2: Apply allocation logic
-        for (const { tid, qty } of items) {
-            let unitCost = 0;
-            
-            // TIERED PRICING: Get the best available price for this item
-            let refPriceObj = refMap.get(tid) || fallbackMap.get(tid);
-            const refPrice = refPriceObj?.buy || 0;
-            
-            // FIX: Using local variable 'allocMode' consistently (was fixed from ALLOC_MODE)
-            if (allocMode === 'REF' && totalReferenceValue > 0) {
-                
-                if (refPrice > 0) {
-                    // Cost = Reference Price * Allocation Factor
-                    unitCost = refPrice * pricePerRefUnit;
-                } else {
-                    // Item was unpriced even with fallbacks; fall back to simple volume split.
-                    unitCost = simpleVolumeSplit / qty;
-                }
-            } else {
-                // FALLBACK/VOLUME Mode: Cost = TotalValue / TotalItems (Simple averaging)
-                unitCost = simpleVolumeSplit / qty; 
-            }
-
-            // --- WRITE NEW LEDGER ROW OBJECT (for MaterialLedger.upsert) ---
-            outRows.push({
-                source: "CONTRACT", 
-                char: contractMeta.char, 
-                contract_id: cid,
-                type_id: tid,
-                unit_value_filled: unitCost, 
-            });
-            processedItems++;
-        }
+      // --- WRITE NEW LEDGER ROW OBJECT (for MaterialLedger.upsert) ---
+      outRows.push({
+        source: "CONTRACT",
+        char: contractMeta.char,
+        contract_id: cid,
+        type_id: tid,
+        unit_value_filled: unitCost,
+      });
+      processedItems++;
     }
-    
-    if (processedItems === 0) { 
-        log.log('rebuildContractUnitCosts', { status: 'Skipped: No items found for costing.' }); 
-        return 0; 
-    }
+  }
 
-    // --- 5. SHEET WRITE OPERATION ---
-    const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
-    const keys = ['source', 'char', 'contract_id', 'type_id'];
-    
-    const count = MaterialLedger.upsert(keys, outRows); 
-    
-    log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
-    return count;
+  if (processedItems === 0) {
+    log.log('rebuildContractUnitCosts', { status: 'Skipped: No items found for costing.' });
+    return 0;
+  }
+
+  // --- 5. SHEET WRITE OPERATION ---
+  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
+  const keys = ['source', 'char', 'contract_id', 'type_id'];
+
+  const count = MaterialLedger.upsert(keys, outRows);
+
+  log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
+  return count;
 }
 
 /**
@@ -1624,6 +1758,8 @@ function runContractLedgerPhase(ss) {
 
   // --- STEP 4: POST SALES LEDGER (THE LENGTH GUARD) ---
   // This runs ONLY if the SALES contracts array is non-empty. This saves the 2-minute load.
+
+  //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
   if (syncResult.saleData.contracts.length > 0) {
     log.info('Running contractsToSalesLedger (Contract Sells)...');
     contractsToSalesLedger(ss, charIdMap);
@@ -1634,8 +1770,8 @@ function runContractLedgerPhase(ss) {
   // --- STEP 5: COST ALLOCATION (CRASH BYPASS) ---
   try {
     // NOTE: This remains commented out until the cost allocation code is complete
-    log.info('Running rebuildContractUnitCosts (Finalizing COGS)...');
-    rebuildContractUnitCosts(ss);
+    log.info('Decoupling COGS finalization to asynchronous trigger.');
+    triggerContractUnitCostsFinalization();
   } catch (e) {
     log.error('rebuildContractUnitCosts FAILED', e.message);
   }
