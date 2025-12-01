@@ -36,6 +36,11 @@ const CONTRACT_ITEMS_RAW_SHEET = "Contract Items (RAW)";
 const CONTRACT_RAW_COLUMNS = 16; // Number of columns in Contracts (RAW)
 const ITEMS_RAW_COLUMNS = 6;     // Number of columns in Contract Items (RAW)
 const CONTRACT_STATUSES = ["finished", "completed", "outstanding"]; // Fetch all relevant states
+const PROP_KEY_COGS_STEP = 'cogsJobStep';
+const STATE_FLAGS_COGS = { FINALIZING: 'FINALIZING' };
+
+const PROP_KEY_CONTRACT_LEASE = 'contractJobLeaseUntil';
+const CONTRACT_LEASE_DURATION_MS = 60 * 60 * 1000; // 1 hour lease in milliseconds
 
 // LEDGER SHEET CONSTANTS
 const LEDGER_BUY_SHEET = 'Material_Ledger';
@@ -523,7 +528,7 @@ function _normalizeCharContracts(res, names, idNameMap) { // NOTE: idNameMap is 
   LOG.log(`CHAR_NORM: Starting normalization for ${names.length} authenticated tokens.`);
 
   // *** FIX 1: Per-Char Arrays (Primary GESI Output) ***
-  if (Array.isArray(res[0]) && res[0].length && typeof res[0][0] === 'object') {
+  if (Array.isArray(res[0]) && (res[0].length === 0 || (res[0].length > 0 && typeof res[0][0] === 'object'))) {
     LOG.log('CHAR_NORM: Using Object Array Normalization Logic.');
     for (var a = 0; a < names.length; a++) {
       var arr = res[a] || [];
@@ -534,7 +539,9 @@ function _normalizeCharContracts(res, names, idNameMap) { // NOTE: idNameMap is 
       for (var b = 0; b < arr.length; b++) {
         var cA = arr[b];
         if (!cA || typeof cA !== 'object') continue;
-
+        if (cA.for_corporation === true) {
+          continue;
+        }
         // CRITICAL FIX: Ensure the ESI IDs are strings for lookup consistency
         const acceptorId = String(cA.acceptor_id);
         const issuerId = String(cA.issuer_id);
@@ -689,7 +696,7 @@ function getContractItemsCached(charName, contractId, force, forCorp) {
 
   var items = forCorp
     ? _fetchCorpContractItems(authName, cid)
-    : _fetchCorpContractItems(authName, cid); // <-- *** POTENTIAL BUG: Should call _fetchCharContractItems for non-corp ***
+    : _fetchCharContractItems(authName, cid);
 
   c.put(k, JSON.stringify(items || []), GESI_TTL.items);
   return items || [];
@@ -1067,8 +1074,11 @@ function syncContracts(ss, charIdMap) {
         show_column_headings: false,
         version: null
       });
+      // CRITICAL FIX: Always push the result array (empty or full) to maintain alignment
+      // with the index position of charName in allNames.
+      allCharContractsRaw.push(contracts || []);
+
       if (contracts && contracts.length > 0) {
-        allCharContractsRaw.push(contracts);
         LoggerEx.debug("charName: " & charName & " contracts: " & JSON.stringify(contracts));
       }
     });
@@ -1163,6 +1173,11 @@ function syncContracts(ss, charIdMap) {
 function contractsToMaterialLedger(ss, charIdMap, buyData) {
 
   //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
+
+  if (!buyData || !buyData.contracts || buyData.contracts.length === 0 || !buyData.items || buyData.items.length === 0) {
+    log.log('contracts->ledger', { status: 'Skipped: In-memory data is empty.' });
+    return 0;
+  }
 
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('GESI');
@@ -1277,11 +1292,53 @@ function triggerContractUnitCostsFinalization() {
  */
 function _runRebuildContractUnitCostsWorker() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  // Use executeWithTryLock to prevent concurrency issues if the trigger overlaps
-  executeWithTryLock(() => {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const funcName = '_runRebuildContractUnitCostsWorker';
+
+  const workerFunc = () => {
     LoggerEx.withTag('COGS_WORKER').info('Running contract unit costs worker.');
+
+    // 1. CHECK STATE: Ensure we are in the correct state for finalization
+    if (SCRIPT_PROP.getProperty(PROP_KEY_COGS_STEP) !== STATE_FLAGS_COGS.FINALIZING) {
+      LoggerEx.withTag('COGS_WORKER').warn('COGS worker called outside FINALIZING state. Aborting.');
+      return; // Abort execution if state is incorrect (e.g., triggered manually by accident)
+    }
+
+    // 2. EXECUTE CORE WORK
     rebuildContractUnitCosts(ss);
-  }, '_runRebuildContractUnitCostsWorker');
+
+    // 3. CLEAR FLAG: Clear the finalize flag on successful completion
+    SCRIPT_PROP.deleteProperty(PROP_KEY_COGS_STEP);
+    LoggerEx.withTag('COGS_WORKER').info('COGS Finalization flag removed on success.');
+  };
+
+  // Use executeWithTryLock from Orchestrator.js to manage the lock
+  executeWithTryLock(workerFunc, funcName);
+}
+
+/**
+ * Checks for and restarts the COGS unit cost worker if the flag is still set.
+ * Assumes scheduleOneTimeTrigger is defined.
+ */
+function _nudgeCogsFinalizer() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  // NOTE: Assuming PROP_KEY_COGS_STEP and STATE_FLAGS_COGS are defined or globally available.
+
+  if (SCRIPT_PROP.getProperty('cogsJobStep') === 'FINALIZING') {
+    const lock = LockService.getScriptLock();
+
+    // Check if the worker's lock is currently available (meaning the worker is not running).
+    if (lock.tryLock(0)) {
+      lock.releaseLock();
+      console.log(`Orchestrator: COGS Finalizer flag found. Re-queuing worker.`);
+      // Assumes _runRebuildContractUnitCostsWorker and scheduleOneTimeTrigger are global.
+      scheduleOneTimeTrigger("_runRebuildContractUnitCostsWorker", 5000);
+      return true;
+    } else {
+      console.log(`Orchestrator: COGS Finalizer flag set but worker lock is busy. Skipping nudge.`);
+    }
+  }
+  return false;
 }
 
 // --- REMOVED withSheetLock wrapper ---
@@ -1714,69 +1771,108 @@ function rebuildContractUnitCosts(ss) {
   const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
   const keys = ['source', 'char', 'contract_id', 'type_id'];
 
-  const count = MaterialLedger.upsert(keys, outRows);
+  // FIX: PAUSE SHEET CALCULATIONS TO PREVENT TIMEOUT
+  var needsWakeUp = pauseSheet(ss);
 
-  log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
-  return count;
+  let count = 0;
+  try {
+    count = MaterialLedger.upsert(keys, outRows);
+
+    log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
+    return count;
+
+  } catch (e) {
+    log.error('rebuildContractUnitCosts WRITE FAILED', e.message);
+    throw e;
+  } finally {
+    // FIX: RESUME SHEET CALCULATIONS, REGARDLESS OF SUCCESS OR FAILURE
+    if (needsWakeUp) {
+      wakeUpSheet(ss);
+    }
+  }
 }
 
 /**
  * MONOLITH BREAKER: Consumes segregated data and runs ledger posts conditionally.
  * Solves the timeout by skipping the unnecessary 2-minute sales write.
  */
+/**
+ * MONOLITH BREAKER: Consumes segregated data and runs ledger posts conditionally.
+ * Implements a 1-hour lease to manage long execution cycles.
+ */
 function runContractLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+
+  // --- 1. ACQUIRE LEASE ---
+  const NOW_MS = new Date().getTime();
+  const LEASE_UNTIL = NOW_MS + CONTRACT_LEASE_DURATION_MS;
+  SCRIPT_PROP.setProperty(PROP_KEY_CONTRACT_LEASE, String(LEASE_UNTIL));
+  log.info(`Contract Ledger Phase LEASE acquired until ${new Date(LEASE_UNTIL).toISOString()}`);
+
   const charIdMap = _charIdMap(ss);
-  // --- STEP 1: SYNC RAW DATA AND SEGREGATE ---
-  log.info('Running syncContracts (Fetch RAW data and Segregate)...');
-
-  // syncResult now contains segregated data: { contracts: N, buyData: {...}, saleData: {...} }
   let syncResult = {};
+
   try {
+    // --- STEP 1: SYNC RAW DATA AND SEGREGATE ---
+    log.info('Running syncContracts (Fetch RAW data and Segregate)...');
+
     syncResult = syncContracts(ss, charIdMap);
-  } catch (e) {
-    log.error('syncContracts FAILED', e.message);
-    throw e;
-  }
 
-  const contractsWritten = syncResult.contracts;
+    const contractsWritten = syncResult.contracts;
 
-  // --- STEP 2: TOTAL COUNT GUARD ---
-  if (contractsWritten === 0) {
-    log.info('Skipping contract ledger processing: No new contracts were synced.');
-    return;
-  }
+    // --- STEP 2: TOTAL COUNT GUARD ---
+    if (contractsWritten === 0) {
+      log.info('Skipping contract ledger processing: No new contracts were synced.');
 
-  // --- STEP 3: POST BUY-SIDE LEDGER (ESSENTIAL) ---
-  // Runs ONLY if the BUY contracts array is non-empty.
-  if (syncResult.buyData.contracts.length > 0) {
-    log.info('Running contractsToMaterialLedger (Contract Buys)...');
-    contractsToMaterialLedger(ss, charIdMap, syncResult.buyData);
-  } else {
-    log.info('contractsToMaterialLedger skipped: No buy contracts found.');
-  }
+      // Release the lease immediately if no work was found.
+      SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
+      return;
+    }
 
-  // --- STEP 4: POST SALES LEDGER (THE LENGTH GUARD) ---
-  // This runs ONLY if the SALES contracts array is non-empty. This saves the 2-minute load.
+    // --- STEP 3 & 4: POST BUY-SIDE / SALES LEDGER ---
+    if (syncResult.buyData.contracts.length > 0) {
+      log.info('Running contractsToMaterialLedger (Contract Buys)...');
+      contractsToMaterialLedger(ss, charIdMap, syncResult.buyData);
+    } else {
+      log.info('contractsToMaterialLedger skipped: No buy contracts found.');
+    }
 
-  //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
-  if (syncResult.saleData.contracts.length > 0) {
-    log.info('Running contractsToSalesLedger (Contract Sells)...');
-    contractsToSalesLedger(ss, charIdMap);
-  } else {
-    log.warn('contractsToSalesLedger skipped: No sales contracts found.');
-  }
+    if (syncResult.saleData.contracts.length > 0) {
+      log.info('Running contractsToSalesLedger (Contract Sells)...');
+      contractsToSalesLedger(ss, charIdMap);
+    } else {
+      log.warn('contractsToSalesLedger skipped: No sales contracts found.');
+    }
 
-  // --- STEP 5: COST ALLOCATION (CRASH BYPASS) ---
-  try {
-    // NOTE: This remains commented out until the cost allocation code is complete
+    // --- STEP 5: COST ALLOCATION (COGS) ---
     log.info('Decoupling COGS finalization to asynchronous trigger.');
     triggerContractUnitCostsFinalization();
-  } catch (e) {
-    log.error('rebuildContractUnitCosts FAILED', e.message);
-  }
 
-  log.info('Contract Ledger Phase Complete.');
+    log.info('Contract Ledger Phase Complete.');
+
+    // --- RELEASE LEASE ON SUCCESS ---
+    SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
+
+  } catch (e) {
+    log.error('runContractLedgerPhase FAILED', e.message);
+    // On hard failure, release the lease immediately so the orchestrator can re-try sooner.
+    SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
+    throw e;
+  }
+}
+
+function triggerContractUnitCostsFinalization() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const LOG = LoggerEx.withTag('COGS_TRIGGER');
+  const FINALIZER_FUNC = '_runRebuildContractUnitCostsWorker';
+
+  // 1. Set the finalize flag before scheduling
+  SCRIPT_PROP.setProperty(PROP_KEY_COGS_STEP, STATE_FLAGS_COGS.FINALIZING);
+
+  // 2. Schedule the worker to run soon after the main ledger phase exits.
+  scheduleOneTimeTrigger(FINALIZER_FUNC, 5000); // 5 seconds delay
+  LOG.info(`Scheduled heavy COGS finalization: ${FINALIZER_FUNC}. Flag set.`);
 }
 
 /**

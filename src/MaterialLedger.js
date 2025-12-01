@@ -63,7 +63,7 @@ var ss;
     out.item_name = r.item_name || '';
 
     // Numeric fields
-    out.qty = +r.qty || 0; 
+   out.qty = Number(String(r.qty).replace(/,/g, '')) || 0;
 
     var u0 = +r.unit_value || 0; // Manual override (Number: 0 or >0)
     var u1 = +r.unit_value_filled || 0; // Calculated value (Number: 0 or >0)

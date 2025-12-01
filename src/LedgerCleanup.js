@@ -38,72 +38,52 @@ function cleanupLedgerSheet(sheetName) {
     return v;
   }
 
-  // Reimplementation of the core logic from ML.normalizeRow_ to clean a row array
-  function normalizeRow(r) {
-    // Map the raw array row (r) into a temporary object structure
-    const inputObj = {
-        date: r[0], type_id: r[1], item_name: r[2], qty: r[3],
-        unit_value: r[4], source: r[5], contract_id: r[6],
-        char: r[7], unit_value_filled: r[8]
-    };
-
-    let dateVal = cleanValue(inputObj.date);
-    let out = {};
-
-    // 1. Clean and format Date
-    if (dateVal) {
-        let d = null;
-        let numVal = Number(dateVal);
-        
-        if (!isNaN(numVal) && numVal >= 40000 && numVal <= 50000) {
-            // Excel serial date detection (typical range 40000-50000)
-            try {
-                // Base date is 1899-12-30. GAS dates typically read Excel dates shifted by +1 day.
-                d = new Date(Date.UTC(1899, 11, 30));
-                // Add the serial number of days, compensating for Excel's 1900 leap year bug by subtracting 1 day
-                d.setDate(d.getDate() + numVal - 1); 
-            } catch (e) {
-                // Fallback attempt
-                d = new Date(dateVal);
-            }
-        } else {
-            // Standard date string parsing (e.g., "2025-11-30")
-            d = new Date(dateVal);
-        }
-
-        // Format the date using the existing PT mechanism or standard utilities
-        out.date = (d && !isNaN(d.getTime()))
-            ? (PT_API ? PT_API.yyyymmdd(d) : Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd"))
-            : ''; 
-    } else {
-        out.date = '';
-    }
-
-    // 2. Clean other fields
-    out.type_id = cleanValue(inputObj.type_id) || '';
-    out.item_name = inputObj.item_name || ''; 
+ // Normalize one logical row → the HEAD order
+  function normalizeRow_(r) {
+    var out = {};
+    const PT_API = getPT_();
     
-    // Qty and unit values are converted to Numbers, falling back to 0 or ''
-    out.qty = Number(cleanValue(inputObj.qty)) || 0;
+    // --- Date Parsing (FIXED) ---
+    let dateVal = r.date;
 
-    const u0_raw = cleanValue(inputObj.unit_value);
-    const u1_raw = cleanValue(inputObj.unit_value_filled);
+    // 1. Attempt to parse date only if it's NOT already a valid Date object.
+    if (!(dateVal instanceof Date)) {
+        // Use PT_API safe parsing if available, otherwise rely on new Date()
+        dateVal = PT_API ? PT_API.parseDateSafe(dateVal) : new Date(dateVal);
+    }
+    
+    // 2. Validate the resulting date object. If it's not a valid date, 
+    // default to today's date.
+    let validDate = (dateVal instanceof Date) && !isNaN(dateVal);
+    let dateToFormat = validDate ? dateVal : (PT_API ? PT_API.now() : new Date());
 
-    const u0 = Number(u0_raw) || 0; // Manual override
-    const u1 = Number(u1_raw) || 0; // Calculated value
+    // 3. Format the valid date object.
+    out.date = PT_API
+               ? PT_API.yyyymmdd(dateToFormat)
+               : Utilities.formatDate(dateToFormat, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    
+    // --- Other Fields (Retaining previous fixes for numeric types) ---
+    out.type_id = r.type_id;
+    out.item_name = r.item_name || '';
 
-    // 3. Apply the original ML logic for unit_value and unit_value_filled
-    out.unit_value        = u0 > 0 ? u0 : '';
-    out.source            = inputObj.source || ''; 
-    out.contract_id       = inputObj.contract_id || ''; 
-    out.char              = inputObj.char || ''; 
+    // Numeric fields
+   out.qty = Number(String(r.qty).replace(/,/g, '')) || 0;
 
-    // If manual override exists (u0>0), use it, otherwise use calculated (u1>0), else blank.
-    out.unit_value_filled = u0 > 0 ? u0 : (u1 > 0 ? u1 : '');
+    var u0 = +r.unit_value || 0; // Manual override (Number: 0 or >0)
+    var u1 = +r.unit_value_filled || 0; // Calculated value (Number: 0 or >0)
 
-    // Convert back to Array in HEAD order
+    out.unit_value = u0 > 0 ? u0 : ''; 
+
+    out.source = r.source || '';
+    out.contract_id = r.contract_id || '';
+    out.char = r.char || '';
+
+    var finalUnitValue = u0 > 0 ? u0 : (u1 > 0 ? u1 : 0);
+    out.unit_value_filled = finalUnitValue > 0 ? finalUnitValue : '';
+
+    // --- Final Mapping ---
     return HEAD.map(function (k) { return (out[k] == null ? '' : out[k]); });
-  }
+}
 
   // --- MAIN EXECUTION ---
   try {

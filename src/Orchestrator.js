@@ -191,6 +191,12 @@ function masterOrchestrator() {
     isJobActive = false;
   }
 
+  
+  // NEW: Check for pending COGS Finalization and process it immediately.
+  if (_nudgeCogsFinalizer()) {
+    return;
+  }
+
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
     const lock = LockService.getScriptLock();
     if (lock.tryLock(0)) {
@@ -240,12 +246,16 @@ function masterOrchestrator() {
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
+  
+  // Assuming these are globally available constants in your environment
+  const PROP_KEY_CONTRACT_LEASE = 'contractJobLeaseUntil'; 
+  const HOURLY_RUN_INTERVAL_MS = 3600000; // 1 hour
 
   const JOB_QUEUE = [
     'cacheAllCorporateAssetsTrigger',
     'runLootAndJournalSync',
-    'runContractSync',
-    'runIndustryLedgerPhase' // <--- ADD THIS
+    'runContractSync', // The job requiring the lease check
+    'runIndustryLedgerPhase'
   ];
 
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
@@ -260,6 +270,20 @@ function runMaintenanceJobs() {
   const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
   const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
 
+  // --- 1. NEW: LEASE CHECK ---
+  if (currentJobName === 'runContractSync') {
+    const LEASE_UNTIL = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CONTRACT_LEASE) || '0', 10);
+
+    if (LEASE_UNTIL > NOW_MS) {
+      console.warn(`[Maintenance] Skipping ${currentJobName}: Lease active until ${new Date(LEASE_UNTIL).toTimeString()}.`);
+      // Advance index and exit
+      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+      return;
+    }
+  }
+
+  // --- 2. HOURLY INTERVAL CHECK ---
   if ((NOW_MS - lastRunTimestamp) < HOURLY_RUN_INTERVAL_MS) {
     let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
     SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
@@ -268,19 +292,26 @@ function runMaintenanceJobs() {
 
   console.log(`[Maintenance] Executing: ${currentJobName}`);
 
+  // --- 3. EXECUTION (ROBUST STATE ADVANCEMENT) ---
   try {
+    // CRITICAL: Advance state BEFORE the function call to prevent deadlocks on hard timeout.
+    
+    // 1. Set last run time for the current job
+    SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+    
+    // 2. Advance the queue index for the NEXT run
+    let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
+    SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+
     const fn = this[currentJobName];
     if (typeof fn === 'function') {
-      fn();
-      SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+      fn(); // Execute the job
     } else {
-      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
+      console.warn(`[Maintenance] Function not found: ${currentJobName}`);
     }
   } catch (e) {
     console.error(`[Maintenance] Failed: ${e.message}`);
+    // State is already advanced, so the queue will move on during the next execution.
   }
 }
 
