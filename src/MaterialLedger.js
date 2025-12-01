@@ -106,14 +106,18 @@ var ss;
       return data.length;
     }
 
-    // The upsertBy function now uses the private 'sheetInst' variable.
-    // CORRECTED: Includes Batching for sheet writes.
-   function upsertBy(keys, rows) {
+   /**
+ * Updates existing rows by key (e.g., [type_id, contract_id]) or appends new rows.
+ * @param {Array<string>} keys - Array of column names to use as the unique key (e.g., ['type_id', 'contract_id']).
+ * @param {Array<Object>} rows - Array of row objects containing new data.
+ * @returns {number} The total count of rows updated or appended.
+ */
+function upsertBy(keys, rows) {
     if (!rows || !rows.length) return 0;
 
-    const WRITE_BATCH_SIZE = 1000;
+    const WRITE_BATCH_SIZE = 1000; 
     const sh = sheetInst; 
-
+    
     // --- 1. Identify Key Columns ---
     const keyIndices = keys.map(function (k) {
         const idx = HEAD.indexOf(k); 
@@ -121,90 +125,103 @@ var ss;
         return idx;
     });
     
-    // NEW HELPER: Forces numeric key parts (type_id) to a clean, rounded integer string.
+    // Helper: Forces numeric key parts (type_id) to a clean, rounded integer string.
     const normalizeKeyPart = function(val, headIdx) {
         if (headIdx === 1) { // Index 1 is 'type_id'
-            // FIX: Round to ensure no decimals (e.g., 8335.0 -> "8335")
             return String(Math.round(Number(val || 0)));
         }
         return String(val != null ? val : '');
     };
 
-    // --- 2. Read Existing Keys (FIXED & DIAGNOSED) ---
+    // --- 2. Read Existing Keys and Map to Array Index ---
     const last = sh.getLastRow();
-    const existingKeys = new Set();
+    // Map to store: Key String -> 0-based Array Index (for allExistingValues array)
+    const existingKeyToArrayIndexMap = new Map();
+    let allExistingValues = [];
+    
     if (last >= 2) {
-        LOG.debug(`Reading existing ${last - 1} rows to check for duplicates...`);
-        
+        LOG.debug(`Reading existing ${last - 1} rows to check for duplicates and map indices...`);
+        // Read the entire data body (all columns)
         const range = sh.getRange(2, 1, last - 1, HEAD.length);
-        const allVals = range.getValues();
-        allVals.forEach(function (row, rowIndex) {
+        allExistingValues = range.getValues();
+        
+        allExistingValues.forEach(function (row, rowIndex) {
             const key = keyIndices.map(function (headIdx) {
-                // Use consistent normalization when reading existing data
                 return normalizeKeyPart(row[headIdx], headIdx);
-            }).join('\u0001'); 
-            existingKeys.add(key);
-            // DIAGNOSTIC LOGGING (Existing Key)
-            if (rowIndex < 5) LOG.debug(`[KEY_READ] Row ${rowIndex + 2} RAW: ${row[keyIndices[0]]}, Normalized: ${key}`);
+            }).join('\u0001');
+
+            existingKeyToArrayIndexMap.set(key, rowIndex);
         });
-        LOG.debug(`Found ${existingKeys.size} unique existing keys.`);
+        LOG.debug(`Found ${existingKeyToArrayIndexMap.size} unique existing keys.`);
     }
 
-    // --- 3. Filter for New Rows (FIXED & DIAGNOSED) ---
-    const newRowsToWrite = [];
-    rows.forEach(function (obj, rowIndex) {
-        const outRow = normalizeRow_(obj); 
+    // --- 3. Separate Rows for Update and Append ---
+    const newRowsToAppend = [];
+    let updateCount = 0;
+
+    rows.forEach(function (obj) {
+        const outRow = normalizeRow_(obj);
         const key = keyIndices.map(function (headIdx) {
-            // Use consistent normalization when generating new data keys
             return normalizeKeyPart(outRow[headIdx], headIdx);
         }).join('\u0001');
 
-        // DIAGNOSTIC LOGGING (New Key Check)
-        if (rowIndex < 5) LOG.debug(`[KEY_GEN] Row ${rowIndex + 1} New: ${outRow[keyIndices[0]]}, Normalized: ${key}, Exists: ${existingKeys.has(key)}`);
-
-        // Only add if the key doesn't already exist
-        if (!existingKeys.has(key)) {
-            newRowsToWrite.push(outRow);
-            // Add the new key immediately to prevent duplicates *within the current batch*
-            existingKeys.add(key);
-            LOG.debug(`[KEY_ADD] New row added to batch for key: ${key}`);
+        if (existingKeyToArrayIndexMap.has(key)) {
+            // FIX: Key exists, so OVERWRITE the data in the existing data array.
+            const rowIndex = existingKeyToArrayIndexMap.get(key); 
+            
+            // This is the critical line that ensures the unit_value_filled is updated
+            allExistingValues[rowIndex] = outRow;
+            updateCount++;
+            LOG.debug(`[KEY_UPDATE] Row ${rowIndex + 2} scheduled for update for key: ${key}`);
+            
         } else {
-            LOG.debug(`[KEY_SKIP] Key already exists: ${key}`);
+            // Key is new: Queue for append
+            newRowsToAppend.push(outRow);
+            LOG.debug(`[KEY_ADD] New row added to batch for key: ${key}`);
         }
     });
+    
+    // --- 4. Write Updates (Overwrite existing range with modified values) ---
+    if (updateCount > 0) {
+        LOG.info(`Updating ${updateCount} existing rows...`);
+        // Re-write the entire existing data range (starting at row 2)
+        sh.getRange(2, 1, allExistingValues.length, HEAD.length).setValues(allExistingValues);
+    } else {
+        LOG.info("No existing rows to update.");
+    }
 
-    // --- 4. Batch Write New Rows ---
-    const totalNewRows = newRowsToWrite.length;
-    let currentIndex = 0; 
-    let nextWriteRow = sh.getLastRow() + 1;
+    // --- 5. Batch Write New Rows (Appends) ---
+    const totalNewRows = newRowsToAppend.length;
+    let totalWritten = 0;
 
     if (totalNewRows > 0) {
         LOG.info(`Writing ${totalNewRows} new rows in batches of ${WRITE_BATCH_SIZE}...`);
         
+        let currentIndex = 0;
+        let nextWriteRow = sh.getLastRow() + 1;
+
         while (currentIndex < totalNewRows) {
-            const batch = newRowsToWrite.slice(currentIndex, currentIndex + WRITE_BATCH_SIZE);
-            const startRow = nextWriteRow; 
-            
+            const batch = newRowsToAppend.slice(currentIndex, currentIndex + WRITE_BATCH_SIZE);
+            const startRow = nextWriteRow;
+
             try {
                 sh.getRange(startRow, 1, batch.length, HEAD.length).setValues(batch);
-                
                 currentIndex += batch.length;
-                nextWriteRow += batch.length; 
-                
-                LOG.debug(`Wrote batch ${Math.floor(currentIndex / WRITE_BATCH_SIZE)}/${Math.ceil(totalNewRows / WRITE_BATCH_SIZE)} (${batch.length} rows) starting at row ${startRow}.`);
+                nextWriteRow += batch.length;
+                totalWritten += batch.length;
+                LOG.debug(`Wrote append batch starting at row ${startRow}.`);
             } catch (e) {
-                // ... (The robust timeout and retry logic) ...
-                LOG.error(`Error writing batch starting at row ${startRow}: ${e.message}`);
-                throw e; 
+                LOG.error(`Error writing append batch starting at row ${startRow}: ${e.message}`);
+                throw e;
             }
         }
-        
         LOG.info(`Finished writing ${totalNewRows} new rows.`);
     } else {
-         LOG.info("No new rows to write.");
+         LOG.info("No new rows to append.");
     }
-
-    return totalNewRows; // Return the count of *newly written* rows
+    
+    // Return total count of actions (updates + appends)
+    return updateCount + totalWritten;
 }
 
 
