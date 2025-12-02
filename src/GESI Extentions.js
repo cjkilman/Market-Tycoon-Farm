@@ -977,11 +977,13 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
 
   if (buyRows.length > 0) {
-    buyCount = MaterialLedger.upsert(keys, buyRows);
+    const buyResult = MaterialLedger.upsert(keys, buyRows);
+    buyCount = buyResult.rows; // FIX: Extract the count from the object
     log.log(`Buy side processed for ${LEDGER_BUY_SHEET}`, { appended_or_updated: buyCount, processed: buyRows.length });
   }
   if (sellRows.length > 0) {
-    sellCount = SalesLedger.upsert(keys, sellRows);
+    const sellResult = SalesLedger.upsert(keys, sellRows);
+    sellCount = sellResult.rows; // FIX: Extract the count from the object
     log.log(`Sell side processed for ${LEDGER_SALE_SHEET}`, { appended_or_updated: sellCount, processed: sellRows.length });
   }
   const result = {
@@ -1264,11 +1266,9 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) {
 
   try {
     const keys = ['source', 'char', 'contract_id', 'type_id'];
-    // FIX: The COGS is still zero because the price cleaning wasn't used HERE.
-    // The unit_value_filled field is empty in this initial write, but the final
-    // allocation logic uses the priceMap which IS fixed (now that the helper is deployed).
-    // This function only writes the skeletal row for later COGS finalization.
-    const count = MaterialLedger.upsert(keys, outRows);
+    const upsertResult = MaterialLedger.upsert(keys, outRows);
+    const count = upsertResult.rows; // FIX: Extract the count from the object
+
     log.log('contracts->ledger', { appended_or_updated: count, processed_rows: outRows.length });
     return count;
 
@@ -1781,11 +1781,12 @@ function rebuildContractUnitCosts(ss) {
   const keys = ['source', 'char', 'contract_id', 'type_id'];
 
   // FIX: PAUSE SHEET CALCULATIONS TO PREVENT TIMEOUT
- // var needsWakeUp = pauseSheet(ss);
+  // var needsWakeUp = pauseSheet(ss);
 
   let count = 0;
   try {
-    count = MaterialLedger.upsert(keys, outRows);
+    const upsertResult = MaterialLedger.upsert(keys, outRows);
+    count = upsertResult.rows; // FIX: Extract the count from the object
 
     log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
     return count;
@@ -1795,7 +1796,7 @@ function rebuildContractUnitCosts(ss) {
     throw e;
   } finally {
     // Moved to ML upsert
-   // if (needsWakeUp) {
+    // if (needsWakeUp) {
     //  wakeUpSheet(ss);
     //}
   }
@@ -1814,7 +1815,7 @@ function resetCorpJournalImport() {
     Logger.log("Reset failed: Script Lock busy. Try again shortly.");
     return;
   }
-  
+
   try {
     const SCRIPT_PROP = PropertiesService.getScriptProperties();
     const LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('RESET_TOOL') : console;
@@ -1825,12 +1826,12 @@ function resetCorpJournalImport() {
 
     // 1. Delete the last transaction ID anchor
     SCRIPT_PROP.deleteProperty(LAST_ID_KEY);
-    
+
     // 2. Delete the resume anchor (for safety against partial API fetches)
     SCRIPT_PROP.deleteProperty(RESUME_KEY);
-    
+
     LOG.info("Corporate Journal Import anchors reset successfully.");
-    
+
     // Provide an alert if run from the editor menu
     if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getUi) {
       SpreadsheetApp.getUi().alert('Corporate Journal Import reset successful. Next run will fetch the full 30-day history.');
