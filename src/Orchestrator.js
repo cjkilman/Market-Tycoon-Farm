@@ -191,7 +191,7 @@ function masterOrchestrator() {
     isJobActive = false;
   }
 
-  
+
   // NEW: Check for pending COGS Finalization and process it immediately.
   if (_nudgeCogsFinalizer()) {
     return;
@@ -243,19 +243,20 @@ function masterOrchestrator() {
   executeWithTryLock(runMaintenanceJobs, 'runMaintenanceJobs');
 }
 
+// File: cjkilman/market-tycoon-farm/Market-Tycoon-Farm-dev/src/Orchestrator.js
+
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
-  
-  // Assuming these are globally available constants in your environment
-  const PROP_KEY_CONTRACT_LEASE = 'contractJobLeaseUntil'; 
-  const HOURLY_RUN_INTERVAL_MS = 3600000; // 1 hour
+  const PROP_KEY_CONTRACT_LEASE = 'contractJobLeaseUntil';
+  const HOURLY_RUN_INTERVAL_MS = 3600000; // Assuming 1 hour interval
 
   const JOB_QUEUE = [
-    'cacheAllCorporateAssetsTrigger',
-    'runLootAndJournalSync',
-    'runContractSync', // The job requiring the lease check
-    'runIndustryLedgerPhase'
+    'runLootDeltaPhase',
+    'Ledger_Import_CorpJournal',
+    'runContractLedgerPhase',
+    'runIndustryLedgerPhase',
+    'cacheAllCorporateAssetsTrigger'
   ];
 
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
@@ -263,55 +264,64 @@ function runMaintenanceJobs() {
 
   const NOW_MS = new Date().getTime();
 
-  let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
-  if (currentIndex >= JOB_QUEUE.length) currentIndex = 0;
+  let startIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
+  if (startIndex >= JOB_QUEUE.length) startIndex = 0;
 
-  const currentJobName = JOB_QUEUE[currentIndex];
-  const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
-  const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
+  let currentIndex = startIndex;
+  let jobExecuted = false;
 
-  // --- 1. NEW: LEASE CHECK ---
-  if (currentJobName === 'runContractSync') {
-    const LEASE_UNTIL = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CONTRACT_LEASE) || '0', 10);
+  // --- LOOP THROUGH ALL JOBS, STARTING AT startIndex ---
+  do {
+    const currentJobName = JOB_QUEUE[currentIndex];
+    const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
+    const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
 
-    if (LEASE_UNTIL > NOW_MS) {
-      console.warn(`[Maintenance] Skipping ${currentJobName}: Lease active until ${new Date(LEASE_UNTIL).toTimeString()}.`);
-      // Advance index and exit
-      let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-      SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
-      return;
+    let isJobDue = (NOW_MS - lastRunTimestamp) >= HOURLY_RUN_INTERVAL_MS;
+    let isLeaseExpired = true; // Assume true unless check proves otherwise
+
+    // 1. LEASE CHECK (Bypasses time check if lease is active)
+    if (currentJobName === 'runContractSync') {
+      const LEASE_UNTIL = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CONTRACT_LEASE) || '0', 10);
+      isLeaseExpired = (LEASE_UNTIL <= NOW_MS);
+
+      if (!isLeaseExpired) {
+        console.warn(`[Maintenance] Skipping ${currentJobName}: Lease active.`);
+        // Job is skipped due to lease, advance to next job immediately and continue loop
+        currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
+        continue;
+      }
     }
-  }
 
-  // --- 2. HOURLY INTERVAL CHECK ---
-  if ((NOW_MS - lastRunTimestamp) < HOURLY_RUN_INTERVAL_MS) {
-    let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-    SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
-    return;
-  }
+    // 2. INTERVAL CHECK (Only proceed if the job is due and lease is expired)
+    if (isJobDue) {
+      console.log(`[Maintenance] Executing: ${currentJobName}`);
 
-  console.log(`[Maintenance] Executing: ${currentJobName}`);
+      try {
+        const fn = this[currentJobName];
+        if (typeof fn === 'function') {
+          fn();
 
-  // --- 3. EXECUTION (ROBUST STATE ADVANCEMENT) ---
-  try {
-    // CRITICAL: Advance state BEFORE the function call to prevent deadlocks on hard timeout.
-    
-    // 1. Set last run time for the current job
-    SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-    
-    // 2. Advance the queue index for the NEXT run
-    let nextIndex = (currentIndex + 1) % JOB_QUEUE.length;
-    SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, nextIndex.toString());
-
-    const fn = this[currentJobName];
-    if (typeof fn === 'function') {
-      fn(); // Execute the job
-    } else {
-      console.warn(`[Maintenance] Function not found: ${currentJobName}`);
+          // CRITICAL: Update state only on successful execution
+          SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+          currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
+          SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, currentIndex.toString());
+          jobExecuted = true;
+          return; // Exit after running one job (Time Slicing)
+        } else {
+          console.warn(`[Maintenance] Function not found: ${currentJobName}. Advancing pointer.`);
+        }
+      } catch (e) {
+        console.error(`[Maintenance] Failed: ${e.message}. Advancing pointer.`);
+      }
     }
-  } catch (e) {
-    console.error(`[Maintenance] Failed: ${e.message}`);
-    // State is already advanced, so the queue will move on during the next execution.
+
+    // Advance pointer if job was not due (interval check failed) or failed to run for non-time reasons
+    currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
+
+  } while (currentIndex !== startIndex); // Stop after checking the entire queue once.
+
+  if (!jobExecuted) {
+    console.log("Maintenance cycle finished: No jobs were due to run.");
   }
 }
 
@@ -365,26 +375,26 @@ function _updateMarketDataSheetWorker() {
     const setupResult = guardedSheetTransaction(() => {
       // 1. Call Helper (Returns {success, state, error})
       const result = prepareTempSheet(ss_anchor, tempSheetName, DATA_SHEET_HEADERS);
-      
+
       // 2. Check Internal Result
       if (!result.success) {
-          // Throwing here causes guardedSheetTransaction to catch it and return {success: false}
-          throw new Error(result.error || "Unknown Prep Failure");
+        // Throwing here causes guardedSheetTransaction to catch it and return {success: false}
+        throw new Error(result.error || "Unknown Prep Failure");
       }
 
       // 3. Perform Sheet Ops (Safe to access .state now)
       if (result.state) {
-          result.state.hideSheet();
+        result.state.hideSheet();
       }
-      
+
       // 4. Return Success
-      return true; 
+      return true;
     }, 60000);
 
     // [WAKE UP] Immediately for live mode
     if (needsWakeUp) {
-        wakeUpSheet(ss_anchor);
-        console.log("[Worker] Surgical Pause complete. Sheet woken up for Write Phase.");
+      wakeUpSheet(ss_anchor);
+      console.log("[Worker] Surgical Pause complete. Sheet woken up for Write Phase.");
     }
 
     if (!setupResult.success) {
@@ -450,17 +460,17 @@ function _updateMarketDataSheetWorker() {
         ...(typeof NITRO_CONFIG !== 'undefined' ? NITRO_CONFIG : {}),
 
         // LIVE MODE TUNING (Stricter because Calcs are ON):
-        MAX_CELLS_PER_CHUNK: 40000, 
-        MAX_CHUNK_SIZE: 2000,       
-      //  MIN_CHUNK_SIZE: 100, // Allow tiny chunks if lag is bad       
-       // SOFT_LIMIT_MS: 240000,
+        MAX_CELLS_PER_CHUNK: 40000,
+        MAX_CHUNK_SIZE: 2000,
+        //  MIN_CHUNK_SIZE: 100, // Allow tiny chunks if lag is bad       
+        // SOFT_LIMIT_MS: 240000,
 
         // Dynamic State
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000')
       }
     };
 
-   // if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 500;
+    // if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 500;
 
     // [NO PAUSE HERE] - Writing Live to keep dashboard usable
 
@@ -480,7 +490,7 @@ function _updateMarketDataSheetWorker() {
 
       const nextIndex = writeResult.state.nextBatchIndex.toString();
       let nextChunkSize = writeResult.state.config.currentChunkSize;
-      
+
       // Aggressive backoff on error
       if (writeResult.error) {
         nextChunkSize = Math.max(100, Math.floor(nextChunkSize / 2)); // Drop significantly
@@ -500,12 +510,12 @@ function _updateMarketDataSheetWorker() {
 function finalizeMarketDataUpdate() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const PROP_KEY_STEP = 'marketDataJobStep';
-  const finalSheetName = 'Market_Data_Raw'; 
+  const finalSheetName = 'Market_Data_Raw';
   const tempSheetName = 'Market_Data_Temp';
-  
+
   const funcName = 'finalizeMarketDataUpdate';
 
-  executeWithTryLock(() => { 
+  executeWithTryLock(() => {
 
     if (SCRIPT_PROP.getProperty(PROP_KEY_STEP) !== 'FINALIZING') {
       _resetMarketDataJobState(new Error(`Wrong state.`));
@@ -515,11 +525,11 @@ function finalizeMarketDataUpdate() {
     var ss_inner = SpreadsheetApp.getActiveSpreadsheet();
 
     // [PAUSE] This flush takes time (e.g. 3.5 minutes)
-    var needsWakeUp = pauseSheet(ss_inner); 
+    var needsWakeUp = pauseSheet(ss_inner);
 
     // [CRITICAL FIX] REFRESH CONNECTION
     // The previous 'ss_inner' is dead after the long flush. Get a new one.
-    ss_inner = SpreadsheetApp.getActiveSpreadsheet(); 
+    ss_inner = SpreadsheetApp.getActiveSpreadsheet();
 
     const repairMap = { ['NR_MARKET_DATA']: 'A:G' };
 

@@ -38,6 +38,7 @@ const ITEMS_RAW_COLUMNS = 6;     // Number of columns in Contract Items (RAW)
 const CONTRACT_STATUSES = ["finished", "completed", "outstanding"]; // Fetch all relevant states
 const PROP_KEY_COGS_STEP = 'cogsJobStep';
 const STATE_FLAGS_COGS = { FINALIZING: 'FINALIZING' };
+const PROP_KEY_LAST_CONTRACT_ID = 'lastProcessedContractId';
 
 const PROP_KEY_CONTRACT_LEASE = 'contractJobLeaseUntil';
 const CONTRACT_LEASE_DURATION_MS = 60 * 60 * 1000; // 1 hour lease in milliseconds
@@ -1039,7 +1040,8 @@ function syncContracts(ss, charIdMap) {
   // Headers are correctly defined by the original function's structure.
   var hdrC = ["char", "contract_id", "type", "status", "issuer_id", "acceptor_id", "date_issued", "date_expired", "price", "reward", "collateral", "volume", "title", "availability", "start_location_id", "end_location_id"];
   var hdrI = ["char", "contract_id", "type_id", "quantity", "is_included", "is_singleton"];
-
+  const LAST_CID = parseInt(PropertiesService.getScriptProperties().getProperty(PROP_KEY_LAST_CONTRACT_ID) || '0', 10);
+  let maxContractId = 0;
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
 
   // Necessary variables for filtering/processing
@@ -1099,6 +1101,12 @@ function syncContracts(ss, charIdMap) {
       const c = tuple.c;
       const cid = _toIntOrNull(c.contract_id);
 
+      if (LAST_CID > 0 && cid <= LAST_CID) {
+        // ESI usually returns newest contracts first. If we hit an old ID, we stop processing this fetch.
+        log.info(`Stopping contract sync: Reached old Contract ID ${cid} (Last processed ID was ${LAST_CID}).`);
+        return; // Use 'return' inside forEach or break the loop if this were not a forEach.
+      }
+
       if (!cid || seenCids.has(cid)) continue;
 
       // --- Determine Buy or Sale Status ---
@@ -1155,8 +1163,9 @@ function syncContracts(ss, charIdMap) {
   // must now be refactored to accept and process this object structure.
   return {
     contracts: outC_Combined.length,
-    buyData: { contracts: outC_Buy, items: outI_Combined }, // NOTE: Item split needs adjustment, but the core contract list is separated.
-    saleData: { contracts: outC_Sale, items: outI_Combined }
+    buyData: { contracts: outC_Buy, items: outI_Combined },
+    saleData: { contracts: outC_Sale, items: outI_Combined },
+    maxContractId: maxContractId // New: Return the highest ID found
   };
 }
 
@@ -1793,6 +1802,48 @@ function rebuildContractUnitCosts(ss) {
 }
 
 /**
+ * Resets the anchor for the Ledger_Import_CorpJournal function,
+ * forcing a re-fetch of the full 30-day history on the next run.
+ * * NOTE: This relies on constants defined in GESI Extentions.js: 
+ * CORP_JOURNAL_LAST_ID and CORP_JOURNAL_RESUME_PROP.
+ */
+function resetCorpJournalImport() {
+  // Use a Script Lock to prevent any maintenance job from running during the reset
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) { // Wait up to 5 seconds to acquire the lock
+    Logger.log("Reset failed: Script Lock busy. Try again shortly.");
+    return;
+  }
+  
+  try {
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
+    const LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('RESET_TOOL') : console;
+
+    // The keys to delete are defined in GESI Extentions.js
+    const LAST_ID_KEY = 'CORP_JOURNAL_LAST_TRANSACTION_ID'; // CORP_JOURNAL_LAST_ID
+    const RESUME_KEY = 'CORP_JOURNAL_DIV_RESUME';           // CORP_JOURNAL_RESUME_PROP
+
+    // 1. Delete the last transaction ID anchor
+    SCRIPT_PROP.deleteProperty(LAST_ID_KEY);
+    
+    // 2. Delete the resume anchor (for safety against partial API fetches)
+    SCRIPT_PROP.deleteProperty(RESUME_KEY);
+    
+    LOG.info("Corporate Journal Import anchors reset successfully.");
+    
+    // Provide an alert if run from the editor menu
+    if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getUi) {
+      SpreadsheetApp.getUi().alert('Corporate Journal Import reset successful. Next run will fetch the full 30-day history.');
+    }
+
+  } catch (e) {
+    Logger.log("Failed to reset Corporate Journal Import anchors: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
  * MONOLITH BREAKER: Consumes segregated data and runs ledger posts conditionally.
  * Solves the timeout by skipping the unnecessary 2-minute sales write.
  */
@@ -1844,12 +1895,18 @@ function runContractLedgerPhase(ss) {
     } else {
       log.warn('contractsToSalesLedger skipped: No sales contracts found.');
     }
-
+    // --- STEP 6: SAVE LAST PROCESSED ID (NEW) ---
+    if (syncResult.maxContractId && syncResult.maxContractId > 0) {
+      SCRIPT_PROP.setProperty(PROP_KEY_LAST_CONTRACT_ID, String(syncResult.maxContractId));
+      log.info(`Saved new last processed Contract ID: ${syncResult.maxContractId}`);
+    }
     // --- STEP 5: COST ALLOCATION (COGS) ---
-    log.info('Decoupling COGS finalization to asynchronous trigger.');
-    triggerContractUnitCostsFinalization();
-
-    log.info('Contract Ledger Phase Complete.');
+    try {
+      log.info('Decoupling COGS finalization to asynchronous trigger.');
+      triggerContractUnitCostsFinalization();
+    } catch (e) {
+      log.error('rebuildContractUnitCosts FAILED', e.message);
+    }
 
     // --- RELEASE LEASE ON SUCCESS ---
     SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
