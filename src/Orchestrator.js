@@ -369,8 +369,6 @@ function _updateMarketDataSheetWorker() {
       return;
     }
 
-    // [PAUSE] Critical for safe sheet operations (Reuse/Clear)
-    var needsWakeUp = pauseSheet(ss_anchor);
 
     const setupResult = guardedSheetTransaction(() => {
       // 1. Call Helper (Returns {success, state, error})
@@ -391,11 +389,7 @@ function _updateMarketDataSheetWorker() {
       return true;
     }, 60000);
 
-    // [WAKE UP] Immediately for live mode
-    if (needsWakeUp) {
-      wakeUpSheet(ss_anchor);
-      console.log("[Worker] Surgical Pause complete. Sheet woken up for Write Phase.");
-    }
+
 
     if (!setupResult.success) {
       console.warn(`[Worker] Sheet prep failed: ${setupResult.error}`);
@@ -524,9 +518,6 @@ function finalizeMarketDataUpdate() {
 
     var ss_inner = SpreadsheetApp.getActiveSpreadsheet();
 
-    // [PAUSE] This flush takes time (e.g. 3.5 minutes)
-    var needsWakeUp = pauseSheet(ss_inner);
-
     // [CRITICAL FIX] REFRESH CONNECTION
     // The previous 'ss_inner' is dead after the long flush. Get a new one.
     ss_inner = SpreadsheetApp.getActiveSpreadsheet();
@@ -538,8 +529,7 @@ function finalizeMarketDataUpdate() {
       return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
     }, 60000);
 
-    // [WAKE UP]
-    if (needsWakeUp) wakeUpSheet(ss_inner);
+
 
     let swapSuccess = (transactionResult.success && transactionResult.state.success);
 

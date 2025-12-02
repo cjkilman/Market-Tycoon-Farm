@@ -1781,7 +1781,7 @@ function rebuildContractUnitCosts(ss) {
   const keys = ['source', 'char', 'contract_id', 'type_id'];
 
   // FIX: PAUSE SHEET CALCULATIONS TO PREVENT TIMEOUT
-  var needsWakeUp = pauseSheet(ss);
+ // var needsWakeUp = pauseSheet(ss);
 
   let count = 0;
   try {
@@ -1794,10 +1794,10 @@ function rebuildContractUnitCosts(ss) {
     log.error('rebuildContractUnitCosts WRITE FAILED', e.message);
     throw e;
   } finally {
-    // FIX: RESUME SHEET CALCULATIONS, REGARDLESS OF SUCCESS OR FAILURE
-    if (needsWakeUp) {
-      wakeUpSheet(ss);
-    }
+    // Moved to ML upsert
+   // if (needsWakeUp) {
+    //  wakeUpSheet(ss);
+    //}
   }
 }
 
