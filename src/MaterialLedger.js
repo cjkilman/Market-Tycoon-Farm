@@ -119,10 +119,15 @@ var ML = (function () {
 
             const WRITE_BATCH_SIZE = 1000;
             const sh = sheetInst;
-            let updateCount = 0;
 
-            // --- Access Globals (Required for Pause/Resume) ---
-            const ss = sh.getParent();
+            // --- CRITICAL FIX: INITIALIZE SCOPE VARIABLES ---
+            let updateCount = 0;
+            let totalWritten = 0;
+
+            // Arrays and maps needed for processing logic below
+            let existingKeyToArrayIndexMap = new Map();
+            let allExistingValues = [];
+            const newRowsToAppend = [];
 
             // --- 1. Identify Key Columns & Read Existing Data (omitted for brevity) ---
             // ... (Reading, mapping, and updateCount logic for Steps 1-3 here) ...
