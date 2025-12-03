@@ -283,9 +283,9 @@ function cacheAllCorporateAssetsWorker() {
                 ...(typeof NITRO_CONFIG !== 'undefined' ? NITRO_CONFIG : {}),
 
                 // OVERRIDES FOR HEAVY ASSETS
-                MAX_CELLS_PER_CHUNK: 20000, // Reduced from standard
-                MAX_CHUNK_SIZE: 1000,       // Force smaller bites
-                SOFT_LIMIT_MS: 270000,      // 4.5 Minutes (BAIL EARLY)
+                MAX_CELLS_PER_CHUNK: 30000, // Reduced from standard
+                MAX_CHUNK_SIZE: 2000,       // Force smaller bites
+                SOFT_LIMIT_MS: 280000,      // 4.5 Minutes (BAIL EARLY)
 
                 // Dynamic State
                 currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '500')

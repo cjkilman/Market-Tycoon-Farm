@@ -203,6 +203,15 @@ function _getColIndexMap(headers, requiredHeaders) {
 function runIndustryLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
+
+  // --- CRITICAL SAFETY GUARD: WAIT FOR CONTRACT PRICING ---
+  // If the Contract Unit Cost worker is still calculating, we must wait.
+  // Otherwise, we risk reading "Zero Cost" materials and ruining the WAC.
+  const cogsState = SCRIPT_PROP.getProperty('cogsJobStep'); // PROP_KEY_COGS_STEP
+  if (cogsState === 'FINALIZING') {
+    log.warn('Skipping Industry Ledger Phase: Contract COGS calculation is pending.');
+    return;
+  }
   const START_TIME = new Date().getTime();
 
   log.info('--- Starting Industry Ledger Phase (BPC Costing & Manufacturing COGS) ---');
@@ -526,8 +535,8 @@ function runIndustryLedgerUpdate() {
 
   // 7. Upsert and Save State
   if (ledgerObjects.length > 0) {
-    const writtenCount = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
-    LOG_INDUSTRY.info(`Successfully processed and wrote ${writtenCount} new manufacturing jobs to the Material_Ledger.`);
+  const result = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
+   LOG_INDUSTRY.info(`Successfully processed and wrote ${result.rows} new manufacturing jobs to the Material_Ledger.`);
   } else {
     LOG_INDUSTRY.info("Finished processing. No new rows to write to Material_Ledger.");
   }
@@ -733,66 +742,50 @@ function _getSdeNameMap(ss) {
 
 /**
  * Helper to find new, completed jobs by activity.
+ * FIX: Now reads directly from the robust, cached ESI data array (bypassing the slow spreadsheet sheet).
  */
 function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
-  const sheet = ss.getSheetByName("ESI Corp Jobs");
-  if (!sheet) { LOG_INDUSTRY.error("Cannot find 'ESI Corp Jobs' sheet!"); return []; }
+  // ss parameter is retained for compatibility but not used for sheet reading.
+  
+  // 1. Get raw job data (reads from cache/live API via helper)
+  // _getCorporateJobsRaw(false) ensures we use the CACHED data from Phase 0.
+  const rawJobData = _getCorporateJobsRaw(false); 
 
-  try {
-    // ⚠️ CRITICAL CHANGE: Start reading from Column C (index 2)
-    const START_COLUMN = 3; // C is the 3rd column (index 2)
-    const MAX_COLUMNS = sheet.getLastColumn();
-    const NUM_COLUMNS = MAX_COLUMNS - START_COLUMN + 1; // Number of columns to read
+  if (!rawJobData || rawJobData.length === 0) { 
+    // This logs the original critical error but now correctly returns if the cache is empty.
+    LOG_INDUSTRY.error("Error reading ESI Corp Jobs: Raw job data is empty or fetch failed."); 
+    return []; 
+  }
+  
+  // 2. Define the expected keys (headers) and activity set
+  const newJobs = [];
+  const activitySet = new Set(activityIds);
+  
+  // 3. Process the array of objects directly from the API helper
+  for (const jobObj of rawJobData) { 
+    const job_id = Number(jobObj.job_id);
 
-    // Read the Header Row (Row 1), starting from Column C
-    const rawHeaders = sheet.getRange(1, START_COLUMN, 1, NUM_COLUMNS).getValues()[0];
-
-    // Fill in the first two columns with placeholders so the dynamic mapper still works
-    // 1. Read the entire header row. Columns A and B will be empty strings.
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-
-    // 2. Map the required headers. The mapper will find them in column 2 (C) and onwards.
-    const requiredHeaders = ['job_id', 'activity_id', 'status', 'blueprint_type_id', 'product_type_id', 'runs', 'end_date', 'installer_id', 'cost', 'location_id'];
-    const col = _getColIndexMap(headers, requiredHeaders); // This should work, even with leading blanks.
-
-    // Safe reading of data block
-    let data = [];
-    const lastRow = sheet.getLastRow();
-    const numRows = lastRow - 1;
-
-    if (numRows > 0) {
-      // Read ALL data (including blank columns A and B) so the column indexes are correct
-      data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues();
+    // Filter by status, activity, and whether it has been processed
+    if (jobObj.status === 'delivered' && 
+        activitySet.has(Number(jobObj.activity_id)) && 
+        !processedJobIds.has(job_id)) {
+      
+      // Data is already an array of objects, just validate and push
+      newJobs.push({
+        job_id: job_id, 
+        activity_id: Number(jobObj.activity_id),
+        blueprint_type_id: Number(jobObj.blueprint_type_id),
+        product_type_id: Number(jobObj.product_type_id),
+        runs: Number(jobObj.runs),
+        end_date: new Date(jobObj.end_date),
+        installer_id: jobObj.installer_id,
+        cost: Number(jobObj.cost),
+        location_id: Number(jobObj.location_id)
+      });
     }
-
-    // The rest of the logic remains the same, using 'col' for indexing...
-
-    const newJobs = [];
-    const activitySet = new Set(activityIds);
-
-    for (const row of data) {
-      // Indexing now uses the column numbers retrieved by _getColIndexMap (plus the 2 blank cols)
-      const job_id = Number(row[col.job_id]);
-      // ... continue with the rest of your job processing logic ...
-
-      const activity_id = Number(row[col.activity_id]);
-      const status = row[col.status];
-
-      if (status === 'delivered' && activitySet.has(activity_id) && !processedJobIds.has(job_id)) {
-        newJobs.push({
-          job_id: job_id, activity_id: activity_id,
-          blueprint_type_id: Number(row[col.blueprint_type_id]),
-          product_type_id: Number(row[col.product_type_id]),
-          runs: Number(row[col.runs]),
-          end_date: new Date(row[col.end_date]),
-          installer_id: row[col.installer_id],
-          cost: Number(row[col.cost]),
-          location_id: Number(row[col.location_id])
-        });
-      }
-    }
-    return newJobs;
-  } catch (e) { LOG_INDUSTRY.error(`Error reading ESI Corp Jobs: ${e.message}`); return []; }
+  }
+  
+  return newJobs;
 }
 
 /**
@@ -1419,23 +1412,14 @@ function _getMarketDemandMap(ss) {
 
 
 /**
- * Custom function to fetch Corporation Industry Jobs with caching (Memoization + CacheService).
- * Prevents continuous API calls during sheet recalculations.
- * * @param {string} name Character name with ESI Corp Jobs scope.
- * @param {boolean} [include_completed=false] Whether to include completed jobs.
- * @returns {any[][]} Raw data from GESI call.
- * @customfunction
- */
-/**
  * Custom function to fetch Corporation Industry Jobs with caching.
- * Prevents continuous API calls during sheet recalculations.
+ * NOW: Checks Cache First -> If Empty, Pulls Live Data.
  * * @param {string} name Character name with ESI Corp Jobs scope.
  * @param {boolean} [include_completed=false] Whether to include completed jobs.
  * @returns {any[][]} Raw data from GESI call.
  * @customfunction
  */
 function GESI_CORP_JOBS_CACHED(name, include_completed) {
-  // NOTE: GLOBAL_STATE_KEY must be accessible. Assuming it's defined elsewhere.
   const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
 
   // START LOGGING & PARAM CHECK
@@ -1448,22 +1432,33 @@ function GESI_CORP_JOBS_CACHED(name, include_completed) {
 
   // ROBUST MAINTENANCE CHECK
   const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
-
   if (systemState === 'MAINTENANCE') {
     Logger.log(`[CIJ_SHEET] ABORT: System is in MAINTENANCE mode.`);
     return [['MAINTENANCE_ACTIVE']];
   }
 
-  // 1. Fetch data from the *shared* cache handled by _getCorporateJobsRaw.
-  // NOTE: We pass 'false' to force the helper to read from the cache only (no live API call).
-  const rawData = _getCorporateJobsRaw(false);
+  // 1. ATTEMPT 1: READ FROM CACHE (Fast)
+  let rawData = _getCorporateJobsRaw(false);
 
-  if (!rawData || rawData.length === 0) {
-    Logger.log('[CIJ_SHEET] WARN: No data found in shared cache. Returning cache instruction.');
-    return [['DATA_NOT_CACHED'], ['Run Industry Ledger script to refresh cache.']];
+  // 2. ATTEMPT 2: LIVE FETCH (If Cache Miss)
+  if (!rawData) {
+    Logger.log('[CIJ_SHEET] Cache Miss. Triggering LIVE fetch.');
+    try {
+      // Force a live refresh. This may take a few seconds.
+      rawData = _getCorporateJobsRaw(true); 
+    } catch (e) {
+      Logger.log(`[CIJ_SHEET] Live fetch failed: ${e.message}`);
+      return [['ERROR'], [`Live fetch failed: ${e.message}`]];
+    }
   }
 
-  // 2. Format output for Google Sheets (array of objects -> array of arrays).
+  // 3. FINAL DATA CHECK
+  if (!rawData || rawData.length === 0) {
+    Logger.log('[CIJ_SHEET] WARN: No data found after cache check and live fetch.');
+    return [['NO_DATA'], ['No industry jobs found.']];
+  }
+
+  // 4. FORMAT OUTPUT (Array of Objects -> Array of Arrays)
   try {
     const headerRow = Object.keys(rawData[0] || {});
 

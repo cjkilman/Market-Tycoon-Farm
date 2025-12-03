@@ -14,7 +14,7 @@ var CHUNK_INDEX_SUFFIX = ':IDX';
 //    This reserves 90s for the "Ghost Gap" in the NEXT run.
 
 const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
-  = [1000, 100, 270000, 5000];
+  = [1000, 100, 280000, 5000];
 /**
  * [NEW] SHARED NITRO CONFIGURATION
  * Centralized settings for high-volume sheet writes.
@@ -23,7 +23,7 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
 var NITRO_CONFIG = {
   // --- Shared Stability Settings ---
   TARGET_WRITE_TIME_MS: 2000,
-  MAX_FACTOR: 1.2,             // Conservative growth (don't grow chunks too fast)
+  MAX_FACTOR: 1.5,             // Conservative growth (don't grow chunks too fast)
   THROTTLE_THRESHOLD_MS: -1,   // Disable standard throttling (rely on adaptive)
   THROTTLE_PAUSE_MS: 30000,     // Long pause if we hit a wall
   LAG_SPIKE_THRESHOLD_MS: 60000,
@@ -237,7 +237,7 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
           // Logic to set named range to the full data extent minus header (usually)
           // Defaulting to "Full Sheet Data" logic if specific logic isn't passed
           if (lastRow > 1) {
-            const range = finalSheet.getRange(2, 1, lastRow - 1, lastCol);
+            const range = finalSheet.getRange(1, 1, lastRow - 1, lastCol);
             ss.setNamedRange(rangeName, range);
             console.log(`[AtomicSwap] Updated Named Range '${rangeName}'`);
           }

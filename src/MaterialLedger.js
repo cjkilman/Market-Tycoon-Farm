@@ -106,12 +106,8 @@ var ML = (function () {
             return data.length;
         }
 
-        /**
-      * Updates existing rows by key (e.g., [type_id, contract_id]) or appends new rows.
-      * @param {Array<string>} keys - Array of column names to use as the unique key (e.g., ['type_id', 'contract_id']).
-      * @param {Array<Object>} rows - Array of row objects containing new data.
-      * @returns {number} The total count of rows updated or appended.
-      */
+        /* In src/MaterialLedger.js */
+
         function upsertBy(keys, rows) {
             if (!rows || !rows.length) {
                 return { rows: 0, status: "SUCCESS", errorMerssage: "" };
@@ -119,32 +115,78 @@ var ML = (function () {
 
             const WRITE_BATCH_SIZE = 1000;
             const sh = sheetInst;
+            const ss = sh.getParent();
 
-            // --- CRITICAL FIX: INITIALIZE SCOPE VARIABLES ---
+            // --- INITIALIZE SCOPE VARIABLES ---
             let updateCount = 0;
             let totalWritten = 0;
+            let needsWakeUp = false;
 
-            // Arrays and maps needed for processing logic below
-            let existingKeyToArrayIndexMap = new Map();
+            const existingKeyToArrayIndexMap = new Map();
             let allExistingValues = [];
             const newRowsToAppend = [];
 
-            // --- 1. Identify Key Columns & Read Existing Data (omitted for brevity) ---
-            // ... (Reading, mapping, and updateCount logic for Steps 1-3 here) ...
+            // --- 1. Identify Key Columns ---
+            // (RESTORED LOGIC)
+            const keyIndices = keys.map(function (k) {
+                const idx = HEAD.indexOf(k);
+                if (idx === -1) throw new Error('Unknown key column in HEAD: ' + k);
+                return idx;
+            });
 
-            // --- NEW: SHEET CONTROL WRAPPER ---
-            let needsWakeUp = false;
+            const normalizeKeyPart = function (val, headIdx) {
+                if (headIdx === 1) { // Index 1 is 'type_id'
+                    return String(Math.round(Number(val || 0)));
+                }
+                return String(val != null ? val : '');
+            };
 
+            // --- 2. Read Existing Keys and Map to Array Index ---
+            // (RESTORED LOGIC)
+            const last = sh.getLastRow();
+
+            if (last >= 2) {
+                // Read the entire data body (all columns)
+                const range = sh.getRange(2, 1, last - 1, HEAD.length);
+                allExistingValues = range.getValues();
+
+                allExistingValues.forEach(function (row, rowIndex) {
+                    const key = keyIndices.map(function (headIdx) {
+                        return normalizeKeyPart(row[headIdx], headIdx);
+                    }).join('\u0001');
+
+                    existingKeyToArrayIndexMap.set(key, rowIndex);
+                });
+            }
+
+            // --- 3. Separate Rows for Update and Append ---
+            // (RESTORED LOGIC)
+            rows.forEach(function (obj) {
+                const outRow = normalizeRow_(obj);
+                const key = keyIndices.map(function (headIdx) {
+                    return normalizeKeyPart(outRow[headIdx], headIdx);
+                }).join('\u0001');
+
+                if (existingKeyToArrayIndexMap.has(key)) {
+                    // Update existing row in memory
+                    const rowIndex = existingKeyToArrayIndexMap.get(key);
+                    allExistingValues[rowIndex] = outRow;
+                    updateCount++;
+                } else {
+                    // Queue for append
+                    newRowsToAppend.push(outRow);
+                }
+            });
+
+            // --- SHEET CONTROL & WRITE OPERATIONS ---
             try {
-                // 1. CRITICAL: Pause sheet calculations right before writing
+                // 1. Pause sheet calculations
                 if (typeof pauseSheet === 'function') {
-                    // Only pause if there is actual data writing work to be done.
                     needsWakeUp = pauseSheet(ss);
                 }
 
-                // --- 4. Write Updates (Overwrite existing range with modified values) ---
+                // --- 4. Write Updates (Overwrite existing range) ---
                 if (updateCount > 0) {
-                    // Write the updates to the existing rows range
                     sh.getRange(2, 1, allExistingValues.length, HEAD.length).setValues(allExistingValues);
                 }
 
@@ -152,56 +194,45 @@ var ML = (function () {
                 const totalNewRows = newRowsToAppend.length;
                 let currentIndex = 0;
                 let nextWriteRow = sh.getLastRow() + 1;
-                let totalWritten = 0;
 
                 if (totalNewRows > 0) {
                     const docLock = LockService.getDocumentLock();
                     let lockAcquired = false;
 
                     try {
-                        // CRITICAL FIX: CHECK FOR PRIORITY INTERRUPT ONCE BEFORE THE LOOP
+                        // Check for Priority Interrupt
                         if (!docLock.tryLock(0)) {
-                            // Lock not acquired (Signal is SET): Predictive Bailout
                             return {
-                                rows: updateCount, // Only counting the updates done so far
+                                rows: updateCount,
                                 status: "PREDICTIVE BAILOUT",
                                 errorMerssage: "Document Lock held by priority process."
                             };
                         }
-
-                        // Lock acquired (Signal is CLEAR): Flag it for release and proceed
                         lockAcquired = true;
 
-                        // Start the actual writing loop (NO MORE LOCK CHECKS INSIDE)
                         while (currentIndex < totalNewRows) {
-
                             const batch = newRowsToAppend.slice(currentIndex, currentIndex + WRITE_BATCH_SIZE);
                             const startRow = nextWriteRow;
 
-                            // Perform the batch write
                             sh.getRange(startRow, 1, batch.length, HEAD.length).setValues(batch);
 
                             currentIndex += batch.length;
                             nextWriteRow += batch.length;
                             totalWritten += batch.length;
                         }
-
                     } catch (e) {
-                        // Return an error object if a write fails
                         return {
-                            rows: totalWritten + updateCount,
+                            rows: updateCount + totalWritten,
                             status: "WRITE ERROR",
                             errorMerssage: e.message
                         };
                     } finally {
-                        // CRITICAL: Release the Document Lock ONLY if it was acquired.
                         if (lockAcquired) {
                             docLock.releaseLock();
                         }
                     }
                 }
 
-                // --- FINAL SUCCESS RETURN ---
                 return {
                     rows: updateCount + totalWritten,
                     status: "SUCCESS",
@@ -209,7 +240,6 @@ var ML = (function () {
                 };
 
             } catch (outerError) {
-                // Catches errors during the update/append/pause phase
                 LoggerEx.withTag('ML_UPSERT').error('Fatal error during upsert process:', outerError);
                 return {
                     rows: updateCount + totalWritten,
@@ -217,7 +247,7 @@ var ML = (function () {
                     errorMerssage: outerError.message
                 };
             } finally {
-                // 2. CRITICAL: Resume sheet calculations, GUARANTEED
+                // 2. Guaranteed resume
                 if (needsWakeUp && typeof wakeUpSheet === 'function') {
                     wakeUpSheet(ss);
                 }

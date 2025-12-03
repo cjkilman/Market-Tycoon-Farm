@@ -80,8 +80,10 @@ var GESI_CONTRACT_COLS = [
 // Cache TTLs (seconds)
 var GESI_TTL = (GESI_TTL != null && typeof GESI_TTL === 'object') ? GESI_TTL : {};
 GESI_TTL.chars = (GESI_TTL.chars != null) ? GESI_TTL.chars : 21600; // 6h (document cache)
-GESI_TTL.contracts = (GESI_TTL.contracts != null) ? GESI_TTL.contracts : 900;    // 15m (unused here)
-GESI_TTL.items = (GESI_TTL.items != null) ? GESI_TTL.items : 900;    // 15m (user cache)
+
+// UPDATED: Set Contracts and Items to 60 minutes (3600 seconds)
+GESI_TTL.contracts = (GESI_TTL.contracts != null) ? GESI_TTL.contracts : 3600;    // 60m
+GESI_TTL.items = (GESI_TTL.items != null) ? GESI_TTL.items : 3600;    // 60m
 
 // ADDED: Module-level cache variable to store the authenticated character name
 // only once per script execution.
@@ -145,9 +147,30 @@ function _rewriteData_(sh, header, rows) {
     sh.getRange(lastNow + 1, 1, extra, sh.getMaxColumns()).clearContent();
   }
 }
+/**
+ * Resets the Loot Delta Snapshot. 
+ * Forces the next run to treat ALL current loot in the external sheet as 'New'
+ * and import it to the ledger.
+ * WARNING: This may cause duplicates if the data is already in the ledger!
+ */
 function resetLootSnapshot() {
-  PropertiesService.getDocumentProperties().deleteProperty('raw_loot:snapshot:v2');
-  SpreadsheetApp.getUi().alert('Loot snapshot successfully reset!');
+  const PROP_KEY = 'raw_loot:snapshot:v2'; // Must match SNAP_KEY in GESI Extentions.js
+  const props = PropertiesService.getDocumentProperties();
+
+  const lock = LockService.getScriptLock();
+  if (lock.tryLock(5000)) {
+    try {
+      props.deleteProperty(PROP_KEY);
+      Logger.log("✅ Loot Snapshot Reset. Next run will import all external quantities as new deltas.");
+      if (typeof SpreadsheetApp !== 'undefined') SpreadsheetApp.getUi().alert("Success: Loot Snapshot Reset.");
+    } catch (e) {
+      Logger.log("❌ Error resetting snapshot: " + e.message);
+    } finally {
+      lock.releaseLock();
+    }
+  } else {
+    Logger.log("⚠️ Could not acquire lock. Try again.");
+  }
 }
 /**
  * Reads external loot sheet, filters for non-null items, and sorts the result.
@@ -764,11 +787,10 @@ function _pickCharForContract(candidates, contractRow, idMap) {
 // START LEDGER FUNCTIONS
 // ==========================================================================================
 
-// --- REMOVED withSheetLock wrapper ---
 /**
- * --- Raw_loot (rolling 30d total) -> Material_Ledger (post deltas) ------------
- * Internal helper for calculating loot deltas and updating the snapshot.
- * Assumes lock is held by caller.
+ * --- Raw_loot -> Material_Ledger (UUID Delta Mode) ---
+ * Generates unique Transaction IDs for every delta.
+ * CRITICAL FIX: Only saves the snapshot if the ledger write succeeds.
  */
 function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives) {
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -783,19 +805,16 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
     return 0;
   }
   const loot = lootData;
-
-  // --- Code previously inside withSheetLock now runs directly ---
   const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
 
   const h = loot.h;
-  const cTid = h['type_id'],
-    cQty = h['total_quantity'],
-    cBuy = h['weighted_average_buy'],
-    cVal = h['weighted_average_value'];
+  const cTid = h['type_id'], cQty = h['total_quantity'], cBuy = h['weighted_average_buy'], cVal = h['weighted_average_value'];
+  
   if ([cTid, cQty, cBuy, cVal].some(v => v == null)) {
     throw new Error(`'${RAW_LOOT_SHEET}' must have headers: type_id, total_quantity, weighted_average_buy, weighted_average_value`);
   }
 
+  // 1. Calculate Deltas
   const curr = new Map();
   for (const r of loot.rows) {
     const tid = Number(r[cTid]) || 0;
@@ -812,68 +831,74 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
   const prevRaw = props.getProperty(SNAP_KEY);
   const prev = prevRaw ? JSON.parse(prevRaw) : {};
 
-  const allTids = new Set([
-    ...curr.keys(),
-    ...Object.keys(prev).map(x => Number(x) || 0)
-  ]);
-
+  const allTids = new Set([...curr.keys(), ...Object.keys(prev).map(x => Number(x) || 0)]);
   const outRows = [];
+
   for (const tid of allTids) {
     const cur = curr.get(tid) || { qty: 0, val: 0, buy: 0 };
     const p = prev[String(tid)] || { qty: 0, val: 0 };
     const dq = cur.qty - (Number(p.qty) || 0);
-    const dv = cur.val - (Number(p.val) || 0);
 
     if (dq === 0) continue;
-    if (!allowNeg && dq < 0) {
-      log.debug('Skipping negative delta due to pruning or loss', { tid, dq });
-      continue;
-    }
+    if (!allowNeg && dq < 0) continue;
 
-    let unit = (isFinite(dv / dq) && Math.abs(dv) > 0) ? Math.abs(dv / dq) : (cur.buy || 0);
+    let unit = (isFinite(cur.val) && cur.qty > 0) ? (cur.val / cur.qty) : (cur.buy || 0);
     if (!(unit > 0)) unit = cur.buy || 0;
 
+    // GENERATE UUID for every delta event
     outRows.push({
       date: dateStr,
       type_id: tid,
       qty: dq,
       unit_value_filled: unit,
       source: source,
-      char: charName
+      char: charName,
+      contract_id: Utilities.getUuid() // Unique Transaction ID
     });
   }
 
   if (outRows.length === 0) {
     log.log('loot_import', { status: 'Skipped ledger update: No deltas found.', processed: allTids.size, date: dateStr });
-    return 0; // Return 0 as count
+    return 0; 
   }
 
-  const keys = ['source', 'char', 'type_id', 'date'];
-  const count = MaterialLedger.upsert(keys, outRows);
+  // 2. Write to Ledger (Using UUID key = Append)
+  // FIX: Check the result object to ensure success BEFORE saving snapshot.
+  const result = MaterialLedger.upsert(['contract_id'], outRows);
+  const count = result.rows || 0; 
 
-  const nextSnap = {};
-  for (const [tid, cur] of curr.entries()) {
-    nextSnap[String(tid)] = { qty: cur.qty, val: cur.val };
+  // 3. Safe Snapshot Save
+  if (result.status === "SUCCESS" || count > 0) {
+    const nextSnap = {};
+    for (const [tid, cur] of curr.entries()) {
+      nextSnap[String(tid)] = { qty: cur.qty, val: cur.val };
+    }
+    props.setProperty(SNAP_KEY, JSON.stringify(nextSnap));
+    
+    log.log('loot_import', { appended: count, status: "SUCCESS", date: dateStr });
+  } else {
+    log.warn('loot_import', { status: "WRITE_FAILED_SNAPSHOT_NOT_SAVED", error: result.errorMerssage });
   }
-  props.setProperty(SNAP_KEY, JSON.stringify(nextSnap));
 
-  log.log('loot_import', {
-    appended_or_updated: count,
-    processed: allTids.size,
-    date: dateStr,
-  });
-
-  return count; // Return actual count
+  return count; 
 }
 
-// --- REMOVED withSheetLock wrapper ---
-/** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Buy and Sell Sides) =====================
- * Imports corporate market transactions (buy and sell) for Division 3 only.
- * Assumes lock is held by caller.
+
+/** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Optimized Cache Handoff) =====================
+ * Imports corporate market transactions (buy and sell) for Division 3.
+ * Fixes Timeout: Phase 1 caches data for Phase 2, skipping the second API fetch.
+ * Fixes RefError: Uses 'authToon' instead of undefined 'charName'.
  */
 function Ledger_Import_CorpJournal(ss, opts) {
   const log = LoggerEx.withTag('CORP_TXN');
   const t = log.startTimer('Ledger_Import_CorpJournal_Setup');
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const CACHE = CacheService.getScriptCache(); // Use Script Cache for handoff
+
+  const PHASE_KEY = 'CORP_JOURNAL_PHASE'; 
+  const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS';
+  const CACHE_KEY_ANCHOR = 'CORP_JOURNAL_HANDOFF_ANCHOR';
+  const CACHE_TTL = 1200; // 20 minutes (plenty for the handoff)
 
   opts = opts || {};
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -885,124 +910,183 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const cutoff = new Date(Date.now() - SINCE_DAYS * MS_PER_DAY);
   const TARGET_DIVISION = 3;
   const authToon = getCorpAuthChar(ss);
-  const props = PropertiesService.getScriptProperties();
-  const rawFromId = props.getProperty(CORP_JOURNAL_LAST_ID);
+  
+  const rawFromId = SCRIPT_PROP.getProperty(CORP_JOURNAL_LAST_ID);
   let currentFromId = rawFromId ? parseInt(rawFromId, 10) : null;
   if (isNaN(currentFromId)) currentFromId = null;
 
-  t.stamp('Setup complete, starting API calls.');
+  const currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
+  log.info(`Starting Corp Journal Import. Current Phase: ${currentPhase}`);
 
-  const allCorpTransactions = [];
-  let fetchMore = true;
+  t.stamp('Setup complete.');
 
-  log.log(`Fetching Corp Transactions for Division ${TARGET_DIVISION} (since ${SINCE_DAYS} days)...`);
+  // --- VARIABLES FOR PROCESSING ---
+  let buyRows = [];
+  let sellRows = [];
+  let allCorpTransactions = [];
+  let newestTransactionId = null;
+  let dataLoadedFromCache = false;
 
-  do { // Fetch loop remains the same
-    try {
-      let from_id_arg = null;
-      const previousFromId = currentFromId;
-      if (currentFromId) {
-        from_id_arg = currentFromId;
-        log.log(`...fetching transactions before ID: ${currentFromId}`);
-      } else {
-        log.log(`...fetching most recent page (no anchor set).`);
-      }
-      const rawEntries = GESI.invokeRaw(
-        GESI_FUNC_NAME,
-        {
-          division: TARGET_DIVISION, from_id: from_id_arg, name: authToon,
-          show_column_headings: false, version: null
-        }
-      );
-      if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
-        fetchMore = false; break;
-      }
-      allCorpTransactions.push(...rawEntries);
-      const oldestEntry = rawEntries[rawEntries.length - 1];
-      const oldestDate = new Date(oldestEntry.date);
-      const oldestEntryId = oldestEntry.transaction_id;
-      if (isNaN(oldestDate.getTime())) {
-        log.error("Invalid Date found in ESI response.", { entry: oldestEntry });
-        fetchMore = false; break;
-      }
-      if (previousFromId && previousFromId === oldestEntryId) {
-        log.log(`Pagination exhausted: Oldest ID ${oldestEntryId} repeated.`);
-        fetchMore = false; break;
-      }
-      if (oldestDate.getTime() < cutoff.getTime()) {
-        log.log(`Oldest entry date (${oldestDate}) past cutoff.`);
-        fetchMore = false;
-      } else {
-        currentFromId = oldestEntryId;
-      }
-      Utilities.sleep(100);
-    } catch (e) {
-      log.error(`Error fetching Division ${TARGET_DIVISION} at from_id ${currentFromId}.`, e);
-      fetchMore = false; throw e;
+  // --- PHASE 2 SHORTCUT: TRY LOADING FROM CACHE ---
+  if (currentPhase === 'SELLS') {
+    const cachedSellData = CACHE.get(CACHE_KEY_SELLS);
+    const cachedAnchor = CACHE.get(CACHE_KEY_ANCHOR);
+    
+    if (cachedSellData) {
+        log.info("Phase 2 Shortcut: Loaded SELL data from cache. Skipping API fetch.");
+        sellRows = JSON.parse(cachedSellData);
+        newestTransactionId = cachedAnchor; // Restore the anchor we found in Phase 1
+        dataLoadedFromCache = true;
     }
-  } while (fetchMore);
-
-  props.deleteProperty(CORP_JOURNAL_RESUME_PROP);
-
-  // --- Processing loop remains the same ---
-  const buyRows = [];
-  const sellRows = [];
-  const charName = authToon;
-  for (const e of allCorpTransactions) {
-    const dt = e.date || e.timestamp || e.time;
-    const d = (typeof PT !== 'undefined' && PT.parseDateSafe) ? PT.parseDateSafe(dt) : new Date(dt);
-    if (!(d instanceof Date) || isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
-    const isBuy = e.is_buy === true;
-    const typeId = Number(e.type_id || 0);
-    const qty = Number(e.quantity || 0);
-    const price = Number(e.unit_price || e.price || 0);
-    const contractId = String(e.transaction_id || e.id || 0);
-    if (!(typeId > 0 && qty > 0 && price > 0)) continue;
-    const row = { date: d, type_id: typeId, qty: isBuy ? qty : -qty, unit_value: '', source: BUY_SOURCE, contract_id: contractId, char: charName, unit_value_filled: price };
-    if (isBuy) buyRows.push(row); else sellRows.push(row);
   }
 
-  // --- Early exit check remains the same ---
-  const isNoNewData = rawFromId && allCorpTransactions.length > 0 && (rawFromId === String(allCorpTransactions[0].transaction_id));
-  if (allCorpTransactions.length === 0 || isNoNewData) {
-    log.log('CORP_TXN', { status: 'Skipped ledger write: No new transactions found.' });
-    return { appended_or_updated_buy: 0, appended_or_updated_sell: 0, processed: allCorpTransactions.length, sheets: { buy: opts.sheet || LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET }, locked: false };
-  }
+  // --- FETCH DATA (Only if NOT loaded from cache) ---
+  if (!dataLoadedFromCache) {
+      let fetchMore = true;
+      log.log(`Fetching Corp Transactions for Division ${TARGET_DIVISION} (since ${SINCE_DAYS} days)...`);
 
-  // --- Code previously inside withSheetLock now runs directly ---
-  const keys = ['source', 'contract_id'];
-  let buyCount = 0;
-  let sellCount = 0;
+      do { 
+        try {
+          let from_id_arg = null;
+          const previousFromId = currentFromId;
+          if (currentFromId) {
+            from_id_arg = currentFromId;
+          }
+          const rawEntries = GESI.invokeRaw(
+            GESI_FUNC_NAME,
+            {
+              division: TARGET_DIVISION, from_id: from_id_arg, name: authToon,
+              show_column_headings: false, version: null
+            }
+          );
+          if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
+            fetchMore = false; break;
+          }
+          allCorpTransactions.push(...rawEntries);
+          const oldestEntry = rawEntries[rawEntries.length - 1];
+          const oldestDate = new Date(oldestEntry.date);
+          const oldestEntryId = oldestEntry.transaction_id;
+          
+          if (isNaN(oldestDate.getTime())) {
+            log.error("Invalid Date found in ESI response.");
+            fetchMore = false; break;
+          }
+          if (previousFromId && previousFromId === oldestEntryId) {
+            log.log(`Pagination exhausted: Oldest ID ${oldestEntryId} repeated.`);
+            fetchMore = false; break;
+          }
+          if (oldestDate.getTime() < cutoff.getTime()) {
+            log.log(`Oldest entry date (${oldestDate}) past cutoff.`);
+            fetchMore = false;
+          } else {
+            currentFromId = oldestEntryId;
+          }
+          Utilities.sleep(50);
+        } catch (e) {
+          log.error(`Error fetching Division ${TARGET_DIVISION} at from_id ${currentFromId}.`, e);
+          fetchMore = false; throw e;
+        }
+      } while (fetchMore);
+
+      SCRIPT_PROP.deleteProperty(CORP_JOURNAL_RESUME_PROP);
+
+      // Capture Newest ID for Anchoring
+      if (allCorpTransactions.length > 0) {
+          newestTransactionId = String(allCorpTransactions[0].transaction_id);
+      }
+
+      // --- PROCESS DATA INTO ROWS ---
+      for (const e of allCorpTransactions) {
+        const d = new Date(e.date);
+        if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
+        
+        const isBuy = e.is_buy === true;
+        const typeId = Number(e.type_id || 0);
+        const qty = Number(e.quantity || 0);
+        const price = Number(e.unit_price || e.price || 0);
+        const contractId = String(e.transaction_id || e.id || 0);
+        
+        // No strict filter, allowing valid sales/tax entries
+        
+        const row = { 
+          date: d, 
+          type_id: typeId, 
+          qty: isBuy ? qty : -qty, 
+          unit_value: '', 
+          source: BUY_SOURCE, 
+          contract_id: contractId, 
+          char: authToon, // FIXED: Used correct variable
+          unit_value_filled: price 
+        };
+        
+        if (isBuy) buyRows.push(row); else sellRows.push(row);
+      }
+  } // End Fetch Block
+
+  // --- PHASED EXECUTION LOGIC ---
   const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
   const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
+  const keys = ['source', 'contract_id'];
+  
+  let buyCount = 0;
+  let sellCount = 0;
 
-  if (buyRows.length > 0) {
-    const buyResult = MaterialLedger.upsert(keys, buyRows);
-    buyCount = buyResult.rows; // FIX: Extract the count from the object
-    log.log(`Buy side processed for ${LEDGER_BUY_SHEET}`, { appended_or_updated: buyCount, processed: buyRows.length });
+  // 1. PHASE: BUYS
+  if (currentPhase === 'BUYS') {
+    if (buyRows.length > 0) {
+        log.info(`Processing ${buyRows.length} BUY transactions...`);
+        const buyResult = MaterialLedger.upsert(keys, buyRows);
+        buyCount = buyResult.rows; // FIX: handle object return
+        log.log(`Buy side processed for ${LEDGER_BUY_SHEET}`, { appended_or_updated: buyCount, processed: buyRows.length });
+    } else {
+        log.info("No BUY transactions to process.");
+    }
+
+    // CACHE HANDOFF: Save 'sellRows' and 'newestTransactionId' for Phase 2
+    if (sellRows.length > 0) {
+        try {
+            CACHE.put(CACHE_KEY_SELLS, JSON.stringify(sellRows), CACHE_TTL);
+            if (newestTransactionId) CACHE.put(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
+            log.info(`Cached ${sellRows.length} SELL rows for Phase 2.`);
+        } catch (e) {
+            log.warn("Failed to cache SELL rows (too large?). Phase 2 will perform full fetch.", e);
+        }
+    }
+
+    // TRANSITION
+    SCRIPT_PROP.setProperty(PHASE_KEY, 'SELLS');
+    log.info("Phase 'BUYS' complete. Saved state 'SELLS'. Exiting.");
+    return { status: "PARTIAL_SUCCESS", phase: "BUYS", buyCount: buyCount };
   }
-  if (sellRows.length > 0) {
-    const sellResult = SalesLedger.upsert(keys, sellRows);
-    sellCount = sellResult.rows; // FIX: Extract the count from the object
-    log.log(`Sell side processed for ${LEDGER_SALE_SHEET}`, { appended_or_updated: sellCount, processed: sellRows.length });
+
+  // 2. PHASE: SELLS
+  if (currentPhase === 'SELLS') {
+    if (sellRows.length > 0) {
+        log.info(`Processing ${sellRows.length} SELL transactions...`);
+        const sellResult = SalesLedger.upsert(keys, sellRows);
+        sellCount = sellResult.rows; // FIX: handle object return
+        log.log(`Sell side processed for ${LEDGER_SALE_SHEET}`, { appended_or_updated: sellCount, processed: sellRows.length });
+    } else {
+        log.info("No SELL transactions to process.");
+    }
+
+    // COMPLETE CYCLE: UPDATE ANCHOR & RESET
+    if (newestTransactionId) {
+        SCRIPT_PROP.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
+        log.log(`Saved new transaction anchor: ${newestTransactionId}`);
+    }
+    
+    SCRIPT_PROP.deleteProperty(PHASE_KEY); 
+    CACHE.remove(CACHE_KEY_SELLS); 
+    CACHE.remove(CACHE_KEY_ANCHOR);
+    log.info("Phase 'SELLS' complete. Cycle finished.");
   }
-  const result = {
+
+  return {
     appended_or_updated_buy: buyCount,
     appended_or_updated_sell: sellCount,
-    processed: allCorpTransactions.length,
-    sheets: { buy: LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET },
-    locked: true // Still conceptually under lock
+    sheets: { buy: LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET }
   };
-  // --- END of code previously locked ---
-
-  // --- ANCHORING WRITE LOGIC (now runs under main lock) ---
-  if (allCorpTransactions.length > 0) {
-    const newestTransactionId = allCorpTransactions[0].transaction_id;
-    props.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
-    log.log(`Saved new transaction anchor: ${newestTransactionId}`);
-  }
-
-  return result; // Return actual result
 }
 
 /**
@@ -1033,9 +1117,48 @@ function runLootDeltaPhase(ss) {
 }
 
 /**
- * REFACTORED GOLD STANDARD: Fetches, Normalizes, and SEGREGATES data by Buy/Sale type.
- * Returns an object with two distinct keys: { buyData: { contracts, items }, saleData: { contracts, items } }
+ * Resets the Contract Sync Anchor and Locks.
+ * Forces the next 'runContractLedgerPhase' to re-scan ALL contracts
+ * within the lookback window (e.g., 30 days) and re-process them.
  */
+function resetContractSync() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    Logger.log("⚠️ Reset failed: Script Lock busy. Try again.");
+    return;
+  }
+
+  try {
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
+    
+    // Keys defined in GESI Extentions.js
+    const ANCHOR_KEY = 'lastProcessedContractId'; // PROP_KEY_LAST_CONTRACT_ID
+    const LEASE_KEY = 'contractJobLeaseUntil';    // PROP_KEY_CONTRACT_LEASE
+    const COGS_FLAG = 'cogsJobStep';              // PROP_KEY_COGS_STEP
+
+    // 1. Delete the Anchor (Forces re-scan of old contracts)
+    SCRIPT_PROP.deleteProperty(ANCHOR_KEY);
+    
+    // 2. Clear Lease (Unblocks execution if stuck)
+    SCRIPT_PROP.deleteProperty(LEASE_KEY);
+
+    // 3. Clear COGS Flag (Resets finalizer state)
+    SCRIPT_PROP.deleteProperty(COGS_FLAG);
+    
+    Logger.log("✅ Contract Sync Reset Complete.");
+    Logger.log("Next run will process ALL contracts in the lookback window.");
+
+    if (typeof SpreadsheetApp !== 'undefined') {
+      SpreadsheetApp.getUi().alert("Contract Sync Reset. The next run will be a full re-scan.");
+    }
+
+  } catch (e) {
+    Logger.log("❌ Error resetting contract sync: " + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function syncContracts(ss, charIdMap) {
   var log = LoggerEx.withTag('GESI');
 
@@ -1053,10 +1176,12 @@ function syncContracts(ss, charIdMap) {
   var authToon = getCorpAuthChar(ss);
   var myCharId = charIdMap[authToon] || null; // CRITICAL: Get the ESI ID for sale/buy checks
   var allNames = getCharNamesFast();
-  const idNameMap = Object.entries(charIdMap).reduce((acc, [name, id]) => {
-    acc[String(id)] = name;
-    return acc;
-  }, {});
+  const idNameMap = {};
+  Object.entries(charIdMap).forEach(([name, id]) => {
+    // We map IDs for ALL corp members so we can resolve names of unauthed acceptors,
+    // but we only fetch FOR the authed list above.
+    idNameMap[String(id)] = name;
+  });
 
   // FINAL DATA ARRAYS (Combined and Segregated)
   var outC_Combined = []; // For writing to Contracts (RAW)
@@ -1072,19 +1197,31 @@ function syncContracts(ss, charIdMap) {
     // --- 1 & 2: Fetch Char & Corp Data ---
     const allCharContractsRaw = [];
     allNames.forEach(charName => {
-      const contracts = GESI.invokeRaw(EP_LIST_CHAR, {
-        name: charName,
-        status: status,
-        show_column_headings: false,
-        version: null
-      });
-      // CRITICAL FIX: Always push the result array (empty or full) to maintain alignment
-      // with the index position of charName in allNames.
-      allCharContractsRaw.push(contracts || []);
+      try {
+        const contracts = GESI.invokeRaw(EP_LIST_CHAR, {
+          name: charName,
+          status: status,
+          show_column_headings: false,
+          version: null
+        });
+        // CRITICAL FIX: Always push the result array (empty or full) to maintain alignment
+        // with the index position of charName in allNames.
+        allCharContractsRaw.push(contracts || []);
+        if (contracts && contracts.length > 0) {
+          LoggerEx.debug("charName: " + charName + " contracts: " + JSON.stringify(contracts));
+        }
 
-      if (contracts && contracts.length > 0) {
-        LoggerEx.debug("charName: " & charName & " contracts: " & JSON.stringify(contracts));
+      } catch (e) {
+        // LOG THE SPECIFIC CHARACTER THAT FAILED
+        log.error(`[SyncContracts] FAILED to fetch contracts for character: ${charName}. Error: ${e.message}`);
+
+        // OPTION A: Fail hard (re-throw) if you want the job to stop
+        //throw new Error(`Auth Error for ${charName}: ${e.message}`);
+
+        // OPTION B: (Recommended) Push empty array and continue, so other chars still sync
+        allCharContractsRaw.push([]);
       }
+
     });
     const resCorp = GESI.invokeRaw(EP_LIST_CORP, {
       status: status,
@@ -1110,7 +1247,7 @@ function syncContracts(ss, charIdMap) {
       }
 
       if (!cid || seenCids.has(cid)) continue;
-
+      if (cid > maxContractId) maxContractId = cid;
       // --- Determine Buy or Sale Status ---
       const isSale = (c.status === 'finished' || c.status === 'completed') &&
         (c.issuer_id === myCharId);
@@ -1125,7 +1262,7 @@ function syncContracts(ss, charIdMap) {
 
       // Standardized Item Row (6 columns)
       const isCorp = (tuple.ch === authToon);
-      const itemsRaw = getContractItemsCached(tuple.ch, cid, false, isCorp) || [];
+      const itemsRaw = getContractItemsCached(tuple.ch, cid, true, isCorp) || [];
       const items = normalizeItemRows(itemsRaw);
 
       // --- PUSH TO SEGREGATED AND COMBINED ARRAYS ---
@@ -1297,7 +1434,7 @@ function triggerContractUnitCostsFinalization() {
 
 /**
  * Worker function that executes the expensive COGS allocation logic.
- * Run asynchronously by a trigger.
+ * NOW CHECKS DEPENDENCIES: Loot, Journal, and Contracts must have run at least once.
  */
 function _runRebuildContractUnitCostsWorker() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1305,20 +1442,40 @@ function _runRebuildContractUnitCostsWorker() {
   const funcName = '_runRebuildContractUnitCostsWorker';
 
   const workerFunc = () => {
-    LoggerEx.withTag('COGS_WORKER').info('Running contract unit costs worker.');
+    const log = LoggerEx.withTag('COGS_WORKER');
+    log.info('Running contract unit costs worker.');
 
-    // 1. CHECK STATE: Ensure we are in the correct state for finalization
+    // --- 1. DEPENDENCY CHECK (NEW) ---
+    // Check if the upstream data sources have run at least once successfully.
+    // These keys match what runMaintenanceJobs uses in Orchestrator.js.
+    const tsPrefix = 'MAINTENANCE_LAST_RUN_TS_';
+    const lastLoot = parseInt(SCRIPT_PROP.getProperty(tsPrefix + 'runLootDeltaPhase') || '0', 10);
+    const lastJournal = parseInt(SCRIPT_PROP.getProperty(tsPrefix + 'Ledger_Import_CorpJournal') || '0', 10);
+    const lastContracts = parseInt(SCRIPT_PROP.getProperty(tsPrefix + 'runContractLedgerPhase') || '0', 10);
+
+    if (lastLoot === 0 || lastJournal === 0 || lastContracts === 0) {
+      log.warn('ABORTING COGS: Dependencies missing. Loot, Journal, and Contracts must complete at least once.');
+      log.info(`Debug Status: Loot=${lastLoot > 0}, Journal=${lastJournal > 0}, Contracts=${lastContracts > 0}`);
+
+      // CRITICAL: We clear the flag so the Orchestrator doesn't get stuck in an infinite "Nudge" loop
+      // trying to run this worker when it is destined to fail.
+      SCRIPT_PROP.deleteProperty(PROP_KEY_COGS_STEP);
+      return;
+    }
+    // --------------------------------
+
+    // 2. CHECK STATE: Ensure we are in the correct state for finalization
     if (SCRIPT_PROP.getProperty(PROP_KEY_COGS_STEP) !== STATE_FLAGS_COGS.FINALIZING) {
-      LoggerEx.withTag('COGS_WORKER').warn('COGS worker called outside FINALIZING state. Aborting.');
-      return; // Abort execution if state is incorrect (e.g., triggered manually by accident)
+      log.warn('COGS worker called outside FINALIZING state. Aborting.');
+      return;
     }
 
-    // 2. EXECUTE CORE WORK
+    // 3. EXECUTE CORE WORK
     rebuildContractUnitCosts(ss);
 
-    // 3. CLEAR FLAG: Clear the finalize flag on successful completion
+    // 4. CLEAR FLAG: Clear the finalize flag on successful completion
     SCRIPT_PROP.deleteProperty(PROP_KEY_COGS_STEP);
-    LoggerEx.withTag('COGS_WORKER').info('COGS Finalization flag removed on success.');
+    log.info('COGS Finalization flag removed on success.');
   };
 
   // Use executeWithTryLock from Orchestrator.js to manage the lock
@@ -1802,11 +1959,11 @@ function rebuildContractUnitCosts(ss) {
   }
 }
 
+
 /**
  * Resets the anchor for the Ledger_Import_CorpJournal function,
  * forcing a re-fetch of the full 30-day history on the next run.
- * * NOTE: This relies on constants defined in GESI Extentions.js: 
- * CORP_JOURNAL_LAST_ID and CORP_JOURNAL_RESUME_PROP.
+ * * NOTE: This clears the two script properties that track the ESI cursor.
  */
 function resetCorpJournalImport() {
   // Use a Script Lock to prevent any maintenance job from running during the reset
@@ -1820,9 +1977,10 @@ function resetCorpJournalImport() {
     const SCRIPT_PROP = PropertiesService.getScriptProperties();
     const LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('RESET_TOOL') : console;
 
-    // The keys to delete are defined in GESI Extentions.js
-    const LAST_ID_KEY = 'CORP_JOURNAL_LAST_TRANSACTION_ID'; // CORP_JOURNAL_LAST_ID
-    const RESUME_KEY = 'CORP_JOURNAL_DIV_RESUME';           // CORP_JOURNAL_RESUME_PROP
+
+    // Keys are defined in GESI Extentions.js
+    const LAST_ID_KEY = CORP_JOURNAL_RESUME_PROP; // Mapped from CORP_JOURNAL_LAST_ID
+    const RESUME_KEY = CORP_JOURNAL_LAST_ID;           // Mapped from CORP_JOURNAL_RESUME_PROP
 
     // 1. Delete the last transaction ID anchor
     SCRIPT_PROP.deleteProperty(LAST_ID_KEY);
