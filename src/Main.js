@@ -100,8 +100,9 @@ function generateRestockQuery() {
     WAREHOUSE_QTY: 'Col28',
     DAYS_OF_INV: 'Col29',
     TOTAL_MARKET_QTY: 'Col33',
-    MEDIAN_BUY: 'Col38',          // CORRECTED: Hub Median Buy Price is Col38
-    MARGIN: 'Col45'
+    MEDIAN_BUY: 'Col38',          // Hub Median Buy Price
+    MARGIN: 'Col45',
+    BUY_ACTION: 'Col51'           // Buy Action (Column AZ) - NEW FILTER SOURCE
   };
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -124,12 +125,9 @@ function generateRestockQuery() {
   const limitNum = filterValues[14][0];          // B19 (Index 14)
   const filterVolumeType = filterValues[16][0];  // B21 (Index 16)
   const filterVolumeValue = filterValues[17][0]; // B22 (Index 17)
-  
-  // NEW: Read Ignore Groups List (B26, Index 21)
-  const filterIgnoreGroups = filterValues[21][0];
+  const filterIgnoreGroups = filterValues[21][0]; // B26 (Index 21)
 
   // --- 1.5. READ NAMED RANGES for Fee and Tax Rates ---
-  
   let FEE_RATE = 0;
   try {
     const feeRange = ss.getRangeByName("FEE_RATE");
@@ -146,65 +144,47 @@ function generateRestockQuery() {
     Logger.log(`Named Range TAX_RATE not found or invalid: ${e}`);
   }
 
-  // Calculate the Cost Multiplier for the QUERY string
   const rateMultiplier = (1 + FEE_RATE + TAX_RATE);
 
   // --- 2. BUILD THE SQL STRING (STABILIZED) ---
 
-  // Re-useable calculated quantity field
   const restockQuantityCalc = `(${COL.EFFECTIVE_VELOCITY}*${filterTargetDays})-(${COL.WAREHOUSE_QTY}+${COL.QUANTITY_LEFT})`;
-
-  // NEW calculated Order Cost field: Quantity * Median Buy * Multiplier
   const orderCostCalc = `(${restockQuantityCalc})*${COL.MEDIAN_BUY}*${rateMultiplier}`;
 
-  // SELECT Clause: Item, Quantity (Calc), Median Buy (NEW), Order Cost (NEW Calc), and existing fields
-  const sqlSelect = `SELECT ${COL.ITEM_NAME}, ${restockQuantityCalc}, ${COL.MEDIAN_BUY}, ${orderCostCalc}, ${COL.TOTAL_MARKET_QTY}, ${COL.VOLUME}, ${COL.MARKET_VOLUME}, ${COL.WAREHOUSE_QTY}, ${COL.MARGIN}`;
+  // SELECT Clause: Includes Buy Action
+  const sqlSelect = `SELECT ${COL.ITEM_NAME}, ${restockQuantityCalc}, ${COL.MEDIAN_BUY}, ${orderCostCalc}, ${COL.TOTAL_MARKET_QTY}, ${COL.VOLUME}, ${COL.MARKET_VOLUME}, ${COL.WAREHOUSE_QTY}, ${COL.MARGIN}, ${COL.BUY_ACTION}`;
 
-  // WHERE Clause: Filters by MinDays (B5) and Margin (B9)
-  let sqlWhere = `WHERE (${COL.DAYS_OF_INV}<${filterMinDays} AND ${COL.MARGIN}>=${filterMargin} AND ${COL.ITEM_NAME} IS NOT NULL`;
+  // WHERE Clause: Removed Condition, Added Buy Action Filter (NO 'SKIP' ITEMS)
+  let sqlWhere = `WHERE (${COL.DAYS_OF_INV}<${filterMinDays} AND ${COL.MARGIN}>=${filterMargin} AND ${COL.ITEM_NAME} IS NOT NULL AND ${restockQuantityCalc} > 0 AND NOT ${COL.BUY_ACTION} CONTAINS 'SKIP'`;
 
-  // --- ***** CORRECTED "Ignore Group" Filter Logic ***** ---
+  // Ignore Group Filter
   if (filterIgnoreGroups && filterIgnoreGroups.toString().trim() !== "") {
     const groupsToExclude = filterIgnoreGroups.toString()
       .split(',')
       .map(g => `'${g.trim().toLowerCase().replace(/'/g, `''`)}'`)
-      .join('|'); // Join with a comma
-      
-    // Use the correct "NOT ... IN" syntax
+      .join('|');
     sqlWhere += ` AND NOT LOWER(${COL.GROUP}) MATCHES (${groupsToExclude})`;
   }
   
-  // Add Volume Filter logic (from B21 and B22)
+  // Volume Filters
   const numVolumeValue = parseFloat(filterVolumeValue);
   switch (filterVolumeType) {
-    case "30 Day Active":
-      sqlWhere += ` AND ${COL.VOLUME}>0`;
-      break;
-    case "Nonactive Sellers":
-      sqlWhere += ` AND ${COL.VOLUME}=0`;
-      break;
-    case "30 Top Sellers":
-      if (!isNaN(numVolumeValue)) { // Add check for valid number
-        sqlWhere += ` AND ${COL.VOLUME}<${numVolumeValue}`;
-      }
-      break;
-    case "30 Low Sellers":
-      if (!isNaN(numVolumeValue)) { // Add check for valid number
-        sqlWhere += ` AND ${COL.VOLUME}>${numVolumeValue}`;
-      }
-      break;
+    case "30 Day Active": sqlWhere += ` AND ${COL.VOLUME}>0`; break;
+    case "Nonactive Sellers": sqlWhere += ` AND ${COL.VOLUME}=0`; break;
+    case "30 Top Sellers": if (!isNaN(numVolumeValue)) sqlWhere += ` AND ${COL.VOLUME}<${numVolumeValue}`; break;
+    case "30 Low Sellers": if (!isNaN(numVolumeValue)) sqlWhere += ` AND ${COL.VOLUME}>${numVolumeValue}`; break;
   }
 
-  // "SELECT ALL GROUPS" logic (if B11 is NOT BLANK)
+  // Group Filter
   if (filterGroup && filterGroup.toString().trim() !== "") {
     const safeFilterGroup = filterGroup.toString().toLowerCase().replace(/'/g, `''`);
     sqlWhere += ` AND LOWER(${COL.GROUP}) CONTAINS '${safeFilterGroup}'`;
   }
   
-  sqlWhere += `)`; // Close the WHERE parenthesis
+  sqlWhere += `)`; 
 
-  // STABILIZE SORT COLUMN
-  let sortCol = "Col2"; // Default to sorting by "Quantity"
+  // SORT COLUMN
+  let sortCol = "Col2"; 
   switch (sortColumnHeader.toString().trim()) {
     case 'Item Name': sortCol = "Col1"; break;
     case 'Quantity': sortCol = "Col2"; break;
@@ -212,38 +192,25 @@ function generateRestockQuery() {
     case 'Order Cost': sortCol = "Col4"; break;
     case 'Total Market Quantity': sortCol = "Col5"; break;
     case '30-day traded volume':
-    case 'Volume':
-      sortCol = "Col6"; break;
+    case 'Volume': sortCol = "Col6"; break;
     case 'Listed Volume (Feed Sell)':
-    case 'Market_Volume':
-      sortCol = "Col7"; break;
+    case 'Market_Volume': sortCol = "Col7"; break;
     case 'Warehouse Qty': sortCol = "Col8"; break;
     case 'Margin': sortCol = "Col9"; break;
+    case 'Buy Action': sortCol = "Col10"; break; 
   }
 
-  // --- 3. ASSEMBLE AND WRITE THE FINAL FORMULA ---
   const orderBySql = `ORDER BY ${sortCol} ${sortDirection}`;
-
   const limitSql = (limitNum == "No Limit" || !limitNum || !limitNum == 0) ? "" : `LIMIT ${limitNum}`;
 
-  // --- ***** CORRECTED `LABEL` Clause (Using your confirmed-working syntax) ***** ---
-  const sqlLabel = `LABEL ${restockQuantityCalc} 'Quantity', ${COL.MEDIAN_BUY} 'Median Buy Price', ${orderCostCalc} 'Order Cost'`;
+  // LABEL Clause
+  const sqlLabel = `LABEL ${restockQuantityCalc} 'Quantity', ${COL.MEDIAN_BUY} 'Median Buy Price', ${orderCostCalc} 'Order Cost', ${COL.BUY_ACTION} 'Buy Action'`;
   const dataRangeRef = 'MarketOverviewData!B3:BA687';
 
-  // Join all clauses in the correct SQL order
-  const finalQueryString = [
-    sqlSelect,
-    sqlWhere,
-    orderBySql,
-    limitSql,
-    sqlLabel
-  ].join(' ');
-
+  const finalQueryString = [sqlSelect, sqlWhere, orderBySql, limitSql, sqlLabel].join(' ');
   const finalFormula = `=IF(Utility!B3<>1,, QUERY(${dataRangeRef}, "${finalQueryString.trim()}", 1))`;
 
-  // Write to the target cell (Need To Buy!C4)
   sheet.getRange(TARGET_CELL).setFormula(finalFormula);
-
   Logger.log(`Successfully updated restock query in ${TARGET_CELL}.`);
 }
 
@@ -274,7 +241,7 @@ function getStructureNames(structureIDs) {
 }
 
 function updateControlSheet() {
-  if (isSdeJobRunning()) { 
+  if (typeof isSdeJobRunning !== 'undefined' && isSdeJobRunning()) { 
     Logger.log("updateControlSheet skipped: SDE Job is running.");
     return;
   }
@@ -340,7 +307,7 @@ function updateControlSheet() {
   // =================================================================
   // 2. READ LOCATIONS
   // =================================================================
-  const locHeaderRowIdx = 4; // Row 5
+  const locHeaderRowIdx = 4; // Row 5 (based on your provided CSV structure)
   const locDataRaw = locationSheet.getDataRange().getValues();
   if (locDataRaw.length <= locHeaderRowIdx) throw new Error("Location sheet too short.");
 
@@ -369,7 +336,10 @@ function updateControlSheet() {
   // =================================================================
   // 3. GENERATE, DEDUPE, & SORT
   // =================================================================
-  withSheetLock(function () {
+  
+  const runLocked = (typeof withSheetLock !== 'undefined') ? withSheetLock : (cb) => cb();
+
+  runLocked(function () {
     controlSheet.clear();
     const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
     controlSheet.getRange(1, 1, 1, 4).setValues(headers);
@@ -396,12 +366,17 @@ function updateControlSheet() {
     
     log.info(`Deduplication: Removed ${output.length - dedupedOutput.length} duplicates.`);
 
-    // --- SORTING ---
-    // 1. Type ID (Asc) -> 2. Location Type (Str Asc) -> 3. Location ID (Num Asc)
+    // --- SORTING (GROUP BY LOCATION) ---
+    // Order: Location ID -> Location Type -> Type ID
     dedupedOutput.sort((a, b) => {
-      if (a[0] !== b[0]) return a[0] - b[0]; // Type ID
-      if (a[1] !== b[1]) return a[1].localeCompare(b[1]); // Location Type
-      return a[2] - b[2]; // Location ID
+      // 1. Location ID (Index 2)
+      if (a[2] !== b[2]) return a[2] - b[2]; 
+      
+      // 2. Location Type (Index 1) - Tie breaker for ID
+      if (a[1] !== b[1]) return a[1].localeCompare(b[1]);
+      
+      // 3. Type ID (Index 0) - Sort items within location
+      return a[0] - b[0]; 
     });
 
     if (dedupedOutput.length > 0) {
@@ -415,7 +390,7 @@ function updateControlSheet() {
     log.info(`Successfully wrote ${dedupedOutput.length} sorted rows.`);
   });
   
-  SpreadsheetApp.getUi().alert(`Done. Wrote ${uniqueItemIds.length * locations.length} rows (Sorted & Deduped).`);
+  SpreadsheetApp.getUi().alert(`Done. Rebuilt Control Sheet (Grouped by Location).`);
 }
 
 /**

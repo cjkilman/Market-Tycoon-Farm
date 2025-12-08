@@ -556,6 +556,7 @@ function isSdeJobRunning() {
 
 /**
  * STAGE 1: START (Called by user)
+ * Updated to include ALL required SDE files.
  */
 function sde_job_START() {
   console.log('--- SDE JOB START INITIATED (Silent Mode) ---');
@@ -567,13 +568,12 @@ function sde_job_START() {
 
   // --- Robust Lock Handling ---
   const lock = LockService.getScriptLock();
-  let lockAcquired = false; // Flag to track lock state
+  let lockAcquired = false; 
   try {
     console.log('START: Attempting to acquire ScriptLock (max wait 7 min)...');
-    lock.waitLock(420000); // Wait up to 7 minutes
-    lockAcquired = true; // Set flag ONLY if waitLock() succeeds
+    lock.waitLock(420000); 
+    lockAcquired = true; 
     console.log('START: ScriptLock acquired.');
-    // --- END Robust Lock Handling ---
 
     SCRIPT_PROPS.setProperty(KEY_JOB_RUNNING, 'true');
 
@@ -582,35 +582,60 @@ function sde_job_START() {
     const loadingHelper = ss.getRange("'Utility'!B3:C3");
     const backupSettings = loadingHelper.getValues();
     loadingHelper.setValues([[0, 0]]);
-    // --- YOUR SUGGESTED FLUSH ---
-    SpreadsheetApp.flush(); // Forces the sheet to update NOW
-    // --- END FLUSH ---
+    SpreadsheetApp.flush(); 
     SCRIPT_PROPS.setProperty(KEY_BACKUP_SETTINGS, JSON.stringify(backupSettings));
 
     // --- Setting MAINTENANCE FLAG ---
     console.log('START: Setting system to MAINTENANCE mode.');
     SCRIPT_PROPS.setProperty(GLOBAL_STATE_KEY, 'MAINTENANCE');
-    // We still delete the master orchestrator to be safe
     _deleteTriggersFor('masterOrchestrator');
     console.log('START: Orchestrator trigger deleted. System is halted.');
-    // --- END: MAINTENANCE FLAG ---
 
-    // Define the Job List
-    const { SdePage } = sdeLib(); // Get SdePage class from the library
+    // --- DEFINE THE FULL JOB LIST HERE ---
+    const { SdePage } = sdeLib(); 
     const sdePages = [
-                    new SdePage(
-                    "SDE_invTypes",
-                    "invTypes.csv",
-                      // Optional headers,  
-                      // invTypes is 100+ megabytes. Select columns needed to help it load faster. 
-                      [ "typeID","groupID","typeName","volume","marketGroupID"]
-                      )
+        // 1. Inventory Types (Heavy - Specific Columns)
+        new SdePage(
+            "SDE_invTypes",
+            "invTypes.csv",
+            ["typeID", "groupID", "typeName", "volume", "marketGroupID"] 
+        ),
+        // 2. Industry Materials (Heavy - All Columns)
+        new SdePage(
+            "SDE_industryActivityMaterials",
+            "industryActivityMaterials.csv",
+            null // null = Grab ALL columns
+        ),
+        // 3. Industry Products (Medium - All Columns)
+        new SdePage(
+            "SDE_industryActivityProducts",
+            "industryActivityProducts.csv",
+            null
+        ),
+        // 4. Inventory Groups (Light)
+        new SdePage(
+            "SDE_invGroups",
+            "invGroups.csv",
+            null
+        ),
+        // 5. Inventory Categories (Light)
+        new SdePage(
+            "SDE_invCategories",
+            "invCategories.csv",
+            null
+        ),
+        // 6. Stations (Medium)
+        new SdePage(
+            "SDE_staStations",
+            "staStations.csv",
+            null
+        )
     ];
 
     // Save State & Start First Trigger
     SCRIPT_PROPS.setProperty(KEY_JOB_LIST, JSON.stringify(sdePages));
     SCRIPT_PROPS.setProperty(KEY_JOB_INDEX, '0');
-    SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, '0'); // Initialize chunk index
+    SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, '0'); 
     _deleteTriggersFor('sde_job_PROCESS');
     Logger.log(`START: Saved ${sdePages.length} pages. Creating trigger for sde_job_PROCESS.`);
     ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(5000).create();
@@ -618,7 +643,6 @@ function sde_job_START() {
   } catch (e) {
     if (!lockAcquired) {
       console.error(`START: Failed to acquire ScriptLock. Another process is running. Aborting. ${e.message}`);
-      Logger.log('START: Failed to acquire ScriptLock. Aborting.');
     } else {
       Logger.log(`ERROR in sde_job_START: ${e.message} at line ${e.lineNumber}. SYSTEM HALTED.`);
     }

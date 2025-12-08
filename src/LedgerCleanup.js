@@ -1,24 +1,26 @@
+/* global SpreadsheetApp, LoggerEx, PT, writeDataToSheet */
+
 /**
  * Utility function to clean and normalize all data in the Material Ledger sheet.
- * This is primarily intended to fix corrupted data types (like quoted numbers
- * and Excel date serial numbers with commas/quotes) imported from CSV/API sources.
- *
- * NOTE: Assumes PT (Project Time) library and LoggerEx are available globally.
+ * FIXES:
+ * 1. Maps Array-rows to Objects so normalizeRow_ can read them.
+ * 2. Uses 'writeDataToSheet' to handle large data volumes (fixes Cell Limit crashes).
+ * 3. Corrects function naming typos.
  */
 function cleanupLedgerSheet(sheetName) {
   // Use 'Material_Ledger' as the default sheet name
   sheetName = sheetName || 'Material_Ledger';
   
-  // A helper to get the spreadsheet object (assuming global access from Utility.js)
+  // A helper to get the spreadsheet object
   const getSS_ = () => SpreadsheetApp.getActiveSpreadsheet();
 
-  // Header definition copied from MaterialLedger.js
+  // Header definition - MUST match the column order in your sheet
   const HEAD = ['date', 'type_id', 'item_name', 'qty', 'unit_value', 'source', 'contract_id', 'char', 'unit_value_filled'];
 
-  // Logger instance (assuming global access from Logger.js)
+  // Logger instance
   const LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('ML_CLEANUP') : console;
 
-  // Function to get PT API (copied from MaterialLedger.js for date handling)
+  // Function to get PT API
   function getPT_() {
     try {
         if (typeof PT !== 'undefined' && PT.yyyymmdd) return PT;
@@ -27,53 +29,36 @@ function cleanupLedgerSheet(sheetName) {
     }
     return null;
   }
-  const PT_API = getPT_();
   
-  // Helper to safely parse and clean a string value for conversion to number.
-  function cleanValue(v) {
-    if (typeof v === 'string') {
-        // Remove quotes, commas, and any non-numeric suffixes (like 'ISK')
-        v = v.replace(/"/g, '').replace(/,/g, '').replace(/ISK/g, '').trim();
-    }
-    return v;
-  }
-
- // Normalize one logical row → the HEAD order
+  // Normalize one logical row → the HEAD order
   function normalizeRow_(r) {
     var out = {};
     const PT_API = getPT_();
     
-    // --- Date Parsing (FIXED) ---
+    // --- Date Parsing ---
     let dateVal = r.date;
-
-    // 1. Attempt to parse date only if it's NOT already a valid Date object.
     if (!(dateVal instanceof Date)) {
-        // Use PT_API safe parsing if available, otherwise rely on new Date()
+        // Simple fallback parsing if PT is missing
         dateVal = PT_API ? PT_API.parseDateSafe(dateVal) : new Date(dateVal);
     }
-    
-    // 2. Validate the resulting date object. If it's not a valid date, 
-    // default to today's date.
-    let validDate = (dateVal instanceof Date) && !isNaN(dateVal);
-    let dateToFormat = validDate ? dateVal : (PT_API ? PT_API.now() : new Date());
+    let validDate = (dateVal instanceof Date) && !isNaN(dateVal.getTime());
+    let dateToFormat = validDate ? dateVal : new Date();
 
-    // 3. Format the valid date object.
     out.date = PT_API
                ? PT_API.yyyymmdd(dateToFormat)
                : Utilities.formatDate(dateToFormat, Session.getScriptTimeZone(), "yyyy-MM-dd");
     
-    // --- Other Fields (Retaining previous fixes for numeric types) ---
+    // --- Other Fields ---
     out.type_id = r.type_id;
     out.item_name = r.item_name || '';
 
-    // Numeric fields
-   out.qty = Number(String(r.qty).replace(/,/g, '')) || 0;
+    // Numeric fields: Remove commas if present in string representation
+    out.qty = Number(String(r.qty).replace(/,/g, '')) || 0;
 
-    var u0 = +r.unit_value || 0; // Manual override (Number: 0 or >0)
-    var u1 = +r.unit_value_filled || 0; // Calculated value (Number: 0 or >0)
+    var u0 = Number(String(r.unit_value).replace(/[^0-9.]/g, '')) || 0; 
+    var u1 = Number(String(r.unit_value_filled).replace(/[^0-9.]/g, '')) || 0;
 
     out.unit_value = u0 > 0 ? u0 : ''; 
-
     out.source = r.source || '';
     out.contract_id = r.contract_id || '';
     out.char = r.char || '';
@@ -81,9 +66,9 @@ function cleanupLedgerSheet(sheetName) {
     var finalUnitValue = u0 > 0 ? u0 : (u1 > 0 ? u1 : 0);
     out.unit_value_filled = finalUnitValue > 0 ? finalUnitValue : '';
 
-    // --- Final Mapping ---
+    // --- Final Mapping to Array ---
     return HEAD.map(function (k) { return (out[k] == null ? '' : out[k]); });
-}
+  }
 
   // --- MAIN EXECUTION ---
   try {
@@ -96,34 +81,63 @@ function cleanupLedgerSheet(sheetName) {
     }
 
     const lastRow = sh.getLastRow();
-    const lastCol = HEAD.length; // Use fixed column count to prevent reading extra columns
-
+    
+    // If empty, stop
     if (lastRow < 2) {
       LOG.info(`Ledger is empty (only header row). Nothing to clean.`);
       return 0;
     }
 
-    // Read all data including the header, only up to the expected number of columns
-    const rawValues = sh.getRange(1, 1, lastRow, lastCol).getValues();
+    // 1. Read all data including header
+    // We strictly read the width of HEAD to avoid grabbing empty columns
+    const rawValues = sh.getRange(1, 1, lastRow, HEAD.length).getValues();
 
     const header = rawValues[0];
     const dataRows = rawValues.slice(1);
 
-    // Filter out blank rows and clean the remaining data
+    // 2. Process Data
     const cleanedData = dataRows
-      // Filter out any row where joining the values results in an empty string
-      .filter(row => row.map(v => String(v)).join('').trim() !== '') 
-      .map(row => normalizeRow(row));
+      .filter(row => row.join('').trim() !== '') // Remove totally empty rows
+      .map(rowArray => {
+          // [CRITICAL FIX]: Map Array -> Object
+          let rowObj = {};
+          HEAD.forEach((colName, index) => {
+              rowObj[colName] = rowArray[index];
+          });
+          // Now pass the Object to the normalizer
+          return normalizeRow_(rowObj);
+      });
 
-    // Reconstruct the final array with header
+    // Reconstruct final array
     const finalData = [header].concat(cleanedData);
 
-    // Clear everything and overwrite the sheet content
+    // 3. SAFE WRITE BACK (Chunked)
+    // Clear the sheet first to remove old/bad data
     sh.clearContents();
-    sh.getRange(1, 1, finalData.length, HEAD.length).setValues(finalData);
 
-    LOG.info(`Successfully cleaned and rewrote ${cleanedData.length} rows in '${sheetName}'.`);
-    SpreadsheetApp.getUi().alert(`Cleanup successful! Rewrote ${cleanedData.length} rows in '${sheetName}'.`);
+    // Use writeDataToSheet from Utility.js to handle limits
+    if (typeof writeDataToSheet !== 'function') {
+        throw new Error("Utility.js not found or writeDataToSheet missing.");
+    }
+
+    const writeState = {
+        logInfo: LOG.info,
+        logError: LOG.error,
+        logWarn: LOG.warn,
+        config: {
+            MAX_CELLS_PER_CHUNK: 50000, // Safe chunk size
+            TARGET_WRITE_TIME_MS: 2000
+        }
+    };
+
+    const result = writeDataToSheet(sheetName, finalData, 1, 1, writeState);
+
+    if (result.success) {
+        LOG.info(`Successfully cleaned and rewrote ${cleanedData.length} rows.`);
+        SpreadsheetApp.getUi().alert(`Cleanup successful! Processed ${cleanedData.length} rows.`);
+    } else {
+        throw new Error(result.error || "Write failed during chunking.");
+    }
 
     return cleanedData.length;
 
@@ -131,5 +145,27 @@ function cleanupLedgerSheet(sheetName) {
     LOG.error(`Cleanup failed for ${sheetName}: ${e.message}`);
     SpreadsheetApp.getUi().alert(`Error during cleanup: ${e.message}`);
     throw e;
+  }
+}
+
+function fixMaterialLedgerHeaders() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // CORRECT: Only pass the sheet name here
+  var sheet = ss.getSheetByName("Material_Ledger");
+  
+  // Headers defined locally
+  var HEAD = ['date', 'type_id', 'item_name', 'qty', 'unit_value', 'source', 'contract_id', 'char', 'unit_value_filled'];
+  
+  if (sheet) {
+    // 1. Shift existing data down
+    sheet.insertRowBefore(1);
+    
+    // 2. Write headers into the new empty row
+    sheet.getRange(1, 1, 1, HEAD.length).setValues([HEAD]);
+    
+    Logger.log("Success: Material Ledger headers have been restored.");
+  } else {
+    Logger.log("Error: Sheet 'Material_Ledger' not found.");
   }
 }

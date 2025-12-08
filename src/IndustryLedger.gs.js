@@ -751,9 +751,20 @@ function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
   // _getCorporateJobsRaw(false) ensures we use the CACHED data from Phase 0.
   const rawJobData = _getCorporateJobsRaw(false); 
 
+// 2. Attempt 2: Lazy Load (Self-Healing)
+  // If cache is empty, force a live fetch immediately.
+  if (!rawJobData) {
+    LOG_INDUSTRY.info("Industry Cache Miss. Triggering self-healing LIVE fetch...");
+    try {
+      rawJobData = _getCorporateJobsRaw(true); // Force Refresh
+    } catch (e) {
+      LOG_INDUSTRY.error("Self-healing fetch failed: " + e.message);
+    }
+  }
+
+  // 3. Final Data Check
   if (!rawJobData || rawJobData.length === 0) { 
-    // This logs the original critical error but now correctly returns if the cache is empty.
-    LOG_INDUSTRY.error("Error reading ESI Corp Jobs: Raw job data is empty or fetch failed."); 
+    LOG_INDUSTRY.warn("Error reading ESI Corp Jobs: No job data found (Cache & Live failed)."); 
     return []; 
   }
   

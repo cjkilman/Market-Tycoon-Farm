@@ -104,17 +104,57 @@ function prepareTempSheet(ss, sheetName, headers) {
 
 /**
  * [THE BUILDER] - Safe, Non-Destructive Sheet Creator.
+ * UPDATED: Includes 'fixHeaders' argument to repair missing/mismatched headers.
+ * * @param {Spreadsheet} ss - The spreadsheet object.
+ * @param {string} name - The name of the sheet.
+ * @param {Array} headers - 1D array of header strings.
+ * @param {boolean} [fixHeaders=false] - If true, checks Row 1 for mismatch and inserts headers if needed.
  */
-function getOrCreateSheet(ss, name, headers) {
+function getOrCreateSheet(ss, name, headers, fixHeaders = false) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(name);
+  
+  // 1. Create if missing
   if (!sheet) {
     console.log(`Creating new sheet: '${name}'`);
     sheet = ss.insertSheet(name);
-    if (headers && headers.length > 0) {
+  }
+  
+  // 2. Handle Headers
+  if (headers && headers.length > 0) {
+    const lastRow = sheet.getLastRow();
+    const maxCols = sheet.getMaxColumns();
+
+    // Safety: Ensure sheet has enough columns for the headers
+    if (maxCols < headers.length) {
+      sheet.insertColumnsAfter(maxCols, headers.length - maxCols);
+    }
+
+    // Case A: Sheet is empty (Safe to write headers)
+    if (lastRow === 0) {
       sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+      console.log(`Headers written to new/empty sheet '${name}'`);
+    } 
+    // Case B: Sheet has data, check for Repair (Only if fixHeaders is TRUE)
+    else if (fixHeaders === true) {
+       // Read current row 1 to see if it matches
+       const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+       
+       // Compare contents
+       const isMismatch = JSON.stringify(currentHeaders) !== JSON.stringify(headers);
+
+       if (isMismatch) {
+         console.warn(`[getOrCreateSheet] Header mismatch detected in '${name}'. Repairing...`);
+         
+         // CRITICAL: Shift existing data down to Row 2 to prevent overwriting
+         sheet.insertRowBefore(1);
+         
+         // Write correct headers into the NEW empty Row 1
+         sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+       }
     }
   }
+  
   return sheet;
 }
 
