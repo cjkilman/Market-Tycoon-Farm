@@ -535,8 +535,8 @@ function runIndustryLedgerUpdate() {
 
   // 7. Upsert and Save State
   if (ledgerObjects.length > 0) {
-  const result = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
-   LOG_INDUSTRY.info(`Successfully processed and wrote ${result.rows} new manufacturing jobs to the Material_Ledger.`);
+    const result = ledgerAPI.upsert(['source', 'contract_id'], ledgerObjects);
+    LOG_INDUSTRY.info(`Successfully processed and wrote ${result.rows} new manufacturing jobs to the Material_Ledger.`);
   } else {
     LOG_INDUSTRY.info("Finished processing. No new rows to write to Material_Ledger.");
   }
@@ -746,12 +746,12 @@ function _getSdeNameMap(ss) {
  */
 function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
   // ss parameter is retained for compatibility but not used for sheet reading.
-  
+
   // 1. Get raw job data (reads from cache/live API via helper)
   // _getCorporateJobsRaw(false) ensures we use the CACHED data from Phase 0.
-  const rawJobData = _getCorporateJobsRaw(false); 
+  const rawJobData = _getCorporateJobsRaw(false);
 
-// 2. Attempt 2: Lazy Load (Self-Healing)
+  // 2. Attempt 2: Lazy Load (Self-Healing)
   // If cache is empty, force a live fetch immediately.
   if (!rawJobData) {
     LOG_INDUSTRY.info("Industry Cache Miss. Triggering self-healing LIVE fetch...");
@@ -763,27 +763,27 @@ function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
   }
 
   // 3. Final Data Check
-  if (!rawJobData || rawJobData.length === 0) { 
-    LOG_INDUSTRY.warn("Error reading ESI Corp Jobs: No job data found (Cache & Live failed)."); 
-    return []; 
+  if (!rawJobData || rawJobData.length === 0) {
+    LOG_INDUSTRY.warn("Error reading ESI Corp Jobs: No job data found (Cache & Live failed).");
+    return [];
   }
-  
+
   // 2. Define the expected keys (headers) and activity set
   const newJobs = [];
   const activitySet = new Set(activityIds);
-  
+
   // 3. Process the array of objects directly from the API helper
-  for (const jobObj of rawJobData) { 
+  for (const jobObj of rawJobData) {
     const job_id = Number(jobObj.job_id);
 
     // Filter by status, activity, and whether it has been processed
-    if (jobObj.status === 'delivered' && 
-        activitySet.has(Number(jobObj.activity_id)) && 
-        !processedJobIds.has(job_id)) {
-      
+    if (jobObj.status === 'delivered' &&
+      activitySet.has(Number(jobObj.activity_id)) &&
+      !processedJobIds.has(job_id)) {
+
       // Data is already an array of objects, just validate and push
       newJobs.push({
-        job_id: job_id, 
+        job_id: job_id,
         activity_id: Number(jobObj.activity_id),
         blueprint_type_id: Number(jobObj.blueprint_type_id),
         product_type_id: Number(jobObj.product_type_id),
@@ -795,7 +795,7 @@ function _getNewCompletedJobs(ss, processedJobIds, activityIds) {
       });
     }
   }
-  
+
   return newJobs;
 }
 
@@ -931,7 +931,9 @@ function _getBpoAmortizationMap(ss) {
       }
       const product_id = productObj.productTypeID;
 
-      const localValue = blendedCostMap.get(product_id) || marketMedianMap.get(product_id) || 0;
+      // FIX: Look up the BLUEPRINT price (1032), not the Product (399).
+      // Fallback to 91160 (NPC Base Price) if market data is missing.
+      const localValue = blendedCostMap.get(bp_type_id) || marketMedianMap.get(bp_type_id) || 91160;
 
       // Collect data needed for final calculation pass
       amortizationData.push({ bpId: bp_type_id, productId: product_id, runs: totalRuns, localValue: localValue });
@@ -1456,7 +1458,7 @@ function GESI_CORP_JOBS_CACHED(name, include_completed) {
     Logger.log('[CIJ_SHEET] Cache Miss. Triggering LIVE fetch.');
     try {
       // Force a live refresh. This may take a few seconds.
-      rawData = _getCorporateJobsRaw(true); 
+      rawData = _getCorporateJobsRaw(true);
     } catch (e) {
       Logger.log(`[CIJ_SHEET] Live fetch failed: ${e.message}`);
       return [['ERROR'], [`Live fetch failed: ${e.message}`]];

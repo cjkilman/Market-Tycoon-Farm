@@ -598,7 +598,7 @@ function sde_job_START() {
         new SdePage(
             "SDE_invTypes",
             "invTypes.csv",
-            ["typeID", "groupID", "typeName", "volume", "marketGroupID"] 
+            ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice"] // Add this
         ),
         // 2. Industry Materials (Heavy - All Columns)
         new SdePage(

@@ -1,4 +1,48 @@
 /**
+ * CRITICAL DEBUGGER: Reveals why the Calculator thinks Cost is 199k
+ * Run this function directly.
+ */
+function debugSmallShieldBoosterCost() {
+  const TYPE_ID = 399; // Small Shield Booster I
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  Logger.log("--- DEBUGGING COST FOR TYPE " + TYPE_ID + " ---");
+
+  // 1. Fetch the Blended Costs directly from the map
+  // (We use your existing helper function to see what the script sees)
+  var requiredIds = [34, 35, 36]; // Trit, Pye, Mex
+  var costMap = _getBlendedCostMap(ss, requiredIds);
+  
+  var recipe = [
+    {id: 34, name: "Tritanium", qty: 1327},
+    {id: 35, name: "Pyerite", qty: 481},
+    {id: 36, name: "Mexallon", qty: 113}
+  ];
+  
+  var totalCalc = 0;
+  
+  recipe.forEach(mat => {
+    var price = costMap.get(mat.id) || 0;
+    var lineTotal = price * mat.qty;
+    totalCalc += lineTotal;
+    
+    Logger.log(`Material: ${mat.name} (ID ${mat.id})`);
+    Logger.log(`   > Quantity: ${mat.qty}`);
+    Logger.log(`   > Script Price: ${price.toFixed(2)} ISK`); // <--- LOOK HERE
+    Logger.log(`   > Line Total: ${lineTotal.toFixed(2)} ISK`);
+    
+    if (mat.id === 34 && price > 10) {
+      Logger.log("   *** CRITICAL ALERT: Tritanium Price is suspiciously high! (>10 ISK) ***");
+    }
+  });
+  
+  Logger.log("--------------------------------");
+  Logger.log(`TOTAL CALCULATED BUILD COST: ${totalCalc.toFixed(2)} ISK`);
+  Logger.log(`VS YOUR "EFFECTIVE COST": 199,300.00 ISK`);
+}
+
+
+/**
  * Test function to isolate and debug the invTypes.csv parsing process.
  * Runs the buildSDEs engine for a single, known problem file.
  * * NOTE: This test uses the specific 5 headers that were crashing the process 

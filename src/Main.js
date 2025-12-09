@@ -86,46 +86,52 @@ function respondToEdit(e) { // <-- RENAMED from onEdit
 function generateRestockQuery() {
   const SCRIPT_NAME = 'generateRestockQuery';
   const TARGET_SHEET_NAME = 'Need To Buy';
+  const DATA_SHEET_NAME = 'MarketOverviewData'; // Name of the source data sheet
   const TARGET_CELL = 'C4';
 
-  // --- STABILIZED COLUMN INDICES ---
+  // --- STABILIZED COLUMN INDICES (UPDATED FOR CURRENT CSV) ---
   const COL = {
     ITEM_NAME: 'Col2',
     GROUP: 'Col3',
-    QUANTITY_LEFT: 'Col7',        // "Quantity Left" (Existing Buy Orders)
-    BUY_ORDER_QTY: 'Col15',
-    VOLUME: 'Col20',              // 30-day traded volume
-    MARKET_VOLUME: 'Col21',       // Listed Volume (Feed Sell)
-    EFFECTIVE_VELOCITY: 'Col27',
-    WAREHOUSE_QTY: 'Col28',
-    DAYS_OF_INV: 'Col29',
-    TOTAL_MARKET_QTY: 'Col33',
-    MEDIAN_BUY: 'Col38',          // Hub Median Buy Price
-    MARGIN: 'Col45',
-    BUY_ACTION: 'Col51'           // Buy Action (Column AZ) - NEW FILTER SOURCE
+    QUANTITY_LEFT: 'Col6',        // "Quantity Left"
+    BUY_ORDER_QTY: 'Col18',       
+    VOLUME: 'Col22',              // "30-day traded volume"
+    MARKET_VOLUME: 'Col23',       // "Listed Volume (Feed Sell)"
+    EFFECTIVE_VELOCITY: 'Col30',  // "Effective Daily Velocity"
+    WAREHOUSE_QTY: 'Col31',       // "Warehouse Qty"
+    DAYS_OF_INV: 'Col32',         // "Days of Inventory"
+    TOTAL_MARKET_QTY: 'Col36',    // "Total Market Quantity"
+    MEDIAN_BUY: 'Col40',          // "Hub Median Buy"
+    MARGIN: 'Col47',              // "Margin"
+    BUY_ACTION: 'Col53'           // "Buy Action"
   };
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
+  const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
+
   if (!sheet) {
     Logger.log(`Target sheet ${TARGET_SHEET_NAME} not found.`);
+    return;
+  }
+  if (!dataSheet) {
+    Logger.log(`Data sheet ${DATA_SHEET_NAME} not found.`);
     return;
   }
   
   // --- 1. READ DYNAMIC FILTERS from 'Need To Buy' (Extended Layout) ---
   const filterValues = sheet.getRange('B5:B26').getValues();
 
-  // Map values based on their new cell row (index = row_num - 5)
-  const filterMinDays = parseFloat(filterValues[0][0]) || 0;      // B5 (Index 0)
-  const filterTargetDays = parseFloat(filterValues[2][0]) || 0;   // B7 (Index 2)
-  const filterMargin = parseFloat(filterValues[4][0]) || 0;       // B9 (Index 4)
-  const filterGroup = filterValues[6][0];        // B11 (Index 6)
-  const sortDirection = filterValues[8][0];      // B13 (Index 8)
-  const sortColumnHeader = filterValues[9][0];   // B14 (Index 9)
-  const limitNum = filterValues[14][0];          // B19 (Index 14)
-  const filterVolumeType = filterValues[16][0];  // B21 (Index 16)
-  const filterVolumeValue = filterValues[17][0]; // B22 (Index 17)
-  const filterIgnoreGroups = filterValues[21][0]; // B26 (Index 21)
+  const filterMinDays = parseFloat(filterValues[0][0]) || 0;      // B5
+  const filterTargetDays = parseFloat(filterValues[2][0]) || 0;   // B7
+  const filterMargin = parseFloat(filterValues[4][0]) || 0;       // B9
+  const filterGroup = filterValues[6][0];        // B11
+  const sortDirection = filterValues[8][0];      // B13
+  const sortColumnHeader = filterValues[9][0];   // B14
+  const limitNum = filterValues[14][0];          // B19
+  const filterVolumeType = filterValues[16][0];  // B21
+  const filterVolumeValue = filterValues[17][0]; // B22
+  const filterIgnoreGroups = filterValues[21][0]; // B26
 
   // --- 1.5. READ NAMED RANGES for Fee and Tax Rates ---
   let FEE_RATE = 0;
@@ -151,10 +157,10 @@ function generateRestockQuery() {
   const restockQuantityCalc = `(${COL.EFFECTIVE_VELOCITY}*${filterTargetDays})-(${COL.WAREHOUSE_QTY}+${COL.QUANTITY_LEFT})`;
   const orderCostCalc = `(${restockQuantityCalc})*${COL.MEDIAN_BUY}*${rateMultiplier}`;
 
-  // SELECT Clause: Includes Buy Action
+  // SELECT Clause
   const sqlSelect = `SELECT ${COL.ITEM_NAME}, ${restockQuantityCalc}, ${COL.MEDIAN_BUY}, ${orderCostCalc}, ${COL.TOTAL_MARKET_QTY}, ${COL.VOLUME}, ${COL.MARKET_VOLUME}, ${COL.WAREHOUSE_QTY}, ${COL.MARGIN}, ${COL.BUY_ACTION}`;
 
-  // WHERE Clause: Removed Condition, Added Buy Action Filter (NO 'SKIP' ITEMS)
+  // WHERE Clause
   let sqlWhere = `WHERE (${COL.DAYS_OF_INV}<${filterMinDays} AND ${COL.MARGIN}>=${filterMargin} AND ${COL.ITEM_NAME} IS NOT NULL AND ${restockQuantityCalc} > 0 AND NOT ${COL.BUY_ACTION} CONTAINS 'SKIP'`;
 
   // Ignore Group Filter
@@ -205,13 +211,18 @@ function generateRestockQuery() {
 
   // LABEL Clause
   const sqlLabel = `LABEL ${restockQuantityCalc} 'Quantity', ${COL.MEDIAN_BUY} 'Median Buy Price', ${orderCostCalc} 'Order Cost', ${COL.BUY_ACTION} 'Buy Action'`;
-  const dataRangeRef = 'MarketOverviewData!B3:BA687';
+  
+  // --- DYNAMIC DATA RANGE CALCULATION ---
+  // Get the last row with data from the MarketOverviewData sheet
+  const lastRow = dataSheet.getLastRow();
+  // Ensure we include the full width (B to BB) and the full height (3 to lastRow)
+  const dataRangeRef = `'${DATA_SHEET_NAME}'!B3:BB${lastRow}`;
 
   const finalQueryString = [sqlSelect, sqlWhere, orderBySql, limitSql, sqlLabel].join(' ');
   const finalFormula = `=IF(Utility!B3<>1,, QUERY(${dataRangeRef}, "${finalQueryString.trim()}", 1))`;
 
   sheet.getRange(TARGET_CELL).setFormula(finalFormula);
-  Logger.log(`Successfully updated restock query in ${TARGET_CELL}.`);
+  Logger.log(`Successfully updated restock query in ${TARGET_CELL} with range ${dataRangeRef}.`);
 }
 
 /**
