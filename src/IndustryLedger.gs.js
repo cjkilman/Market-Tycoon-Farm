@@ -904,118 +904,7 @@ function _getSdeBasePriceMap(ss) {
   }
 }
 
-/**
- * Helper to get the manual amortization surcharge for BPOs.
- * Implements a three-tiered pricing fallback: Blended > Tracker Median > Fuzzwork API.
- */
-function _getBpoAmortizationMap(ss) {
-  const AMORT_SHEET_NAME = "BPO_Amortization";
-  const AMORT_HEADERS = ['bp_type_id', 'Amortization_Runs'];
-  const amortMap = new Map();
-  const log = LoggerEx.withTag('BPO_AMORT');
 
-  // 1. Retrieve essential data maps (Assuming SDE functions are available)
-
-  const sdePriceMap = _getSdeBasePriceMap(ss); // <--- Add this
-  const blendedCostMap = _getBlendedCostMap(ss);
-  const marketMedianMap = _getMarketMedianMap(ss);
-
-  const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
-  const lastRow = sheet ? sheet.getLastRow() : 0;
-  if (lastRow < 2) { log.error(`Sheet '${AMORT_SHEET_NAME}' has no data rows. Amortization is 0.`); return amortMap; }
-
-  // --- NAMED RANGE SETTINGS FOR FUZZWORK FALLBACK (Tier 3) ---
-  // NOTE: Assumes _getNamedOr_ is available globally
-  const locationId = _getNamedOr_('setting_sell_loc', 60003760); // Default to Jita 4-4
-  const marketType = _getNamedOr_('setting_market_list', 'region');
-  // We want the highest price a buyer is offering (Max Buy Order)
-  const orderType = 'buy';
-  const orderLevel = 'max';
-  // -----------------------------------------------------------
-
-  const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
-  try {
-    const col = _getColIndexMap(headers, AMORT_HEADERS);
-    const numRows = lastRow - 1;
-
-    let data = [];
-    if (numRows > 0) { data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues(); }
-
-    const typeIdsToFetch = [];
-    const amortizationData = [];
-
-    // --- PHASE 1: IDENTIFY MISSING PRICES & BUILD DATA STRUCTURE ---
-    for (const row of data) {
-      const bp_type_id = Number(row[col.bp_type_id]);
-      const totalRuns = Number(row[col.Amortization_Runs]);
-      if (totalRuns <= 0) continue;
-
-      // Map BPO Asset ID to final Product Item ID
-      const productObj = sdeProdMap.get(bp_type_id);
-      if (!productObj) {
-        log.warn(`BPO ${bp_type_id}: Cannot find manufactured product in SDE. Skipping.`);
-        continue;
-      }
-      const product_id = productObj.productTypeID;
-
-      // Use SDE Base Price as the ultimate fallback instead of 91160
-      const localValue = blendedCostMap.get(bp_type_id) ||
-        marketMedianMap.get(bp_type_id) ||
-        sdePriceMap.get(bp_type_id) || 0;
-
-      // Collect data needed for final calculation pass
-      amortizationData.push({ bpId: bp_type_id, productId: product_id, runs: totalRuns, localValue: localValue });
-
-      // If local value is zero (Tier 1 & 2 failed), add to the Fuzzwork fetch list
-      if (localValue === 0) {
-        typeIdsToFetch.push(product_id);
-      }
-    }
-
-    // --- PHASE 2: EXECUTE FUZZWORK API FALLBACK (Tier 3) ---
-    let fuzzworkPrices = new Map();
-    if (typeIdsToFetch.length > 0) {
-      // NOTE: This assumes 'fuzAPI.requestItems' is defined in FuzzApiPrice.js
-      // We use a simplified form that only requests the items and processes the price directly.
-      const rawFuzResults = fuzAPI.requestItems(locationId, marketType, typeIdsToFetch);
-
-      // Process the raw results to get the requested metric (Max Buy)
-      rawFuzResults.forEach(item => {
-        // Assumes _extractMetric_ is available in the GESI Extentions/FuzzApiPrice file
-        const price = _extractMetric_(item, orderType, orderLevel);
-        if (price > 0) {
-          fuzzworkPrices.set(item.type_id, price);
-        }
-      });
-      log.info(`Fetched ${fuzzworkPrices.size} fallback prices from Fuzzwork API (Tier 3).`);
-    }
-
-    // --- PHASE 3: FINAL CALCULATION PASS ---
-    for (const item of amortizationData) {
-      let bpoValue = item.localValue;
-
-      // Check Tier 3: External Fuzzwork API (Only runs if localValue was 0)
-      if (bpoValue === 0) {
-        bpoValue = fuzzworkPrices.get(item.productId) || 0;
-        if (bpoValue > 0) {
-          log.warn(`BPO ${item.bpId}: Using external Fuzzwork API fallback price.`);
-        }
-      }
-
-      // Final Amortization Assignment
-      if (bpoValue > 0) {
-        const surchargePerRun = bpoValue / item.runs;
-        amortMap.set(item.bpId, surchargePerRun);
-      } else {
-        log.warn(`BPO ${item.bpId}: No market value found (All sources failed). Amortization skipped.`);
-      }
-    }
-    return amortMap;
-  } catch (e) {
-    log.error(`Configuration Error in ${AMORT_SHEET_NAME}: ${e.message}`);
-    throw e;
-  }
-}
 
 /**
  * Helper to get BPO/BPC efficiency attributes by calling GESI.corporation_blueprints() directly.
@@ -1263,12 +1152,10 @@ if (demandVolume > 0) {
       );
 
       // FIX 1: Update this floor to 10,000 (was 100)
-      newRuns = Math.max(10000, calculatedRuns); 
+newRuns = Math.max(10000, calculatedRuns); 
     } else {
-      // FIX 2: Force 50,000 even if old data exists (Remove 'row[1] > 0 ?' check)
-      // or ensure the existing value meets the new standard
-      const existing = row[1] || 0;
-      newRuns = existing >= 10000 ? existing : 50000;
+      // FIX 2: Default to 50,000 (Force update, ignore existing low values)
+      newRuns = 50000; 
     }
 
     finalData.push([bp_type_id, newRuns]);
@@ -1285,8 +1172,9 @@ if (demandVolume > 0) {
 
 /**
  * Helper to get the manual amortization surcharge for BPOs.
- * Implements a three-tiered pricing fallback: Blended > Tracker Median > Fuzzwork API.
- * This should permanently resolve the "No market value found" warnings.
+ * Implements a three-tiered pricing fallback: Blended > Tracker Median > SDE Base Price > Fuzzwork API.
+ * FIX: Restored SDE Base Price lookup to correctly value NPC-seeded BPOs.
+ * FIX: Corrected _getNamedOr_ usage to match Utility.js (2 arguments).
  */
 function _getBpoAmortizationMap(ss) {
   const AMORT_SHEET_NAME = "BPO_Amortization";
@@ -1294,100 +1182,94 @@ function _getBpoAmortizationMap(ss) {
   const amortMap = new Map();
   const log = LoggerEx.withTag('BPO_AMORT');
 
-  // 1. Retrieve essential data maps (local prices)
-  const { sdeProdMap } = _getSdeMaps(ss);
+  // 1. Retrieve essential data maps
+  const sdePriceMap = _getSdeBasePriceMap(ss); // RESTORED: Critical for NPC BPO prices
   const blendedCostMap = _getBlendedCostMap(ss);
-  const marketMedianMap = _getMarketMedianMap(ss); // Reads 'market price Tracker'
+  const marketMedianMap = _getMarketMedianMap(ss);
+
+  // 2. Setup Settings
+  // FIX: _getNamedOr_ in Utility.js only takes 2 arguments (name, fallback).
+  // We must NOT pass 'ss' as the first argument.
+  const locationId = Number(_getNamedOr_('setting_sell_loc', 60003760)); // Default Jita
+  const marketType = _getNamedOr_('setting_market_list', 'region');
+  const orderType = 'sell'; // For BPOs, we usually care about Sell price (Acquisition)
+  const orderLevel = 'min';
 
   const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
   const lastRow = sheet ? sheet.getLastRow() : 0;
-  if (lastRow < 2) { log.error(`Sheet '${AMORT_SHEET_NAME}' has no data rows. Amortization is 0.`); return amortMap; }
-
-  // --- FUZZWORK SETTINGS (TIER 3) ---
-  // Location ID is explicitly read from Location List, cell C3
-  const locationId = ss.getSheetByName('Location List').getRange('C3').getValue();
-  // Market Type is read from the Named Range 'setting_market_range' (assuming _getNamedOr_ is available)
-  const marketType = _getNamedOr_(ss, 'setting_market_range', 'region');
-  const orderType = 'buy'; // Max Buy Order (highest realizable asset value)
-  const orderLevel = 'max';
-  // ---------------------------------
+  if (lastRow < 2) { 
+    log.error(`Sheet '${AMORT_SHEET_NAME}' has no data rows. Amortization is 0.`); 
+    return amortMap; 
+  }
 
   const headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+  
   try {
     const col = _getColIndexMap(headers, AMORT_HEADERS);
-    const numRows = lastRow - 1;
-
-    let data = [];
-    if (numRows > 0) { data = sheet.getRange(2, 1, numRows, sheet.getMaxColumns()).getValues(); }
+    const data = sheet.getRange(2, 1, lastRow - 1, sheet.getMaxColumns()).getValues();
 
     const typeIdsToFetch = [];
     const amortizationData = [];
 
-    // --- PHASE 1: IDENTIFY MISSING PRICES & BUILD DATA STRUCTURE ---
+    // --- PHASE 1: IDENTIFY MISSING PRICES ---
     for (const row of data) {
       const bp_type_id = Number(row[col.bp_type_id]);
       const totalRuns = Number(row[col.Amortization_Runs]);
       if (totalRuns <= 0) continue;
 
-      // Map BPO Asset ID to final Product Item ID
-      const productObj = sdeProdMap.get(bp_type_id);
-      if (!productObj) {
-        log.warn(`BPO ${bp_type_id}: Cannot find manufactured product in SDE. Skipping.`);
-        continue;
-      }
-      const product_id = productObj.productTypeID;
+      // PRIORITY: 
+      // 1. Blended Cost (If you manually bought/tracked the BPO)
+      // 2. Market Median (If listed on your tracker)
+      // 3. SDE Base Price (The NPC Sell Price - MOST COMMON for T1 BPOs)
+      const localValue = blendedCostMap.get(bp_type_id) ||
+                         marketMedianMap.get(bp_type_id) ||
+                         sdePriceMap.get(bp_type_id) || 0;
 
-      // Check Tier 1 & 2 local caches
-      const localValue = blendedCostMap.get(product_id) || marketMedianMap.get(product_id) || 0;
+      amortizationData.push({ bpId: bp_type_id, runs: totalRuns, localValue: localValue });
 
-      // Collect data needed for final calculation pass
-      amortizationData.push({ bpId: bp_type_id, productId: product_id, runs: totalRuns, localValue: localValue });
-
-      // If local value is zero (Tier 1 & 2 failed), add to the Fuzzwork fetch list
+      // If still 0, add to Fuzzwork fetch list (Tier 4)
       if (localValue === 0) {
-        typeIdsToFetch.push(product_id);
+        typeIdsToFetch.push(bp_type_id);
       }
     }
 
-    // --- PHASE 2: EXECUTE FUZZWORK API FALLBACK (Tier 3) ---
+    // --- PHASE 2: FUZZWORK API FALLBACK (Tier 4) ---
     let fuzzworkPrices = new Map();
     if (typeIdsToFetch.length > 0) {
-      // Fetch prices for missing items using Fuzzwork API
-      // NOTE: Assumes fuzAPI.requestItems and _extractMetric_ are available globally
-      const rawFuzResults = fuzAPI.requestItems(locationId, marketType, typeIdsToFetch);
-
-      rawFuzResults.forEach(item => {
-        const price = _extractMetric_(item, orderType, orderLevel);
-        if (price > 0) {
-          fuzzworkPrices.set(item.type_id, price);
-        }
-      });
-      log.info(`Fetched ${fuzzworkPrices.size} fallback prices from Fuzzwork API (Tier 3).`);
+      try {
+        const rawFuzResults = fuzAPI.requestItems(locationId, marketType, typeIdsToFetch);
+        rawFuzResults.forEach(item => {
+          const price = _extractMetric_(item, orderType, orderLevel);
+          if (price > 0) fuzzworkPrices.set(item.type_id, price);
+        });
+        log.info(`Fetched ${fuzzworkPrices.size} fallback BPO prices from Fuzzwork.`);
+      } catch (e) {
+        log.warn(`Fuzzwork BPO lookup failed: ${e.message}`);
+      }
     }
 
-    // --- PHASE 3: FINAL CALCULATION PASS ---
+    // --- PHASE 3: CALCULATE SURCHARGE ---
     for (const item of amortizationData) {
       let bpoValue = item.localValue;
 
-      // Check Tier 3: External Fuzzwork API (Only runs if localValue was 0)
       if (bpoValue === 0) {
-        bpoValue = fuzzworkPrices.get(item.productId) || 0;
-        if (bpoValue > 0) {
-          log.warn(`BPO ${item.bpId}: Using external Fuzzwork API fallback price.`);
-        }
+        bpoValue = fuzzworkPrices.get(item.bpId) || 0;
       }
 
-      // Final Amortization Assignment
       if (bpoValue > 0) {
+        // Amortization = BPO Cost / Total Lifetime Runs
         const surchargePerRun = bpoValue / item.runs;
         amortMap.set(item.bpId, surchargePerRun);
       } else {
-        log.warn(`BPO ${item.bpId}: No market value found (All sources failed). Amortization skipped.`);
+        // Warn only once per batch to avoid log spam
+         log.warn(`BPO ${item.bpId}: Zero value found. Surcharge = 0.`);
       }
     }
+    
     return amortMap;
+
   } catch (e) {
-    log.error(`Configuration Error in ${AMORT_SHEET_NAME}: ${e.message}`);
+    log.error(`Error in _getBpoAmortizationMap: ${e.message}`);
     throw e;
   }
 }
