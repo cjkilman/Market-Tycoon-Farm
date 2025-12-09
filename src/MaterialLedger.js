@@ -106,8 +106,6 @@ var ML = (function () {
             return data.length;
         }
 
-        /* In src/MaterialLedger.js */
-
         function upsertBy(keys, rows) {
             if (!rows || !rows.length) {
                 return { rows: 0, status: "SUCCESS", errorMerssage: "" };
@@ -127,7 +125,6 @@ var ML = (function () {
             const newRowsToAppend = [];
 
             // --- 1. Identify Key Columns ---
-            // (RESTORED LOGIC)
             const keyIndices = keys.map(function (k) {
                 const idx = HEAD.indexOf(k);
                 if (idx === -1) throw new Error('Unknown key column in HEAD: ' + k);
@@ -141,12 +138,9 @@ var ML = (function () {
                 return String(val != null ? val : '');
             };
 
-            // --- 2. Read Existing Keys and Map to Array Index ---
-            // (RESTORED LOGIC)
+            // --- 2. Read Existing Keys ---
             const last = sh.getLastRow();
-
             if (last >= 2) {
-                // Read the entire data body (all columns)
                 const range = sh.getRange(2, 1, last - 1, HEAD.length);
                 allExistingValues = range.getValues();
 
@@ -154,13 +148,11 @@ var ML = (function () {
                     const key = keyIndices.map(function (headIdx) {
                         return normalizeKeyPart(row[headIdx], headIdx);
                     }).join('\u0001');
-
                     existingKeyToArrayIndexMap.set(key, rowIndex);
                 });
             }
 
-            // --- 3. Separate Rows for Update and Append ---
-            // (RESTORED LOGIC)
+            // --- 3. Separate Rows ---
             rows.forEach(function (obj) {
                 const outRow = normalizeRow_(obj);
                 const key = keyIndices.map(function (headIdx) {
@@ -168,24 +160,21 @@ var ML = (function () {
                 }).join('\u0001');
 
                 if (existingKeyToArrayIndexMap.has(key)) {
-                    // Update existing row in memory
                     const rowIndex = existingKeyToArrayIndexMap.get(key);
                     allExistingValues[rowIndex] = outRow;
                     updateCount++;
                 } else {
-                    // Queue for append
                     newRowsToAppend.push(outRow);
                 }
             });
 
             // --- SHEET CONTROL & WRITE OPERATIONS ---
             try {
-                // 1. Pause sheet calculations
                 if (typeof pauseSheet === 'function') {
                     needsWakeUp = pauseSheet(ss);
                 }
 
-                // --- 4. Write Updates (Overwrite existing range) ---
+                // --- 4. Write Updates ---
                 if (updateCount > 0) {
                     sh.getRange(2, 1, allExistingValues.length, HEAD.length).setValues(allExistingValues);
                 }
@@ -196,64 +185,50 @@ var ML = (function () {
                 let nextWriteRow = sh.getLastRow() + 1;
 
                 if (totalNewRows > 0) {
+                    // *** CRITICAL FIX: CHECK & INSERT ROWS ***
+                    const maxRows = sh.getMaxRows();
+                    const requiredRows = nextWriteRow + totalNewRows - 1;
+                    if (requiredRows > maxRows) {
+                        // Add exactly what we need plus a buffer of 50
+                        sh.insertRowsAfter(maxRows, (requiredRows - maxRows) + 50);
+                    }
+                    // *****************************************
+
                     const docLock = LockService.getDocumentLock();
                     let lockAcquired = false;
 
                     try {
-                        // Check for Priority Interrupt
                         if (!docLock.tryLock(0)) {
-                            return {
-                                rows: updateCount,
-                                status: "PREDICTIVE BAILOUT",
-                                errorMerssage: "Document Lock held by priority process."
-                            };
+                            return { rows: updateCount, status: "PREDICTIVE BAILOUT", errorMerssage: "Document Lock held by priority process." };
                         }
                         lockAcquired = true;
 
                         while (currentIndex < totalNewRows) {
                             const batch = newRowsToAppend.slice(currentIndex, currentIndex + WRITE_BATCH_SIZE);
-                            const startRow = nextWriteRow;
-
-                            sh.getRange(startRow, 1, batch.length, HEAD.length).setValues(batch);
-
+                            sh.getRange(nextWriteRow, 1, batch.length, HEAD.length).setValues(batch);
                             currentIndex += batch.length;
                             nextWriteRow += batch.length;
                             totalWritten += batch.length;
                         }
                     } catch (e) {
-                        return {
-                            rows: updateCount + totalWritten,
-                            status: "WRITE ERROR",
-                            errorMerssage: e.message
-                        };
+                        return { rows: updateCount + totalWritten, status: "WRITE ERROR", errorMerssage: e.message };
                     } finally {
-                        if (lockAcquired) {
-                            docLock.releaseLock();
-                        }
+                        if (lockAcquired) docLock.releaseLock();
                     }
                 }
 
-                return {
-                    rows: updateCount + totalWritten,
-                    status: "SUCCESS",
-                    errorMerssage: ""
-                };
+                return { rows: updateCount + totalWritten, status: "SUCCESS", errorMerssage: "" };
 
             } catch (outerError) {
-                LoggerEx.withTag('ML_UPSERT').error('Fatal error during upsert process:', outerError);
-                return {
-                    rows: updateCount + totalWritten,
-                    status: "FATAL_ERROR",
-                    errorMerssage: outerError.message
-                };
+                if (typeof LoggerEx !== 'undefined') LoggerEx.withTag('ML_UPSERT').error('Fatal error during upsert process:', outerError);
+                return { rows: updateCount + totalWritten, status: "FATAL_ERROR", errorMerssage: outerError.message };
             } finally {
-                // 2. Guaranteed resume
                 if (needsWakeUp && typeof wakeUpSheet === 'function') {
                     wakeUpSheet(ss);
                 }
             }
         }
-
+            
 
         // --- PUBLIC INTERFACE FOR THIS INSTANCE ---
         return {
