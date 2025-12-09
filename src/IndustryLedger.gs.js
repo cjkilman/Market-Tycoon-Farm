@@ -379,7 +379,7 @@ function runBpcCreationLedger() {
 /**
  * Resets the script properties that track processed Industry Jobs and 
  * calculated BPC Weighted Average Costs (WAC).
- * This forces the Ledger to re-process all 'delivered' jobs and recalculate BPC costs.
+ * SAFE VERSION: Uses console logs instead of UI Alerts to prevent crash.
  */
 function resetIndustryLedgerProperties() {
 
@@ -392,8 +392,6 @@ function resetIndustryLedgerProperties() {
   const keysToDelete = [INDUSTRY_JOB_KEY, BPC_JOB_KEY, BPC_WAC_KEY];
   let deletedCount = 0;
 
-  const ui = SpreadsheetApp.getUi();
-
   try {
     // Deletes the tracking keys
     for (const key of keysToDelete) {
@@ -403,14 +401,12 @@ function resetIndustryLedgerProperties() {
       }
     }
 
-    // Success message for the user
-    const message = `✅ Success! Deleted ${deletedCount} Industry Ledger properties. 
-    The script will now re-process all delivered jobs and recalculate BPC costs on the next run.`;
-
-    ui.alert('Ledger Reset Complete', message, ui.ButtonSet.OK);
+    // Log success to the console instead of trying to popup a UI alert
+    console.log(`✅ Success! Deleted ${deletedCount} Industry Ledger properties.`);
+    console.log(`The script will now re-process all delivered jobs and recalculate BPC costs on the next run.`);
 
   } catch (e) {
-    ui.alert('Reset Failed', `An error occurred while deleting properties: ${e.message}`, ui.ButtonSet.OK);
+    console.error(`Reset Failed: An error occurred while deleting properties: ${e.message}`);
   }
 }
 
@@ -879,6 +875,36 @@ function _getMarketMedianMap(ss) {
 }
 
 /**
+ * Helper to get NPC Base Prices from SDE_invTypes.
+ */
+function _getSdeBasePriceMap(ss) {
+  const sheet = ss.getSheetByName("SDE_invTypes");
+  if (!sheet || sheet.getLastRow() < 2) return new Map();
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  try {
+    // Look for the 'basePrice' column you just added
+    const col = _getColIndexMap(headers, ['typeID', 'basePrice']);
+
+    // Read Data
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
+    const priceMap = new Map();
+
+    for (const row of data) {
+      const type_id = Number(row[col.typeID]);
+      const price = Number(row[col.basePrice]);
+      if (!isNaN(type_id) && !isNaN(price)) {
+        priceMap.set(type_id, price);
+      }
+    }
+    return priceMap;
+  } catch (e) {
+    LOG_INDUSTRY.warn(`SDE Base Price lookup failed (Column missing?): ${e.message}`);
+    return new Map();
+  }
+}
+
+/**
  * Helper to get the manual amortization surcharge for BPOs.
  * Implements a three-tiered pricing fallback: Blended > Tracker Median > Fuzzwork API.
  */
@@ -889,7 +915,8 @@ function _getBpoAmortizationMap(ss) {
   const log = LoggerEx.withTag('BPO_AMORT');
 
   // 1. Retrieve essential data maps (Assuming SDE functions are available)
-  const { sdeProdMap } = _getSdeMaps(ss);
+
+  const sdePriceMap = _getSdeBasePriceMap(ss); // <--- Add this
   const blendedCostMap = _getBlendedCostMap(ss);
   const marketMedianMap = _getMarketMedianMap(ss);
 
@@ -931,9 +958,10 @@ function _getBpoAmortizationMap(ss) {
       }
       const product_id = productObj.productTypeID;
 
-      // FIX: Look up the BLUEPRINT price (1032), not the Product (399).
-      // Fallback to 91160 (NPC Base Price) if market data is missing.
-      const localValue = blendedCostMap.get(bp_type_id) || marketMedianMap.get(bp_type_id) || 91160;
+      // Use SDE Base Price as the ultimate fallback instead of 91160
+      const localValue = blendedCostMap.get(bp_type_id) ||
+        marketMedianMap.get(bp_type_id) ||
+        sdePriceMap.get(bp_type_id) || 0;
 
       // Collect data needed for final calculation pass
       amortizationData.push({ bpId: bp_type_id, productId: product_id, runs: totalRuns, localValue: localValue });
@@ -1228,17 +1256,19 @@ function runBpoAmortizationSetupAndCalculate() {
     const demandVolume = demandMap.get(bp_type_id) || 0;
     let newRuns = 0;
 
-    if (demandVolume > 0) {
+if (demandVolume > 0) {
       // Calculation: (30-Day Volume / 30 days) * 365 days * 10% market share
       const calculatedRuns = Math.round(
         (demandVolume / 30) * 365 * MARKET_SHARE_TARGET
       );
 
-      // Set a minimum floor of 100 runs if calculated value is tiny
-      newRuns = Math.max(100, calculatedRuns);
+      // FIX 1: Update this floor to 10,000 (was 100)
+      newRuns = Math.max(10000, calculatedRuns); 
     } else {
-      // If market data is missing, we use the existing value (which may be 0) or set the floor to 100
-      newRuns = row[1] > 0 ? row[1] : 100;
+      // FIX 2: Force 50,000 even if old data exists (Remove 'row[1] > 0 ?' check)
+      // or ensure the existing value meets the new standard
+      const existing = row[1] || 0;
+      newRuns = existing >= 10000 ? existing : 50000;
     }
 
     finalData.push([bp_type_id, newRuns]);
