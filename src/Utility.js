@@ -5,8 +5,9 @@
 // ======================================================================
 
 // --- GLOBAL CONSTANTS ---
-var MAX_CACHE_CHUNK_SIZE = 8000;
-var CHUNK_INDEX_SUFFIX = ':IDX';
+// !!! ADD THESE TWO LINES !!!
+const MAX_CACHE_CHUNK_SIZE = 95000; // Safe limit under 100KB
+const CHUNK_INDEX_SUFFIX = '_CHUNKS';
 
 // NITRO_CONFIG TUNING FOR ASSETS
 // 1. Drop MAX_CHUNK_SIZE: Assets are complex, 8000 is too big. 
@@ -22,15 +23,15 @@ const [MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, SOFT_LIMIT_MS, RESCHEDULE_DELAY_MS]
  */
 var NITRO_CONFIG = {
   // --- Shared Stability Settings ---
-  TARGET_WRITE_TIME_MS: 2000,
-  MAX_FACTOR: 1.5,             // Conservative growth (don't grow chunks too fast)
+  TARGET_WRITE_TIME_MS: 3000,
+  MAX_FACTOR: 1.8,             // Conservative growth (don't grow chunks too fast)
   THROTTLE_THRESHOLD_MS: -1,   // Disable standard throttling (rely on adaptive)
   THROTTLE_PAUSE_MS: 30000,     // Long pause if we hit a wall
   LAG_SPIKE_THRESHOLD_MS: 60000,
 
   // --- Baseline Defaults (Override these in Worker if needed) ---
   MAX_CELLS_PER_CHUNK: 40000,
-  SOFT_LIMIT_MS: 270000,       // 4.5 Minutes
+  SOFT_LIMIT_MS: 280000,       // 4.5 Minutes
   MIN_CHUNK_SIZE: 500,
   MAX_CHUNK_SIZE: 4000
 };

@@ -45,45 +45,7 @@ function _getNamedOr_(arg1, arg2, arg3) {
   } catch (e) { return fallback; }
 }
 
-// ----------------------------------------------------------------------
-// --- CORE UTILITY: CACHE SHARDING FUNCTIONS ---
-// ----------------------------------------------------------------------
 
-function _chunkAndPut(key, largeString, ttl) {
-  const cache = CacheService.getUserCache();
-  const chunks = [];
-  const numChunks = Math.ceil(largeString.length / MAX_CACHE_CHUNK_SIZE);
-  for (let i = 0; i < numChunks; i++) {
-    const start = i * MAX_CACHE_CHUNK_SIZE;
-    const end = start + MAX_CACHE_CHUNK_SIZE;
-    chunks.push(largeString.substring(start, end));
-  }
-  const keysToWrite = {};
-  for (let i = 0; i < chunks.length; i++) {
-    keysToWrite[key + ':' + i] = chunks[i];
-  }
-  keysToWrite[key + CHUNK_INDEX_SUFFIX] = String(numChunks);
-  cache.putAll(keysToWrite, ttl);
-}
-
-function _getAndDechunk(key) {
-  const cache = CacheService.getUserCache();
-  const numChunksRaw = cache.get(key + CHUNK_INDEX_SUFFIX);
-  if (!numChunksRaw) return null;
-  const numChunks = parseInt(numChunksRaw, 10);
-  const keysToGet = [];
-  for (let i = 0; i < numChunks; i++) {
-    keysToGet.push(key + ':' + i);
-  }
-  const chunks = cache.getAll(keysToGet);
-  const result = [];
-  for (let i = 0; i < numChunks; i++) {
-    const chunk = chunks[key + ':' + i];
-    if (chunk == null) return null;
-    result.push(chunk);
-  }
-  return result.join('');
-}
 
 // ----------------------------------------------------------------------
 // --- CORE UTILITY: DYNAMIC HEADER MAPPING ---

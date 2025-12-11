@@ -431,9 +431,11 @@ function _updateMarketDataSheetWorker() {
         }
       });
 
-      if (allRowsToWrite.length === 0) {
-        SCRIPT_PROP.setProperty(PROP_KEY_STEP, STATE_FLAGS.FINALIZING);
-        scheduleOneTimeTrigger('finalizeMarketDataUpdate', RESCHEDULE_DELAY_MS);
+if (allRowsToWrite.length === 0) {
+        // SAFEGUARD: If we requested items but got 0 rows back, DO NOT finalize.
+        // This prevents wiping the sheet if the API fails silently or returns empty data.
+        console.error("Worker: allRowsToWrite is empty! Aborting write to prevent data wipe.");
+        _resetMarketDataJobState(new Error("Zero rows returned from API - Aborted Write"));
         return;
       }
     } catch (e) {
