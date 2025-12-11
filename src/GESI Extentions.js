@@ -887,7 +887,7 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
 /** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Optimized Cache Handoff) =====================
  * Imports corporate market transactions (buy and sell) for Division 3.
  * Fixes Timeout: Phase 1 caches data for Phase 2, skipping the second API fetch.
- * Fixes RefError: Uses 'authToon' instead of undefined 'charName'.
+ * Fixes "Argument too large": Now uses CHUNKED CACHING to handle large sell volumes.
  */
 function Ledger_Import_CorpJournal(ss, opts) {
   const log = LoggerEx.withTag('CORP_TXN');
@@ -927,9 +927,26 @@ function Ledger_Import_CorpJournal(ss, opts) {
   let newestTransactionId = null;
   let dataLoadedFromCache = false;
 
-  // --- PHASE 2 SHORTCUT: TRY LOADING FROM CACHE ---
+  // --- PHASE 2 SHORTCUT: TRY LOADING FROM CACHE (CHUNKED SUPPORT) ---
   if (currentPhase === 'SELLS') {
-    const cachedSellData = CACHE.get(CACHE_KEY_SELLS);
+    let cachedSellData = CACHE.get(CACHE_KEY_SELLS);
+
+    // If main key is missing, check for CHUNKED keys
+    if (!cachedSellData) {
+      const chunkCountStr = CACHE.get(CACHE_KEY_SELLS + '_CHUNKS');
+      if (chunkCountStr) {
+        const count = parseInt(chunkCountStr, 10);
+        const parts = [];
+        let missing = false;
+        for (let i = 0; i < count; i++) {
+          const part = CACHE.get(CACHE_KEY_SELLS + '_' + i);
+          if (part) parts.push(part);
+          else { missing = true; break; }
+        }
+        if (!missing) cachedSellData = parts.join('');
+      }
+    }
+
     const cachedAnchor = CACHE.get(CACHE_KEY_ANCHOR);
 
     if (cachedSellData) {
@@ -1006,8 +1023,6 @@ function Ledger_Import_CorpJournal(ss, opts) {
       const price = Number(e.unit_price || e.price || 0);
       const contractId = String(e.transaction_id || e.id || 0);
 
-      // No strict filter, allowing valid sales/tax entries
-
       const row = {
         date: d,
         type_id: typeId,
@@ -1015,7 +1030,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
         unit_value: '',
         source: BUY_SOURCE,
         contract_id: contractId,
-        char: authToon, // FIXED: Used correct variable
+        char: authToon, 
         unit_value_filled: price
       };
 
@@ -1036,7 +1051,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
     if (buyRows.length > 0) {
       log.info(`Processing ${buyRows.length} BUY transactions...`);
       const buyResult = MaterialLedger.upsert(keys, buyRows);
-      buyCount = buyResult.rows; // FIX: handle object return
+      buyCount = buyResult.rows; 
       log.log(`Buy side processed for ${LEDGER_BUY_SHEET}`, { appended_or_updated: buyCount, processed: buyRows.length });
     } else {
       log.info("No BUY transactions to process.");
@@ -1045,11 +1060,28 @@ function Ledger_Import_CorpJournal(ss, opts) {
     // CACHE HANDOFF: Save 'sellRows' and 'newestTransactionId' for Phase 2
     if (sellRows.length > 0) {
       try {
-        CACHE.put(CACHE_KEY_SELLS, JSON.stringify(sellRows), CACHE_TTL);
+        const jsonStr = JSON.stringify(sellRows);
+        const MAX_BYTES = 90000; // Safe Chunk Size (Limit is 100KB)
+
+        if (jsonStr.length <= MAX_BYTES) {
+           CACHE.put(CACHE_KEY_SELLS, jsonStr, CACHE_TTL);
+           log.info(`Cached ${sellRows.length} SELL rows directly.`);
+        } else {
+           // CHUNK IT
+           const chunks = [];
+           for (let i = 0; i < jsonStr.length; i += MAX_BYTES) {
+             chunks.push(jsonStr.substring(i, i + MAX_BYTES));
+           }
+           CACHE.put(CACHE_KEY_SELLS + '_CHUNKS', String(chunks.length), CACHE_TTL);
+           chunks.forEach((chunk, idx) => {
+             CACHE.put(CACHE_KEY_SELLS + '_' + idx, chunk, CACHE_TTL);
+           });
+           log.info(`Cached ${sellRows.length} SELL rows in ${chunks.length} chunks.`);
+        }
+        
         if (newestTransactionId) CACHE.put(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
-        log.info(`Cached ${sellRows.length} SELL rows for Phase 2.`);
       } catch (e) {
-        log.warn("Failed to cache SELL rows (too large?). Phase 2 will perform full fetch.", e);
+        log.warn("Failed to cache SELL rows. Phase 2 will perform full fetch.", e);
       }
     }
 
@@ -1064,7 +1096,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
     if (sellRows.length > 0) {
       log.info(`Processing ${sellRows.length} SELL transactions...`);
       const sellResult = SalesLedger.upsert(keys, sellRows);
-      sellCount = sellResult.rows; // FIX: handle object return
+      sellCount = sellResult.rows; 
       log.log(`Sell side processed for ${LEDGER_SALE_SHEET}`, { appended_or_updated: sellCount, processed: sellRows.length });
     } else {
       log.info("No SELL transactions to process.");
@@ -1079,6 +1111,15 @@ function Ledger_Import_CorpJournal(ss, opts) {
     SCRIPT_PROP.deleteProperty(PHASE_KEY);
     CACHE.remove(CACHE_KEY_SELLS);
     CACHE.remove(CACHE_KEY_ANCHOR);
+    
+    // Clean up chunks if they exist
+    const chunkCountStr = CACHE.get(CACHE_KEY_SELLS + '_CHUNKS');
+    if (chunkCountStr) {
+      const count = parseInt(chunkCountStr, 10);
+      for(let i=0; i<count; i++) CACHE.remove(CACHE_KEY_SELLS + '_' + i);
+      CACHE.remove(CACHE_KEY_SELLS + '_CHUNKS');
+    }
+
     log.info("Phase 'SELLS' complete. Cycle finished.");
   }
 
@@ -1979,12 +2020,12 @@ function resetCorpJournalImport() {
 
   try {
     const SCRIPT_PROP = PropertiesService.getScriptProperties();
-    const LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('RESET_TOOL') : console;
-
+    // Safety check for LoggerEx vs console
+    const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('RESET_TOOL') : console;
 
     // Keys are defined in GESI Extentions.js
-    const LAST_ID_KEY = CORP_JOURNAL_RESUME_PROP; // Mapped from CORP_JOURNAL_LAST_ID
-    const RESUME_KEY = CORP_JOURNAL_LAST_ID;           // Mapped from CORP_JOURNAL_RESUME_PROP
+    const LAST_ID_KEY = 'CORP_JOURNAL_DIV_RESUME'; // Mapped from CORP_JOURNAL_RESUME_PROP
+    const RESUME_KEY = 'CORP_JOURNAL_LAST_TRANSACTION_ID'; // Mapped from CORP_JOURNAL_LAST_ID
 
     // 1. Delete the last transaction ID anchor
     SCRIPT_PROP.deleteProperty(LAST_ID_KEY);
@@ -1992,11 +2033,17 @@ function resetCorpJournalImport() {
     // 2. Delete the resume anchor (for safety against partial API fetches)
     SCRIPT_PROP.deleteProperty(RESUME_KEY);
 
-    LOG.info("Corporate Journal Import anchors reset successfully.");
+    if (LOG.info) LOG.info("Corporate Journal Import anchors reset successfully.");
+    else LOG.log("Corporate Journal Import anchors reset successfully.");
 
-    // Provide an alert if run from the editor menu
-    if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getUi) {
-      SpreadsheetApp.getUi().alert('Corporate Journal Import reset successful. Next run will fetch the full 30-day history.');
+    // 3. Provide an alert (SAFEGUARDED against headless context)
+    try {
+      if (typeof SpreadsheetApp !== 'undefined') {
+        SpreadsheetApp.getUi().alert('Corporate Journal Import reset successful. Next run will fetch the full 30-day history.');
+      }
+    } catch (uiError) {
+      // Ignore UI errors (happens when running from Editor or Trigger)
+      console.warn("UI Alert skipped (Context does not support UI): " + uiError.message);
     }
 
   } catch (e) {
