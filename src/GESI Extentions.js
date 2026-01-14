@@ -912,7 +912,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const authToon = getCorpAuthChar(ss);
 
   const rawFromId = SCRIPT_PROP.getProperty(CORP_JOURNAL_LAST_ID);
-  let currentFromId = rawFromId ? parseInt(rawFromId, 10) : null;
+  let currentFromId =  null;
   if (isNaN(currentFromId)) currentFromId = null;
 
   const currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';

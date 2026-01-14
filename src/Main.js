@@ -83,87 +83,76 @@ function respondToEdit(e) { // <-- RENAMED from onEdit
  * reads FEE_RATE and TAX_RATE from named ranges,
  * builds the stable QUERY string, and writes the final formula to 'Need To Buy'!C4.
  */
+/**
+ * Executes the Restock List logic with CORRECTED COLUMN INDEXES.
+ * Range Base: MarketOverviewData!B3:BF
+ */
 function generateRestockQuery() {
-  const SCRIPT_NAME = 'generateRestockQuery';
   const TARGET_SHEET_NAME = 'Need To Buy';
-  const DATA_SHEET_NAME = 'MarketOverviewData'; // Name of the source data sheet
   const TARGET_CELL = 'C4';
 
-  // --- STABILIZED COLUMN INDICES (UPDATED FOR CURRENT CSV) ---
+  // --- UPDATED COLUMN MAPPING (Relative to Col B = 1) ---
   const COL = {
-    ITEM_NAME: 'Col2',
-    GROUP: 'Col3',
-    QUANTITY_LEFT: 'Col6',        // "Quantity Left"
-    BUY_ORDER_QTY: 'Col18',       
-    VOLUME: 'Col22',              // "30-day traded volume"
-    MARKET_VOLUME: 'Col23',       // "Listed Volume (Feed Sell)"
-    EFFECTIVE_VELOCITY: 'Col30',  // "Effective Daily Velocity"
-    WAREHOUSE_QTY: 'Col31',       // "Warehouse Qty"
-    DAYS_OF_INV: 'Col32',         // "Days of Inventory"
-    TOTAL_MARKET_QTY: 'Col36',    // "Total Market Quantity"
-    MEDIAN_BUY: 'Col40',          // "Hub Median Buy"
-    MARGIN: 'Col47',              // "Margin"
-    BUY_ACTION: 'Col53'           // "Buy Action"
+    ITEM_NAME: 'Col2',          // C (Item Name)
+    GROUP: 'Col3',              // D (Group)
+    QUANTITY_LEFT: 'Col6',      // G (Quantity Left)
+    VOLUME: 'Col21',            // V (Buy Vol) 
+    EFFECTIVE_VELOCITY: 'Col31',// AF (Effective Daily Velocity) [User Verified]
+    WAREHOUSE_QTY: 'Col32',     // AG (Warehouse Qty)
+    DAYS_OF_INV: 'Col35',       // AJ (Days of Inventory)
+    TOTAL_MARKET_QTY: 'Col39',  // AN (Total Market Quantity)
+    MEDIAN_BUY: 'Col42',        // AQ (Hub Median Buy)
+    MARGIN: 'Col50',            // AY (Margin)
+    BUY_ACTION: 'Col56'         // BE (Buy Action)
   };
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
-  const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
-
   if (!sheet) {
-    Logger.log(`Target sheet ${TARGET_SHEET_NAME} not found.`);
-    return;
-  }
-  if (!dataSheet) {
-    Logger.log(`Data sheet ${DATA_SHEET_NAME} not found.`);
+    console.error(`Target sheet ${TARGET_SHEET_NAME} not found.`);
     return;
   }
   
-  // --- 1. READ DYNAMIC FILTERS from 'Need To Buy' (Extended Layout) ---
+  // --- 1. READ FILTERS ---
   const filterValues = sheet.getRange('B5:B26').getValues();
 
-  const filterMinDays = parseFloat(filterValues[0][0]) || 0;      // B5
-  const filterTargetDays = parseFloat(filterValues[2][0]) || 0;   // B7
-  const filterMargin = parseFloat(filterValues[4][0]) || 0;       // B9
-  const filterGroup = filterValues[6][0];        // B11
-  const sortDirection = filterValues[8][0];      // B13
-  const sortColumnHeader = filterValues[9][0];   // B14
-  const limitNum = filterValues[14][0];          // B19
-  const filterVolumeType = filterValues[16][0];  // B21
-  const filterVolumeValue = filterValues[17][0]; // B22
-  const filterIgnoreGroups = filterValues[21][0]; // B26
+  const filterMinDays = parseFloat(filterValues[0][0]) || 0;      
+  const filterTargetDays = parseFloat(filterValues[2][0]) || 0;   
+  const filterMargin = parseFloat(filterValues[4][0]) || 0;       
+  const filterGroup = filterValues[6][0];        
+  const sortDirection = filterValues[8][0];      
+  const sortColumnHeader = filterValues[9][0];   
+  const limitNum = filterValues[14][0];          
+  const filterVolumeType = filterValues[16][0];  
+  const filterVolumeValue = filterValues[17][0]; 
+  const filterIgnoreGroups = filterValues[21][0]; 
 
-  // --- 1.5. READ NAMED RANGES for Fee and Tax Rates ---
+  // --- 1.5. READ RATES ---
   let FEE_RATE = 0;
   try {
     const feeRange = ss.getRangeByName("FEE_RATE");
     FEE_RATE = parseFloat(feeRange ? feeRange.getValue() : 0) || 0;
-  } catch (e) {
-    Logger.log(`Named Range FEE_RATE not found or invalid: ${e}`);
-  }
+  } catch (e) { console.warn("FEE_RATE missing"); }
   
   let TAX_RATE = 0;
   try {
     const taxRange = ss.getRangeByName("TAX_RATE");
     TAX_RATE = parseFloat(taxRange ? taxRange.getValue() : 0) || 0;
-  } catch (e) {
-    Logger.log(`Named Range TAX_RATE not found or invalid: ${e}`);
-  }
+  } catch (e) { console.warn("TAX_RATE missing"); }
 
   const rateMultiplier = (1 + FEE_RATE + TAX_RATE);
 
-  // --- 2. BUILD THE SQL STRING (STABILIZED) ---
+  // --- 2. BUILD SQL ---
 
+  // Calculations inside Query
   const restockQuantityCalc = `(${COL.EFFECTIVE_VELOCITY}*${filterTargetDays})-(${COL.WAREHOUSE_QTY}+${COL.QUANTITY_LEFT})`;
   const orderCostCalc = `(${restockQuantityCalc})*${COL.MEDIAN_BUY}*${rateMultiplier}`;
 
-  // SELECT Clause
-  const sqlSelect = `SELECT ${COL.ITEM_NAME}, ${restockQuantityCalc}, ${COL.MEDIAN_BUY}, ${orderCostCalc}, ${COL.TOTAL_MARKET_QTY}, ${COL.VOLUME}, ${COL.MARKET_VOLUME}, ${COL.WAREHOUSE_QTY}, ${COL.MARGIN}, ${COL.BUY_ACTION}`;
+  const sqlSelect = `SELECT ${COL.ITEM_NAME}, ${restockQuantityCalc}, ${COL.MEDIAN_BUY}, ${orderCostCalc}, ${COL.TOTAL_MARKET_QTY}, ${COL.VOLUME}, 0, ${COL.WAREHOUSE_QTY}, ${COL.MARGIN}, ${COL.BUY_ACTION}`;
 
-  // WHERE Clause
   let sqlWhere = `WHERE (${COL.DAYS_OF_INV}<${filterMinDays} AND ${COL.MARGIN}>=${filterMargin} AND ${COL.ITEM_NAME} IS NOT NULL AND ${restockQuantityCalc} > 0 AND NOT ${COL.BUY_ACTION} CONTAINS 'SKIP'`;
 
-  // Ignore Group Filter
+  // Ignore Groups
   if (filterIgnoreGroups && filterIgnoreGroups.toString().trim() !== "") {
     const groupsToExclude = filterIgnoreGroups.toString()
       .split(',')
@@ -172,7 +161,7 @@ function generateRestockQuery() {
     sqlWhere += ` AND NOT LOWER(${COL.GROUP}) MATCHES (${groupsToExclude})`;
   }
   
-  // Volume Filters
+  // Volume
   const numVolumeValue = parseFloat(filterVolumeValue);
   switch (filterVolumeType) {
     case "30 Day Active": sqlWhere += ` AND ${COL.VOLUME}>0`; break;
@@ -181,7 +170,7 @@ function generateRestockQuery() {
     case "30 Low Sellers": if (!isNaN(numVolumeValue)) sqlWhere += ` AND ${COL.VOLUME}>${numVolumeValue}`; break;
   }
 
-  // Group Filter
+  // Specific Group
   if (filterGroup && filterGroup.toString().trim() !== "") {
     const safeFilterGroup = filterGroup.toString().toLowerCase().replace(/'/g, `''`);
     sqlWhere += ` AND LOWER(${COL.GROUP}) CONTAINS '${safeFilterGroup}'`;
@@ -189,7 +178,7 @@ function generateRestockQuery() {
   
   sqlWhere += `)`; 
 
-  // SORT COLUMN
+  // Sort
   let sortCol = "Col2"; 
   switch (sortColumnHeader.toString().trim()) {
     case 'Item Name': sortCol = "Col1"; break;
@@ -209,20 +198,16 @@ function generateRestockQuery() {
   const orderBySql = `ORDER BY ${sortCol} ${sortDirection}`;
   const limitSql = (limitNum == "No Limit" || !limitNum || !limitNum == 0) ? "" : `LIMIT ${limitNum}`;
 
-  // LABEL Clause
   const sqlLabel = `LABEL ${restockQuantityCalc} 'Quantity', ${COL.MEDIAN_BUY} 'Median Buy Price', ${orderCostCalc} 'Order Cost', ${COL.BUY_ACTION} 'Buy Action'`;
   
-  // --- DYNAMIC DATA RANGE CALCULATION ---
-  // Get the last row with data from the MarketOverviewData sheet
-  const lastRow = dataSheet.getLastRow();
-  // Ensure we include the full width (B to BB) and the full height (3 to lastRow)
-  const dataRangeRef = `'${DATA_SHEET_NAME}'!B3:BB${lastRow}`;
+  // FIXED RANGE: Extends to BF (Col 57) to include 'Buy Action'
+  const dataRangeRef = 'MarketOverviewData!B3:BF';
 
   const finalQueryString = [sqlSelect, sqlWhere, orderBySql, limitSql, sqlLabel].join(' ');
   const finalFormula = `=IF(Utility!B3<>1,, QUERY(${dataRangeRef}, "${finalQueryString.trim()}", 1))`;
 
   sheet.getRange(TARGET_CELL).setFormula(finalFormula);
-  Logger.log(`Successfully updated restock query in ${TARGET_CELL} with range ${dataRangeRef}.`);
+  Logger.log(`Restock Query Updated in ${TARGET_CELL}`);
 }
 
 /**
@@ -264,7 +249,7 @@ function updateControlSheet() {
     CONTROL_SHEET_NAME: 'Market_Control',
     SDE_SHEET_NAME: 'SDE_invTypes',
     ITEM_NAME_HEADERS: ['Item Name', 'TypeName', 'Type Name', 'Name', 'Item'],
-    ITEM_ID_HEADERS: ['TypeID', 'Type ID', 'Item ID'], 
+   ITEM_ID_HEADERS: ['type_id', 'TypeID', 'Type ID', 'Item ID'],
     LOC_HEADERS: ['Station', 'System', 'Region'] 
   };
 

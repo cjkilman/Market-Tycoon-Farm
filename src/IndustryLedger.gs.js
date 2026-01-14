@@ -191,12 +191,29 @@ function runBpcCreationLedger() {
     newlyProcessedIds.push(job.job_id);
   }
 
+  // Retrieve existing history or initialize
+  const historyData = JSON.parse(SCRIPT_PROP.getProperty('BpcHistoryData') || '{}');
   const finalWAC = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
+
   for (const [bpID, data] of bpcCostMap.entries()) {
-    finalWAC[bpID] = data.totalCost / data.totalRuns;
+    // Get existing totals
+    const existing = historyData[bpID] || { totalCost: 0, totalRuns: 0 };
+    
+    // Add new batch to existing totals
+    existing.totalCost += data.totalCost;
+    existing.totalRuns += data.totalRuns;
+    
+    // Save back to history object
+    historyData[bpID] = existing;
+    
+    // Calculate TRUE weighted average
+    finalWAC[bpID] = existing.totalCost / existing.totalRuns;
   }
 
+  // Save both properties
+  SCRIPT_PROP.setProperty('BpcHistoryData', JSON.stringify(historyData));
   SCRIPT_PROP.setProperty(BPC_WAC_KEY, JSON.stringify(finalWAC));
+
   newlyProcessedIds.forEach(id => processedJobIds.add(id));
   SCRIPT_PROP.setProperty(BPC_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-1000)));
 }
@@ -676,4 +693,63 @@ function resetIndustryLedgerProperties() {
   props.deleteProperty(BPC_JOB_KEY);
   props.deleteProperty(BPC_WAC_KEY);
   console.log("Industry Ledger Properties Reset.");
+}
+
+/**
+ * Custom function to fetch Corporation Industry Jobs with caching.
+ * Prevents continuous API calls during sheet recalculations.
+ * * @param {string} name Character name with ESI Corp Jobs scope.
+ * @param {boolean} [include_completed=false] Whether to include completed jobs.
+ * @returns {any[][]} Raw data from GESI call.
+ * @customfunction
+ */
+function GESI_CORP_JOBS_CACHED(name, include_completed) {
+    // NOTE: GLOBAL_STATE_KEY must be accessible. Assuming it's defined elsewhere.
+    const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
+    
+    // START LOGGING & PARAM CHECK
+    Logger.log(`[CIJ_SHEET] START: Name='${name}', Completed=${include_completed}`);
+
+    if (!name) {
+        Logger.log('[CIJ_SHEET] FAIL: Name is missing.');
+        return [['Error: Auth name required']];
+    }
+    
+    // ROBUST MAINTENANCE CHECK
+    const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+
+    if (systemState === 'MAINTENANCE') {
+        Logger.log(`[CIJ_SHEET] ABORT: System is in MAINTENANCE mode.`);
+        return [['MAINTENANCE_ACTIVE']];
+    }
+    
+    // 1. Fetch data from the *shared* cache handled by _getCorporateJobsRaw.
+    // NOTE: We pass 'false' to force the helper to read from the cache only (no live API call).
+    const rawData = _getCorporateJobsRaw(false); 
+
+    if (!rawData || rawData.length === 0) {
+        Logger.log('[CIJ_SHEET] WARN: No data found in shared cache. Returning cache instruction.');
+        return [['DATA_NOT_CACHED'], ['Run Industry Ledger script to refresh cache.']];
+    }
+
+    // 2. Format output for Google Sheets (array of objects -> array of arrays).
+    try {
+        const headerRow = Object.keys(rawData[0] || {});
+        
+        if (headerRow.length === 0) {
+            Logger.log('[CIJ_SHEET] ERROR: Raw data object structure is invalid (no headers).');
+            return [['ERROR: Invalid Data Structure']];
+        }
+
+        // Map the array of objects to an array of arrays for sheet compatibility
+        const values = rawData.map(obj => headerRow.map(key => obj[key]));
+
+        Logger.log(`[CIJ_SHEET] SUCCESS: Returning ${values.length} jobs.`);
+
+        // Return the headers and the values
+        return [headerRow, ...values];
+    } catch (e) {
+        Logger.log(`[CIJ_SHEET] ERROR: Formatting failed: ${e.message}`);
+        return [['ERROR', `Formatting failed: ${e.message}`]];
+    }
 }

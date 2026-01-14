@@ -216,7 +216,17 @@ function withRetries(fn, tries = 3, base = 300) {
       if (!call.items || call.items.length === 0) continue;
 
       const url = "https://market.fuzzwork.co.uk/aggregates/";
-      const payload = { [call.locationType]: call.locationId, types: call.items.join(",") };
+      
+      // --- THE FIX ---
+      // Force the parameter key to be 'region' even if we are looking up a system.
+      // This forces Fuzzworks to filter by the ID we provide (3000xxxx), 
+      // instead of ignoring the 'system' tag and returning the whole region.
+      let paramKey = 'region'; 
+      
+      // Note: We still send the System ID (3000...) or Station ID (6000...)
+      // We just call it a "region" in the JSON payload so the API respects it.
+      const payload = { [paramKey]: call.locationId, types: call.items.join(",") };
+      // ----------------
 
       requests.push({
         url: url,
