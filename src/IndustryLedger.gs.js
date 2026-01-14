@@ -692,6 +692,10 @@ function resetIndustryLedgerProperties() {
   props.deleteProperty(INDUSTRY_JOB_KEY);
   props.deleteProperty(BPC_JOB_KEY);
   props.deleteProperty(BPC_WAC_KEY);
+  
+  // ADD THIS LINE:
+  props.deleteProperty('BpcHistoryData'); 
+  
   console.log("Industry Ledger Properties Reset.");
 }
 
