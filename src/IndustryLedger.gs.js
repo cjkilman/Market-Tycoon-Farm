@@ -604,24 +604,41 @@ function _getCorporateJobsRaw(forceRefresh) {
 
   if (!authToon) return null;
 
-  if (!forceRefresh) {
-    const cachedJson = _getAndDechunk(CACHE_KEY);
-    if (cachedJson) return JSON.parse(cachedJson);
-    return null;
+  // 1. Always attempt to load from Cache first
+  const cachedJson = _getAndDechunk(CACHE_KEY);
+
+  // 2. DECISION MATRIX:
+  // IF cache exists AND we are NOT forcing a refresh -> Return Cache (Speed)
+  // IF cache is missing (Sheet is empty) -> Fetch (Self-Heal)
+  // IF forceRefresh is true (Background Script) -> Fetch (Update)
+  if (cachedJson && !forceRefresh) {
+    return JSON.parse(cachedJson);
   }
 
+  // 3. Execution (Cache Miss OR Force Refresh)
   try {
+    console.log(`[CorpJobs] Fetching live data... (Reason: ${forceRefresh ? "Force Refresh" : "Cache Miss"})`);
+    
     const rawObjects = GESI.invokeRaw(ENDPOINT, {
         include_completed: true,
         name: authToon,
         show_column_headings: false,
         version: null
     });
-    if (!Array.isArray(rawObjects)) return null;
+
+    if (!Array.isArray(rawObjects)) {
+      console.warn("[CorpJobs] ESI returned invalid structure.");
+      return null;
+    }
+
+    // 4. Update Cache (So the next 50 reads are fast)
     _chunkAndPut(CACHE_KEY, JSON.stringify(rawObjects), CACHE_TTL);
+    
     return rawObjects;
   } catch (e) {
-    console.log(`ESI Fetch Failed: ${e.message}`);
+    console.error(`[CorpJobs] ESI Fetch Failed: ${e.message}`);
+    // Optional fallback: If live fetch fails but we had stale cache, we could return it here.
+    // For now, we return null to indicate failure.
     return null;
   }
 }

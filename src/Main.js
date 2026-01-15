@@ -161,7 +161,6 @@ function generateRestockQuery() {
     const group = (row[2] || "").toString();
     const qtyLeft = Number(row[5]) || 0;
     const activeJobs = Number(row[10]) || 0;  
-    const buyOrderQty = Number(row[17]) || 0; 
     const volume = Number(row[20]) || 0;
     const effectiveVel = Number(row[30]) || 0;
     const warehouseQty = Number(row[31]) || 0;
@@ -173,7 +172,7 @@ function generateRestockQuery() {
 
     // -- CALCULATE --
     const targetQty = effectiveVel * filterTargetDays;
-    const existingStock = warehouseQty + qtyLeft + activeJobs + buyOrderQty;
+    const existingStock = warehouseQty + qtyLeft + activeJobs + qtyLeft;
     const restockNeed = Math.round(targetQty - existingStock);
     const orderCost = restockNeed * medianBuy * rateMultiplier;
 
