@@ -68,6 +68,14 @@ function Full_Recalculate_Cycle() {
     log.error('Failed to set sheet recalculation trigger cell.', e.message);
   }
 
+  // --- NEW: Update Need To Buy List ---
+  try {
+    generateRestockQuery(); // <--- Add this line
+    log.info('Need To Buy list regenerated.');
+  } catch (e) {
+    log.warn('Failed to regenerate restock list inside refresh cycle.', e.message);
+  }
+
   log.info('Full recalculate cycle finished. Script will now exit.');
 }
 

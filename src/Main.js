@@ -155,24 +155,48 @@ function generateRestockQuery() {
   for (let i = 0; i < rawData.length; i++) {
     const row = rawData[i];
     
-    const itemName = row[1];
+    // --- CORRECTED COLUMN MAPPING (Relative to Col B = Index 0) ---
+    // Col B = 0, C = 1, ...
+    
+    const itemName = row[1]; // Col C
     if (!itemName) continue; 
 
-    const group = (row[2] || "").toString();
-    const qtyLeft = Number(row[5]) || 0;
-    const activeJobs = Number(row[10]) || 0;  
-    const volume = Number(row[20]) || 0;
-    const effectiveVel = Number(row[30]) || 0;
-    const warehouseQty = Number(row[31]) || 0;
-    const daysOfInv = Number(row[34]); 
-    const totalMarketQty = Number(row[38]) || 0;
-    const medianBuy = Number(row[41]) || 0;
-    const margin = Number(row[49]) || 0;
-    const buyAction = (row[55] || "").toString();
+    const group = (row[2] || "").toString(); // Col D
+    const qtyLeft = Number(row[5]) || 0;     // Col G (Quantity Left / Sell Orders)
+    const activeJobs = Number(row[10]) || 0; // Col L (Active Jobs)
+    
+    // Volume: 30-day traded volume (Col W / Index 21) - Was reading V (Avg Price)
+    const volume = Number(row[21]) || 0; 
+    
+    // Buy Order Qty: Listed Volume Feed Buy (Col Y / Index 23)
+    const buyOrderQty = Number(row[23]) || 0; 
+
+    // Velocity: Effective Daily Velocity (Col AE / Index 29) - Was reading AF
+    const effectiveVel = Number(row[29]) || 0; 
+    
+    // Warehouse: Warehouse Qty (Col AF / Index 30) - Was reading AG
+    const warehouseQty = Number(row[30]) || 0; 
+    
+    // Days Inv: Days of Inventory (Col AI / Index 33) - Was reading AJ
+    const daysOfInv = Number(row[33]); 
+    
+    // Total Market: Total Market Quantity (Col AM / Index 37) - Was reading AN
+    const totalMarketQty = Number(row[37]) || 0; 
+    
+    const medianBuy = Number(row[41]) || 0; // Col AQ (OK)
+    
+    // Margin: (Col AX / Index 48) - Was reading AY
+    const margin = Number(row[48]) || 0; 
+    
+    // Buy Action: (Col BD / Index 54) - Was reading BE (Total Value Left)
+    const buyAction = (row[54] || "").toString(); 
 
     // -- CALCULATE --
     const targetQty = effectiveVel * filterTargetDays;
-    const existingStock = warehouseQty + qtyLeft + activeJobs + qtyLeft;
+    
+    // FIX: Count Warehouse + Sell Orders + Active Jobs + Buy Orders
+    const existingStock = warehouseQty + qtyLeft + activeJobs + buyOrderQty;
+    
     const restockNeed = Math.round(targetQty - existingStock);
     const orderCost = restockNeed * medianBuy * rateMultiplier;
 
