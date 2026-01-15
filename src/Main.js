@@ -89,8 +89,10 @@ function generateRestockQuery() {
     ITEM_NAME: 'Col2',          // C (Item Name)
     GROUP: 'Col3',              // D (Group)
     QUANTITY_LEFT: 'Col6',      // G (Quantity Left)
+    ACTIVE_JOBS: 'Col11',       // L (Active Jobs)  <-- NEW
+    BUY_ORDER_QTY: 'Col18',     // S (Buy Order Qty) <-- NEW
     VOLUME: 'Col21',            // V (Buy Vol) 
-    EFFECTIVE_VELOCITY: 'Col31',// AF (Effective Daily Velocity) [User Verified]
+    EFFECTIVE_VELOCITY: 'Col31',// AF (Effective Daily Velocity)
     WAREHOUSE_QTY: 'Col32',     // AG (Warehouse Qty)
     DAYS_OF_INV: 'Col35',       // AJ (Days of Inventory)
     TOTAL_MARKET_QTY: 'Col39',  // AN (Total Market Quantity)
@@ -138,7 +140,9 @@ function generateRestockQuery() {
   // --- 2. BUILD SQL ---
 
   // Calculations inside Query
-  const restockQuantityCalc = `(${COL.EFFECTIVE_VELOCITY}*${filterTargetDays})-(${COL.WAREHOUSE_QTY}+${COL.QUANTITY_LEFT})`;
+  // UPDATED: Now subtracts (WAREHOUSE + MARKET + ACTIVE_JOBS + BUY_ORDERS) from the Target
+  const restockQuantityCalc = `(${COL.EFFECTIVE_VELOCITY}*${filterTargetDays})-(${COL.WAREHOUSE_QTY}+${COL.QUANTITY_LEFT}+${COL.ACTIVE_JOBS}+${COL.BUY_ORDER_QTY})`;
+  
   const orderCostCalc = `(${restockQuantityCalc})*${COL.MEDIAN_BUY}*${rateMultiplier}`;
 
   const sqlSelect = `SELECT ${COL.ITEM_NAME}, ${restockQuantityCalc}, ${COL.MEDIAN_BUY}, ${orderCostCalc}, ${COL.TOTAL_MARKET_QTY}, ${COL.VOLUME}, 0, ${COL.WAREHOUSE_QTY}, ${COL.MARGIN}, ${COL.BUY_ACTION}`;
@@ -172,7 +176,6 @@ function generateRestockQuery() {
   sqlWhere += `)`; 
 
   // Sort
-  // FIXED: Mapped sort keys to Source Columns or Calculation Expressions
   let sortCol = COL.ITEM_NAME; 
   switch (sortColumnHeader.toString().trim()) {
     case 'Item Name': sortCol = COL.ITEM_NAME; break;
@@ -183,7 +186,7 @@ function generateRestockQuery() {
     case '30-day traded volume':
     case 'Volume': sortCol = COL.VOLUME; break;
     case 'Listed Volume (Feed Sell)':
-    case 'Market_Volume': sortCol = "Col24"; break; // Explicit mapping for 'Listed Volume (Feed Sell)'
+    case 'Market_Volume': sortCol = "Col24"; break; 
     case 'Warehouse Qty': sortCol = COL.WAREHOUSE_QTY; break;
     case 'Margin': sortCol = COL.MARGIN; break;
     case 'Buy Action': sortCol = COL.BUY_ACTION; break; 
@@ -194,7 +197,6 @@ function generateRestockQuery() {
 
   const sqlLabel = `LABEL ${restockQuantityCalc} 'Quantity', ${COL.MEDIAN_BUY} 'Median Buy Price', ${orderCostCalc} 'Order Cost', ${COL.BUY_ACTION} 'Buy Action'`;
   
-  // FIXED RANGE: Extends to BF (Col 57) to include 'Buy Action'
   const dataRangeRef = 'MarketOverviewData!B3:BF';
 
   const finalQueryString = [sqlSelect, sqlWhere, orderBySql, limitSql, sqlLabel].join(' ');
