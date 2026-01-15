@@ -884,21 +884,23 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
 }
 
 
-/** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Optimized Cache Handoff) =====================
- * Imports corporate market transactions (buy and sell) for Division 3.
- * Fixes Timeout: Phase 1 caches data for Phase 2, skipping the second API fetch.
- * Fixes "Argument too large": Now uses CHUNKED CACHING to handle large sell volumes.
+/** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Symmetric Ping-Pong Cache) =====================
+ * Imports corporate market transactions for Division 3.
+ * Refactored to use Utility.js for cache management.
  */
 function Ledger_Import_CorpJournal(ss, opts) {
   const log = LoggerEx.withTag('CORP_TXN');
   const t = log.startTimer('Ledger_Import_CorpJournal_Setup');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const CACHE = CacheService.getScriptCache(); // Use Script Cache for handoff
 
+  // --- CONFIGURATION ---
   const PHASE_KEY = 'CORP_JOURNAL_PHASE';
   const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS';
+  const CACHE_KEY_BUYS  = 'CORP_JOURNAL_HANDOFF_BUYS';
   const CACHE_KEY_ANCHOR = 'CORP_JOURNAL_HANDOFF_ANCHOR';
-  const CACHE_TTL = 1200; // 20 minutes (plenty for the handoff)
+  
+  // 60 Minutes Cache (Survives the 30 Minute wait)
+  const CACHE_TTL = 3600; 
 
   opts = opts || {};
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -911,223 +913,192 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const TARGET_DIVISION = 3;
   const authToon = getCorpAuthChar(ss);
 
+  // Load Anchor
   const rawFromId = SCRIPT_PROP.getProperty(CORP_JOURNAL_LAST_ID);
-  let currentFromId =  null;
-  if (isNaN(currentFromId)) currentFromId = null;
+  let currentFromId = null;
+  if (rawFromId && !isNaN(rawFromId)) currentFromId = rawFromId;
 
+  // Load Phase
   const currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
   log.info(`Starting Corp Journal Import. Current Phase: ${currentPhase}`);
 
-  t.stamp('Setup complete.');
+  // Setup Ledgers
+  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
+  const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
+  const keys = ['source', 'contract_id'];
 
-  // --- VARIABLES FOR PROCESSING ---
-  let buyRows = [];
-  let sellRows = [];
-  let allCorpTransactions = [];
+  // --- VARIABLES ---
+  let targetRows = []; // The rows we want to process NOW
   let newestTransactionId = null;
   let dataLoadedFromCache = false;
 
-  // --- PHASE 2 SHORTCUT: TRY LOADING FROM CACHE (CHUNKED SUPPORT) ---
-  if (currentPhase === 'SELLS') {
-    let cachedSellData = CACHE.get(CACHE_KEY_SELLS);
-
-    // If main key is missing, check for CHUNKED keys
-    if (!cachedSellData) {
-      const chunkCountStr = CACHE.get(CACHE_KEY_SELLS + '_CHUNKS');
-      if (chunkCountStr) {
-        const count = parseInt(chunkCountStr, 10);
-        const parts = [];
-        let missing = false;
-        for (let i = 0; i < count; i++) {
-          const part = CACHE.get(CACHE_KEY_SELLS + '_' + i);
-          if (part) parts.push(part);
-          else { missing = true; break; }
-        }
-        if (!missing) cachedSellData = parts.join('');
-      }
-    }
-
-    const cachedAnchor = CACHE.get(CACHE_KEY_ANCHOR);
-
-    if (cachedSellData) {
-      log.info("Phase 2 Shortcut: Loaded SELL data from cache. Skipping API fetch.");
-      sellRows = JSON.parse(cachedSellData);
-      newestTransactionId = cachedAnchor; // Restore the anchor we found in Phase 1
+  // =========================================================================
+  // LOGIC BLOCK 1: CHECK CACHE (Using Utility.js)
+  // =========================================================================
+  if (currentPhase === 'BUYS') {
+    // Phase 1: Did Phase 2 leave us a gift?
+    const cachedBuys = _getAndDechunk(CACHE_KEY_BUYS);
+    if (cachedBuys) {
+      log.info(`[CACHE HIT] Found cached BUY rows from previous run.`);
+      targetRows = JSON.parse(cachedBuys);
       dataLoadedFromCache = true;
+      
+      const cachedAnchor = _getAndDechunk(CACHE_KEY_ANCHOR);
+      if (cachedAnchor) newestTransactionId = cachedAnchor;
+    }
+  } else {
+    // Phase 2: Did Phase 1 leave us a gift?
+    const cachedSells = _getAndDechunk(CACHE_KEY_SELLS);
+    if (cachedSells) {
+      log.info(`[CACHE HIT] Found cached SELL rows from previous run.`);
+      targetRows = JSON.parse(cachedSells);
+      dataLoadedFromCache = true;
+      
+      const cachedAnchor = _getAndDechunk(CACHE_KEY_ANCHOR);
+      if (cachedAnchor) newestTransactionId = cachedAnchor;
     }
   }
 
-  // --- FETCH DATA (Only if NOT loaded from cache) ---
+  // =========================================================================
+  // LOGIC BLOCK 2: FRESH FETCH (IF CACHE MISSED)
+  // =========================================================================
   if (!dataLoadedFromCache) {
-    let fetchMore = true;
-    log.log(`Fetching Corp Transactions for Division ${TARGET_DIVISION} (since ${SINCE_DAYS} days)...`);
+    log.warn(`[CACHE MISS] Fetching fresh data from ESI for Phase: ${currentPhase}`);
 
+    let allCorpTransactions = [];
+    let fetchMore = true;
+    let tempFromId = currentFromId;
+
+    // --- A. THE FETCH LOOP ---
     do {
       try {
-        let from_id_arg = null;
-        const previousFromId = currentFromId;
-        if (currentFromId) {
-          from_id_arg = currentFromId;
-        }
-        const rawEntries = GESI.invokeRaw(
-          GESI_FUNC_NAME,
-          {
-            division: TARGET_DIVISION, from_id: from_id_arg, name: authToon,
+        const rawEntries = GESI.invokeRaw(GESI_FUNC_NAME, {
+            division: TARGET_DIVISION, from_id: tempFromId, name: authToon,
             show_column_headings: false, version: null
-          }
-        );
+        });
+
         if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
           fetchMore = false; break;
         }
+
         allCorpTransactions.push(...rawEntries);
         const oldestEntry = rawEntries[rawEntries.length - 1];
         const oldestDate = new Date(oldestEntry.date);
-        const oldestEntryId = oldestEntry.transaction_id;
+        
+        // Safety Check: Infinite Loops
+        if (tempFromId && tempFromId === oldestEntry.transaction_id) {
+           fetchMore = false; break;
+        }
 
-        if (isNaN(oldestDate.getTime())) {
-          log.error("Invalid Date found in ESI response.");
-          fetchMore = false; break;
-        }
-        if (previousFromId && previousFromId === oldestEntryId) {
-          log.log(`Pagination exhausted: Oldest ID ${oldestEntryId} repeated.`);
-          fetchMore = false; break;
-        }
         if (oldestDate.getTime() < cutoff.getTime()) {
-          log.log(`Oldest entry date (${oldestDate}) past cutoff.`);
-          fetchMore = false;
+           fetchMore = false;
         } else {
-          currentFromId = oldestEntryId;
+           tempFromId = oldestEntry.transaction_id;
         }
         Utilities.sleep(50);
       } catch (e) {
-        log.error(`Error fetching Division ${TARGET_DIVISION} at from_id ${currentFromId}.`, e);
-        fetchMore = false; throw e;
+        log.error("ESI Fetch Error", e);
+        fetchMore = false; 
       }
     } while (fetchMore);
 
-    SCRIPT_PROP.deleteProperty(CORP_JOURNAL_RESUME_PROP);
-
-    // Capture Newest ID for Anchoring
     if (allCorpTransactions.length > 0) {
       newestTransactionId = String(allCorpTransactions[0].transaction_id);
     }
 
-    // --- PROCESS DATA INTO ROWS ---
+    // --- B. PARSE INTO BUYS AND SELLS ---
+    const freshBuys = [];
+    const freshSells = [];
+
     for (const e of allCorpTransactions) {
       const d = new Date(e.date);
       if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
 
       const isBuy = e.is_buy === true;
-      const typeId = Number(e.type_id || 0);
-      const qty = Number(e.quantity || 0);
-      const price = Number(e.unit_price || e.price || 0);
-      const contractId = String(e.transaction_id || e.id || 0);
-
       const row = {
         date: d,
-        type_id: typeId,
-        qty: isBuy ? qty : -qty,
+        type_id: Number(e.type_id || 0),
+        qty: isBuy ? Number(e.quantity) : -Number(e.quantity),
         unit_value: '',
         source: BUY_SOURCE,
-        contract_id: contractId,
-        char: authToon, 
-        unit_value_filled: price
+        contract_id: String(e.transaction_id || e.id),
+        char: authToon,
+        unit_value_filled: Number(e.unit_price || e.price || 0)
       };
 
-      if (isBuy) buyRows.push(row); else sellRows.push(row);
+      if (isBuy) freshBuys.push(row); else freshSells.push(row);
     }
-  } // End Fetch Block
 
-  // --- PHASED EXECUTION LOGIC ---
-  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
-  const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
-  const keys = ['source', 'contract_id'];
-
-  let buyCount = 0;
-  let sellCount = 0;
-
-  // 1. PHASE: BUYS
-  if (currentPhase === 'BUYS') {
-    if (buyRows.length > 0) {
-      log.info(`Processing ${buyRows.length} BUY transactions...`);
-      const buyResult = MaterialLedger.upsert(keys, buyRows);
-      buyCount = buyResult.rows; 
-      log.log(`Buy side processed for ${LEDGER_BUY_SHEET}`, { appended_or_updated: buyCount, processed: buyRows.length });
+    // --- C. DISTRIBUTE & CACHE (THE PING PONG) ---
+    // Using Utility._chunkAndPut for safe storage
+    if (currentPhase === 'BUYS') {
+      // Phase 1: Eat Buys, Cache Sells
+      targetRows = freshBuys;
+      if (freshSells.length > 0) {
+        log.info(`Caching ${freshSells.length} SELL rows for Phase 2.`);
+        _chunkAndPut(CACHE_KEY_SELLS, JSON.stringify(freshSells), CACHE_TTL);
+        if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
+      }
     } else {
-      log.info("No BUY transactions to process.");
-    }
-
-    // CACHE HANDOFF: Save 'sellRows' and 'newestTransactionId' for Phase 2
-    if (sellRows.length > 0) {
-      try {
-        const jsonStr = JSON.stringify(sellRows);
-        const MAX_BYTES = 90000; // Safe Chunk Size (Limit is 100KB)
-
-        if (jsonStr.length <= MAX_BYTES) {
-           CACHE.put(CACHE_KEY_SELLS, jsonStr, CACHE_TTL);
-           log.info(`Cached ${sellRows.length} SELL rows directly.`);
-        } else {
-           // CHUNK IT
-           const chunks = [];
-           for (let i = 0; i < jsonStr.length; i += MAX_BYTES) {
-             chunks.push(jsonStr.substring(i, i + MAX_BYTES));
-           }
-           CACHE.put(CACHE_KEY_SELLS + '_CHUNKS', String(chunks.length), CACHE_TTL);
-           chunks.forEach((chunk, idx) => {
-             CACHE.put(CACHE_KEY_SELLS + '_' + idx, chunk, CACHE_TTL);
-           });
-           log.info(`Cached ${sellRows.length} SELL rows in ${chunks.length} chunks.`);
-        }
-        
-        if (newestTransactionId) CACHE.put(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
-      } catch (e) {
-        log.warn("Failed to cache SELL rows. Phase 2 will perform full fetch.", e);
+      // Phase 2: Eat Sells, Cache Buys
+      targetRows = freshSells;
+      if (freshBuys.length > 0) {
+        log.info(`Caching ${freshBuys.length} BUY rows for next Phase 1.`);
+        _chunkAndPut(CACHE_KEY_BUYS, JSON.stringify(freshBuys), CACHE_TTL);
+        if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
       }
     }
+  } 
 
-    // TRANSITION
-    SCRIPT_PROP.setProperty(PHASE_KEY, 'SELLS');
-    log.info("Phase 'BUYS' complete. Saved state 'SELLS'. Exiting.");
-    return { status: "PARTIAL_SUCCESS", phase: "BUYS", buyCount: buyCount };
-  }
+  // =========================================================================
+  // LOGIC BLOCK 3: PROCESS THE DATA
+  // =========================================================================
+  let resultCount = 0;
 
-  // 2. PHASE: SELLS
-  if (currentPhase === 'SELLS') {
-    if (sellRows.length > 0) {
-      log.info(`Processing ${sellRows.length} SELL transactions...`);
-      const sellResult = SalesLedger.upsert(keys, sellRows);
-      sellCount = sellResult.rows; 
-      log.log(`Sell side processed for ${LEDGER_SALE_SHEET}`, { appended_or_updated: sellCount, processed: sellRows.length });
+  if (targetRows && targetRows.length > 0) {
+    if (currentPhase === 'BUYS') {
+      log.info(`Processing ${targetRows.length} BUY transactions...`);
+      const res = MaterialLedger.upsert(keys, targetRows);
+      resultCount = res.rows;
     } else {
-      log.info("No SELL transactions to process.");
+      log.info(`Processing ${targetRows.length} SELL transactions...`);
+      const res = SalesLedger.upsert(keys, targetRows);
+      resultCount = res.rows;
     }
-
-    // COMPLETE CYCLE: UPDATE ANCHOR & RESET
-    if (newestTransactionId) {
-      SCRIPT_PROP.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
-      log.log(`Saved new transaction anchor: ${newestTransactionId}`);
-    }
-
-    SCRIPT_PROP.deleteProperty(PHASE_KEY);
-    CACHE.remove(CACHE_KEY_SELLS);
-    CACHE.remove(CACHE_KEY_ANCHOR);
-    
-    // Clean up chunks if they exist
-    const chunkCountStr = CACHE.get(CACHE_KEY_SELLS + '_CHUNKS');
-    if (chunkCountStr) {
-      const count = parseInt(chunkCountStr, 10);
-      for(let i=0; i<count; i++) CACHE.remove(CACHE_KEY_SELLS + '_' + i);
-      CACHE.remove(CACHE_KEY_SELLS + '_CHUNKS');
-    }
-
-    log.info("Phase 'SELLS' complete. Cycle finished.");
+  } else {
+    log.info(`No transactions found for Phase: ${currentPhase}`);
   }
 
-  return {
-    appended_or_updated_buy: buyCount,
-    appended_or_updated_sell: sellCount,
-    sheets: { buy: LEDGER_BUY_SHEET, sell: LEDGER_SALE_SHEET }
-  };
+  // =========================================================================
+  // LOGIC BLOCK 4: TRANSITION & CLEANUP
+  // =========================================================================
+  if (currentPhase === 'BUYS') {
+    // Switch to Phase 2
+    SCRIPT_PROP.setProperty(PHASE_KEY, 'SELLS');
+    
+    // Clear the Buy cache (we just used it)
+    _deleteShardedData(CACHE_KEY_BUYS);
+
+    log.info("Phase 'BUYS' complete. Transitioning to 'SELLS'.");
+    return { status: "SUCCESS_BUYS", count: resultCount };
+  } 
+  else {
+    // Phase 2 Complete. Update Anchor.
+    if (newestTransactionId) {
+       SCRIPT_PROP.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
+       log.log(`Cycle Complete. Anchor Updated: ${newestTransactionId}`);
+    }
+    
+    // Switch back to Phase 1
+    SCRIPT_PROP.setProperty(PHASE_KEY, 'BUYS');
+    
+    // Clear the Sell cache (we just used it)
+    _deleteShardedData(CACHE_KEY_SELLS);
+    _deleteShardedData(CACHE_KEY_ANCHOR);
+
+    log.info("Phase 'SELLS' complete. Transitioning to 'BUYS'.");
+    return { status: "SUCCESS_SELLS", count: resultCount };
+  }
 }
 
 /**

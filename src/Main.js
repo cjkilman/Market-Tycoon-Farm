@@ -77,13 +77,6 @@ function respondToEdit(e) { // <-- RENAMED from onEdit
 }
 
 /**
- * Executes the complex Restock List logic.
- * This is a lightweight function called by the onEdit trigger.
- * It reads all inputs from their *correct* new cell locations,
- * reads FEE_RATE and TAX_RATE from named ranges,
- * builds the stable QUERY string, and writes the final formula to 'Need To Buy'!C4.
- */
-/**
  * Executes the Restock List logic with CORRECTED COLUMN INDEXES.
  * Range Base: MarketOverviewData!B3:BF
  */
@@ -179,20 +172,21 @@ function generateRestockQuery() {
   sqlWhere += `)`; 
 
   // Sort
-  let sortCol = "Col2"; 
+  // FIXED: Mapped sort keys to Source Columns or Calculation Expressions
+  let sortCol = COL.ITEM_NAME; 
   switch (sortColumnHeader.toString().trim()) {
-    case 'Item Name': sortCol = "Col1"; break;
-    case 'Quantity': sortCol = "Col2"; break;
-    case 'Median Buy Price': sortCol = "Col3"; break; 
-    case 'Order Cost': sortCol = "Col4"; break;
-    case 'Total Market Quantity': sortCol = "Col5"; break;
+    case 'Item Name': sortCol = COL.ITEM_NAME; break;
+    case 'Quantity': sortCol = restockQuantityCalc; break;
+    case 'Median Buy Price': sortCol = COL.MEDIAN_BUY; break; 
+    case 'Order Cost': sortCol = orderCostCalc; break;
+    case 'Total Market Quantity': sortCol = COL.TOTAL_MARKET_QTY; break;
     case '30-day traded volume':
-    case 'Volume': sortCol = "Col6"; break;
+    case 'Volume': sortCol = COL.VOLUME; break;
     case 'Listed Volume (Feed Sell)':
-    case 'Market_Volume': sortCol = "Col7"; break;
-    case 'Warehouse Qty': sortCol = "Col8"; break;
-    case 'Margin': sortCol = "Col9"; break;
-    case 'Buy Action': sortCol = "Col10"; break; 
+    case 'Market_Volume': sortCol = "Col24"; break; // Explicit mapping for 'Listed Volume (Feed Sell)'
+    case 'Warehouse Qty': sortCol = COL.WAREHOUSE_QTY; break;
+    case 'Margin': sortCol = COL.MARGIN; break;
+    case 'Buy Action': sortCol = COL.BUY_ACTION; break; 
   }
 
   const orderBySql = `ORDER BY ${sortCol} ${sortDirection}`;

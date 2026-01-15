@@ -243,13 +243,17 @@ function masterOrchestrator() {
   executeWithTryLock(runMaintenanceJobs, 'runMaintenanceJobs');
 }
 
-// File: cjkilman/market-tycoon-farm/Market-Tycoon-Farm-dev/src/Orchestrator.js
 
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
   const PROP_KEY_CONTRACT_LEASE = 'contractJobLeaseUntil';
-  const HOURLY_RUN_INTERVAL_MS = 3600000; // Assuming 1 hour interval
+  
+  // STANDARD INTERVAL (60 Minutes) - Default for Loot, Contracts, Industry
+  const STANDARD_INTERVAL_MS = 3600000; 
+  
+  // JOURNAL INTERVAL (30 Minutes) - Specific override for Ledger Import
+  const JOURNAL_INTERVAL_MS = 1800000; 
 
   const JOB_QUEUE = [
     'runLootDeltaPhase',
@@ -276,7 +280,13 @@ function runMaintenanceJobs() {
     const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
     const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
 
-    let isJobDue = (NOW_MS - lastRunTimestamp) >= HOURLY_RUN_INTERVAL_MS;
+    // --- DYNAMIC INTERVAL CHECK ---
+    let requiredInterval = STANDARD_INTERVAL_MS;
+    if (currentJobName === 'Ledger_Import_CorpJournal') {
+        requiredInterval = JOURNAL_INTERVAL_MS;
+    }
+
+    let isJobDue = (NOW_MS - lastRunTimestamp) >= requiredInterval;
     let isLeaseExpired = true; // Assume true unless check proves otherwise
 
     // 1. LEASE CHECK (Bypasses time check if lease is active)
@@ -294,7 +304,7 @@ function runMaintenanceJobs() {
 
     // 2. INTERVAL CHECK (Only proceed if the job is due and lease is expired)
     if (isJobDue) {
-      console.log(`[Maintenance] Executing: ${currentJobName}`);
+      console.log(`[Maintenance] Executing: ${currentJobName} (Interval: ${Math.round(requiredInterval/60000)}m)`);
 
       try {
         const fn = this[currentJobName];
