@@ -103,30 +103,12 @@ function respondToEdit(e) {
 }
 
 /**
- * Executes the Restock List logic using a JS Worker (No Formulas).
- * NOW INCLUDES HEADERS.
+ * Executes the Restock List logic using a JS Worker.
+ * FIX: Uses Dynamic Column Mapping to prevent index errors.
  */
 function generateRestockQuery() {
   const TARGET_SHEET_NAME = 'Need To Buy';
   const DATA_SHEET_NAME = 'MarketOverviewData';
-
-  // HEADERS go in Row 4
-  const HEADER_ROW = 4;
-  const DATA_START_ROW = 5;
-  const START_COL_WRITE = 3; // Col C
-
-  const HEADERS = [
-    "Item Name",
-    "Quantity",
-    "Median Buy Price",
-    "Order Cost",
-    "Total Market Quantity",
-    "Volume",
-    "0",
-    "Warehouse Qty",
-    "Margin",
-    "Buy Action"
-  ];
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
@@ -137,196 +119,184 @@ function generateRestockQuery() {
     return;
   }
 
-  // --- 1. READ FILTERS ---
-  const filterValues = sheet.getRange('B5:B26').getValues();
+  // --- 1. DYNAMIC COLUMN MAPPING ---
+  // Read headers from Row 3 of MarketOverviewData
+  const lastCol = dataSheet.getLastColumn();
+  const headers = dataSheet.getRange(3, 1, 1, lastCol).getValues()[0];
+  
+  // Helper to find index (0-based relative to the range, but range starts at Col A=0)
+  const getIdx = (name) => {
+    const idx = headers.indexOf(name);
+    if (idx === -1) console.warn(`Warning: Column "${name}" not found in ${DATA_SHEET_NAME}`);
+    return idx;
+  };
 
+  const colMap = {
+    itemName: getIdx("Item Name"),
+    group: getIdx("Group"),
+    qtyLeft: getIdx("Quantity Left"), // "Quantity Left" usually implies Sell Orders
+    activeJobs: getIdx("Active Jobs"),
+    deliveries: getIdx("Deliveries"),
+    volume: getIdx("30-day traded volume"),
+    buyOrderQty: getIdx("Listed Volume (Feed Buy)"),
+    effectiveVel: getIdx("Effective Daily Velocity (u/d)"),
+    warehouseQty: getIdx("Warehouse Qty"),
+    daysOfInv: getIdx("Days of Inventory"),
+    totalMarketQty: getIdx("Total Market Quantity"),
+    medianBuy: getIdx("Hub Median Buy"),
+    margin: getIdx("Margin"),
+    buyAction: getIdx("Buy Action")
+  };
+
+  if (colMap.itemName === -1) return; // Critical fail if no Item Name
+
+  // --- 2. READ FILTERS ---
+  const filterValues = sheet.getRange('B5:B26').getValues();
   const filterMinDays = parseFloat(filterValues[0][0]) || 0;
   const filterTargetDays = parseFloat(filterValues[2][0]) || 0;
   const filterMargin = parseFloat(filterValues[4][0]) || 0;
   const filterGroup = (filterValues[6][0] || "").toString().toLowerCase().trim();
   const sortDirection = (filterValues[8][0] || "ASC").toString().toUpperCase();
   const sortColumnHeader = (filterValues[9][0] || "Item Name").toString().trim();
-
   let limitNum = filterValues[14][0];
   if (limitNum === "No Limit" || limitNum === "" || limitNum === 0) limitNum = 999999;
-
   const filterVolumeType = filterValues[16][0];
   const filterVolumeValue = parseFloat(filterValues[17][0]) || 0;
+  const filterIgnoreGroups = (filterValues[21][0] || "").toString().toLowerCase().split(',').map(g => g.trim()).filter(g => g);
 
-  const filterIgnoreGroupsRaw = filterValues[21][0];
-  const filterIgnoreGroups = filterIgnoreGroupsRaw
-    ? filterIgnoreGroupsRaw.toString().toLowerCase().split(',').map(g => g.trim())
-    : [];
-
-  // --- 2. READ TAX RATES ---
-  let FEE_RATE = 0;
-  let TAX_RATE = 0;
+  // --- 3. READ TAX RATES ---
+  let rateMultiplier = 1.0;
   try {
-    const feeRange = ss.getRangeByName("FEE_RATE");
-    if (feeRange) FEE_RATE = parseFloat(feeRange.getValue()) || 0;
-    const taxRange = ss.getRangeByName("TAX_RATE");
-    if (taxRange) TAX_RATE = parseFloat(taxRange.getValue()) || 0;
-  } catch (e) { }
-  const rateMultiplier = (1 + FEE_RATE + TAX_RATE);
+    const fee = ss.getRangeByName("FEE_RATE")?.getValue() || 0;
+    const tax = ss.getRangeByName("TAX_RATE")?.getValue() || 0;
+    rateMultiplier = (1 + Number(fee) + Number(tax));
+  } catch (e) {}
 
-  // --- 3. FETCH RAW DATA ---
+  // --- 4. FETCH DATA ---
   const lastRow = dataSheet.getLastRow();
-  if (lastRow < 3) return;
+  if (lastRow < 4) return;
+  
+  // Get data starting Row 4
+  const rawData = dataSheet.getRange(4, 1, lastRow - 3, lastCol).getValues();
 
-  const rawData = dataSheet.getRange(3, 2, lastRow - 2, 57).getValues();
-
-  // --- 4. PROCESS DATA ---
+  // --- 5. PROCESS DATA ---
   let processedData = [];
 
   for (let i = 0; i < rawData.length; i++) {
     const row = rawData[i];
-
-    // --- CORRECTED COLUMN MAPPING (Relative to Col B = Index 0) ---
-    // Col B = 0, C = 1, ...
-
-    const itemName = row[1]; // Col C
+    const itemName = row[colMap.itemName];
     if (!itemName) continue;
 
-    const group = (row[2] || "").toString(); // Col D
-    const qtyLeft = Number(row[5]) || 0;     // Col G (Quantity Left / Sell Orders)
-    const activeJobs = Number(row[10]) || 0; // Col L (Active Jobs)
+    // Safe Number Parsing
+    const val = (idx) => (idx > -1) ? (Number(row[idx]) || 0) : 0;
+    const txt = (idx) => (idx > -1) ? (String(row[idx]) || "") : "";
+
+    const group = txt(colMap.group);
+    const buyAction = txt(colMap.buyAction);
     
-    // ADDED: Deliveries (Col Q / Index 15)
-    const deliveries = Number(row[15]) || 0; 
-
-    // Volume: 30-day traded volume (Col W / Index 21) - Was reading V (Avg Price)
-    const volume = Number(row[21]) || 0;
-
-    // Buy Order Qty: Listed Volume Feed Buy (Col Y / Index 23)
-    const buyOrderQty = Number(row[23]) || 0;
-
-    // Velocity: Effective Daily Velocity (Col AE / Index 29) - Was reading AF
-    const effectiveVel = Number(row[29]) || 0;
-
-    // Warehouse: Warehouse Qty (Col AF / Index 30) - Was reading AG
-    const warehouseQty = Number(row[30]) || 0;
-
-    // Days Inv: Days of Inventory (Col AI / Index 33) - Was reading AJ
-    const daysOfInv = Number(row[33]);
-
-    // Total Market: Total Market Quantity (Col AM / Index 37) - Was reading AN
-    const totalMarketQty = Number(row[37]) || 0;
-
-    const medianBuy = Number(row[41]) || 0; // Col AQ (OK)
-
-    // Margin: (Col AX / Index 48) - Was reading AY
-    const margin = Number(row[48]) || 0;
-
-    // Buy Action: (Col BD / Index 54) - Was reading BE (Total Value Left)
-    const buyAction = (row[54] || "").toString();
-
-    // -- CALCULATE --
-    const targetQty = effectiveVel * filterTargetDays;
-
-    // FIX: Count Warehouse + Sell Orders + Active Jobs + Buy Orders + DELIVERIES
-    const existingStock = warehouseQty + qtyLeft + activeJobs + buyOrderQty + deliveries;
-
-    const restockNeed = Math.round(targetQty - existingStock);
-    const orderCost = restockNeed * medianBuy * rateMultiplier;
+    // Inventory Calculation
+    const stock = val(colMap.warehouseQty) + val(colMap.qtyLeft) + val(colMap.activeJobs) + val(colMap.buyOrderQty) + val(colMap.deliveries);
+    
+    const velocity = val(colMap.effectiveVel);
+    const targetQty = velocity * filterTargetDays;
+    const restockNeed = Math.round(targetQty - stock);
+    
+    const medianBuyPrice = val(colMap.medianBuy);
+    const orderCost = restockNeed * medianBuyPrice * rateMultiplier;
+    
+    const margin = val(colMap.margin); // Often a decimal (0.20 = 20%)
+    const daysInv = val(colMap.daysOfInv);
+    const volume = val(colMap.volume);
 
     // -- FILTERS --
     if (restockNeed <= 0) continue;
-    if (buyAction.includes("SKIP")) continue;
-    if (buyAction.includes("HOLD")) continue;
+    if (buyAction.includes("SKIP") || buyAction.includes("HOLD")) continue;
+    
+    // Check Filters
     if (margin < filterMargin) continue;
-    if (daysOfInv >= filterMinDays) continue;
-
+    if (daysInv >= filterMinDays) continue;
     if (filterGroup && !group.toLowerCase().includes(filterGroup)) continue;
+    if (filterIgnoreGroups.some(ig => group.toLowerCase().includes(ig))) continue;
 
-    if (filterIgnoreGroups.length > 0) {
-      const groupLower = group.toLowerCase();
-      if (filterIgnoreGroups.some(ignored => groupLower.includes(ignored))) continue;
-    }
-
+    // Volume Filter
     if (filterVolumeType === "30 Day Active" && volume <= 0) continue;
     if (filterVolumeType === "Nonactive Sellers" && volume !== 0) continue;
     if (filterVolumeType === "30 Top Sellers" && volume >= filterVolumeValue) continue;
     if (filterVolumeType === "30 Low Sellers" && volume <= filterVolumeValue) continue;
 
     processedData.push({
-      row: [itemName, restockNeed, medianBuy, orderCost, totalMarketQty, volume, 0, warehouseQty, margin, buyAction],
-      sortObj: { itemName, restockNeed, medianBuy, orderCost, totalMarketQty, volume, warehouseQty, margin, buyAction }
+      row: [
+        itemName, 
+        restockNeed, 
+        medianBuyPrice, 
+        orderCost, 
+        val(colMap.totalMarketQty), 
+        volume, 
+        0, // Placeholder column "0" from your headers
+        val(colMap.warehouseQty), 
+        margin, 
+        buyAction
+      ],
+      sortObj: { 
+        itemName, restockNeed, medianBuy: medianBuyPrice, orderCost, 
+        volume, margin, buyAction 
+      }
     });
   }
 
-  // --- 5. SORT ---
+  // --- 6. SORT ---
   processedData.sort((a, b) => {
-    let valA, valB;
-    switch (sortColumnHeader) {
-      case 'Item Name': valA = a.sortObj.itemName; valB = b.sortObj.itemName; break;
-      case 'Quantity': valA = a.sortObj.restockNeed; valB = b.sortObj.restockNeed; break;
-      case 'Median Buy Price': valA = a.sortObj.medianBuy; valB = b.sortObj.medianBuy; break;
-      case 'Order Cost': valA = a.sortObj.orderCost; valB = b.sortObj.orderCost; break;
-      case 'Total Market Quantity': valA = a.sortObj.totalMarketQty; valB = b.sortObj.totalMarketQty; break;
-      case 'Volume':
-      case '30-day traded volume': valA = a.sortObj.volume; valB = b.sortObj.volume; break;
-      case 'Warehouse Qty': valA = a.sortObj.warehouseQty; valB = b.sortObj.warehouseQty; break;
-      case 'Margin': valA = a.sortObj.margin; valB = b.sortObj.margin; break;
-      case 'Buy Action': valA = a.sortObj.buyAction; valB = b.sortObj.buyAction; break;
-      default: valA = a.sortObj.itemName; valB = b.sortObj.itemName;
-    }
-    if (valA < valB) return sortDirection === 'ASC' ? -1 : 1;
-    if (valA > valB) return sortDirection === 'ASC' ? 1 : -1;
+    let vA = a.sortObj.itemName, vB = b.sortObj.itemName;
+    
+    // Map header name to sort key
+    if (sortColumnHeader === 'Quantity') { vA = a.sortObj.restockNeed; vB = b.sortObj.restockNeed; }
+    else if (sortColumnHeader === 'Order Cost') { vA = a.sortObj.orderCost; vB = b.sortObj.orderCost; }
+    else if (sortColumnHeader === 'Margin') { vA = a.sortObj.margin; vB = b.sortObj.margin; }
+    else if (sortColumnHeader === 'Volume') { vA = a.sortObj.volume; vB = b.sortObj.volume; }
+    
+    if (vA < vB) return sortDirection === 'ASC' ? -1 : 1;
+    if (vA > vB) return sortDirection === 'ASC' ? 1 : -1;
     return 0;
   });
 
-  // --- 6. LIMIT ---
-  if (limitNum && processedData.length > limitNum) {
-    processedData = processedData.slice(0, limitNum);
-  }
+  // --- 7. LIMIT & WRITE ---
+  if (limitNum && processedData.length > limitNum) processedData = processedData.slice(0, limitNum);
 
-  // --- 7. WRITE TO SHEET ---
-  const maxRows = sheet.getMaxRows();
+  const HEADER_ROW = 4;
+  const DATA_START_ROW = 5;
+  const START_COL = 3; // Col C
 
-  // Clear everything from Header Row down
-  const rangeToClear = sheet.getRange(HEADER_ROW, START_COL_WRITE, maxRows - HEADER_ROW + 1, HEADERS.length);
-  rangeToClear.clearContent();
-
-  // Write Headers
-  sheet.getRange(HEADER_ROW, START_COL_WRITE, 1, HEADERS.length).setValues([HEADERS]);
-
-  // Write Data (if any)
+  // Headers
+  const HEADERS = ["Item Name", "Quantity", "Median Buy Price", "Order Cost", "Total Market Quantity", "Volume", "0", "Warehouse Qty", "Margin", "Buy Action"];
+  
+  // Clear & Write
+  sheet.getRange(HEADER_ROW, START_COL, sheet.getMaxRows(), HEADERS.length).clearContent();
+  sheet.getRange(HEADER_ROW, START_COL, 1, HEADERS.length).setValues([HEADERS]).setFontWeight("bold");
+  
   if (processedData.length > 0) {
-    const outputValues = processedData.map(item => item.row);
-    sheet.getRange(DATA_START_ROW, START_COL_WRITE, outputValues.length, outputValues[0].length).setValues(outputValues);
-    console.log(`Generated Restock List: ${outputValues.length} items.`);
-  } else {
-    console.log("Restock List Empty based on current filters.");
+    const out = processedData.map(p => p.row);
+    sheet.getRange(DATA_START_ROW, START_COL, out.length, out[0].length).setValues(out);
   }
+  console.log(`Need To Buy updated: ${processedData.length} rows.`);
 }
 
 /**
- * GENERATE RESTOCK ITEMS ON HAND (Static Version - Final Polish)
- * Output Range: C3:AA (Headers on Row 3, Data on Row 4)
- * Features: Dynamic Sorting (Matches B15), Header Formatting, Error Handling
+ * GENERATE RESTOCK ITEMS ON HAND (Fixed Column Mapping)
  */
 function generateRestockItemsOnHand() {
-  const TARGET_SHEET_NAME = 'Restock Items On Hand';
-  const DATA_SHEET_NAME = 'MarketOverviewData';
-  const SETTINGS_SHEET_NAME = 'Market Overview';
+  const TARGET_SHEET = 'Restock Items On Hand';
+  const DATA_SHEET = 'MarketOverviewData';
+  const SETTINGS_SHEET = 'Market Overview';
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
-  const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
-  const settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+  const sheet = ss.getSheetByName(TARGET_SHEET);
+  const dataSheet = ss.getSheetByName(DATA_SHEET);
+  const settingsSheet = ss.getSheetByName(SETTINGS_SHEET);
 
-  if (!sheet || !dataSheet) {
-    console.error("Required sheets not found.");
-    return;
-  }
+  if (!sheet || !dataSheet) return;
 
   // --- 1. CONFIGURATION ---
-  const OUTPUT_HEADER_ROW = 3;
-  const OUTPUT_DATA_ROW = 4;
-  const OUTPUT_START_COL = 3; // Column C
-
-  // The Exact Headers (25 Columns)
-  const outputHeaders = [
+  const OUT_HEADERS = [
     "Item Name", "Posting Price", "Hub Sell Price", "Seed Qty (units)",
     "Seed Posting Cost (ISK)", "Delta Sell", "Delta Buy", "Total Value",
     "Quantity", "Warehouse Level", "Pending Orders", "Projected Buy",
@@ -336,59 +306,46 @@ function generateRestockItemsOnHand() {
     "Hub Median Buy", "Effective Cost", "Sell Action", "Buy Action", "Sell Quantity"
   ];
 
-  // --- 2. READ FILTERS (Column B) ---
+  // --- 2. FILTERS (Column B) ---
   const bCol = sheet.getRange("B1:B45").getValues();
-
-  const filterStockLevel = parseFloat(bCol[5][0]) || 999999;
-  const minROI = parseFloat(bCol[7][0]) || 0;
-  const boostPct = parseFloat(bCol[9][0]) || 0;
-  const filterGroup = (bCol[11][0] || "").toString().toLowerCase();
-  const sortDirection = (bCol[13][0] || "ASC").toString().toUpperCase();
-  const sortColumn = (bCol[14][0] || "").toString(); // This is what we sort by
-  const deltaSellMax = bCol[16][0];
-  const deltaSellMin = bCol[17][0];
-  const deltaBuyMax = bCol[19][0];
-  const deltaBuyMin = bCol[20][0];
-  const filterVol = bCol[22][0] === true;
-  const filterLoot = bCol[24][0] === true;
-  const filterWhLevel = bCol[26][0] === true;
-  const filterWhLvlVal = parseFloat(bCol[27][0]) || 0;
-  const limitNum = bCol[32][0];
-  const minVol30 = bCol[35][0];
-  const minWarehouse = bCol[38][0];
-  const maxFeedDays = bCol[41][0];
-
-  let enableFallback = false;
-  if (settingsSheet) {
-    enableFallback = settingsSheet.getRange("E8").getValue() === true;
-  }
-  const boost = (boostPct > 1) ? boostPct / 100 : boostPct;
-
-  // --- 3. FETCH DATA ---
-  const lastRow = dataSheet.getLastRow();
-  const lastCol = dataSheet.getLastColumn();
-
-  const SOURCE_HEADER_ROW = 3; // Headers in Data Sheet
-  if (lastRow <= SOURCE_HEADER_ROW) return;
-
-  const headers = dataSheet.getRange(SOURCE_HEADER_ROW, 1, 1, lastCol).getValues()[0];
-  const data = dataSheet.getRange(SOURCE_HEADER_ROW + 1, 1, lastRow - SOURCE_HEADER_ROW, lastCol).getValues();
-
-  const getIdx = (name) => headers.indexOf(name);
-  const parseMoney = (val) => {
-    if (typeof val === 'number') return val;
-    if (!val) return 0;
-    return parseFloat(String(val).replace(/[^0-9.-]+/g, "")) || 0;
+  const getFilter = (r, type='string') => {
+    const val = bCol[r-1][0]; // r is 1-based row index
+    if (type === 'num') return parseFloat(val) || 0;
+    if (type === 'bool') return val === true;
+    return String(val);
   };
 
-  // Map Data Columns
-  const cols = {
-    itemName: getIdx("Item Name"),
+  const filterStockLvl = getFilter(6, 'num') || 999999;
+  const minROI = getFilter(8, 'num');
+  const boostPct = getFilter(10, 'num');
+  const boost = (boostPct > 1) ? boostPct/100 : boostPct;
+  const filterGroup = getFilter(12).toLowerCase();
+  const sortDir = getFilter(14).toUpperCase() || "ASC";
+  const sortColName = getFilter(15);
+  
+  const deltaSellMax = bCol[15][0]; // Row 16
+  const deltaSellMin = bCol[16][0]; // Row 17
+  
+  const enableFallback = settingsSheet ? (settingsSheet.getRange("E8").getValue() === true) : false;
+
+  // --- 3. DYNAMIC COLUMN MAPPING ---
+  const sourceLastCol = dataSheet.getLastColumn();
+  const sourceHeaders = dataSheet.getRange(3, 1, 1, sourceLastCol).getValues()[0];
+  
+  const getIdx = (name) => {
+    const i = sourceHeaders.indexOf(name);
+    // Flexible matching for "Quantity Left" vs "Posted Sell Quantuty"
+    if (i === -1 && name === "Posted Sell Quantuty") return sourceHeaders.indexOf("Quantity Left");
+    return i;
+  };
+
+  const colMap = {
+    item: getIdx("Item Name"),
     target: getIdx("Target"),
     hubSell: getIdx("Hub Sell Price"),
     mfgCost: getIdx("Manufacturing Unit Cost"),
     effCost: getIdx("Effective Cost"),
-    sellQty: getIdx("Posted Sell Quantuty"),
+    sellQty: getIdx("Posted Sell Quantuty"), // or Quantity Left
     seedQty: getIdx("Seed Qty (units)"),
     seedCost: getIdx("Seed Posting Cost (ISK)"),
     deltaSell: getIdx("Delta Sell"),
@@ -404,188 +361,131 @@ function generateRestockItemsOnHand() {
     charCont: getIdx("Char Contracts"),
     effVel: getIdx("Effective Daily Velocity (u/d)"),
     vol30: getIdx("30-day traded volume"),
-    listedVol: getIdx("Listed Volume (Feed Sell)"),
+    listVol: getIdx("Listed Volume (Feed Sell)"),
     feedDays: getIdx("Feed Days of Book"),
-    hubMedianBuy: getIdx("Hub Median Buy"),
-    sellAction: getIdx("Sell Action"),
-    buyAction: getIdx("Buy Action"),
+    hubMedBuy: getIdx("Hub Median Buy"),
+    sellAct: getIdx("Sell Action"),
+    buyAct: getIdx("Buy Action"),
     group: getIdx("Group"),
-    mktStockLvl: getIdx("Market Stock Level"),
-    medianROI: getIdx("Median ROI"),
+    stockLvl: getIdx("Market Stock Level"),
+    medROI: getIdx("Median ROI"),
     feedGate: getIdx("Feed Gate"),
-    hubGate: getIdx("Hub Gate"),
+    hubGate: getIdx("Hub Gate")
   };
 
-  if (cols.itemName === -1) return console.error("Headers not found.");
+  if (colMap.item === -1) {
+    console.error("Critical headers missing in MarketOverviewData");
+    return;
+  }
 
-  let processedData = [];
+  // --- 4. PROCESS DATA ---
+  const lastRow = dataSheet.getLastRow();
+  if (lastRow < 4) return;
+  const rawData = dataSheet.getRange(4, 1, lastRow - 3, sourceLastCol).getValues();
+  
+  let resultRows = [];
 
-  // --- 4. PROCESS ROW BY ROW ---
-  for (let i = 0; i < data.length; i++) {
-    const row = data[i];
-    if (!row[cols.itemName]) continue;
+  const cleanNum = (v) => (typeof v === 'number') ? v : parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
 
-    const val_HubSell = parseMoney(row[cols.hubSell]);
-    const val_Mfg = parseMoney(row[cols.mfgCost]);
-    const val_Eff = parseMoney(row[cols.effCost]);
-    const val_SellQty = parseMoney(row[cols.sellQty]);
+  for (let r of rawData) {
+    if (!r[colMap.item]) continue;
 
-    const target = Number(row[cols.target]) || 0;
-    const seedQty = Number(row[cols.seedQty]) || 0;
-    const pending = Number(row[cols.pending]) || 0;
-    const mktQty = Number(row[cols.mktQty]) || 0;
-    const whQty = Number(row[cols.whQty]) || 0;
-    const whLevel = Number(row[cols.whLevel]) || 0;
-    const vol30 = Number(row[cols.vol30]) || 0;
-    const lootTrans = Number(row[cols.lootTrans]) || 0;
-    const deltaSell = Number(row[cols.deltaSell]);
-    const deltaBuy = Number(row[cols.deltaBuy]);
+    // Extract Values
+    const hubSell = cleanNum(r[colMap.hubSell]);
+    const mfgCost = cleanNum(r[colMap.mfgCost]);
+    const effCost = cleanNum(r[colMap.effCost]);
+    const postedQty = cleanNum(r[colMap.sellQty]);
+    const target = cleanNum(r[colMap.target]);
+    const pending = cleanNum(r[colMap.pending]);
+    const seedQty = cleanNum(r[colMap.seedQty]);
+    
+    // ROI Calculation Logic
+    const baseCost = (mfgCost > 0) ? mfgCost : effCost;
+    const floorPrice = baseCost * (1 + minROI);
+    // Post at Hub Price if profitable, else Floor
+    const postPrice = (hubSell >= floorPrice) ? hubSell : floorPrice; 
 
-    const medianROI = (typeof row[cols.medianROI] === 'string')
-      ? parseFloat(row[cols.medianROI].replace('%', '')) / 100
-      : Number(row[cols.medianROI]);
+    // Quantities
+    const qtyNeed = Math.max(0, target - postedQty);
+    const projBuy = Math.max(0, (target * (1 + boost)) - pending);
+    
+    // Acquisition Total
+    const acq30 = cleanNum(r[colMap.buyVol]) + cleanNum(r[colMap.mfgComp]) + cleanNum(r[colMap.lootTrans]) + cleanNum(r[colMap.charCont]);
 
-    const feedDays = Number(row[cols.feedDays]);
-    const feedGate = String(row[cols.feedGate]);
-    const hubGate = String(row[cols.hubGate]);
-    const sellAction = String(row[cols.sellAction]);
-    const group = String(row[cols.group]);
+    // Filtering
+    const sellAction = String(r[colMap.sellAct]);
+    if (sellAction.includes("HOLD") || sellAction.includes("IGNORE") || sellAction.includes("SKIP")) continue;
+    
+    const roiVal = (typeof r[colMap.medROI] === 'string') ? parseFloat(r[colMap.medROI])/100 : r[colMap.medROI];
+    if (roiVal < minROI) continue;
 
-    // Pricing Logic
-    const val_Base = (val_Mfg > 0) ? val_Mfg : val_Eff;
-    const val_Floor = val_Base * (1 + minROI);
-    const val_Post = (val_HubSell >= val_Floor) ? val_HubSell : val_Floor;
+    if (filterGroup && !String(r[colMap.group]).toLowerCase().includes(filterGroup)) continue;
 
-    const qtyNeeded = target - val_SellQty;
-    const projBuy = (target * (1 + boost)) - pending;
-
-    const acq30d = (Number(row[cols.buyVol]) || 0) +
-      (Number(row[cols.mfgComp]) || 0) +
-      lootTrans +
-      (Number(row[cols.charCont]) || 0);
-
-    const totalValue = qtyNeeded * val_Post;
-    const projectedValue = projBuy * parseMoney(row[cols.hubBuy]);
-
-    // --- FILTERS ---
-    if (target < 0) continue;
-    if (mktQty < 0) continue;
-    if (pending < 0) continue;
-    if (seedQty <= 0) continue;
-
-    if (minWarehouse !== "" && whQty < minWarehouse) continue;
-    if (Number(row[cols.mktStockLvl]) > filterStockLevel) continue;
-    if (filterWhLevel && whLevel < filterWhLvlVal) continue;
-    if (filterVol && vol30 <= 0) continue;
-    if (filterLoot && lootTrans <= 0) continue;
-
-    if (deltaSellMax !== "" && deltaSell > deltaSellMax) continue;
-    if (deltaSellMin !== "" && deltaSell < deltaSellMin) continue;
-    if (deltaBuyMax !== "" && deltaBuy > deltaBuyMax) continue;
-    if (deltaBuyMin !== "" && deltaBuy < deltaBuyMin) continue;
-
-    if (medianROI < minROI) continue;
-    if (filterGroup && !group.toLowerCase().includes(filterGroup)) continue;
-    if (minVol30 !== "" && vol30 < minVol30) continue;
-    if (maxFeedDays !== "" && feedDays > maxFeedDays) continue;
-    if (target <= val_SellQty) continue;
-
-    if (enableFallback) {
-      if (feedGate !== 'OK' && hubGate !== 'OK') continue;
-    } else {
-      if (feedGate !== 'OK') continue;
-    }
-    if (sellAction.includes("HOLD")) continue;
-    if (sellAction.includes("IGNORE")) continue;
-    if (sellAction.includes('SKIP')) continue;
-
-    // --- BUILD ROW ---
-    // This array order MUST match outputHeaders exactly
-    const outputRow = [
-      row[cols.itemName],         // 1. Item Name
-      val_Post,                   // 2. Posting Price
-      row[cols.hubSell],          // 3. Hub Sell Price
-      row[cols.seedQty],          // 4. Seed Qty
-      row[cols.seedCost],         // 5. Seed Posting Cost
-      row[cols.deltaSell],        // 6. Delta Sell
-      row[cols.deltaBuy],         // 7. Delta Buy
-      totalValue,                 // 8. Total Value
-      qtyNeeded,                  // 9. Quantity
-      row[cols.whLevel],          // 10. Warehouse Level
-      row[cols.pending],          // 11. Pending Orders
-      projBuy,                    // 12. Projected Buy
-      projectedValue,             // 13. Projected Value
-      row[cols.mktQty],           // 14. Total Market Qty
-      row[cols.whQty],            // 15. Warehouse Qty
-      acq30d,                     // 16. Acquisition (30d)
-      row[cols.effVel],           // 17. Effective Daily Velocity
-      row[cols.vol30],            // 18. 30-day traded volume
-      row[cols.listedVol],        // 19. Listed Volume
-      row[cols.feedDays],         // 20. Feed Days
-      row[cols.hubMedianBuy],     // 21. Hub Median Buy
-      row[cols.effCost],          // 22. Effective Cost
-      row[cols.sellAction],       // 23. Sell Action
-      row[cols.buyAction],        // 24. Buy Action
-      val_SellQty                 // 25. Sell Quantity
+    // --- BUILD ROW (Order matches OUT_HEADERS) ---
+    const rowOut = [
+      r[colMap.item],                 // Item Name
+      postPrice,                      // Posting Price
+      hubSell,                        // Hub Sell
+      seedQty,                        // Seed Qty
+      r[colMap.seedCost],             // Seed Cost
+      r[colMap.deltaSell],            // Delta Sell
+      r[colMap.deltaBuy],             // Delta Buy
+      (qtyNeed * postPrice),          // Total Value
+      qtyNeed,                        // Quantity (To List)
+      r[colMap.whLevel],              // WH Level
+      pending,                        // Pending
+      projBuy,                        // Projected Buy
+      (projBuy * cleanNum(r[colMap.hubBuy])), // Projected Value
+      r[colMap.mktQty],               // Total Mkt Qty
+      r[colMap.whQty],                // Warehouse Qty
+      acq30,                          // Acquisition 30d
+      r[colMap.effVel],               // Velocity
+      r[colMap.vol30],                // Vol 30d
+      r[colMap.listVol],              // Listed Vol
+      r[colMap.feedDays],             // Feed Days
+      r[colMap.hubMedBuy],            // Hub Med Buy
+      effCost,                        // Effective Cost
+      sellAction,                     // Sell Action
+      r[colMap.buyAct],               // Buy Action
+      postedQty                       // Sell Qty
     ];
 
-    processedData.push({
-      row: outputRow,
-      sortCriteria: { roi: medianROI } // Keep ROI here in case we need it specifically
+    resultRows.push({
+      row: rowOut,
+      sortVal: (sortColName === 'Margin' || sortColName === 'Median ROI') ? roiVal : r[colMap.item] 
     });
   }
 
-  // --- 5. DYNAMIC SORTING ---
-  // Find which column index matches the header name in Cell B15
-  let sortColIndex = outputHeaders.indexOf(sortColumn);
+  // --- 5. SORT ---
+  // If specific column selected, map index. Else default Item Name.
+  let sortIdx = OUT_HEADERS.indexOf(sortColName);
+  if (sortIdx === -1 && sortColName !== 'Median ROI') sortIdx = 0;
 
-  // Fallback: If "Median ROI" is selected (which isn't in output), handle specifically
-  // Otherwise, if not found, default to Item Name (Index 0)
-
-  processedData.sort((a, b) => {
-    let valA, valB;
-
-    if (sortColumn === 'Median ROI' || sortColumn === 'Margin') {
-      valA = a.sortCriteria.roi;
-      valB = b.sortCriteria.roi;
-    } else {
-      // If column name matches a header, sort by that column
-      // If mismatch, sort by Item Name (Index 0)
-      const idx = (sortColIndex > -1) ? sortColIndex : 0;
-      valA = a.row[idx];
-      valB = b.row[idx];
-    }
-
-    // Handle strings case-insensitive
+  resultRows.sort((a, b) => {
+    let valA = (sortIdx > -1) ? a.row[sortIdx] : a.sortVal;
+    let valB = (sortIdx > -1) ? b.row[sortIdx] : b.sortVal;
+    
     if (typeof valA === 'string') valA = valA.toLowerCase();
     if (typeof valB === 'string') valB = valB.toLowerCase();
 
-    if (valA < valB) return sortDirection === 'ASC' ? -1 : 1;
-    if (valA > valB) return sortDirection === 'ASC' ? 1 : -1;
+    if (valA < valB) return (sortDir === 'ASC') ? -1 : 1;
+    if (valA > valB) return (sortDir === 'ASC') ? 1 : -1;
     return 0;
   });
 
-  // --- 6. LIMIT ---
-  if (limitNum !== "No Limit" && limitNum > 0) {
-    processedData = processedData.slice(0, limitNum);
-  }
-
-  // --- 7. WRITE OUTPUT ---
-  const maxRows = sheet.getMaxRows();
-  sheet.getRange(OUTPUT_HEADER_ROW, OUTPUT_START_COL, maxRows - OUTPUT_HEADER_ROW + 1, outputHeaders.length).clearContent();
-
+  // --- 6. WRITE ---
+  const writeRange = sheet.getRange(3, 3, sheet.getMaxRows(), OUT_HEADERS.length);
+  writeRange.clearContent();
+  
   // Write Headers
-  const headerRange = sheet.getRange(OUTPUT_HEADER_ROW, OUTPUT_START_COL, 1, outputHeaders.length);
-  headerRange.setValues([outputHeaders]);
-  headerRange.setFontWeight("bold").setHorizontalAlignment("center"); // <-- VISUAL FIX
+  sheet.getRange(3, 3, 1, OUT_HEADERS.length).setValues([OUT_HEADERS]).setFontWeight("bold");
 
   // Write Data
-  if (processedData.length > 0) {
-    const output = processedData.map(d => d.row);
-    sheet.getRange(OUTPUT_DATA_ROW, OUTPUT_START_COL, output.length, output[0].length).setValues(output);
-    console.log(`Restock Items On Hand: Updated ${output.length} rows.`);
+  if (resultRows.length > 0) {
+    const finalData = resultRows.map(o => o.row);
+    sheet.getRange(4, 3, finalData.length, finalData[0].length).setValues(finalData);
   } else {
-    sheet.getRange(OUTPUT_DATA_ROW, OUTPUT_START_COL).setValue("No items match filter criteria.");
+    sheet.getRange(4, 3).setValue("No items found.");
   }
 }
 
