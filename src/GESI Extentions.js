@@ -1331,6 +1331,8 @@ function syncContracts(ss, charIdMap) {
  * @param {object} buyData - { contracts: any[][], items: any[][] }
  */
 function contractsToMaterialLedger(ss, charIdMap, buyData) {
+  // MOVED UP: Initialize log immediately so it can be used in the check below
+  const log = LoggerEx.withTag('GESI');
 
   //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
 
@@ -1340,7 +1342,7 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) {
   }
 
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  const log = LoggerEx.withTag('GESI');
+  // const log = LoggerEx.withTag('GESI'); // <--- REMOVED FROM HERE
   const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
 
   // Define header indices based on the column positions written by syncContracts
@@ -1351,12 +1353,7 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) {
   const colC = { char: ix(hC_Names, "char"), contract_id: ix(hC_Names, "contract_id"), date_issued: ix(hC_Names, "date_issued") };
   const colI = { contract_id: ix(hI_Names, "contract_id"), type_id: ix(hI_Names, "type_id"), quantity: ix(hI_Names, "quantity"), is_included: ix(hI_Names, "is_included") };
 
-  // Input Check (replaces slow lastRow checks)
-  if (!buyData || !buyData.contracts || buyData.contracts.length === 0 || !buyData.items || buyData.items.length === 0) {
-    log.log('contracts->ledger', { status: 'Skipped: In-memory data is empty.' });
-    return 0;
-  }
-
+  // ... rest of the function remains the same ...
   // 1. Retrieve the list of ALL currently authenticated characters (the "Active Filter")
   const LOGGED_IN_CHARS = new Set(getCharNamesFast());
 
