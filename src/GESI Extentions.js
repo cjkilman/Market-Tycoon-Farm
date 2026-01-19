@@ -99,6 +99,23 @@ var _cachedCharIdMap = null;
 // UTILITIES (GAS-SAFE)
 // ==========================================================================================
 
+function FORCE_RESET_CACHES() {
+  const props = PropertiesService.getScriptProperties();
+
+  // 1. DELETE THE "CJ KILMAN" LOCK
+  // This forces lines 280-350 in your code to actually run again and read the sheet.
+  props.deleteProperty('GESI_PERSISTED_CORP_AUTH_CHAR');
+
+  // 2. RESET THE JOURNAL ANCHORS
+  // This forces a fresh 30-day fetch instead of trying to resume from a broken point.
+  props.deleteProperty('CORP_JOURNAL_DIV_RESUME');
+  props.deleteProperty('CORP_JOURNAL_LAST_TRANSACTION_ID');
+  props.deleteProperty('CORP_JOURNAL_PHASE'); // Resets the "Buy/Sell" Ping Pong phase
+
+  console.log("✅ CACHE FLUSHED.");
+  console.log("The system has forgotten 'CJ Kilman'. Next run will read 'Jason Kilman' from the sheet.");
+}
+
 /**
  * Utility function to read all data from a sheet (rows 2+) and return header map.
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
@@ -997,8 +1014,10 @@ function Ledger_Import_CorpJournal(ss, opts) {
         }
         Utilities.sleep(50);
       } catch (e) {
-        log.error("ESI Fetch Error", e);
-        fetchMore = false; 
+// Force the error to reveal its secrets
+        const msg = e.message || JSON.stringify(e);
+        log.error("ESI Fetch Error: " + msg);
+        fetchMore = false;
       }
     } while (fetchMore);
 
