@@ -281,7 +281,7 @@ function generateRestockQuery() {
 }
 
 /**
- * GENERATE RESTOCK ITEMS ON HAND (Fixed Column Mapping)
+ * GENERATE RESTOCK ITEMS ON HAND (Fixed Warehouse Logic & Name Formatting)
  */
 function generateRestockItemsOnHand() {
   const TARGET_SHEET = 'Restock Items On Hand';
@@ -309,7 +309,7 @@ function generateRestockItemsOnHand() {
   // --- 2. FILTERS (Column B) ---
   const bCol = sheet.getRange("B1:B45").getValues();
   const getFilter = (r, type='string') => {
-    const val = bCol[r-1][0]; // r is 1-based row index
+    const val = bCol[r-1][0]; 
     if (type === 'num') return parseFloat(val) || 0;
     if (type === 'bool') return val === true;
     return String(val);
@@ -323,18 +323,12 @@ function generateRestockItemsOnHand() {
   const sortDir = getFilter(14).toUpperCase() || "ASC";
   const sortColName = getFilter(15);
   
-  const deltaSellMax = bCol[15][0]; // Row 16
-  const deltaSellMin = bCol[16][0]; // Row 17
-  
-  const enableFallback = settingsSheet ? (settingsSheet.getRange("E8").getValue() === true) : false;
-
   // --- 3. DYNAMIC COLUMN MAPPING ---
   const sourceLastCol = dataSheet.getLastColumn();
   const sourceHeaders = dataSheet.getRange(3, 1, 1, sourceLastCol).getValues()[0];
   
   const getIdx = (name) => {
     const i = sourceHeaders.indexOf(name);
-    // Flexible matching for "Quantity Left" vs "Posted Sell Quantuty"
     if (i === -1 && name === "Posted Sell Quantuty") return sourceHeaders.indexOf("Quantity Left");
     return i;
   };
@@ -345,7 +339,7 @@ function generateRestockItemsOnHand() {
     hubSell: getIdx("Hub Sell Price"),
     mfgCost: getIdx("Manufacturing Unit Cost"),
     effCost: getIdx("Effective Cost"),
-    sellQty: getIdx("Posted Sell Quantuty"), // or Quantity Left
+    sellQty: getIdx("Posted Sell Quantuty"), 
     seedQty: getIdx("Seed Qty (units)"),
     seedCost: getIdx("Seed Posting Cost (ISK)"),
     deltaSell: getIdx("Delta Sell"),
@@ -367,10 +361,7 @@ function generateRestockItemsOnHand() {
     sellAct: getIdx("Sell Action"),
     buyAct: getIdx("Buy Action"),
     group: getIdx("Group"),
-    stockLvl: getIdx("Market Stock Level"),
-    medROI: getIdx("Median ROI"),
-    feedGate: getIdx("Feed Gate"),
-    hubGate: getIdx("Hub Gate")
+    medROI: getIdx("Median ROI")
   };
 
   if (colMap.item === -1) {
@@ -388,7 +379,12 @@ function generateRestockItemsOnHand() {
   const cleanNum = (v) => (typeof v === 'number') ? v : parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
 
   for (let r of rawData) {
-    if (!r[colMap.item]) continue;
+    let rawName = r[colMap.item];
+    if (!rawName) continue;
+
+    // --- FIX: Formatting Fix for Meta Items ---
+    // Detects items starting with ' and removes the surrounding quotes (e.g., 'Arbalest' -> Arbalest)
+    let itemName = String(rawName).replace(/^'([^']+)'/, '$1');
 
     // Extract Values
     const hubSell = cleanNum(r[colMap.hubSell]);
@@ -398,18 +394,23 @@ function generateRestockItemsOnHand() {
     const target = cleanNum(r[colMap.target]);
     const pending = cleanNum(r[colMap.pending]);
     const seedQty = cleanNum(r[colMap.seedQty]);
+    const whQty = cleanNum(r[colMap.whQty]); 
     
-    // ROI Calculation Logic
+    // Filter: Ignore if No Stock
+    if (whQty <= 0) continue; 
+
+    // ROI Calculation
     const baseCost = (mfgCost > 0) ? mfgCost : effCost;
     const floorPrice = baseCost * (1 + minROI);
-    // Post at Hub Price if profitable, else Floor
     const postPrice = (hubSell >= floorPrice) ? hubSell : floorPrice; 
 
-    // Quantities
-    const qtyNeed = Math.max(0, target - postedQty);
+    // Logic: Calculate List Quantity
+    const gap = Math.max(0, target - postedQty);
+    let qtyToList = Math.min(gap, whQty); 
+
+    if (qtyToList <= 0) continue; 
+
     const projBuy = Math.max(0, (target * (1 + boost)) - pending);
-    
-    // Acquisition Total
     const acq30 = cleanNum(r[colMap.buyVol]) + cleanNum(r[colMap.mfgComp]) + cleanNum(r[colMap.lootTrans]) + cleanNum(r[colMap.charCont]);
 
     // Filtering
@@ -421,23 +422,23 @@ function generateRestockItemsOnHand() {
 
     if (filterGroup && !String(r[colMap.group]).toLowerCase().includes(filterGroup)) continue;
 
-    // --- BUILD ROW (Order matches OUT_HEADERS) ---
+    // --- BUILD ROW ---
     const rowOut = [
-      r[colMap.item],                 // Item Name
+      itemName,                       // Fixed Item Name
       postPrice,                      // Posting Price
       hubSell,                        // Hub Sell
       seedQty,                        // Seed Qty
       r[colMap.seedCost],             // Seed Cost
       r[colMap.deltaSell],            // Delta Sell
       r[colMap.deltaBuy],             // Delta Buy
-      (qtyNeed * postPrice),          // Total Value
-      qtyNeed,                        // Quantity (To List)
+      (qtyToList * postPrice),        // Total Value 
+      qtyToList,                      // Quantity
       r[colMap.whLevel],              // WH Level
       pending,                        // Pending
       projBuy,                        // Projected Buy
       (projBuy * cleanNum(r[colMap.hubBuy])), // Projected Value
       r[colMap.mktQty],               // Total Mkt Qty
-      r[colMap.whQty],                // Warehouse Qty
+      whQty,                          // Warehouse Qty
       acq30,                          // Acquisition 30d
       r[colMap.effVel],               // Velocity
       r[colMap.vol30],                // Vol 30d
@@ -452,12 +453,11 @@ function generateRestockItemsOnHand() {
 
     resultRows.push({
       row: rowOut,
-      sortVal: (sortColName === 'Margin' || sortColName === 'Median ROI') ? roiVal : r[colMap.item] 
+      sortVal: (sortColName === 'Margin' || sortColName === 'Median ROI') ? roiVal : itemName 
     });
   }
 
   // --- 5. SORT ---
-  // If specific column selected, map index. Else default Item Name.
   let sortIdx = OUT_HEADERS.indexOf(sortColName);
   if (sortIdx === -1 && sortColName !== 'Median ROI') sortIdx = 0;
 
@@ -476,11 +476,8 @@ function generateRestockItemsOnHand() {
   // --- 6. WRITE ---
   const writeRange = sheet.getRange(3, 3, sheet.getMaxRows(), OUT_HEADERS.length);
   writeRange.clearContent();
-  
-  // Write Headers
   sheet.getRange(3, 3, 1, OUT_HEADERS.length).setValues([OUT_HEADERS]).setFontWeight("bold");
 
-  // Write Data
   if (resultRows.length > 0) {
     const finalData = resultRows.map(o => o.row);
     sheet.getRange(4, 3, finalData.length, finalData[0].length).setValues(finalData);

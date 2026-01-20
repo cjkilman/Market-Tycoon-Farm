@@ -933,7 +933,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
   // Load Anchor
   const rawFromId = SCRIPT_PROP.getProperty(CORP_JOURNAL_LAST_ID);
   let currentFromId = null;
-  if (rawFromId && !isNaN(rawFromId)) currentFromId = rawFromId;
+  if (rawFromId && !isNaN(rawFromId)) currentFromId = Number(rawFromId);
 
   // Load Phase
   const currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
@@ -1014,7 +1014,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
         }
         Utilities.sleep(50);
       } catch (e) {
-// Force the error to reveal its secrets
+        // Force the error to reveal its secrets
         const msg = e.message || JSON.stringify(e);
         log.error("ESI Fetch Error: " + msg);
         fetchMore = false;
@@ -1025,7 +1025,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
       newestTransactionId = String(allCorpTransactions[0].transaction_id);
     }
 
-    // --- B. PARSE INTO BUYS AND SELLS ---
+    // --- B. PARSE INTO BUYS AND SELLS (FIXED MATH) ---
     const freshBuys = [];
     const freshSells = [];
 
@@ -1034,15 +1034,28 @@ function Ledger_Import_CorpJournal(ss, opts) {
       if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
 
       const isBuy = e.is_buy === true;
+      const qty = Math.abs(Number(e.quantity || 1)); // Ensure positive quantity for division
+
+      // --- MATH FIX: Calculate Unit Value Safely ---
+      // 1. Try explicit unit_price from ESI.
+      // 2. If missing, fall back to total price / quantity.
+      let finalUnitValue = Number(e.unit_price);
+      
+      if (isNaN(finalUnitValue) || finalUnitValue === 0) {
+          // Fallback: If 'price' or 'amount' represents the TOTAL
+          const totalAmount = Number(e.price || e.amount || 0);
+          finalUnitValue = Math.abs(totalAmount) / qty;
+      }
+
       const row = {
         date: d,
         type_id: Number(e.type_id || 0),
-        qty: isBuy ? Number(e.quantity) : -Number(e.quantity),
+        qty: isBuy ? qty : -qty, // Positive for Buy, Negative for Sell
         unit_value: '',
         source: BUY_SOURCE,
         contract_id: String(e.transaction_id || e.id),
         char: authToon,
-        unit_value_filled: Number(e.unit_price || e.price || 0)
+        unit_value_filled: finalUnitValue
       };
 
       if (isBuy) freshBuys.push(row); else freshSells.push(row);
@@ -1098,7 +1111,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
     // Clear the Buy cache (we just used it)
     _deleteShardedData(CACHE_KEY_BUYS);
 
-    log.info("Phase 'BUYS' complete. Transitioning to 'SELLS'.");
+    log.info("Phase 'BUYS' complete. Transitioning to 'SELLS'.py");
     return { status: "SUCCESS_BUYS", count: resultCount };
   } 
   else {

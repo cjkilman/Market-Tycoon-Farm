@@ -63,7 +63,7 @@ const sdeLib = () => {
 
   const downloadTextData = (csvFile) => {
     console.time("downloadTextData( csvFile:" + csvFile + " )");
-    const baseURL = 'https://www.fuzzwork.co.uk/dump/latest/' + csvFile;
+    const baseURL = 'https://raw.githubusercontent.com/cjkilman/eve-sde-dump/main/' + csvFile;
     const csvContent = UrlFetchApp.fetch(baseURL).getContentText();
     console.timeEnd("downloadTextData( csvFile:" + csvFile + " )");
     return csvContent.trim().replace(/\n$/, "");
@@ -101,46 +101,46 @@ const sdeLib = () => {
 
 
 
-/**
- * Downloads a specific CSV file from Fuzzwork and parses it using the robust internal parser.
- * This is the public interface for the Orchestrator to fetch SDE files like mapDenormalize.
- * @param {string} fileName - The name of the CSV file to download (e.g., 'mapDenormalize.csv').
- * @param {Array<string>} [headers=null] - Array of specific columns to keep.
- * @param {boolean} [publishedOnly=false] - Whether to filter for published items.
- * @returns {Array<Array>} The 2D array of parsed data (including header row), or [] on failure.
- */
-const fetchSDEFile = (fileName, headers = null, publishedOnly = false) => {
+  /**
+   * Downloads a specific CSV file from Fuzzwork and parses it using the robust internal parser.
+   * This is the public interface for the Orchestrator to fetch SDE files like mapDenormalize.
+   * @param {string} fileName - The name of the CSV file to download (e.g., 'mapDenormalize.csv').
+   * @param {Array<string>} [headers=null] - Array of specific columns to keep.
+   * @param {boolean} [publishedOnly=false] - Whether to filter for published items.
+   * @returns {Array<Array>} The 2D array of parsed data (including header row), or [] on failure.
+   */
+  const fetchSDEFile = (fileName, headers = null, publishedOnly = false) => {
     const SCRIPT_NAME = 'fetchSDEFile';
-    
+
     // NOTE: Assumes downloadTextData and CSVToArray are available in the sdeLib scope.
-    
+
     try {
-        if (!fileName || typeof fileName !== 'string') {
-            throw new Error("File name is required.");
-        }
-        
-        // 1. Download the file content (reusing existing logic)
-        // This relies on the downloadTextData helper within the sdeLib closure.
-        const csvContent = downloadTextData(fileName); 
-        
-        // 2. Parse the data (reusing existing robust parser)
-        // Uses the built-in CSVToArray logic pattern for robust parsing and column filtering.
-        const parsedData = CSVToArray(csvContent, ",", headers, publishedOnly); 
-        
-        if (!parsedData || parsedData.length < 2) {
-            throw new Error("Parsed data is empty or invalid after download.");
-        }
-        
-        console.log(`${SCRIPT_NAME}: Successfully downloaded and parsed ${parsedData.length} rows from ${fileName}.`);
-        
-        return parsedData;
+      if (!fileName || typeof fileName !== 'string') {
+        throw new Error("File name is required.");
+      }
+
+      // 1. Download the file content (reusing existing logic)
+      // This relies on the downloadTextData helper within the sdeLib closure.
+      const csvContent = downloadTextData(fileName);
+
+      // 2. Parse the data (reusing existing robust parser)
+      // Uses the built-in CSVToArray logic pattern for robust parsing and column filtering.
+      const parsedData = CSVToArray(csvContent, ",", headers, publishedOnly);
+
+      if (!parsedData || parsedData.length < 2) {
+        throw new Error("Parsed data is empty or invalid after download.");
+      }
+
+      console.log(`${SCRIPT_NAME}: Successfully downloaded and parsed ${parsedData.length} rows from ${fileName}.`);
+
+      return parsedData;
 
     } catch (e) {
-        console.error(`${SCRIPT_NAME}: FATAL ERROR during SDE fetch: ${e.message}`);
-        // Returns empty array on failure, forcing the worker to handle the error state.
-        return []; 
+      console.error(`${SCRIPT_NAME}: FATAL ERROR during SDE fetch: ${e.message}`);
+      // Returns empty array on failure, forcing the worker to handle the error state.
+      return [];
     }
-};
+  };
 
   /**
    * ==================================================================
@@ -568,11 +568,11 @@ function sde_job_START() {
 
   // --- Robust Lock Handling ---
   const lock = LockService.getScriptLock();
-  let lockAcquired = false; 
+  let lockAcquired = false;
   try {
     console.log('START: Attempting to acquire ScriptLock (max wait 7 min)...');
-    lock.waitLock(420000); 
-    lockAcquired = true; 
+    lock.waitLock(420000);
+    lockAcquired = true;
     console.log('START: ScriptLock acquired.');
 
     SCRIPT_PROPS.setProperty(KEY_JOB_RUNNING, 'true');
@@ -582,7 +582,7 @@ function sde_job_START() {
     const loadingHelper = ss.getRange("'Utility'!B3:C3");
     const backupSettings = loadingHelper.getValues();
     loadingHelper.setValues([[0, 0]]);
-    SpreadsheetApp.flush(); 
+    SpreadsheetApp.flush();
     SCRIPT_PROPS.setProperty(KEY_BACKUP_SETTINGS, JSON.stringify(backupSettings));
 
     // --- Setting MAINTENANCE FLAG ---
@@ -592,50 +592,50 @@ function sde_job_START() {
     console.log('START: Orchestrator trigger deleted. System is halted.');
 
     // --- DEFINE THE FULL JOB LIST HERE ---
-    const { SdePage } = sdeLib(); 
+    const { SdePage } = sdeLib();
     const sdePages = [
-        // 1. Inventory Types (Heavy - Specific Columns)
-        new SdePage(
-            "SDE_invTypes",
-            "invTypes.csv",
-            ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice"] // Add this
-        ),
-        // 2. Industry Materials (Heavy - All Columns)
-        new SdePage(
-            "SDE_industryActivityMaterials",
-            "industryActivityMaterials.csv",
-            null // null = Grab ALL columns
-        ),
-        // 3. Industry Products (Medium - All Columns)
-        new SdePage(
-            "SDE_industryActivityProducts",
-            "industryActivityProducts.csv",
-            null
-        ),
-        // 4. Inventory Groups (Light)
-        new SdePage(
-            "SDE_invGroups",
-            "invGroups.csv",
-            null
-        ),
-        // 5. Inventory Categories (Light)
-        new SdePage(
-            "SDE_invCategories",
-            "invCategories.csv",
-            null
-        ),
-        // 6. Stations (Medium)
-        new SdePage(
-            "SDE_staStations",
-            "staStations.csv",
-            null
-        )
+      // 1. Inventory Types (Heavy - Specific Columns)
+      new SdePage(
+        "SDE_invTypes",
+        "invTypes.csv",
+        ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice"] // Add this
+      ),
+      // 2. Industry Materials (Heavy - All Columns)
+      new SdePage(
+        "SDE_industryActivityMaterials",
+        "industryActivityMaterials.csv",
+        null // null = Grab ALL columns
+      ),
+      // 3. Industry Products (Medium - All Columns)
+      new SdePage(
+        "SDE_industryActivityProducts",
+        "industryActivityProducts.csv",
+        null
+      ),
+      // 4. Inventory Groups (Light)
+      new SdePage(
+        "SDE_invGroups",
+        "invGroups.csv",
+        null
+      ),
+      // 5. Inventory Categories (Light)
+      new SdePage(
+        "SDE_invCategories",
+        "invCategories.csv",
+        null
+      ),
+      // 6. Stations (Medium)
+      new SdePage(
+        "SDE_staStations",
+        "staStations.csv",
+        null
+      )
     ];
 
     // Save State & Start First Trigger
     SCRIPT_PROPS.setProperty(KEY_JOB_LIST, JSON.stringify(sdePages));
     SCRIPT_PROPS.setProperty(KEY_JOB_INDEX, '0');
-    SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, '0'); 
+    SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, '0');
     _deleteTriggersFor('sde_job_PROCESS');
     Logger.log(`START: Saved ${sdePages.length} pages. Creating trigger for sde_job_PROCESS.`);
     ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(5000).create();
@@ -728,21 +728,21 @@ function sde_job_PROCESS() {
     ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(2000).create();
 
   } catch (e) {
-  const errorMessage = e.message.toLowerCase();
-    
+    const errorMessage = e.message.toLowerCase();
+
     // Check for fatal errors that should NOT resume
     if (errorMessage.includes("csvtoarray") || errorMessage.includes("not found") || errorMessage.includes("critical")) {
-      
+
       Logger.log(`FATAL ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message}. Calling FINALIZE to abort.`);
       sde_job_FINALIZE(); // This is the "Die and reset"
-    
+
     } else {
-      
+
       // Assume it's a temporary timeout, as intended
       Logger.log(`RESUMABLE ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message}. Re-triggering to attempt resume.`);
       _deleteTriggersFor('sde_job_PROCESS');
       ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(10000).create();
-    
+
     }
   } finally {
     lock.releaseLock();
