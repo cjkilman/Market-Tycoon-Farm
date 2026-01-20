@@ -84,7 +84,7 @@ const sdeLib = () => {
       sheet.clearContents();
     } else {
       isNewSheet = true;
-      sheet = activeSpreadsheet.insertSheet();
+      sheet = activeSpreadsheet.insertSheet(sheetName, activeSpreadsheet.getNumSheets());
       sheet.setName(sheetName);
     }
 
@@ -556,7 +556,7 @@ function isSdeJobRunning() {
 
 /**
  * STAGE 1: START (Called by user)
- * Updated to include ALL required SDE files.
+ * Updated: Orchestrator trigger logic removed.
  */
 function sde_job_START() {
   console.log('--- SDE JOB START INITIATED (Silent Mode) ---');
@@ -564,6 +564,14 @@ function sde_job_START() {
   if (isSdeJobRunning()) {
     Logger.log('START: Job already running. Aborting new request.');
     return;
+  }
+  // 1. RUN THE HOOK FIRST (Before locking anything)
+  const shouldContinue = tryCallHook('ON_SDE_START');
+  
+  if (shouldContinue === false) {
+    console.log('START: Process cancelled by User (ON_SDE_START returned false).');
+    SpreadsheetApp.getActiveSpreadsheet().toast("Update Cancelled.", "System", 3);
+    return; // STOP EVERYTHING
   }
 
   // --- Robust Lock Handling ---
@@ -577,60 +585,54 @@ function sde_job_START() {
 
     SCRIPT_PROPS.setProperty(KEY_JOB_RUNNING, 'true');
 
+    // --- DYNAMIC UTILITY CONFIG ---
+    let utilConf = { sheetName: "Utility", range: "B3:C3" }; // Default Fallback
+    if (typeof GET_UTILITY_CONFIG === 'function') {
+      utilConf = GET_UTILITY_CONFIG();
+    }
+
     // Halt Formulas
     const ss = getSS();
-    const loadingHelper = ss.getRange("'Utility'!B3:C3");
+    const loadingHelper = ss.getRange(`'${utilConf.sheetName}'!${utilConf.range}`);
+    
+    // Capture current values to restore later
     const backupSettings = loadingHelper.getValues();
-    loadingHelper.setValues([[0, 0]]);
-    SpreadsheetApp.flush();
     SCRIPT_PROPS.setProperty(KEY_BACKUP_SETTINGS, JSON.stringify(backupSettings));
 
-    // --- Setting MAINTENANCE FLAG ---
+    // Create a zero-filled array matching the range size (Dynamic "Off" Switch)
+    const zeroValues = backupSettings.map(r => r.map(() => 0));
+    loadingHelper.setValues(zeroValues);
+    SpreadsheetApp.flush();
+
+    // --- Setting MAINTENANCE FLAG (Optional: Keep if other tools use it, otherwise safe to remove) ---
     console.log('START: Setting system to MAINTENANCE mode.');
     SCRIPT_PROPS.setProperty(GLOBAL_STATE_KEY, 'MAINTENANCE');
-    _deleteTriggersFor('masterOrchestrator');
-    console.log('START: Orchestrator trigger deleted. System is halted.');
 
-    // --- DEFINE THE FULL JOB LIST HERE ---
+
+
+    // --- DYNAMIC CONFIGURATION LOADER ---
     const { SdePage } = sdeLib();
-    const sdePages = [
-      // 1. Inventory Types (Heavy - Specific Columns)
-      new SdePage(
-        "SDE_invTypes",
-        "invTypes.csv",
-        ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice"] // Add this
-      ),
-      // 2. Industry Materials (Heavy - All Columns)
-      new SdePage(
-        "SDE_industryActivityMaterials",
-        "industryActivityMaterials.csv",
-        null // null = Grab ALL columns
-      ),
-      // 3. Industry Products (Medium - All Columns)
-      new SdePage(
-        "SDE_industryActivityProducts",
-        "industryActivityProducts.csv",
-        null
-      ),
-      // 4. Inventory Groups (Light)
-      new SdePage(
-        "SDE_invGroups",
-        "invGroups.csv",
-        null
-      ),
-      // 5. Inventory Categories (Light)
-      new SdePage(
-        "SDE_invCategories",
-        "invCategories.csv",
-        null
-      ),
-      // 6. Stations (Medium)
-      new SdePage(
-        "SDE_staStations",
-        "staStations.csv",
-        null
-      )
-    ];
+    let configRaw = [];
+
+    // 1. Check if the active project has a specific config function
+    if (typeof GET_SDE_CONFIG === 'function') {
+      console.log('START: Loading project-specific SDE configuration.');
+      configRaw = GET_SDE_CONFIG();
+    } else {
+      // 2. Fallback Default (If you forget to add the config to Main.js)
+      console.warn('START: No GET_SDE_CONFIG found. Using DEFAULT fallback list.');
+      configRaw = [
+        { name: "SDE_invTypes", file: "invTypes.csv", cols: ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice"] },
+        { name: "SDE_invGroups", file: "invGroups.csv", cols: null },
+      ];
+    }
+
+    // 3. Convert JSON Config to SdePage Objects
+    const sdePages = configRaw.map(item => new SdePage(item.name, item.file, item.cols));
+
+    if (sdePages.length === 0) {
+      throw new Error("SDE Config is empty! Check GET_SDE_CONFIG in Main.js");
+    }
 
     // Save State & Start First Trigger
     SCRIPT_PROPS.setProperty(KEY_JOB_LIST, JSON.stringify(sdePages));
@@ -652,6 +654,25 @@ function sde_job_START() {
       console.log('START: Lock released.');
     }
   }
+}
+
+/**
+ * Safe Hook Caller
+ * Returns the result of the function (or true if function doesn't exist)
+ */
+function tryCallHook(functionName) {
+  if (typeof this[functionName] === 'function') {
+    console.log(`HOOK: Found '${functionName}'. Executing...`);
+    try {
+      const result = this[functionName](); 
+      // If the function returns nothing (undefined), assume it meant "True/Continue"
+      return result === undefined ? true : result;
+    } catch (e) {
+      console.warn(`HOOK: Error running '${functionName}': ${e.message}`);
+      return true; // Default to continue if hook fails
+    }
+  }
+  return true; // Default to continue if hook is missing
 }
 
 
@@ -757,33 +778,36 @@ function sde_job_PROCESS() {
 function sde_job_FINALIZE() {
   // --- Robust Lock Handling ---
   const lock = LockService.getScriptLock();
-  let lockAcquired = false; // Flag to track lock state
+  let lockAcquired = false;
   try {
     console.log('FINALIZE: Attempting to acquire ScriptLock (max wait 7 min)...');
-    lock.waitLock(420000); // Wait up to 7 minutes
-    lockAcquired = true; // Set flag ONLY if waitLock() succeeds
+    lock.waitLock(420000);
+    lockAcquired = true;
     console.log('FINALIZE: ScriptLock acquired.');
-    // --- END Robust Lock Handling ---
 
     console.log('--- SDE JOB FINALIZE STARTED (Silent Mode) ---');
 
-    // 1. Release formula lock
+// 1. Release formula lock
     const backupSettingsJSON = SCRIPT_PROPS.getProperty(KEY_BACKUP_SETTINGS);
     if (backupSettingsJSON) {
+      // Re-fetch config in case it changed (or just to get location)
+      let utilConf = { sheetName: "Utility", range: "B3:C3" }; 
+      if (typeof GET_UTILITY_CONFIG === 'function') {
+        utilConf = GET_UTILITY_CONFIG();
+      }
+
       const backupSettings = JSON.parse(backupSettingsJSON);
-      const ss = getSS(); // Optimization
-      // FIX: Changed range from B3:C3 (2 cols) to B3:D3 (3 cols)
-      const loadingHelper = ss.getRange("'Utility'!B3:C3");
+      const ss = getSS();
+      const loadingHelper = ss.getRange(`'${utilConf.sheetName}'!${utilConf.range}`);
       loadingHelper.setValues(backupSettings);
-      Logger.log('FINALIZE: Restored formula settings.');
+      Logger.log(`FINALIZE: Restored formula settings to ${utilConf.sheetName}!${utilConf.range}.`);
     }
 
-    // 2. Restart Orchestrator & Clear Maintenance Flag
+    // 2. Clear Maintenance Flag (WITHOUT restarting Orchestrator)
     SCRIPT_PROPS.setProperty(GLOBAL_STATE_KEY, 'RUNNING');
     Logger.log('FINALIZE: System state set to RUNNING.');
-    _deleteTriggersFor('masterOrchestrator');
-    ScriptApp.newTrigger('masterOrchestrator').timeBased().everyMinutes(15).create();
-    Logger.log('FINALIZE: Orchestrator trigger recreated.');
+
+    tryCallHook('ON_SDE_COMPLETE');
 
     // 3. Clear all state properties and triggers
     SCRIPT_PROPS.deleteProperty(KEY_JOB_RUNNING);
@@ -799,7 +823,6 @@ function sde_job_FINALIZE() {
     if (!lockAcquired) {
       Logger.log('FINALIZE: Lock unavailable. Aborting.');
     } else {
-      // The fatal error from the mismatch is caught here
       Logger.log(`ERROR in sde_job_FINALIZE: ${e.message} at line ${e.lineNumber}`);
     }
   } finally {
