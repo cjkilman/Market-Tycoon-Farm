@@ -665,7 +665,8 @@ function updateControlSheet() {
     log.info(`Successfully wrote ${dedupedOutput.length} sorted rows.`);
   });
 
-  SpreadsheetApp.getUi().alert(`Done. Rebuilt Control Sheet (Grouped by Location).`);
+  // --- FIX: Use toast instead of alert to avoid timeouts ---
+  SpreadsheetApp.getActiveSpreadsheet().toast(`Rebuilt Control Sheet. Rows: ${dedupedOutput ? dedupedOutput.length : 0}`, "Success");
 }
 
 /**
