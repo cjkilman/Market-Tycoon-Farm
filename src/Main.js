@@ -493,6 +493,170 @@ function generateRestockItemsOnHand() {
   }
 }
 
+function getStructureNames(structureIDs) {
+  if (!(Array.isArray(structureIDs))) { structureIDs = [[structureIDs]] };
+  var output = [];
+  for (var i = 0; i < structureIDs.length; i++) {
+    var data = GESI.universe_structures_structure(structureIDs[i][0], GESI.getMainCharacter(), false);
+    output.push(data[0][0]);
+  }
+  return output;
+}
+
+function updateControlSheet() {
+  if (typeof isSdeJobRunning !== 'undefined' && isSdeJobRunning()) {
+    Logger.log("updateControlSheet skipped: SDE Job is running.");
+    return;
+  }
+
+  // --- CONFIGURATION ---
+  const CONFIG = {
+    ITEM_SHEET_NAME: 'MarketOverviewData',
+    LOCATION_SHEET_NAME: 'Location List',
+    CONTROL_SHEET_NAME: 'Market_Control',
+    SDE_SHEET_NAME: 'SDE_invTypes',
+    ITEM_NAME_HEADERS: ['Item Name', 'TypeName', 'Type Name', 'Name', 'Item'],
+    ITEM_ID_HEADERS: ['type_id', 'TypeID', 'Type ID', 'Item ID'],
+    LOC_HEADERS: ['Station', 'System', 'Region']
+  };
+
+  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CONTROL_GEN') : console);
+  log.info(`Starting Rebuild with Sort & Dedupe. Source: ${CONFIG.ITEM_SHEET_NAME} & ${CONFIG.LOCATION_SHEET_NAME}`);
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const itemSheet = ss.getSheetByName(CONFIG.ITEM_SHEET_NAME);
+  const locationSheet = ss.getSheetByName(CONFIG.LOCATION_SHEET_NAME);
+  const controlSheet = ss.getSheetByName(CONFIG.CONTROL_SHEET_NAME);
+  const sdeSheet = ss.getSheetByName(CONFIG.SDE_SHEET_NAME);
+
+  if (!itemSheet || !locationSheet || !controlSheet) throw new Error("Missing required sheets.");
+
+  // =================================================================
+  // 1. READ ITEMS
+  // =================================================================
+  let uniqueItemIds = [];
+  const itemDataRaw = itemSheet.getDataRange().getValues();
+  if (itemDataRaw.length < 2) throw new Error("Item sheet is empty.");
+
+  let itemHeaderRowIdx = -1, nameColIdx = -1, idColIdx = -1;
+
+  for (let r = 0; r < Math.min(5, itemDataRaw.length); r++) {
+    const row = itemDataRaw[r].map(c => String(c).trim().toLowerCase());
+    CONFIG.ITEM_NAME_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { nameColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
+    CONFIG.ITEM_ID_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { idColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
+    if (itemHeaderRowIdx > -1) break;
+  }
+
+  if (itemHeaderRowIdx === -1) throw new Error(`Could not find Item headers in '${CONFIG.ITEM_SHEET_NAME}'.`);
+
+  const rawItems = [];
+  if (idColIdx > -1) {
+    for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+      const val = itemDataRaw[i][idColIdx];
+      if (Number(val) > 0) rawItems.push(Number(val));
+    }
+  } else if (nameColIdx > -1 && sdeSheet) {
+    const sdeVals = sdeSheet.getRange('A2:C' + sdeSheet.getLastRow()).getValues();
+    const typeMap = new Map(sdeVals.map(r => [String(r[2]).trim().toLowerCase(), r[0]]));
+    for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+      const name = String(itemDataRaw[i][nameColIdx]).trim().toLowerCase();
+      if (name && typeMap.has(name)) rawItems.push(typeMap.get(name));
+    }
+  }
+
+  uniqueItemIds = Array.from(new Set(rawItems));
+  log.info(`Found ${uniqueItemIds.length} unique items.`);
+
+  // =================================================================
+  // 2. READ LOCATIONS
+  // =================================================================
+  const locHeaderRowIdx = 4; // Row 5 (based on your provided CSV structure)
+  const locDataRaw = locationSheet.getDataRange().getValues();
+  if (locDataRaw.length <= locHeaderRowIdx) throw new Error("Location sheet too short.");
+
+  const headerRow = locDataRaw[locHeaderRowIdx].map(c => String(c).trim().toLowerCase());
+  const colMap = {};
+  CONFIG.LOC_HEADERS.forEach(h => colMap[h] = headerRow.indexOf(h.toLowerCase()));
+
+  const locSet = new Set();
+  for (let i = locHeaderRowIdx + 1; i < locDataRaw.length; i++) {
+    const row = locDataRaw[i];
+    CONFIG.LOC_HEADERS.forEach(type => {
+      const idx = colMap[type];
+      if (idx > -1) {
+        const val = row[idx];
+        if (val && !isNaN(val) && Number(val) > 0) locSet.add(`${type}|${val}`);
+      }
+    });
+  }
+
+  const locations = Array.from(locSet).map(s => {
+    const parts = s.split('|');
+    return { type: parts[0], id: Number(parts[1]) };
+  });
+  log.info(`Found ${locations.length} unique locations.`);
+
+  // =================================================================
+  // 3. GENERATE, DEDUPE, & SORT
+  // =================================================================
+
+  const runLocked = (typeof withSheetLock !== 'undefined') ? withSheetLock : (cb) => cb();
+
+  runLocked(function () {
+    controlSheet.clear();
+    const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
+    controlSheet.getRange(1, 1, 1, 4).setValues(headers);
+
+    let output = [];
+
+    // Generate Rows
+    for (const loc of locations) {
+      for (const itemId of uniqueItemIds) {
+        output.push([itemId, loc.type, loc.id, '']);
+      }
+    }
+
+    // --- DEDUPLICATION ---
+    const seen = new Set();
+    const dedupedOutput = [];
+    for (const row of output) {
+      const key = `${row[0]}_${row[1]}_${row[2]}`; // type_id_loctype_locid
+      if (!seen.has(key)) {
+        seen.add(key);
+        dedupedOutput.push(row);
+      }
+    }
+
+    log.info(`Deduplication: Removed ${output.length - dedupedOutput.length} duplicates.`);
+
+    // --- SORTING (GROUP BY LOCATION) ---
+    // Order: Location ID -> Location Type -> Type ID
+    dedupedOutput.sort((a, b) => {
+      // 1. Location ID (Index 2)
+      if (a[2] !== b[2]) return a[2] - b[2];
+
+      // 2. Location Type (Index 1) - Tie breaker for ID
+      if (a[1] !== b[1]) return a[1].localeCompare(b[1]);
+
+      // 3. Type ID (Index 0) - Sort items within location
+      return a[0] - b[0];
+    });
+
+    if (dedupedOutput.length > 0) {
+      controlSheet.getRange(2, 1, dedupedOutput.length, 4).setValues(dedupedOutput);
+
+      const maxRows = controlSheet.getMaxRows();
+      if (maxRows > dedupedOutput.length + 1) {
+        controlSheet.deleteRows(dedupedOutput.length + 2, maxRows - (dedupedOutput.length + 1));
+      }
+    }
+    log.info(`Successfully wrote ${dedupedOutput.length} sorted rows.`);
+  });
+
+  // --- FIX: Use toast instead of alert to avoid timeouts ---
+  SpreadsheetApp.getActiveSpreadsheet().toast(`Rebuilt Control Sheet. Rows: ${dedupedOutput ? dedupedOutput.length : 0}`, "Success");
+}
+
 /**
  * HOOK: Called BEFORE SDE Start
  * Returns TRUE to continue, FALSE to cancel.
