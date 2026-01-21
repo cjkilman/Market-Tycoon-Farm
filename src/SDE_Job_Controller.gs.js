@@ -69,8 +69,9 @@ const sdeLib = () => {
     return csvContent.trim().replace(/\n$/, "");
   };
 
-  /**
-   * Refactored: Creates or clears the sheet and writes headers directly.
+ /**
+   * Refactored: Clears content without destroying the layout immediately.
+   * This prevents custom columns from being deleted during the update process.
    */
   const createOrClearSdeSheet = (activeSpreadsheet, sheetName, headers) => {
     console.time("createOrClearSdeSheet({sheetName:" + sheetName + "})");
@@ -78,22 +79,20 @@ const sdeLib = () => {
     if (!headers || !headers.length) throw "headers are required to set up the sheet;";
 
     let sheet = activeSpreadsheet.getSheetByName(sheetName);
-    let isNewSheet = false;
 
     if (sheet) {
+      // CLEAR contents to remove old data, but do NOT delete rows/cols here.
+      // Deleting rows here destroys any custom formulas or formatting you have.
+      // We will do the "Snug-fit" at the very end of the job instead.
       sheet.clearContents();
     } else {
-      isNewSheet = true;
       sheet = activeSpreadsheet.insertSheet(sheetName, activeSpreadsheet.getNumSheets());
       sheet.setName(sheetName);
     }
 
     // Write the headers (Always row 1)
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-    // --- CRITICAL FIX: Populate the cache map ---
     _sheetCache[sheetName] = sheet;
-    // --- END CRITICAL FIX ---
 
     console.timeEnd("createOrClearSdeSheet({sheetName:" + sheetName + "})");
     return sheet;
@@ -337,184 +336,125 @@ const sdeLib = () => {
     }
   }
 
-  // --- "Public" Engine Function (buildSDEs) ---
+  /**
+   * Public Engine Function (buildSDEs)
+   * FIX: Scoping for headers/dataRows moved above try block to fix crash.
+   */
   const buildSDEs = (sdePage, scriptStartTime) => {
     if (sdePage == null) throw "sdePage is required";
     console.time("buildSDEs( sheetName:" + sdePage.sheet + ")");
 
-    // --- Your Design Parameters ---
-    const MAX_CHUNK_SIZE = 5000;      // Max rows to write at once
-    const MIN_CHUNK_SIZE = 500;       // Min rows to write at once
-    const TARGET_WRITE_TIME_MS = 3000; // Target time for setValues() to take (3 seconds)
-    const DOC_LOCK_TIMEOUT = 30000;    // 30 second wait for DocumentLock (used only for initial clear)
-    const SCRIPT_TIME_LIMIT = 285000; // 4m 45s - Predictive reschedule
+    const MAX_CHUNK_SIZE = 5000;
+    const MIN_CHUNK_SIZE = 500;
+    const TARGET_WRITE_TIME_MS = 3000;
+    const DOC_LOCK_TIMEOUT = 30000;
+    const SCRIPT_TIME_LIMIT = 285000;
 
-    // --- DYNAMIC STATE ---
-    // Initialize currentChunkSize to the maximum safe size
     let currentChunkSize = MAX_CHUNK_SIZE;
-
-    // --- Your Adaptive Throttle Parameters ---
-    const THROTTLE_BASE_SLEEP_MS = 250;      // Min 0.25s sleep between writes
-    const THROTTLE_LATENCY_FACTOR = 1.2;     // Sleep for 1.2x the last write duration
-    const THROTTLE_MAX_SLEEP_MS = 5000;      // Max 5s sleep
-    let lastWriteDurationMs = 500;           // Default for first loop
-    // --- End Parameters ---
+    const THROTTLE_BASE_SLEEP_MS = 250;
+    const THROTTLE_LATENCY_FACTOR = 1.2;
+    const THROTTLE_MAX_SLEEP_MS = 5000;
+    let lastWriteDurationMs = 500;
 
     const activeSpreadsheet = getSS();
 
-    // STAGE 1: Fetch & Parse (Done once)
+    // STAGE 1: Fetch & Parse
     const csvContent = downloadTextData(sdePage.csvFile);
     const csvData = CSVToArray(csvContent, ",", sdePage.headers, sdePage.publishedOnly);
 
-    // --- CRASH-PROOF CHECK ---
     if (!csvData || csvData.length < 2 || csvData[0].length === 0) {
-      console.warn(`FATAL_DATA_WARNING: Parsed data for ${sdePage.sheet} is empty or invalid. Skipping sheet update.`);
-      return true; // Return true (finished) to skip this job
+      console.warn(`FATAL_DATA_WARNING: Parsed data for ${sdePage.sheet} is empty. Skipping.`);
+      return true;
     }
-    // --- END CRASH-PROOF CHECK ---
+
+    // --- FIX: SCOPING ---
+    // Declaring these here ensures they are available to the "Snug-fit" logic at the end.
+    const headers = csvData.slice(0, 1)[0];
+    const dataRows = csvData.slice(1);
+    const numCols = headers.length;
+    // --------------------
 
     const docLock = LockService.getDocumentLock();
-
-    // --- NEW: Read the saved chunk index ---
     let currentRow = parseInt(SCRIPT_PROPS.getProperty(KEY_JOB_CHUNK_INDEX) || '0', 10);
-    // --- END NEW ---
-
-    // Hold the sheet object reference for final resize
     let finalSheetReference;
 
     try {
-      // STAGE 2: Prepare
-      // Headers are still needed here for column count and for createOrClearSdeSheet
-      const headers = csvData.slice(0, 1)[0];
-      const dataRows = csvData.slice(1);
-      const numCols = headers.length;
-
-      // --- NEW: Only clear/write headers if we are on the first chunk ---
       if (currentRow === 0) {
-        console.log(`buildSDEs: First run for ${sdePage.sheet}. Clearing sheet and writing headers.`);
-
-        // Use non-blocking lock to perform the initial clear, waiting up to DOC_LOCK_TIMEOUT
+        console.log(`buildSDEs: First run for ${sdePage.sheet}. Preparing sheet.`);
         if (!docLock.tryLock(DOC_LOCK_TIMEOUT)) {
-          // If initial lock fails, we can't start the job. Treat as a temporary pause state.
           SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, currentRow.toString());
-          console.warn(`buildSDEs: Initial Document Lock failed. Pausing to retry start.`);
           return false;
         }
-
         try {
-          // createOrClearSdeSheet now handles clearing AND writing headers
           finalSheetReference = createOrClearSdeSheet(activeSpreadsheet, sdePage.sheet, headers);
         } finally {
           docLock.releaseLock();
         }
       } else {
         finalSheetReference = activeSpreadsheet.getSheetByName(sdePage.sheet);
-        if (!finalSheetReference) {
-          throw new Error(`Sheet ${sdePage.sheet} not found on resume.`);
-        }
-        // Also ensure the sheet is in the cache for _writeChunkInternal to find it
+        if (!finalSheetReference) throw new Error(`Sheet ${sdePage.sheet} not found on resume.`);
         _sheetCache[sdePage.sheet] = finalSheetReference;
-        console.log(`buildSDEs: Resuming job for ${sdePage.sheet} from row ${currentRow}.`);
       }
-      // --- END NEW ---
 
-      // STAGE 3: Write & Finalize (in Chunks)
-      console.info(`buildSDEs: Total rows to write: ${dataRows.length}. Starting at: ${currentRow}`);
-
+      // STAGE 3: Write Chunks
       while (currentRow < dataRows.length) {
-
-        // --- Adaptive Throttle Logic (Sleep only if last write was successful) ---
         if (lastWriteDurationMs > 0) {
-          let sleepMs = Math.max(THROTTLE_BASE_SLEEP_MS, lastWriteDurationMs * THROTTLE_LATENCY_FACTOR);
-          sleepMs = Math.min(THROTTLE_MAX_SLEEP_MS, sleepMs); // Cap at max
-          console.log(`buildSDEs: Throttling for ${sleepMs.toFixed(0)}ms (based on last write of ${lastWriteDurationMs}ms)`);
+          let sleepMs = Math.min(THROTTLE_MAX_SLEEP_MS, Math.max(THROTTLE_BASE_SLEEP_MS, lastWriteDurationMs * THROTTLE_LATENCY_FACTOR));
           Utilities.sleep(sleepMs);
         }
 
-        // --- Your Timeout Check Logic ---
-        const elapsedTime = new Date().getTime() - scriptStartTime; // Check against the PROCESS job start time
-        if (elapsedTime > SCRIPT_TIME_LIMIT) {
-          // --- PAUSE AND RESUME ---
+        if ((new Date().getTime() - scriptStartTime) > SCRIPT_TIME_LIMIT) {
           SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, currentRow.toString());
-          console.warn(`buildSDEs: Predictive timeout hit (${elapsedTime}ms). Saving state to resume at row ${currentRow}.`);
-          console.timeEnd("buildSDEs( sheetName:" + sdePage.sheet + ")");
-          return false; // --- Signal to sde_job_PROCESS to re-run this job ---
-          // --- END PAUSE ---
+          console.warn(`buildSDEs: Timeout hit. Saving state at row ${currentRow}.`);
+          return false;
         }
-        // --- End Timeout Check ---
 
-        const chunkEnd = Math.min(currentRow + currentChunkSize, dataRows.length); // Use DYNAMIC SIZE
+        const chunkEnd = Math.min(currentRow + currentChunkSize, dataRows.length);
         const chunk = dataRows.slice(currentRow, chunkEnd);
-        const writeRow = currentRow + 2; // +1 for 1-based index, +1 for header row (which is now written by createOrClearSdeSheet)
+        const writeRow = currentRow + 2; 
 
         if (chunk.length > 0) {
-
-          let result;
-          try {
-            // --- NEW: Call the non-blocking writer ---
-            result = _writeChunkInternal(chunk, writeRow, numCols, sdePage.sheet);
-            // ----------------------------------------
-          } catch (e) {
-            // Catches CRITICAL cache miss error or severe API error
-            throw e;
-          }
-
+          let result = _writeChunkInternal(chunk, writeRow, numCols, sdePage.sheet);
           if (result.success === true) {
-            // Success: Update duration and advance row
             lastWriteDurationMs = result.duration;
-
-            // --- DYNAMIC CHUNK SIZE ADJUSTMENT ---
-            // Calculate the ratio: If it took 10s (slow), ratio is 3000/10000 = 0.3
-            const adjustmentFactor = TARGET_WRITE_TIME_MS / lastWriteDurationMs;
-
-            // Adjust the size for the NEXT chunk
-            currentChunkSize = Math.round(currentChunkSize * adjustmentFactor);
-
-            // Enforce Min/Max bounds
-            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, currentChunkSize));
-
-            console.log(`buildSDEs: Chunk write successful. Rows written: ${chunk.length}. Duration: ${lastWriteDurationMs}ms. Next chunk size adjusted to ${currentChunkSize}.`);
-            // --- END DYNAMIC ADJUSTMENT ---
-
+            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, Math.round(currentChunkSize * (TARGET_WRITE_TIME_MS / lastWriteDurationMs))));
             currentRow = chunkEnd;
-
           } else {
-            // Failure: Lock contention (tryLock failed). Aggressive reduction.
-            lastWriteDurationMs = 0;
-
-            // --- AGGRESSIVE HALVING ---
             currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
-            console.warn(`buildSDEs: Document Lock contention hit. Halving chunk size aggressively to ${currentChunkSize}. Retrying chunk immediately.`);
-            // --- END AGGRESSIVE HALVING ---
-
-            continue; // Immediately start next iteration of while loop
+            continue; 
           }
         } else {
           break;
         }
       }
-
-      console.log(`buildSDEs: Finished writing all ${dataRows.length} data rows.`);
-
-      // Use the final reference acquired during Stage 2
-      // autoResizeColumns(finalSheetReference); // Commented out for stability
-
     } catch (e) {
-      // Ensure lock is released on error if it was held (only needed for initial clear, but safe to check)
-      if (docLock.hasLock()) {
-        docLock.releaseLock();
-      }
-      // --- NEW: Save chunk index on failure ---
+      if (docLock.hasLock()) docLock.releaseLock();
       SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, currentRow.toString());
-      console.error(`buildSDEs: Error during write. State saved to resume at row ${currentRow}.`);
-      // --- END NEW ---
-      throw e; // Re-throw the error to be caught by sde_job_PROCESS
+      throw e; 
     }
 
-    // --- JOB IS FINISHED ---
+    // --- JOB FINISHED ---
     console.timeEnd("buildSDEs( sheetName:" + sdePage.sheet + ")");
-    SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, '0'); // Reset chunk index for next job
-    return true; // --- Signal to sde_job_PROCESS that this job is done ---
+    SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, '0');
+
+    // --- STAGE 4: SNUG-FIT (Row/Column Management) ---
+    // This now works because dataRows and headers are in the correct scope.
+    const finalMaxRows = finalSheetReference.getMaxRows();
+    const finalMaxCols = finalSheetReference.getMaxColumns();
+    const dataRowsPlusHeader = dataRows.length + 1;
+
+    // Delete excess rows (Respecting sheet limits)
+    if (finalMaxRows > dataRowsPlusHeader) {
+      finalSheetReference.deleteRows(dataRowsPlusHeader + 1, finalMaxRows - dataRowsPlusHeader);
+    }
+
+    // Delete excess columns (ONLY if you don't have custom columns to the right!)
+    // WARNING: This will delete any manual columns you added past the SDE data.
+    if (finalMaxCols > numCols) {
+      finalSheetReference.deleteColumns(numCols + 1, finalMaxCols - numCols);
+    }
+
+    return true; 
   };
 
   // --- Return the Public Interface ---
@@ -567,7 +507,7 @@ function sde_job_START() {
   }
   // 1. RUN THE HOOK FIRST (Before locking anything)
   const shouldContinue = tryCallHook('ON_SDE_START');
-  
+
   if (shouldContinue === false) {
     console.log('START: Process cancelled by User (ON_SDE_START returned false).');
     SpreadsheetApp.getActiveSpreadsheet().toast("Update Cancelled.", "System", 3);
@@ -594,7 +534,7 @@ function sde_job_START() {
     // Halt Formulas
     const ss = getSS();
     const loadingHelper = ss.getRange(`'${utilConf.sheetName}'!${utilConf.range}`);
-    
+
     // Capture current values to restore later
     const backupSettings = loadingHelper.getValues();
     SCRIPT_PROPS.setProperty(KEY_BACKUP_SETTINGS, JSON.stringify(backupSettings));
@@ -664,7 +604,7 @@ function tryCallHook(functionName) {
   if (typeof this[functionName] === 'function') {
     console.log(`HOOK: Found '${functionName}'. Executing...`);
     try {
-      const result = this[functionName](); 
+      const result = this[functionName]();
       // If the function returns nothing (undefined), assume it meant "True/Continue"
       return result === undefined ? true : result;
     } catch (e) {
@@ -787,11 +727,11 @@ function sde_job_FINALIZE() {
 
     console.log('--- SDE JOB FINALIZE STARTED (Silent Mode) ---');
 
-// 1. Release formula lock
+    // 1. Release formula lock
     const backupSettingsJSON = SCRIPT_PROPS.getProperty(KEY_BACKUP_SETTINGS);
     if (backupSettingsJSON) {
       // Re-fetch config in case it changed (or just to get location)
-      let utilConf = { sheetName: "Utility", range: "B3:C3" }; 
+      let utilConf = { sheetName: "Utility", range: "B3:C3" };
       if (typeof GET_UTILITY_CONFIG === 'function') {
         utilConf = GET_UTILITY_CONFIG();
       }
