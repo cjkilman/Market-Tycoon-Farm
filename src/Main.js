@@ -504,157 +504,184 @@ function getStructureNames(structureIDs) {
 }
 
 function updateControlSheet() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
+
+  // 1. SAFETY CHECK
   if (typeof isSdeJobRunning !== 'undefined' && isSdeJobRunning()) {
-    Logger.log("updateControlSheet skipped: SDE Job is running.");
+    console.warn("updateControlSheet skipped: SDE Job is running.");
     return;
   }
 
-  // --- CONFIGURATION ---
-  const CONFIG = {
-    ITEM_SHEET_NAME: 'MarketOverviewData',
-    LOCATION_SHEET_NAME: 'Location List',
-    CONTROL_SHEET_NAME: 'Market_Control',
-    SDE_SHEET_NAME: 'SDE_invTypes',
-    ITEM_NAME_HEADERS: ['Item Name', 'TypeName', 'Type Name', 'Name', 'Item'],
-    ITEM_ID_HEADERS: ['type_id', 'TypeID', 'Type ID', 'Item ID'],
-    LOC_HEADERS: ['Station', 'System', 'Region']
-  };
+  try {
+    // 2. MAINTENANCE MODE
+    SCRIPT_PROP.setProperty(GLOBAL_STATE_KEY, 'MAINTENANCE');
+    SpreadsheetApp.getActiveSpreadsheet().toast("Orchestrator Paused (Maintenance Mode)", "System Status");
+    console.log("System entered MAINTENANCE mode.");
 
-  const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CONTROL_GEN') : console);
-  log.info(`Starting Rebuild with Sort & Dedupe. Source: ${CONFIG.ITEM_SHEET_NAME} & ${CONFIG.LOCATION_SHEET_NAME}`);
+    // --- CONFIGURATION ---
+    const CONFIG = {
+      ITEM_SHEET_NAME: 'MarketOverviewData',
+      LOCATION_SHEET_NAME: 'Location List',
+      CONTROL_SHEET_NAME: 'Market_Control',
+      SDE_SHEET_NAME: 'SDE_invTypes',
+      ITEM_ID_HEADERS: ['type_id', 'TypeID', 'Type ID', 'Item ID'], 
+      ITEM_NAME_HEADERS: ['Item Name', 'TypeName', 'Type Name', 'Name'],
+      LOC_HEADERS: ['Station', 'System', 'Region']
+    };
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const itemSheet = ss.getSheetByName(CONFIG.ITEM_SHEET_NAME);
-  const locationSheet = ss.getSheetByName(CONFIG.LOCATION_SHEET_NAME);
-  const controlSheet = ss.getSheetByName(CONFIG.CONTROL_SHEET_NAME);
-  const sdeSheet = ss.getSheetByName(CONFIG.SDE_SHEET_NAME);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const itemSheet = ss.getSheetByName(CONFIG.ITEM_SHEET_NAME);
+    const locationSheet = ss.getSheetByName(CONFIG.LOCATION_SHEET_NAME);
+    const controlSheet = ss.getSheetByName(CONFIG.CONTROL_SHEET_NAME);
+    const sdeSheet = ss.getSheetByName(CONFIG.SDE_SHEET_NAME);
 
-  if (!itemSheet || !locationSheet || !controlSheet) throw new Error("Missing required sheets.");
+    if (!itemSheet || !locationSheet || !controlSheet) throw new Error("Missing required sheets.");
 
-  // =================================================================
-  // 1. READ ITEMS
-  // =================================================================
-  let uniqueItemIds = [];
-  const itemDataRaw = itemSheet.getDataRange().getValues();
-  if (itemDataRaw.length < 2) throw new Error("Item sheet is empty.");
+    // =================================================================
+    // 3. READ ITEMS (Fixed Logic)
+    // =================================================================
+    const itemDataRaw = itemSheet.getDataRange().getValues();
+    if (itemDataRaw.length < 2) throw new Error("Item sheet is empty.");
 
-  let itemHeaderRowIdx = -1, nameColIdx = -1, idColIdx = -1;
-
-  for (let r = 0; r < Math.min(5, itemDataRaw.length); r++) {
-    const row = itemDataRaw[r].map(c => String(c).trim().toLowerCase());
-    CONFIG.ITEM_NAME_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { nameColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
-    CONFIG.ITEM_ID_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { idColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
-    if (itemHeaderRowIdx > -1) break;
-  }
-
-  if (itemHeaderRowIdx === -1) throw new Error(`Could not find Item headers in '${CONFIG.ITEM_SHEET_NAME}'.`);
-
-  const rawItems = [];
-  if (idColIdx > -1) {
-    for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
-      const val = itemDataRaw[i][idColIdx];
-      if (Number(val) > 0) rawItems.push(Number(val));
+    let itemHeaderRowIdx = -1, nameColIdx = -1, idColIdx = -1;
+    
+    // Scan first 10 rows for headers
+    for (let r = 0; r < Math.min(10, itemDataRaw.length); r++) {
+      const row = itemDataRaw[r].map(c => String(c).trim().toLowerCase());
+      CONFIG.ITEM_ID_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { idColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
+      CONFIG.ITEM_NAME_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { nameColIdx = row.indexOf(h.toLowerCase()); } });
+      if (idColIdx > -1) break; 
     }
-  } else if (nameColIdx > -1 && sdeSheet) {
-    const sdeVals = sdeSheet.getRange('A2:C' + sdeSheet.getLastRow()).getValues();
-    const typeMap = new Map(sdeVals.map(r => [String(r[2]).trim().toLowerCase(), r[0]]));
-    for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
-      const name = String(itemDataRaw[i][nameColIdx]).trim().toLowerCase();
-      if (name && typeMap.has(name)) rawItems.push(typeMap.get(name));
+
+    if (itemHeaderRowIdx === -1 && nameColIdx > -1) {
+       for (let r = 0; r < Math.min(10, itemDataRaw.length); r++) {
+         const row = itemDataRaw[r].map(c => String(c).trim().toLowerCase());
+         if (row.indexOf(CONFIG.ITEM_NAME_HEADERS[0].toLowerCase()) > -1 || row.indexOf('item name') > -1) {
+           itemHeaderRowIdx = r;
+           break;
+         }
+       }
     }
-  }
 
-  uniqueItemIds = Array.from(new Set(rawItems));
-  log.info(`Found ${uniqueItemIds.length} unique items.`);
+    if (itemHeaderRowIdx === -1) throw new Error("Could not find headers in MarketOverviewData.");
 
-  // =================================================================
-  // 2. READ LOCATIONS
-  // =================================================================
-  const locHeaderRowIdx = 4; // Row 5 (based on your provided CSV structure)
-  const locDataRaw = locationSheet.getDataRange().getValues();
-  if (locDataRaw.length <= locHeaderRowIdx) throw new Error("Location sheet too short.");
-
-  const headerRow = locDataRaw[locHeaderRowIdx].map(c => String(c).trim().toLowerCase());
-  const colMap = {};
-  CONFIG.LOC_HEADERS.forEach(h => colMap[h] = headerRow.indexOf(h.toLowerCase()));
-
-  const locSet = new Set();
-  for (let i = locHeaderRowIdx + 1; i < locDataRaw.length; i++) {
-    const row = locDataRaw[i];
-    CONFIG.LOC_HEADERS.forEach(type => {
-      const idx = colMap[type];
-      if (idx > -1) {
-        const val = row[idx];
-        if (val && !isNaN(val) && Number(val) > 0) locSet.add(`${type}|${val}`);
+    const rawItems = [];
+    if (idColIdx > -1) {
+      for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+        const val = Number(itemDataRaw[i][idColIdx]);
+        if (val > 0) rawItems.push(val);
       }
+    }
+
+    if (rawItems.length === 0 && nameColIdx > -1 && sdeSheet) {
+      console.log("Using SDE Name Lookup...");
+      const sdeVals = sdeSheet.getRange('A2:C' + sdeSheet.getLastRow()).getValues();
+      const typeMap = new Map(sdeVals.map(r => [String(r[2]).trim().toLowerCase(), r[0]]));
+      
+      for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+        let name = String(itemDataRaw[i][nameColIdx]).trim().toLowerCase().replace(/^'|'$/g, '');
+        if (name && typeMap.has(name)) rawItems.push(typeMap.get(name));
+      }
+    }
+
+    const uniqueItemIds = Array.from(new Set(rawItems));
+    console.log(`Found ${uniqueItemIds.length} unique items.`);
+
+    if (uniqueItemIds.length === 0) {
+      ss.toast("Error: No items found. Check 'MarketOverviewData' headers.", "Failed");
+      return; 
+    }
+
+    // =================================================================
+    // 4. READ LOCATIONS
+    // =================================================================
+    const locDataRaw = locationSheet.getDataRange().getValues();
+    const locHeaderRowIdx = 4; // Row 5
+    const locSet = new Set();
+    
+    if (locDataRaw.length > locHeaderRowIdx) {
+      const headerRow = locDataRaw[locHeaderRowIdx].map(c => String(c).trim().toLowerCase());
+      const colMap = {};
+      CONFIG.LOC_HEADERS.forEach(h => colMap[h] = headerRow.indexOf(h.toLowerCase()));
+
+      for (let i = locHeaderRowIdx + 1; i < locDataRaw.length; i++) {
+        const row = locDataRaw[i];
+        CONFIG.LOC_HEADERS.forEach(type => {
+          const idx = colMap[type];
+          if (idx > -1) {
+            const val = row[idx];
+            if (val && !isNaN(val) && Number(val) > 0) locSet.add(`${type}|${val}`);
+          }
+        });
+      }
+    }
+
+    const locations = Array.from(locSet).map(s => {
+      const parts = s.split('|');
+      return { type: parts[0], id: Number(parts[1]) };
     });
-  }
+    
+    // --- [NEW LOG] Show Location Count ---
+    console.log(`Found ${locations.length} unique locations (Markets).`);
 
-  const locations = Array.from(locSet).map(s => {
-    const parts = s.split('|');
-    return { type: parts[0], id: Number(parts[1]) };
-  });
-  log.info(`Found ${locations.length} unique locations.`);
-
-  // =================================================================
-  // 3. GENERATE, DEDUPE, & SORT
-  // =================================================================
-
-  const runLocked = (typeof withSheetLock !== 'undefined') ? withSheetLock : (cb) => cb();
-
-  runLocked(function () {
-    controlSheet.clear();
-    const headers = [['type_id', 'location_type', 'location_id', 'last_updated']];
-    controlSheet.getRange(1, 1, 1, 4).setValues(headers);
-
-    let output = [];
-
-    // Generate Rows
+    // =================================================================
+    // 5. PREPARE DATA
+    // =================================================================
+    const dedupedOutput = [];
     for (const loc of locations) {
       for (const itemId of uniqueItemIds) {
-        output.push([itemId, loc.type, loc.id, '']);
+        dedupedOutput.push([itemId, loc.type, loc.id, '']);
       }
     }
 
-    // --- DEDUPLICATION ---
-    const seen = new Set();
-    const dedupedOutput = [];
-    for (const row of output) {
-      const key = `${row[0]}_${row[1]}_${row[2]}`; // type_id_loctype_locid
-      if (!seen.has(key)) {
-        seen.add(key);
-        dedupedOutput.push(row);
-      }
+    dedupedOutput.sort((a, b) => (a[2] !== b[2]) ? a[2] - b[2] : (a[1] !== b[1]) ? a[1].localeCompare(b[1]) : a[0] - b[0]);
+
+    controlSheet.clear();
+    controlSheet.getRange(1, 1, 1, 4).setValues([['type_id', 'location_type', 'location_id', 'last_updated']]);
+
+    // =================================================================
+    // 6. EXECUTE WRITE (LOCAL FUNCTION)
+    // =================================================================
+    const safeBatchWrite = (targetSheet, data, startRow, startCol) => {
+        const SOFT_LIMIT_MS = 280000;
+        const startTime = new Date().getTime();
+        const CHUNK_SIZE = 5000;
+        let rowsWritten = 0;
+
+        for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+            if ((new Date().getTime() - startTime) > SOFT_LIMIT_MS) {
+                return { success: false, rows: rowsWritten, reason: "TIME_LIMIT" };
+            }
+            const chunk = data.slice(i, i + CHUNK_SIZE);
+            if (chunk.length > 0) {
+                targetSheet.getRange(startRow + i, startCol, chunk.length, chunk[0].length).setValues(chunk);
+                rowsWritten += chunk.length;
+                SpreadsheetApp.flush(); 
+                Utilities.sleep(50);    
+            }
+        }
+        return { success: true, rows: rowsWritten };
+    };
+
+    const writeResult = safeBatchWrite(controlSheet, dedupedOutput, 2, 1);
+
+    if (writeResult.success) {
+       // --- [UPDATED TOAST/LOG] ---
+       ss.toast(`Success! Rebuilt ${dedupedOutput.length} rows.`, "Control Sheet");
+       console.log(`Rebuild Complete. Total Rows: ${dedupedOutput.length} | Items: ${uniqueItemIds.length} | Locations: ${locations.length}`);
+    } else {
+       ss.toast(`Partial Write: ${writeResult.rows} rows. Reason: ${writeResult.reason}`, "Warning");
     }
 
-    log.info(`Deduplication: Removed ${output.length - dedupedOutput.length} duplicates.`);
-
-    // --- SORTING (GROUP BY LOCATION) ---
-    // Order: Location ID -> Location Type -> Type ID
-    dedupedOutput.sort((a, b) => {
-      // 1. Location ID (Index 2)
-      if (a[2] !== b[2]) return a[2] - b[2];
-
-      // 2. Location Type (Index 1) - Tie breaker for ID
-      if (a[1] !== b[1]) return a[1].localeCompare(b[1]);
-
-      // 3. Type ID (Index 0) - Sort items within location
-      return a[0] - b[0];
-    });
-
-    if (dedupedOutput.length > 0) {
-      controlSheet.getRange(2, 1, dedupedOutput.length, 4).setValues(dedupedOutput);
-
-      const maxRows = controlSheet.getMaxRows();
-      if (maxRows > dedupedOutput.length + 1) {
-        controlSheet.deleteRows(dedupedOutput.length + 2, maxRows - (dedupedOutput.length + 1));
-      }
-    }
-    log.info(`Successfully wrote ${dedupedOutput.length} sorted rows.`);
-  });
-
-  // --- FIX: Use toast instead of alert to avoid timeouts ---
-  SpreadsheetApp.getActiveSpreadsheet().toast(`Rebuilt Control Sheet. Rows: ${dedupedOutput ? dedupedOutput.length : 0}`, "Success");
+  } catch (e) {
+    console.error("Control Sheet Rebuild Failed: " + e.message);
+    SpreadsheetApp.getActiveSpreadsheet().toast("Rebuild Failed. See Logs.", "Error");
+  } finally {
+    // 7. RESTORE ORCHESTRATOR
+    SCRIPT_PROP.setProperty(GLOBAL_STATE_KEY, 'RUNNING');
+    console.log("System State restored to RUNNING.");
+  }
 }
 
 /**
