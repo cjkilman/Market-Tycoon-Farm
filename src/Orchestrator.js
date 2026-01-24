@@ -336,6 +336,7 @@ function runMaintenanceJobs() {
 }
 
 function updateMarketDataSheet() {
+
   const funcName = 'updateMarketDataSheet';
   const result = executeWithTryLock(_updateMarketDataSheetWorker, funcName);
   if (result === null) console.warn(`${funcName} skipped (Lock).`);
@@ -347,7 +348,16 @@ function updateMarketDataSheet() {
  * Phase 1: Surgical Pause (Prevent creation crash)
  * Phase 2: Live Write (No pause, allows dashboard use)
  */
-function _updateMarketDataSheetWorker() {
+function updateMarketDataSheet() {
+    if (isSdeJobRunning()) {
+    console.warn("ABORT: SDE Update in progress. Parking Market Tycoon.");
+    return; 
+  }
+
+  if (!isEngineRunning_()) {
+    console.warn("ABORT: Engine is parked. Market Tycoon skipping fetch.");
+    return;
+  }
   const START_TIME = new Date().getTime();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 

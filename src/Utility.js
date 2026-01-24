@@ -306,6 +306,19 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
 }
 
 /**
+ * Internal check to see if the refresh "Engine" is active.
+ * Returns true if the ESI toggle (D3) in the Utility sheet is set to 1.
+ */
+function isEngineRunning_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const util = ss.getSheetByName("Utility");
+  if (!util) return false;
+  
+  // Checks cell D3 (TICK.ESI)
+  return util.getRange("D3").getValue() === 1;
+}
+
+/**
  * UTILITY: EMERGENCY DEFIBRILLATOR (Glitch-Proof Version)
  * Checks for Manual Calculation Mode. 
  * If the script engine is broken (missing Enums), it prompts for a UI check and exits safely.
