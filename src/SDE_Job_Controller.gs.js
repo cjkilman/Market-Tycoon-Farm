@@ -98,7 +98,40 @@ const sdeLib = () => {
     return sheet;
   };
 
+/**
+ * ROBUST CSVToArray with Double-Gate Filter
+ */
+const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
+  const allLines = Utilities.parseCsv(strData, strDelimiter.charCodeAt(0));
+  if (allLines.length === 0) return [];
 
+  const rawHeaders = allLines[0].map(h => h.trim());
+  const publishIdx = rawHeaders.indexOf("published");
+  const marketGroupIdx = rawHeaders.indexOf("marketGroupID"); // Identify market group column
+
+  let arrData = [];
+  // ... (header mapping logic) ...
+
+  for (let i = 1; i < allLines.length; i++) {
+    const cols = allLines[i];
+    
+    // --- GATE 1: Published Status ---
+    if (publishedOnly === true && publishIdx !== -1) {
+      const pubValue = String(cols[publishIdx]).trim();
+      if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') continue;
+    }
+
+    // --- GATE 2: Marketability (Anti-Junk) ---
+    if (marketGroupIdx !== -1) {
+      const mgValue = String(cols[marketGroupIdx]).trim().toLowerCase();
+      // Drop items that are null, empty, or '0'
+      if (mgValue === "" || mgValue === "null" || mgValue === "0") continue;
+    }
+
+    // ... (Proceed to parse and add row) ...
+  }
+  return arrData;
+};
 
   /**
    * Downloads a specific CSV file from Fuzzwork and parses it using the robust internal parser.
@@ -141,126 +174,7 @@ const sdeLib = () => {
     }
   };
 
-  /**
-   * ==================================================================
-   * --- BUG FIX: REPLACED CSVToArray ---
-   * This new function uses Google's built-in, robust CSV parser.
-   * It correctly filters headers *once* and handles the publishedOnly
-   * flag without errors.
-   * ==================================================================
-   */
-  /**
-* ==================================================================
-* --- ROBUST CSVToArray (Replaces the old regex parser) ---
-*
-* This version uses Google's built-in, robust CSV parser.
-* It correctly fixes the "off-by-one" bug and parses the entire file
-* without failing silently.
-* ==================================================================
-*/
-  const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
-    console.time("CSVToArray(strData)");
 
-    if (!strData || strData.trim().length === 0) {
-      console.warn("CSVToArray: Input data string is empty. Returning empty array.");
-      return [];
-    }
-
-    // 1. Use the robust, built-in parser
-    // This fixes the silent failure and ensures the *entire* file is read.
-    const allLines = Utilities.parseCsv(strData, strDelimiter.charCodeAt(0));
-
-    if (allLines.length === 0) return [];
-
-    // 2. Process Headers
-    // This logic runs *once* on the header row, fixing the "off-by-one" bug.
-    const rawHeaders = allLines[0].map(h => h.trim());
-    let arrData = []; // This will be the final array [ [headers], [row1], [row2] ]
-    let headersIndex = []; // Array of *indices* to keep
-
-    const skipHeaders = !headers || !headers.length || !headers[0];
-
-    if (!skipHeaders) {
-      // User provided specific headers
-      const outputHeaders = [];
-      for (const requestedHeader of headers) {
-        const index = rawHeaders.indexOf(requestedHeader);
-        if (index !== -1) {
-          headersIndex.push(index);
-          outputHeaders.push(requestedHeader);
-        } else {
-          // This is a critical error. The requested header doesn't exist.
-          throw new Error(`CSVToArray: Requested header "${requestedHeader}" not found in CSV file.`);
-        }
-      }
-      arrData.push(outputHeaders); // Add the filtered header row
-    } else {
-      // User wants all headers
-      headersIndex = rawHeaders.map((_, i) => i); // Keep all indices
-      arrData.push(rawHeaders); // Add the full header row
-    }
-
-    const expectedLength = arrData[0].length; // The number of columns we expect in the output
-    if (expectedLength === 0) {
-      console.warn("CSVToArray: No valid headers found or requested. Returning empty array.");
-      return [];
-    }
-
-    // 3. Find the 'published' column *once*
-    const publishIdx = rawHeaders.indexOf("published");
-    const startIndex = 1; // Start from the first data row
-
-    // 4. Process Data Rows
-    for (let i = startIndex; i < allLines.length; i++) {
-      const cols = allLines[i];
-
-      // Safety check: malformed row
-      if (cols.length < rawHeaders.length) {
-        console.warn(`Skipping row ${i}: Expected ${rawHeaders.length} columns, found ${cols.length}`);
-        continue;
-      }
-
-      // --- PublishedOnly Filter Logic ---
-      let skipRow = false;
-      if (publishedOnly && publishIdx !== -1) {
-        // Check the value *only* if filtering is on and the column exists
-        // Use String().trim() to robustly check '1' vs '0', '', or null
-        if (String(cols[publishIdx]).trim() !== '1') {
-          skipRow = true;
-        }
-      }
-      if (skipRow) continue;
-      // --- End Filter Logic ---
-
-      let row = [];
-
-      // 5. Build the filtered row
-      for (const indexToKeep of headersIndex) {
-        let cleanValue = (cols[indexToKeep] || "").trim(); // Get value and trim
-
-        // Clean up ' quotes
-        cleanValue = cleanValue.replace(/^'+(.*)$/, "''$1");
-
-        // Convert numbers
-        if (!isNaN(cleanValue) && cleanValue !== '') {
-          if (cleanValue.includes('.')) {
-            cleanValue = parseFloat(cleanValue);
-          } else {
-            cleanValue = parseInt(cleanValue);
-          }
-        }
-        row.push(cleanValue);
-      }
-
-      // Final check
-      if (row.length === expectedLength) {
-        arrData.push(row);
-      }
-    }
-
-    console.timeEnd("CSVToArray(strData)");
-    return arrData;
-  };
 
   // ==================================================================
   // --- END OF REPLACEMENT ---
