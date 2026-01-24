@@ -3,49 +3,20 @@
 
 /**
  * SDE_Job_Controller.gs
- * This file is a self-contained module for running a stateful,
- * multi-step SDE import job that is resilient to the 6-minute execution limit.
- *
- * NOTE: This file assumes the constant SCRIPT_PROPS is declared once in Main.js.
- *
- * --- FIX v4.6 (Dynamic Chunking) ---
- * - Replaced fixed CHUNK_SIZE with dynamic calculation based on TARGET_WRITE_TIME_MS (3s).
- * - Aggressively reduces chunk size on Document Lock contention or slow write times.
+ * Stateful, multi-step SDE import job resilient to execution limits.
  */
 
-// --- Safely define global constants with 'var' ---
-// NOTE: Google Apps Script requires 'var' for true global scope across files
-if (typeof KEY_JOB_RUNNING === 'undefined') {
-  var KEY_JOB_RUNNING = 'SDE_JOB_RUNNING';
-}
-if (typeof KEY_JOB_LIST === 'undefined') {
-  var KEY_JOB_LIST = 'SDE_JOB_LIST';
-}
-if (typeof KEY_JOB_INDEX === 'undefined') {
-  var KEY_JOB_INDEX = 'SDE_JOB_INDEX';
-}
-if (typeof KEY_BACKUP_SETTINGS === 'undefined') {
-  var KEY_BACKUP_SETTINGS = 'SDE_BACKUP_SETTINGS';
-}
-if (typeof GLOBAL_STATE_KEY === 'undefined') {
-  var GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE'; // Maintenance Flag
-}
-// --- NEW: Resumable chunk index ---
-if (typeof KEY_JOB_CHUNK_INDEX === 'undefined') {
-  var KEY_JOB_CHUNK_INDEX = 'SDE_JOB_CHUNK_INDEX'; // Stores the next row to write
-}
+// --- Safely define global constants ---
+if (typeof KEY_JOB_RUNNING === 'undefined') { var KEY_JOB_RUNNING = 'SDE_JOB_RUNNING'; }
+if (typeof KEY_JOB_LIST === 'undefined') { var KEY_JOB_LIST = 'SDE_JOB_LIST'; }
+if (typeof KEY_JOB_INDEX === 'undefined') { var KEY_JOB_INDEX = 'SDE_JOB_INDEX'; }
+if (typeof KEY_BACKUP_SETTINGS === 'undefined') { var KEY_BACKUP_SETTINGS = 'SDE_BACKUP_SETTINGS'; }
+if (typeof GLOBAL_STATE_KEY === 'undefined') { var GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE'; }
+if (typeof KEY_JOB_CHUNK_INDEX === 'undefined') { var KEY_JOB_CHUNK_INDEX = 'SDE_JOB_CHUNK_INDEX'; }
 
-// --- Global Spreadsheet Object (Optimization: call getActiveSpreadsheet() once) ---
 var SS;
-
-/**
- * Lazy-loads the active spreadsheet object.
- * @returns {GoogleAppsScript.Spreadsheet.Spreadsheet} The active spreadsheet object.
- */
 function getSS() {
-  if (!SS) {
-    SS = SpreadsheetApp.getActiveSpreadsheet();
-  }
+  if (!SS) { SS = SpreadsheetApp.getActiveSpreadsheet(); }
   return SS;
 }
 
@@ -54,339 +25,202 @@ function getSS() {
 // -----------------------------------------------------------------------------
 
 const sdeLib = () => {
-
-  // --- CRITICAL FIX: _sheetCache is now an object map { sheetName: sheetObject } ---
   let _sheetCache = {};
-  // --- END CRITICAL FIX ---
 
-  // --- "Private" Helper Functions ---
-
-  const downloadTextData = (csvFile) => {
+ const downloadTextData = (csvFile) => {
     console.time("downloadTextData( csvFile:" + csvFile + " )");
     const baseURL = 'https://raw.githubusercontent.com/cjkilman/eve-sde-dump/main/' + csvFile;
-    const csvContent = UrlFetchApp.fetch(baseURL).getContentText();
-    console.timeEnd("downloadTextData( csvFile:" + csvFile + " )");
-    return csvContent.trim().replace(/\n$/, "");
+    
+    try {
+      const csvContent = UrlFetchApp.fetch(baseURL).getContentText();
+      console.timeEnd("downloadTextData( csvFile:" + csvFile + " )");
+      return csvContent.trim().replace(/\n$/, "");
+    } catch (e) {
+      // --- ABORT ON ERROR: Quota/Limit Detection ---
+      if (e.message.includes('too many times') || e.message.includes('limit exceeded')) {
+        console.error("CRITICAL: SDE Download hit Google Quota. Shutting down SDE Job.");
+        sde_job_KILL_ALL_TRIGGERS(); // Hard stop
+      }
+      throw e; 
+    }
   };
 
- /**
-   * Refactored: Clears content without destroying the layout immediately.
-   * This prevents custom columns from being deleted during the update process.
+  /**
+   * Internal helper: Ensures a sheet exists without destructive clearing.
    */
-  const createOrClearSdeSheet = (activeSpreadsheet, sheetName, headers) => {
-    console.time("createOrClearSdeSheet({sheetName:" + sheetName + "})");
-    if (!sheetName) throw "sheet name is required;";
-    if (!headers || !headers.length) throw "headers are required to set up the sheet;";
-
+  const getOrCreateSheet = (activeSpreadsheet, sheetName) => {
     let sheet = activeSpreadsheet.getSheetByName(sheetName);
-
-    if (sheet) {
-      // CLEAR contents to remove old data, but do NOT delete rows/cols here.
-      // Deleting rows here destroys any custom formulas or formatting you have.
-      // We will do the "Snug-fit" at the very end of the job instead.
-      sheet.clearContents();
-    } else {
+    if (!sheet) {
       sheet = activeSpreadsheet.insertSheet(sheetName, activeSpreadsheet.getNumSheets());
       sheet.setName(sheetName);
     }
-
-    // Write the headers (Always row 1)
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    _sheetCache[sheetName] = sheet;
-
-    console.timeEnd("createOrClearSdeSheet({sheetName:" + sheetName + "})");
     return sheet;
   };
 
-/**
- * ROBUST CSVToArray with Double-Gate Filter
- */
-const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
-  const allLines = Utilities.parseCsv(strData, strDelimiter.charCodeAt(0));
-  if (allLines.length === 0) return [];
 
-  const rawHeaders = allLines[0].map(h => h.trim());
-  const publishIdx = rawHeaders.indexOf("published");
-  const marketGroupIdx = rawHeaders.indexOf("marketGroupID"); // Identify market group column
-
-  let arrData = [];
-  // ... (header mapping logic) ...
-
-  for (let i = 1; i < allLines.length; i++) {
-    const cols = allLines[i];
-    
-    // --- GATE 1: Published Status ---
-    if (publishedOnly === true && publishIdx !== -1) {
-      const pubValue = String(cols[publishIdx]).trim();
-      if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') continue;
-    }
-
-    // --- GATE 2: Marketability (Anti-Junk) ---
-    if (marketGroupIdx !== -1) {
-      const mgValue = String(cols[marketGroupIdx]).trim().toLowerCase();
-      // Drop items that are null, empty, or '0'
-      if (mgValue === "" || mgValue === "null" || mgValue === "0") continue;
-    }
-
-    // ... (Proceed to parse and add row) ...
-  }
-  return arrData;
-};
 
   /**
-   * Downloads a specific CSV file from Fuzzwork and parses it using the robust internal parser.
-   * This is the public interface for the Orchestrator to fetch SDE files like mapDenormalize.
-   * @param {string} fileName - The name of the CSV file to download (e.g., 'mapDenormalize.csv').
-   * @param {Array<string>} [headers=null] - Array of specific columns to keep.
-   * @param {boolean} [publishedOnly=false] - Whether to filter for published items.
-   * @returns {Array<Array>} The 2D array of parsed data (including header row), or [] on failure.
+   * Prepares the sheet. Row 1 is cleared to be overwritten by sanitized headers.
    */
-  const fetchSDEFile = (fileName, headers = null, publishedOnly = false) => {
-    const SCRIPT_NAME = 'fetchSDEFile';
-
-    // NOTE: Assumes downloadTextData and CSVToArray are available in the sdeLib scope.
-
-    try {
-      if (!fileName || typeof fileName !== 'string') {
-        throw new Error("File name is required.");
-      }
-
-      // 1. Download the file content (reusing existing logic)
-      // This relies on the downloadTextData helper within the sdeLib closure.
-      const csvContent = downloadTextData(fileName);
-
-      // 2. Parse the data (reusing existing robust parser)
-      // Uses the built-in CSVToArray logic pattern for robust parsing and column filtering.
-      const parsedData = CSVToArray(csvContent, ",", headers, publishedOnly);
-
-      if (!parsedData || parsedData.length < 2) {
-        throw new Error("Parsed data is empty or invalid after download.");
-      }
-
-      console.log(`${SCRIPT_NAME}: Successfully downloaded and parsed ${parsedData.length} rows from ${fileName}.`);
-
-      return parsedData;
-
-    } catch (e) {
-      console.error(`${SCRIPT_NAME}: FATAL ERROR during SDE fetch: ${e.message}`);
-      // Returns empty array on failure, forcing the worker to handle the error state.
-      return [];
-    }
+  const createOrClearSdeSheet = (activeSpreadsheet, sheetName) => {
+    let sheet = getOrCreateSheet(activeSpreadsheet, sheetName);
+    sheet.clearContents();
+    _sheetCache[sheetName] = sheet;
+    return sheet;
   };
 
+  const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
+    const allLines = Utilities.parseCsv(strData, strDelimiter.charCodeAt(0));
+    if (allLines.length === 0) return [];
 
+    const rawHeaders = allLines[0].map(h => h.trim());
 
-  // ==================================================================
-  // --- END OF REPLACEMENT ---
-  // ==================================================================
+    let colIndices = (headers && headers.length > 0)
+      ? headers.map(h => rawHeaders.indexOf(h)).filter(idx => idx !== -1)
+      : rawHeaders.map((_, i) => i);
 
-  const autoResizeColumns = (sheet) => {
-    // This function is present but commented out in buildSDEs for stability
-    if (!sheet) return;
-    const lastColumn = sheet.getLastColumn();
-    if (lastColumn > 0) {
-      sheet.autoResizeColumns(1, lastColumn);
+    const publishIdx = rawHeaders.indexOf("published");
+    const marketGroupIdx = rawHeaders.indexOf("marketGroupID");
+
+    let arrData = [];
+
+    for (let i = 1; i < allLines.length; i++) {
+      const cols = allLines[i];
+
+      // Gates
+      if (publishedOnly === true && publishIdx !== -1) {
+        const pubValue = String(cols[publishIdx]).trim();
+        if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') continue;
+      }
+      if (marketGroupIdx !== -1) {
+        const mgValue = String(cols[marketGroupIdx]).trim().toLowerCase();
+        if (mgValue === "" || mgValue === "null" || mgValue === "0") continue;
+      }
+
+      // --- ESCAPE LOGIC ---
+      let sanitizedRow = colIndices.map(idx => {
+        let val = String(cols[idx] || "").trim();
+
+        // 1. If it's a Number -> Add ' to prevent scientific notation (e.g. '34)
+        if (val !== "" && !isNaN(val)) {
+          return "'" + val;
+        }
+
+        // 2. If it starts with ' -> Add ANOTHER ' so it displays correctly (e.g. ''Arbalest')
+        if (val.startsWith("'")) {
+          return "'" + val;
+        }
+
+        // 3. Else -> Leave it alone
+        return val;
+      });
+      arrData.push(sanitizedRow);
     }
+
+    // Headers: Always tick them to be safe
+    const finalHeaders = (headers && headers.length > 0) ? headers : rawHeaders;
+    arrData.unshift(finalHeaders.map(h => "'" + h));
+
+    return arrData;
   };
 
-  /**
-   * NEW: Non-blocking Document Lock helper function.
-   */
   function _writeChunkInternal(dataChunk, startRow, numCols, sheetName) {
     const chunkStartTime = new Date().getTime();
-    let writeDurationMs = 0;
-    const DOC_LOCK_TIMEOUT = 5000; // TryLock 5s 
-
     const docLock = LockService.getDocumentLock();
-
-    // Attempt non-blocking lock
-    if (!docLock.tryLock(DOC_LOCK_TIMEOUT)) {
-      return { success: false, duration: 0 };
-    }
+    if (!docLock.tryLock(5000)) return { success: false, duration: 0 };
 
     try {
-      // Now retrieving the Sheet object from the module-level map
       let workSheet = _sheetCache[sheetName];
-      if (!workSheet) {
-        // CRITICAL FAILURE: Cache must be hot by this point.
-        throw new Error(`CRITICAL: Sheet object for '${sheetName}' not found in memory cache. Job state compromised.`);
-      }
-
+      if (!workSheet) throw new Error(`Sheet '${sheetName}' not in cache.`);
       workSheet.getRange(startRow, 1, dataChunk.length, numCols).setValues(dataChunk);
-
-
-    } catch (e) {
-      console.error(`_writeChunkInternal: Write failed while locked: ${e.message}`);
-      throw e;
     } finally {
       docLock.releaseLock();
-      writeDurationMs = new Date().getTime() - chunkStartTime;
     }
-
-    return { success: true, duration: writeDurationMs };
+    return { success: true, duration: new Date().getTime() - chunkStartTime };
   }
 
-  // --- "Public" Class (Exposed via 'return') ---
   class SdePage {
     constructor(sheet, csvFile, headers = null, backupRanges = null, publishedOnly = true) {
       this.sheet = sheet;
-      this.backupRanges = null;
       this.csvFile = csvFile;
-      this.headers = null;
-      this.publishedOnly = false;
-      if (headers != null) {
-        this.headers = headers;
-        if (!Array.isArray(headers)) this.headers = [headers];
-      }
-      if (backupRanges != null) {
-        this.backupRanges = backupRanges;
-        if (!Array.isArray(backupRanges)) this.backupRanges = [backupRanges];
-      }
-      if (publishedOnly == null) {
-        this.publishedOnly = true;
-      } else {
-        this.publishedOnly = publishedOnly;
-      }
+      this.headers = (headers && !Array.isArray(headers)) ? [headers] : headers;
+      this.backupRanges = (backupRanges && !Array.isArray(backupRanges)) ? [backupRanges] : backupRanges;
+      this.publishedOnly = (publishedOnly == null) ? true : publishedOnly;
     }
   }
 
-  /**
-   * Public Engine Function (buildSDEs)
-   * FIX: Scoping for headers/dataRows moved above try block to fix crash.
-   */
   const buildSDEs = (sdePage, scriptStartTime) => {
     if (sdePage == null) throw "sdePage is required";
-    console.time("buildSDEs( sheetName:" + sdePage.sheet + ")");
-
-    const MAX_CHUNK_SIZE = 5000;
-    const MIN_CHUNK_SIZE = 500;
-    const TARGET_WRITE_TIME_MS = 3000;
-    const DOC_LOCK_TIMEOUT = 30000;
-    const SCRIPT_TIME_LIMIT = 285000;
-
-    let currentChunkSize = MAX_CHUNK_SIZE;
-    const THROTTLE_BASE_SLEEP_MS = 250;
-    const THROTTLE_LATENCY_FACTOR = 1.2;
-    const THROTTLE_MAX_SLEEP_MS = 5000;
-    let lastWriteDurationMs = 500;
-
     const activeSpreadsheet = getSS();
 
-    // STAGE 1: Fetch & Parse
     const csvContent = downloadTextData(sdePage.csvFile);
     const csvData = CSVToArray(csvContent, ",", sdePage.headers, sdePage.publishedOnly);
 
-    if (!csvData || csvData.length < 2 || csvData[0].length === 0) {
-      console.warn(`FATAL_DATA_WARNING: Parsed data for ${sdePage.sheet} is empty. Skipping.`);
-      return true;
-    }
+    if (!csvData || csvData.length < 1) return true;
 
-    // --- FIX: SCOPING ---
-    // Declaring these here ensures they are available to the "Snug-fit" logic at the end.
-    const headers = csvData.slice(0, 1)[0];
-    const dataRows = csvData.slice(1);
-    const numCols = headers.length;
-    // --------------------
-
-    const docLock = LockService.getDocumentLock();
+    const numCols = csvData[0].length;
     let currentRow = parseInt(SCRIPT_PROPS.getProperty(KEY_JOB_CHUNK_INDEX) || '0', 10);
     let finalSheetReference;
 
-    try {
-      if (currentRow === 0) {
-        console.log(`buildSDEs: First run for ${sdePage.sheet}. Preparing sheet.`);
-        if (!docLock.tryLock(DOC_LOCK_TIMEOUT)) {
-          SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, currentRow.toString());
-          return false;
-        }
-        try {
-          finalSheetReference = createOrClearSdeSheet(activeSpreadsheet, sdePage.sheet, headers);
-        } finally {
-          docLock.releaseLock();
-        }
-      } else {
-        finalSheetReference = activeSpreadsheet.getSheetByName(sdePage.sheet);
-        if (!finalSheetReference) throw new Error(`Sheet ${sdePage.sheet} not found on resume.`);
-        _sheetCache[sdePage.sheet] = finalSheetReference;
-      }
-
-      // STAGE 3: Write Chunks
-      while (currentRow < dataRows.length) {
-        if (lastWriteDurationMs > 0) {
-          let sleepMs = Math.min(THROTTLE_MAX_SLEEP_MS, Math.max(THROTTLE_BASE_SLEEP_MS, lastWriteDurationMs * THROTTLE_LATENCY_FACTOR));
-          Utilities.sleep(sleepMs);
-        }
-
-        if ((new Date().getTime() - scriptStartTime) > SCRIPT_TIME_LIMIT) {
-          SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, currentRow.toString());
-          console.warn(`buildSDEs: Timeout hit. Saving state at row ${currentRow}.`);
-          return false;
-        }
-
-        const chunkEnd = Math.min(currentRow + currentChunkSize, dataRows.length);
-        const chunk = dataRows.slice(currentRow, chunkEnd);
-        const writeRow = currentRow + 2; 
-
-        if (chunk.length > 0) {
-          let result = _writeChunkInternal(chunk, writeRow, numCols, sdePage.sheet);
-          if (result.success === true) {
-            lastWriteDurationMs = result.duration;
-            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, Math.round(currentChunkSize * (TARGET_WRITE_TIME_MS / lastWriteDurationMs))));
-            currentRow = chunkEnd;
-          } else {
-            currentChunkSize = Math.max(MIN_CHUNK_SIZE, Math.round(currentChunkSize / 2));
-            continue; 
-          }
-        } else {
-          break;
-        }
-      }
-    } catch (e) {
-      if (docLock.hasLock()) docLock.releaseLock();
-      SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, currentRow.toString());
-      throw e; 
+    if (currentRow === 0) {
+      finalSheetReference = createOrClearSdeSheet(activeSpreadsheet, sdePage.sheet);
+    } else {
+      finalSheetReference = activeSpreadsheet.getSheetByName(sdePage.sheet);
+      _sheetCache[sdePage.sheet] = finalSheetReference;
     }
 
-    // --- JOB FINISHED ---
-    console.timeEnd("buildSDEs( sheetName:" + sdePage.sheet + ")");
+    while (currentRow < csvData.length) {
+      // 285000ms = 4.75 minutes (Safety margin for 6-minute limit)
+      if ((new Date().getTime() - scriptStartTime) > 285000) {
+        SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, currentRow.toString());
+        return false;
+      }
+
+      const chunkSize = 2000;
+      const chunkEnd = Math.min(currentRow + chunkSize, csvData.length);
+      const chunk = csvData.slice(currentRow, chunkEnd);
+
+      let result = _writeChunkInternal(chunk, currentRow + 1, numCols, sdePage.sheet);
+      if (result.success) {
+        currentRow = chunkEnd;
+      } else {
+        Utilities.sleep(1000);
+      }
+    }
+
+    // --- Final Trimming ---
+    // This runs only when the loop completes successfully
     SCRIPT_PROPS.setProperty(KEY_JOB_CHUNK_INDEX, '0');
 
-    // --- STAGE 4: SNUG-FIT (Row/Column Management) ---
-    // This now works because dataRows and headers are in the correct scope.
-    const finalMaxRows = finalSheetReference.getMaxRows();
-    const finalMaxCols = finalSheetReference.getMaxColumns();
-    const dataRowsPlusHeader = dataRows.length + 1;
+    const maxCols = finalSheetReference.getMaxColumns();
+    const maxRows = finalSheetReference.getMaxRows();
+    const dataRows = csvData.length;
 
-    // Delete excess rows (Respecting sheet limits)
-    if (finalMaxRows > dataRowsPlusHeader) {
-      finalSheetReference.deleteRows(dataRowsPlusHeader + 1, finalMaxRows - dataRowsPlusHeader);
+    if (maxCols > numCols) {
+      finalSheetReference.deleteColumns(numCols + 1, maxCols - numCols);
+    }
+    if (maxRows > dataRows) {
+      finalSheetReference.deleteRows(dataRows + 1, maxRows - dataRows);
     }
 
-    // Delete excess columns (ONLY if you don't have custom columns to the right!)
-    // WARNING: This will delete any manual columns you added past the SDE data.
-    if (finalMaxCols > numCols) {
-      finalSheetReference.deleteColumns(numCols + 1, finalMaxCols - numCols);
-    }
-
-    return true; 
+    return true;
   };
 
-  // --- Return the Public Interface ---
-  return {
-    SdePage: SdePage, // SdePage class is now defined inside sdeLib
-    fetchSDEFile: fetchSDEFile,
-    buildSDEs: buildSDEs
-  };
+  // This closes the sdeLib arrow function
+  return { SdePage, buildSDEs };
 };
 
-
 // -----------------------------------------------------------------------------
-// --- STATEFUL JOB CONTROLLER FUNCTIONS ---
+// --- CONTROLLER FUNCTIONS ---
 // -----------------------------------------------------------------------------
 
 /**
- * Helper function to delete triggers.
+ * Helper: Checks if the SDE update is running.
  */
+function isSdeJobRunning() {
+  return SCRIPT_PROPS.getProperty(KEY_JOB_RUNNING) === 'true';
+}
+
 function _deleteTriggersFor(functionName) {
   const allTriggers = ScriptApp.getProjectTriggers();
   let deletedCount = 0;
@@ -399,13 +233,6 @@ function _deleteTriggersFor(functionName) {
   if (deletedCount > 0) {
     console.log(`Deleted ${deletedCount} trigger(s) for ${functionName}.`);
   }
-}
-
-/**
- * Helper: Checks if the SDE update is running.
- */
-function isSdeJobRunning() {
-  return SCRIPT_PROPS.getProperty(KEY_JOB_RUNNING) === 'true';
 }
 
 /**
@@ -529,6 +356,25 @@ function tryCallHook(functionName) {
   return true; // Default to continue if hook is missing
 }
 
+/**
+ * Hard abort for emergency quota saving.
+ * Must be a top-level function to be visible to the PROCESS catch block.
+ */
+function sde_job_KILL_ALL_TRIGGERS() {
+  const SCRIPT_PROPS = PropertiesService.getScriptProperties();
+  
+  // 1. Delete the repeating SDE trigger to stop the loop
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'sde_job_PROCESS') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  
+  // 2. Clear the running flag so other workers know the job is dead
+  SCRIPT_PROPS.deleteProperty('SDE_JOB_RUNNING');
+  
+  console.error("SYSTEM: Emergency Shutdown. SDE triggers purged due to Quota exhaustion.");
+}
 
 /**
  * STAGE 2: PROCESS (Run by a trigger)
@@ -602,22 +448,27 @@ function sde_job_PROCESS() {
     _deleteTriggersFor('sde_job_PROCESS');
     ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(2000).create();
 
-  } catch (e) {
+} catch (e) {
     const errorMessage = e.message.toLowerCase();
+
+    // --- NEW: QUOTA CHECK ---
+    // If we hit the quota, we MUST kill all triggers immediately to stop the loop.
+    if (errorMessage.includes("too many times") || errorMessage.includes("limit exceeded")) {
+      console.error("ABORTING: Quota reached. Shutting down SDE Job.");
+      sde_job_KILL_ALL_TRIGGERS(); 
+      return; // Do not schedule any further triggers
+    }
 
     // Check for fatal errors that should NOT resume
     if (errorMessage.includes("csvtoarray") || errorMessage.includes("not found") || errorMessage.includes("critical")) {
-
       Logger.log(`FATAL ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message}. Calling FINALIZE to abort.`);
-      sde_job_FINALIZE(); // This is the "Die and reset"
+      sde_job_FINALIZE(); 
 
     } else {
-
-      // Assume it's a temporary timeout, as intended
+      // Assume it's a temporary timeout (like a network hiccup), re-trigger to attempt resume.
       Logger.log(`RESUMABLE ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message}. Re-triggering to attempt resume.`);
       _deleteTriggersFor('sde_job_PROCESS');
       ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(10000).create();
-
     }
   } finally {
     lock.releaseLock();
