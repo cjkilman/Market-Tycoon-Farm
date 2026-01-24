@@ -13,10 +13,7 @@ function GET_SDE_CONFIG() {
     { name: "SDE_invTypes", file: "invTypes.csv", cols: ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice"] },
     { name: "SDE_invGroups", file: "invGroups.csv", cols: null },
     { name: "SDE_staStations", file: "staStations.csv", cols: null },
-    
-    // Map Data (For Route Planning)
-    { name: "SDE_mapSolarSystems", file: "mapSolarSystems.csv", cols: ["regionID", "solarSystemID", "solarSystemName", "security"] },
-    
+      
     // Industry Data (For Manufacturing)
     { name: "SDE_industryActivityMaterials", file: "industryActivityMaterials.csv", cols: null },
     { name: "SDE_industryActivityProducts", file: "industryActivityProducts.csv", cols: null }
