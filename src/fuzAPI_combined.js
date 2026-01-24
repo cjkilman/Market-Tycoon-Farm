@@ -358,17 +358,51 @@ function withRetries(fn, tries = 3, base = 300) {
     return { cachedData, missingRequests };
   }
 
+  /** * NEW: Explicit Quota Check for Modular use.
+   * Checks if the circuit is open due to a Google Quota hit.
+   */
+  function _isQuotaExhausted() {
+    const state = _props.getProperty(CIRCUIT_PROPS.STATE);
+    if (state === 'OPEN') {
+      const openUntil = parseInt(_props.getProperty(CIRCUIT_PROPS.OPEN_UNTIL) || '0', 10);
+      if (Date.now() < openUntil) return true;
+      
+      // Cooldown expired, move to HALF_OPEN to test a single fetch
+      _props.setProperty(CIRCUIT_PROPS.STATE, 'HALF_OPEN');
+    }
+    return false;
+  }
+
   function getDataForRequests(marketRequests) {
     if (!marketRequests || marketRequests.length === 0) return [];
+
+    // --- QUOTA MAGIC GATE ---
+    if (_isQuotaExhausted()) {
+      console.warn("fuzAPI: Circuit is OPEN (Quota hit). Fetching blocked for cooldown.");
+      return []; // Return empty array; calling code handles the data void
+    }
+
     if (_isCircuitOpen()) return [];
 
     const { cachedData, missingRequests } = _checkCacheForRequests(marketRequests);
 
-    let newlyFetchedData = [];
+let newlyFetchedData = [];
     if (missingRequests.length > 0) {
-      const fetchResult = _executeFetchAll(missingRequests);
-      newlyFetchedData = fetchResult.newlyFetchedData;
-      _cacheNewData(fetchResult.dataToCache);
+      try {
+        const fetchResult = _executeFetchAll(missingRequests);
+        newlyFetchedData = fetchResult.newlyFetchedData;
+        _cacheNewData(fetchResult.dataToCache);
+        _resetCircuit(); // Success resets failure counts
+      } catch (e) {
+        const msg = e.message.toLowerCase();
+        // Detect Google Account-Wide Quota Limits
+        if (msg.includes("too many times") || msg.includes("limit exceeded")) {
+           _tripCircuit("Google Account Quota Exhausted.");
+        } else {
+           _tripCircuit(e.message);
+        }
+        throw e; 
+      }
     }
 
     const finalDataMap = {};
@@ -417,6 +451,49 @@ function withRetries(fn, tries = 3, base = 300) {
 
 
 // --- Public Custom Functions (Wrappers for Google Sheets) ---
+
+/**
+ * MANUAL RESET: Run this function to clear the fuzAPI quota locks immediately.
+ * Use this when you know your 20k/100k UrlFetch quota has reset.
+ */
+function manual_FuzAPI_Reset() {
+  const props = PropertiesService.getScriptProperties();
+  const keysToReset = [
+    'FuzCircuitState', 
+    'FuzCircuitFailCount', 
+    'FuzCircuitOpenUntilMs'
+  ];
+  
+  keysToReset.forEach(key => props.deleteProperty(key));
+  
+  console.log("fuzAPI: Quota Crowbar manually reset. Circuit is now CLOSED.");
+  if (typeof SpreadsheetApp !== 'undefined') {
+    SpreadsheetApp.getActiveSpreadsheet().toast("fuzAPI Circuit Reset Successful", "Quota Magic");
+  }
+}
+
+/**
+ * DAILY SCHEDULE: Run this function ONCE to set up a 24-hour reset trigger.
+ * This ensures the "Crowbar" is pulled back every morning automatically.
+ */
+function setupDailyFuzReset() {
+  // Clear any existing reset triggers to avoid duplicates
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    if (t.getHandlerFunction() === 'manual_FuzAPI_Reset') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // Create a new trigger to run once a day (e.g., between 5 AM and 6 AM)
+  ScriptApp.newTrigger('manual_FuzAPI_Reset')
+    .timeBased()
+    .everyDays(1)
+    .atHour(5) 
+    .create();
+
+  console.log("fuzAPI: 24-hour reset trigger installed.");
+}
 
 /**
  * Generic API to get prices for an array/range of type_ids at a location.
