@@ -184,12 +184,30 @@ function withRetries(fn, tries = 3, base = 300) {
       console.warn(`Circuit Breaker failure count: ${failCount}/${CIRCUIT_THRESHOLD}.`);
     }
   }
+/**
+   * Internal Reset: Clears the script properties for the circuit breaker.
+   * MODIFIED: Silent execution unless the circuit was actually tripped.
+   */
   function _resetCircuit() {
-    const state = _props.getProperty(CIRCUIT_PROPS.STATE);
-    if (state === 'OPEN' || state === 'HALF_OPEN' || _props.getProperty(CIRCUIT_PROPS.FAIL_COUNT) !== null) {
-      _props.deleteProperty(CIRCUIT_PROPS.FAIL_COUNT);
-      _props.deleteProperty(CIRCUIT_PROPS.OPEN_UNTIL);
-      _props.setProperty(CIRCUIT_PROPS.STATE, 'CLOSED');
+    const currentState = _props.getProperty(CIRCUIT_PROPS.STATE);
+    const failCount = _props.getProperty(CIRCUIT_PROPS.FAIL_COUNT);
+    
+    // If system is already clean, do nothing and say nothing.
+    if (!currentState && !failCount) {
+      return;
+    }
+
+    // Clear the properties
+    const keys = [
+      CIRCUIT_PROPS.STATE,
+      CIRCUIT_PROPS.FAIL_COUNT,
+      CIRCUIT_PROPS.OPEN_UNTIL
+    ];
+    keys.forEach(k => _props.deleteProperty(k));
+    
+    // LOGGING GATE: Only log if we actually recovered from a failure
+    if (currentState === 'OPEN' || currentState === 'HALF_OPEN') {
+      console.log("fuzAPI: Circuit RESET (Quota Crowbar Pulled). System Restored.");
     }
   }
   function _fuzKey(location_type, location_id, type_id) {
@@ -491,6 +509,11 @@ let newlyFetchedData = [];
  */
 function fuzAPI_DailyReset_Trigger() {
   fuzAPI.resetCircuit();
+}
+
+function force_Engine_Wake() {
+  PropertiesService.getScriptProperties().setProperty('GLOBAL_SYSTEM_STATE', 'RUNNING');
+  SpreadsheetApp.getActiveSpreadsheet().toast("Engine Woken Manually", "System Status");
 }
 
 /**
