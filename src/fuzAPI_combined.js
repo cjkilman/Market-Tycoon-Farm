@@ -184,30 +184,12 @@ function withRetries(fn, tries = 3, base = 300) {
       console.warn(`Circuit Breaker failure count: ${failCount}/${CIRCUIT_THRESHOLD}.`);
     }
   }
-/**
-   * Internal Reset: Clears the script properties for the circuit breaker.
-   * MODIFIED: Silent execution unless the circuit was actually tripped.
-   */
   function _resetCircuit() {
-    const currentState = _props.getProperty(CIRCUIT_PROPS.STATE);
-    const failCount = _props.getProperty(CIRCUIT_PROPS.FAIL_COUNT);
-    
-    // If system is already clean, do nothing and say nothing.
-    if (!currentState && !failCount) {
-      return;
-    }
-
-    // Clear the properties
-    const keys = [
-      CIRCUIT_PROPS.STATE,
-      CIRCUIT_PROPS.FAIL_COUNT,
-      CIRCUIT_PROPS.OPEN_UNTIL
-    ];
-    keys.forEach(k => _props.deleteProperty(k));
-    
-    // LOGGING GATE: Only log if we actually recovered from a failure
-    if (currentState === 'OPEN' || currentState === 'HALF_OPEN') {
-      console.log("fuzAPI: Circuit RESET (Quota Crowbar Pulled). System Restored.");
+    const state = _props.getProperty(CIRCUIT_PROPS.STATE);
+    if (state === 'OPEN' || state === 'HALF_OPEN' || _props.getProperty(CIRCUIT_PROPS.FAIL_COUNT) !== null) {
+      _props.deleteProperty(CIRCUIT_PROPS.FAIL_COUNT);
+      _props.deleteProperty(CIRCUIT_PROPS.OPEN_UNTIL);
+      _props.setProperty(CIRCUIT_PROPS.STATE, 'CLOSED');
     }
   }
   function _fuzKey(location_type, location_id, type_id) {
@@ -459,43 +441,10 @@ let newlyFetchedData = [];
     console.log("fuzAPI: Initiating cache refresh. Call to sheet reader is intentionally bypassed.");
   }
 
-  /**
-   * Internal Reset: Clears the script properties for the circuit breaker.
-   */
-  function _resetCircuit() {
-    const keys = [
-      CIRCUIT_PROPS.STATE,
-      CIRCUIT_PROPS.FAIL_COUNT,
-      CIRCUIT_PROPS.OPEN_UNTIL
-    ];
-    keys.forEach(k => _props.deleteProperty(k));
-    console.log("fuzAPI: Quota Crowbar manually reset. Circuit CLOSED.");
-  }
-
-  /**
-   * Trigger Installer: Sets up the 24-hour reset.
-   */
-  function setupDailyReset() {
-    // Delete existing to prevent duplicates
-    ScriptApp.getProjectTriggers().forEach(t => {
-      if (t.getHandlerFunction() === 'fuzAPI_DailyReset_Trigger') ScriptApp.deleteTrigger(t);
-    });
-
-    // Create fresh 24-hour trigger
-    ScriptApp.newTrigger('fuzAPI_DailyReset_Trigger')
-      .timeBased()
-      .everyDays(1)
-      .atHour(5) // Resets at 5 AM
-      .create();
-    
-    console.log("fuzAPI: 24-hour reset trigger installed.");
-  }
-
   return {
-   getDataForRequests: getDataForRequests,
+    getDataForRequests: getDataForRequests,
     requestItems: requestItems,
-    resetCircuit: _resetCircuit,     // Exposing the reset
-    setupDailyReset: setupDailyReset // Exposing the installer
+    cacheRefresh: cacheRefresh
   };
 
 })();
@@ -504,26 +453,46 @@ let newlyFetchedData = [];
 // --- Public Custom Functions (Wrappers for Google Sheets) ---
 
 /**
- * GLOBAL BRIDGE: This is what the 24-hour trigger calls.
- * It reaches into the protected fuzAPI and pulls the reset lever.
+ * MANUAL RESET: Run this function to clear the fuzAPI quota locks immediately.
+ * Use this when you know your 20k/100k UrlFetch quota has reset.
  */
-function fuzAPI_DailyReset_Trigger() {
-  fuzAPI.resetCircuit();
-}
-
-function force_Engine_Wake() {
-  PropertiesService.getScriptProperties().setProperty('GLOBAL_SYSTEM_STATE', 'RUNNING');
-  SpreadsheetApp.getActiveSpreadsheet().toast("Engine Woken Manually", "System Status");
+function manual_FuzAPI_Reset() {
+  const props = PropertiesService.getScriptProperties();
+  const keysToReset = [
+    'FuzCircuitState', 
+    'FuzCircuitFailCount', 
+    'FuzCircuitOpenUntilMs'
+  ];
+  
+  keysToReset.forEach(key => props.deleteProperty(key));
+  
+  console.log("fuzAPI: Quota Crowbar manually reset. Circuit is now CLOSED.");
+  if (typeof SpreadsheetApp !== 'undefined') {
+    SpreadsheetApp.getActiveSpreadsheet().toast("fuzAPI Circuit Reset Successful", "Quota Magic");
+  }
 }
 
 /**
- * MANUAL UI HOOK: You can run this from the editor to reset immediately.
+ * DAILY SCHEDULE: Run this function ONCE to set up a 24-hour reset trigger.
+ * This ensures the "Crowbar" is pulled back every morning automatically.
  */
-function manual_FuzAPI_Reset() {
-  fuzAPI.resetCircuit();
-  if (typeof SpreadsheetApp !== 'undefined') {
-    SpreadsheetApp.getActiveSpreadsheet().toast("fuzAPI Crowbar Reset", "Quota Magic");
-  }
+function setupDailyFuzReset() {
+  // Clear any existing reset triggers to avoid duplicates
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    if (t.getHandlerFunction() === 'manual_FuzAPI_Reset') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // Create a new trigger to run once a day (e.g., between 5 AM and 6 AM)
+  ScriptApp.newTrigger('manual_FuzAPI_Reset')
+    .timeBased()
+    .everyDays(1)
+    .atHour(5) 
+    .create();
+
+  console.log("fuzAPI: 24-hour reset trigger installed.");
 }
 
 /**

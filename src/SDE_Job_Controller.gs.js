@@ -97,21 +97,23 @@ const sdeLib = () => {
         if (mgValue === "" || mgValue === "null" || mgValue === "0") continue;
       }
 
-      // --- ESCAPE LOGIC ---
+// --- UPDATED ESCAPE LOGIC ---
       let sanitizedRow = colIndices.map(idx => {
         let val = String(cols[idx] || "").trim();
 
-        // 1. If it's a Number -> Add ' to prevent scientific notation (e.g. '34)
+        // 1. Check if it's a number (TypeIDs, Quantities, Prices)
+        // We only convert to Number if it's not empty and is numeric
         if (val !== "" && !isNaN(val)) {
-          return "'" + val;
+          return Number(val); 
         }
 
-        // 2. If it starts with ' -> Add ANOTHER ' so it displays correctly (e.g. ''Arbalest')
+        // 2. Handle strings starting with ' (e.g., 'Accord' or 'Arbalest')
+        // In Google Sheets, to display a leading ', you must write TWO leading ''
         if (val.startsWith("'")) {
           return "'" + val;
         }
 
-        // 3. Else -> Leave it alone
+        // 3. Else return as a standard string
         return val;
       });
       arrData.push(sanitizedRow);
