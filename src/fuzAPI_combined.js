@@ -511,10 +511,12 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
     return Number.isFinite(n) ? n : null;
   });
 
+  // --- IMPROVED ERROR LOGGING ---
   const lt = String(location_type || "").toLowerCase();
   if (!["region","system","station"].includes(lt)) {
-    throw new Error("Location Undefined (use 'region', 'system', or 'station')");
+    throw new Error(`Location Undefined: Received "${location_type}". Valid types are 'region', 'system', or 'station'. Check your spreadsheet parameters.`);
   }
+  // ------------------------------
 
   const { type: side, level: lvl } = _normalizeOrder(order_type, order_level);
   const validIds = flatIds.filter(n => n != null);
