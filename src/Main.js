@@ -99,7 +99,7 @@ function triggerRestockSync() {
   try {
     generateRestockQuery(ss);
     generateRestockItemsOnHand(ss);
-    //refreshData();
+    generateDumpToBuyOrder(ss);
     ss.toast("✅ Restock & NeedToBuy synced successfully.", "Engine Room", 3);
   } catch (e) {
     ss.toast("❌ Sync failed: " + e.message, "Engine Room Error");
@@ -126,174 +126,291 @@ function respondToEdit(e) {
   }
 }
 
-/**
- * EVE ONLINE MARKET TRADER SCRIPT: LCM EDITION
- * This script plugs ISK leaks by choosing the lowest of:
- * Blended Cost, Manufacturing Cost, or Hub Buy Price.
- */
-
 function generateRestockQuery(ss) {
   const TARGET_SHEET_NAME = 'Need To Buy';
   const DATA_SHEET_NAME = 'MarketOverviewData';
+  const AUDIT_SHEET_NAME = 'Audit items';
+  
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
+  const auditSheet = ss.getSheetByName(AUDIT_SHEET_NAME);
 
-  if (!sheet || !dataSheet) return;
+  if (!sheet || !dataSheet || !auditSheet) return;
 
-  // --- 1. DYNAMIC COLUMN MAPPING ---
-  const lastCol = dataSheet.getLastColumn();
-  const headers = dataSheet.getRange(3, 1, 1, lastCol).getValues()[0];
-  const getIdx = (name) => headers.indexOf(name);
+  // --- BATCH DATA LOAD (Speed Move #1) ---
+  // Load everything into memory at once to avoid repeated API calls
+  const rawDataValues = dataSheet.getDataRange().getValues();
+  const headers = rawDataValues[2]; // Headers are on Row 3 (index 2)
+  const marketRows = rawDataValues.slice(3); // Data starts on Row 4
+  
+  const auditValues = auditSheet.getDataRange().getValues();
+  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), r[1]]));
 
-  const colMap = {
-    itemName: getIdx("Item Name"), 
-    group: getIdx("Group"), 
-    qtyLeft: getIdx("Quantity Left"),
-    activeJobs: getIdx("Active Jobs"), 
-    deliveries: getIdx("Deliveries"),
-    volume: getIdx("30-day traded volume"), 
-    buyOrderQty: getIdx("Listed Volume (Feed Buy)"),
-    effectiveVel: getIdx("Effective Daily Velocity (u/d)"), 
-    warehouseQty: getIdx("Warehouse Qty"),
-    daysOfInv: getIdx("Days of Inventory"), 
-    totalMarketQty: getIdx("Total Market Quantity"),
-    medianBuy: getIdx("Hub Median Buy"), 
-    margin: getIdx("Margin"), 
-    buyAction: getIdx("Buy Action"),
-    effCost: getIdx("Effective Cost"), // <--- THE LCM COLUMN
-    mfgCost: getIdx("Manufacturing Unit Cost")
+  // --- PRE-PROCESS FILTERS (Speed Move #2) ---
+  const filters = sheet.getRange('B5:B26').getValues();
+  const cfg = {
+    minDays: parseFloat(filters[0][0]) || 0,
+    targetDays: parseFloat(filters[2][0]) || 0,
+    minMargin: parseFloat(filters[4][0]) || 0,
+    groups: (filters[6][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
+    sortDir: (filters[8][0] || "ASC").toUpperCase(),
+    sortCol: (filters[9][0] || "Item Name").trim(),
+    limit: filters[14][0] === "No Limit" ? 5000 : parseInt(filters[14][0]) || 5000,
+    ignoreGroups: (filters[21][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s)
   };
 
-  if (colMap.itemName === -1) return;
+  const getIdx = (name) => headers.indexOf(name);
+  const col = {
+    name: getIdx("Item Name"),
+    group: getIdx("Group"),
+    warehouse: getIdx("Warehouse Qty"),
+    action: getIdx("Buy Action"),
+    vel: getIdx("Effective Daily Velocity (u/d)"),
+    margin: getIdx("Margin"),
+    effCost: getIdx("Effective Cost"),
+    mfgCost: getIdx("Manufacturing Unit Cost"),
+    hubBuy: getIdx("Hub Median Buy"),
+    totalMkt: getIdx("Total Market Quantity"),
+    vol30: getIdx("30-day traded volume"),
+    // Inventory components
+    qLeft: getIdx("Quantity Left"),
+    jobs: getIdx("Active Jobs"),
+    buyQty: getIdx("Listed Volume (Feed Buy)"),
+    deliv: getIdx("Deliveries")
+  };
 
-  // --- 2. READ FILTERS ---
-  const filterValues = sheet.getRange('B5:B26').getValues();
-  const filterMinDays = parseFloat(filterValues[0][0]) || 0;
-  const filterTargetDays = parseFloat(filterValues[2][0]) || 0;
-  const filterMargin = parseFloat(filterValues[4][0]) || 0;
-  const filterGroups = (filterValues[6][0] || "").toString().toLowerCase().split(',').map(g => g.trim()).filter(g => g);
-  const sortDirection = (filterValues[8][0] || "ASC").toString().toUpperCase();
-  const sortColumnHeader = (filterValues[9][0] || "Item Name").toString().trim();
-  let limitNum = filterValues[14][0] === "No Limit" ? 999999 : (parseFloat(filterValues[14][0]) || 999999);
-  const filterIgnoreGroups = (filterValues[21][0] || "").toString().toLowerCase().split(',').map(g => g.trim()).filter(g => g);
+  // --- PROCESS DATA IN-MEMORY ---
+  let results = [];
+  marketRows.forEach(row => {
+    const name = String(row[col.name] || "");
+    if (!name || auditMap.get(name) !== true) return; // The Audit Gate
 
-  // --- 3. READ TAX RATES ---
-  let rateMultiplier = 1.0;
+    const action = String(row[col.action] || "");
+    if (action === "" || /SKIP|HOLD/i.test(action)) return;
+
+    const group = String(row[col.group] || "").toLowerCase().trim();
+    if (cfg.ignoreGroups.includes(group)) return;
+    if (cfg.groups.length > 0 && !cfg.groups.includes(group)) return;
+
+    const velocity = Number(row[col.vel]) || 0;
+    const currentStock = (Number(row[col.warehouse]) || 0) + 
+                         (Number(row[col.qLeft]) || 0) + 
+                         (Number(row[col.jobs]) || 0) + 
+                         (Number(row[col.buyQty]) || 0) + 
+                         (Number(row[col.deliv]) || 0);
+    
+    const restockNeed = Math.round((velocity * cfg.targetDays) - currentStock);
+    if (restockNeed <= 0) return;
+
+    const margin = Number(row[col.margin]) || 0;
+    if (margin < cfg.minMargin) return;
+
+    // Price Selection (LCM)
+    const cost = Number(row[col.effCost]) || Number(row[col.mfgCost]) || Number(row[col.hubBuy]) || 0;
+
+    results.push({
+      data: [name, restockNeed, cost, restockNeed * cost, Number(row[col.totalMkt]) || 0, Number(row[col.vol30]) || 0, 0, Number(row[col.warehouse]) || 0, margin, action],
+      sortKey: name // Default sort
+    });
+  });
+
+  // --- SORTING ---
+  results.sort((a, b) => {
+    const modifier = cfg.sortDir === "ASC" ? 1 : -1;
+    return a.sortKey.localeCompare(b.sortKey) * modifier;
+  });
+
+  // --- BATCH WRITE (Speed Move #3) ---
+  const output = results.slice(0, cfg.limit).map(r => r.data);
+  const clearRange = sheet.getRange(5, 3, Math.max(1, sheet.getLastRow()), 10);
+  clearRange.clearContent();
+
+  if (output.length > 0) {
+    sheet.getRange(5, 3, output.length, 10).setValues(output);
+  }
+}
+
+/**
+ * RECONSTRUCTED: generateDumpToBuyOrder(ss)
+ * Logic: B5 (Min Days) | B9 (Min Margin) | B11 (Group Search)
+ * Safety: Full Broker Fee + Sales Tax + Corp Safety Check
+ * Purpose: Establish floor prices by filling bots without losing ISK.
+ */
+function generateDumpToBuyOrder(ss) {
+  const TARGET_SHEET = 'Dump to Buy';
+  const DATA_SHEET = 'MarketOverviewData'; 
+  const CORP_ORDERS_SHEET = 'CorpOrdersCalc'; 
+
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(TARGET_SHEET);
+  const dataSheet = ss.getSheetByName(DATA_SHEET);
+  const corpOrdersSheet = ss.getSheetByName(CORP_ORDERS_SHEET);
+  
+  if (!sheet || !dataSheet) return;
+
+  // --- 1. TAX & BROKER FEE BUFFER ---
+  // Matches Main.js logic: rateMultiplier = (1 + fee + tax)
+  let rateMultiplier = 1.046; // Default buffer (3.6% Tax + 1% Fee)
   try {
-    const fee = ss.getRangeByName("FEE_RATE")?.getValue() || 0;
-    const tax = ss.getRangeByName("TAX_RATE")?.getValue() || 0;
+    const fee = ss.getRangeByName("FEE_RATE")?.getValue() || 0.01;
+    const tax = ss.getRangeByName("TAX_RATE")?.getValue() || 0.036;
     rateMultiplier = (1 + Number(fee) + Number(tax));
   } catch (e) { }
 
-  const lastRow = dataSheet.getLastRow();
-  if (lastRow < 4) return;
-  const rawData = dataSheet.getRange(4, 1, lastRow - 3, lastCol).getValues();
+  // --- 2. READ B-COLUMN CONTROL PANE ---
+  const bColValues = sheet.getRange("B1:B15").getValues();
+  const filterMinDays = parseFloat(bColValues[4][0]) || 0;    // B5
+  const filterMinMargin = parseFloat(bColValues[8][0]) || 0;  // B9
+  const filterGroupName = String(bColValues[10][0]).toLowerCase(); // B11
 
-  // --- 5. PROCESS DATA ---
-  let processedData = [];
+  // --- 3. CORP SAFETY BLACKLIST ---
+  let corpBuyPrices = {}; 
+  if (corpOrdersSheet) {
+    const corpData = corpOrdersSheet.getDataRange().getValues();
+    const h = corpData[1]; // Headers on row 2
+    const pIdx = h.indexOf("price");
+    const tIdx = h.indexOf("type_id");
+    const bIdx = h.indexOf("is_buy_order");
 
-  for (let i = 0; i < rawData.length; i++) {
-    const row = rawData[i];
-    const rawName = String(row[colMap.itemName] || "");
-    if (!rawName) continue;
-
-    const itemName = (rawName.charAt(0) === "'") ? "'" + rawName : rawName;
-    const warehouseAmount = Number(row[colMap.warehouseQty]) || 0;
-    const buyAction = String(row[colMap.buyAction] || "");
-    if (buyAction.includes("SKIP") || buyAction.includes("HOLD") || buyAction === "") continue;
-
-    const margin = Number(row[colMap.margin]) || 0;
-    const daysInv = Number(row[colMap.daysOfInv]) || 0;
-    const volume = Number(row[colMap.volume]) || 0;
-    const group = String(row[colMap.group] || "").toLowerCase().trim();
-
-    // Inventory Calc
-    const stock = warehouseAmount + (Number(row[colMap.qtyLeft]) || 0) + (Number(row[colMap.activeJobs]) || 0) + (Number(row[colMap.buyOrderQty]) || 0) + (Number(row[colMap.deliveries]) || 0);
-    const velocity = Number(row[colMap.effectiveVel]) || 0;
-    const targetQty = velocity * filterTargetDays;
-
-    let restockNeed = Math.round(targetQty - stock);
-    if (restockNeed <= 0) continue;
-    if (margin < filterMargin || daysInv >= filterMinDays) continue;
-    if (filterGroups.length > 0 && !filterGroups.includes(group)) continue;
-    if (filterIgnoreGroups.includes(group)) continue;
-
-    // --- LCM PRICE SELECTION ---
-    const hubBuy = Number(row[colMap.medianBuy]) || 0;
-    const mfg = Number(row[colMap.mfgCost]) || 0;
-    const eff = Number(row[colMap.effCost]) || 0;
-
-    // Use the cheapest available acquisition cost
-    const baseCost = (eff > 0) ? eff : (mfg > 0 ? mfg : hubBuy);
-    const orderCost = restockNeed * baseCost * rateMultiplier;
-
-    processedData.push({
-      row: [itemName, restockNeed, baseCost, orderCost, Number(row[colMap.totalMarketQty]) || 0, volume, 0, warehouseAmount, margin, buyAction],
-      sortObj: { itemName, restockNeed, orderCost, margin, volume }
-    });
+    for (let i = 2; i < corpData.length; i++) {
+      if (corpData[i][bIdx] === true || corpData[i][bIdx] === "TRUE") {
+        const typeId = corpData[i][tIdx];
+        const price = parseFloat(corpData[i][pIdx]);
+        if (typeId && price) {
+          if (!corpBuyPrices[typeId]) corpBuyPrices[typeId] = [];
+          corpBuyPrices[typeId].push(price.toFixed(2));
+        }
+      }
+    }
   }
 
-  // --- 6. SORT ---
-  processedData.sort((a, b) => {
-    let vA = a.sortObj.itemName, vB = b.sortObj.itemName;
-    if (sortColumnHeader === 'Quantity') { vA = a.sortObj.restockNeed; vB = b.sortObj.restockNeed; }
-    else if (sortColumnHeader === 'Order Cost') { vA = a.sortObj.orderCost; vB = b.sortObj.orderCost; }
-    else if (sortColumnHeader === 'Margin') { vA = a.sortObj.margin; vB = b.sortObj.margin; }
-    else if (sortColumnHeader === 'Volume') { vA = a.sortObj.volume; vB = b.sortObj.volume; }
-    if (vA < vB) return sortDirection === 'ASC' ? -1 : 1;
-    if (vA > vB) return sortDirection === 'ASC' ? 1 : -1;
-    return 0;
-  });
+  // --- 4. DYNAMIC COLUMN MAPPING ---
+  const lastCol = dataSheet.getLastColumn();
+  const allHeaders = dataSheet.getRange(1, 1, 10, lastCol).getValues();
+  let hIdx = -1;
+  for (let i = 0; i < 10; i++) {
+    if (allHeaders[i].indexOf("Item Name") > -1) { hIdx = i; break; }
+  }
+  if (hIdx === -1) return;
+  
+  const headers = allHeaders[hIdx];
+  const getIdx = (name) => headers.indexOf(name);
+  const col = {
+    id: getIdx("type_id"),
+    item: getIdx("Item Name"),
+    group: getIdx("Group"),
+    effCost: getIdx("Effective Cost"),
+    medianBuy: getIdx("Hub Median Buy"),
+    whQty: getIdx("Warehouse Qty"),
+    daysInv: getIdx("Days of Inventory")
+  };
 
-  if (limitNum && processedData.length > limitNum) processedData = processedData.slice(0, limitNum);
+  const rawData = dataSheet.getRange(hIdx + 2, 1, dataSheet.getLastRow() - (hIdx + 1), lastCol).getValues();
+  let dumpResults = [];
 
-  // --- 7. WRITE ---
-  const HEADER_ROW = 4;
-  sheet.getRange(HEADER_ROW, 3, Math.max(1, sheet.getLastRow() - HEADER_ROW + 1), 10).clearContent();
-  sheet.getRange(HEADER_ROW, 3, 1, 10).setValues([["Item Name", "Quantity", "Effective Cost", "Order Cost", "Total Market Quantity", "Volume", "0", "Warehouse Qty", "Margin", "Buy Action"]]).setFontWeight("bold");
+  // --- 5. SCAN DATA ---
+  for (let r of rawData) {
+    const name = r[col.item];
+    const typeId = r[col.id];
+    const group = String(r[col.group]).toLowerCase();
+    const daysOfInv = parseFloat(r[col.daysInv]) || 0;
+    
+    // Filters: Group check and Overstock (Min Days) check
+    if (filterGroupName && group.indexOf(filterGroupName) === -1) continue;
+    if (!name || daysOfInv < filterMinDays) continue;
 
-  if (processedData.length > 0) {
-    const out = processedData.map(p => p.row);
-    sheet.getRange(HEADER_ROW + 1, 3, out.length, out[0].length).setValues(out);
+    const baseCost = parseFloat(r[col.effCost]) || 0;
+    const hubBuy = parseFloat(r[col.medianBuy]) || 0;
+    const qty = parseFloat(r[col.whQty]) || 0;
+
+    if (baseCost <= 0 || hubBuy <= 0 || qty <= 0) continue;
+
+    // Safety: Don't fill your own corp buy orders
+    if (corpBuyPrices[typeId] && corpBuyPrices[typeId].includes(hubBuy.toFixed(2))) continue;
+
+    // Forensic Margin: Accounts for station overhead before confirming profit
+    const netProceeds = hubBuy / rateMultiplier; 
+    const margin = (netProceeds - baseCost) / baseCost;
+
+    if (margin >= filterMinMargin) {
+      dumpResults.push([
+        name,            // C: Item Name
+        baseCost,        // D: Effective Cost
+        hubBuy,          // E: Median Buy
+        margin,          // F: Margin
+        qty,             // G: Qty On Hand
+        (hubBuy * qty)   // H: Total Dump ISK
+      ]);
+    }
+  }
+
+  // --- 6. SORT & WRITE (C4:H) ---
+  dumpResults.sort((a, b) => b[3] - a[3]); 
+
+  const START_ROW = 5;
+  if (sheet.getLastRow() >= START_ROW) {
+    sheet.getRange(START_ROW, 3, sheet.getLastRow() - (START_ROW - 1), 6).clearContent();
+  }
+
+  if (dumpResults.length > 0) {
+    sheet.getRange(START_ROW, 3, dumpResults.length, 6).setValues(dumpResults);
+    sheet.getRange(START_ROW, 6, dumpResults.length, 1).setNumberFormat("0.00%");
+    ss.toast("CSI: Forensic dump analysis complete. " + dumpResults.length + " targets found.", "Engine Room");
   }
 }
 
 function generateRestockItemsOnHand(ss) {
   const TARGET_SHEET = 'Restock Items On Hand';
   const DATA_SHEET = 'MarketOverviewData';
+  const AUDIT_SHEET = 'Audit items';
+  
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET);
   const dataSheet = ss.getSheetByName(DATA_SHEET);
-  if (!sheet || !dataSheet) return;
+  const auditSheet = ss.getSheetByName(AUDIT_SHEET);
+  
+  if (!sheet || !dataSheet || !auditSheet) return;
 
   const clean = (v) => {
     if (typeof v === 'number') return v;
     return parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
   };
 
-  const headers = dataSheet.getRange(3, 1, 1, dataSheet.getLastColumn()).getValues()[0];
+  // --- OPTIMIZATION 1: PRE-LOAD AUDIT DATA (Outside Loop) ---
+  const auditValues = auditSheet.getDataRange().getValues();
+  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), r[1]]));
+
+  // --- OPTIMIZATION 2: BATCH LOAD MARKET DATA ---
+  const rawDataValues = dataSheet.getDataRange().getValues();
+  const headers = rawDataValues[2]; // Row 3
+  const rawData = rawDataValues.slice(3); // Row 4+
+
   const getIdx = (name) => {
     let i = headers.indexOf(name);
     return (i === -1 && name === "Posted Sell Quantuty") ? headers.indexOf("Quantity Left") : i;
   };
 
-  const colMap = {
-    item: getIdx("Item Name"), targetGoal: getIdx("Target"), 
-    sellQty: getIdx("Posted Sell Quantuty"), whQty: getIdx("Warehouse Qty"),
-    effVel: getIdx("Effective Daily Velocity (u/d)"), hubSell: getIdx("Hub Sell Price"),
-    medROI: getIdx("Median ROI"), sellAct: getIdx("Sell Action"),
-    hubBuy: getIdx("Hub Buy Price"), mktQty: getIdx("Total Market Quantity"),
-    effCost: getIdx("Effective Cost"), mfgCost: getIdx("Manufacturing Unit Cost")
+  const col = {
+    item: getIdx("Item Name"),
+    targetGoal: getIdx("Target"), 
+    sellQty: getIdx("Posted Sell Quantuty"), 
+    whQty: getIdx("Warehouse Qty"),
+    effVel: getIdx("Effective Daily Velocity (u/d)"), 
+    hubSell: getIdx("Hub Sell Price"),
+    medROI: getIdx("Median ROI"), 
+    sellAct: getIdx("Sell Action"),
+    hubBuy: getIdx("Hub Buy Price"), 
+    mktQty: getIdx("Total Market Quantity"),
+    effCost: getIdx("Effective Cost"), 
+    mfgCost: getIdx("Manufacturing Unit Cost")
   };
 
+  // --- OPTIMIZATION 3: PRE-LOAD FILTERS ---
   const bCol = sheet.getRange("A1:B45").getValues();
   const seedDays = clean(bCol[38][0]) || 3; 
   const minROI = clean(bCol[7][1]);
-
-  const lastRow = dataSheet.getLastRow();
-  if (lastRow < 4) return;
-  const rawData = dataSheet.getRange(4, 1, lastRow - 3, dataSheet.getLastColumn()).getValues();
+  const minOrderValue = 1000000; // Add an optional ISK floor (1M ISK)
 
   const OUT_HEADERS = [
     "Item Name", "Posting Price", "Hub Sell Price", "Quantity", "Total Value", "Delta Sell", "Delta Buy",
@@ -304,52 +421,54 @@ function generateRestockItemsOnHand(ss) {
 
   let resultRows = [];
 
+  // --- MAIN PROCESSING LOOP ---
   for (let r of rawData) {
-    if (!r[colMap.item]) continue;
+    const rawName = String(r[col.item] || "");
+    if (!rawName) continue;
 
-    let itemName = String(r[colMap.item]);
-    if (itemName.charAt(0) === "'") itemName = "'" + itemName;
+    // --- THE AUDIT GATE ---
+    if (auditMap.get(rawName) !== true) continue;
 
-    const velocity = clean(r[colMap.effVel]);
-    const warehouseStock = clean(r[colMap.whQty]);
-    const currentMarket = clean(r[colMap.sellQty]);
-    const targetGoal = clean(r[colMap.targetGoal]);
+    const action = String(r[col.sellAct] || "");
+    if (/SKIP|HOLD|IGNORE/i.test(action) || action === "") continue;
 
+    const velocity = clean(r[col.effVel]);
+    const warehouseStock = clean(r[col.whQty]);
+    const currentMarket = clean(r[col.sellQty]);
+    const targetGoal = clean(r[col.targetGoal]);
+
+    // Calculate how much we can actually restock from the warehouse
     let targetNeeded = velocity * seedDays;
     if (targetGoal > 0) targetNeeded = Math.min(targetNeeded, targetGoal);
 
     let gap = Math.max(0, targetNeeded - currentMarket);
-   let finalQuantity = Math.round(Math.min(gap, warehouseStock));
+    let finalQuantity = Math.round(Math.min(gap, warehouseStock));
 
     if (finalQuantity <= 0) continue;
 
-    const action = String(r[colMap.sellAct] || "");
-    if (action.includes("SKIP") || action.includes("HOLD") || action.includes("IGNORE")) continue;
-
-    const roiVal = clean(r[colMap.medROI]);
-    if (roiVal < minROI) continue;
-
-    const hubSell = clean(r[colMap.hubSell]);
-    
-    // --- LCM SYNC ---
-    // Look at your sheet's Effective Cost column first (it's the smartest value).
-    const baseCost = clean(r[colMap.effCost]) || clean(r[colMap.mfgCost]);
-    
-    // This price is now "Un-Ghosted"
+    const hubSell = clean(r[col.hubSell]);
+    const baseCost = clean(r[col.effCost]) || clean(r[col.mfgCost]);
     const postPrice = Math.max(hubSell, baseCost * (1 + minROI));
+    const totalOrderValue = finalQuantity * postPrice;
+
+    // --- MINIMUM ISK FILTER ---
+    if (totalOrderValue < minOrderValue) continue;
+
+    let itemName = (rawName.charAt(0) === "'") ? rawName : rawName;
 
     resultRows.push([
-      itemName, postPrice, hubSell, finalQuantity, (finalQuantity * postPrice),
+      itemName, postPrice, hubSell, finalQuantity, totalOrderValue,
       r[getIdx("Delta Sell")], r[getIdx("Delta Buy")], r[getIdx("Warehouse Level")],
-      r[getIdx("Pending Orders")], r[colMap.mktQty], warehouseStock,
+      r[getIdx("Pending Orders")], r[col.mktQty], warehouseStock,
       r[getIdx("Acquisition (30d)")], velocity, r[getIdx("30-day traded volume")],
       r[getIdx("Listed Volume (Feed Sell)")], r[getIdx("Feed Days of Book")],
-      clean(r[colMap.hubBuy]), baseCost, action, r[getIdx("Buy Action")], currentMarket
+      clean(r[col.hubBuy]), baseCost, action, r[getIdx("Buy Action")], currentMarket
     ]);
   }
 
-  const clearRows = Math.max(1, sheet.getLastRow() - 2);
-  sheet.getRange(3, 3, clearRows, 21).clearContent();
+  // --- OPTIMIZATION 4: BATCH CLEAR AND WRITE ---
+  const maxRows = Math.max(1, sheet.getLastRow());
+  sheet.getRange(3, 3, maxRows, 21).clearContent();
   sheet.getRange(3, 3, 1, 21).setValues([OUT_HEADERS]).setFontWeight("bold");
 
   if (resultRows.length > 0) {
