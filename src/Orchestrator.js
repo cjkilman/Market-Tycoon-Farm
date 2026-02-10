@@ -349,7 +349,7 @@ function updateMarketDataSheet() {
  * Phase 2: Live Write (No pause, allows dashboard use)
  */
 function updateMarketDataSheet() {
-    if (isSdeJobRunning()) {
+  if (isSdeJobRunning()) {
     console.warn("ABORT: SDE Update in progress. Parking Market Tycoon.");
     return; 
   }
@@ -366,8 +366,6 @@ function updateMarketDataSheet() {
   const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize';
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS';
-
-
 
   SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
 
@@ -389,27 +387,16 @@ function updateMarketDataSheet() {
       return;
     }
 
-
     const setupResult = guardedSheetTransaction(() => {
-      // 1. Call Helper (Returns {success, state, error})
       const result = prepareTempSheet(ss_anchor, tempSheetName, DATA_SHEET_HEADERS);
-
-      // 2. Check Internal Result
       if (!result.success) {
-        // Throwing here causes guardedSheetTransaction to catch it and return {success: false}
         throw new Error(result.error || "Unknown Prep Failure");
       }
-
-      // 3. Perform Sheet Ops (Safe to access .state now)
       if (result.state) {
         result.state.hideSheet();
       }
-
-      // 4. Return Success
       return true;
     }, 60000);
-
-
 
     if (!setupResult.success) {
       console.warn(`[Worker] Sheet prep failed: ${setupResult.error}`);
@@ -451,9 +438,7 @@ function updateMarketDataSheet() {
         }
       });
 
-if (allRowsToWrite.length === 0) {
-        // SAFEGUARD: If we requested items but got 0 rows back, DO NOT finalize.
-        // This prevents wiping the sheet if the API fails silently or returns empty data.
+      if (allRowsToWrite.length === 0) {
         console.error("Worker: allRowsToWrite is empty! Aborting write to prevent data wipe.");
         _resetMarketDataJobState(new Error("Zero rows returned from API - Aborted Write"));
         return;
@@ -463,7 +448,6 @@ if (allRowsToWrite.length === 0) {
       return;
     }
 
-    // Refresh SS reference
     ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
     let writeState = {
@@ -472,23 +456,12 @@ if (allRowsToWrite.length === 0) {
       ss: ss_anchor,
       metrics: { startTime: START_TIME },
       config: {
-        // Inherit Shared Settings from Utility.js
         ...(typeof NITRO_CONFIG !== 'undefined' ? NITRO_CONFIG : {}),
-
-        // LIVE MODE TUNING (Stricter because Calcs are ON):
         MAX_CELLS_PER_CHUNK: 40000,
         MAX_CHUNK_SIZE: 2000,
-        //  MIN_CHUNK_SIZE: 100, // Allow tiny chunks if lag is bad       
-        // SOFT_LIMIT_MS: 240000,
-
-        // Dynamic State
         currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000')
       }
     };
-
-    // if (writeState.nextBatchIndex === 0) writeState.config.currentChunkSize = 500;
-
-    // [NO PAUSE HERE] - Writing Live to keep dashboard usable
 
     const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
 
@@ -507,9 +480,8 @@ if (allRowsToWrite.length === 0) {
       const nextIndex = writeResult.state.nextBatchIndex.toString();
       let nextChunkSize = writeResult.state.config.currentChunkSize;
 
-      // Aggressive backoff on error
       if (writeResult.error) {
-        nextChunkSize = Math.max(100, Math.floor(nextChunkSize / 2)); // Drop significantly
+        nextChunkSize = Math.max(100, Math.floor(nextChunkSize / 2)); 
       }
 
       SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
@@ -518,7 +490,21 @@ if (allRowsToWrite.length === 0) {
       scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
     }
     else {
-      _resetMarketDataJobState(new Error(`Write Failure: ${writeResult.error}`));
+      // --- CRITICAL FIX START ---
+      if (writeResult.error && (writeResult.error.includes("Lock Failed") || writeResult.error.includes("Lock timeout"))) {
+        console.warn("Lock Conflict detected. Pausing for Sheet to breathe. DO NOT RESET.");
+        
+        // Preserve the current index so it picks up where it left off
+        const nextIndex = (writeResult.state.nextBatchIndex || 0).toString();
+        SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
+        
+        // Force a 30-second delay to allow Google Sheets to finish calculations
+        scheduleOneTimeTrigger('updateMarketDataSheet', 30000); 
+      } else {
+        // Only reset on actual data corruption or API failures
+        _resetMarketDataJobState(new Error(`Write Failure: ${writeResult.error}`));
+      }
+      // --- CRITICAL FIX END ---
     }
   }
 }
