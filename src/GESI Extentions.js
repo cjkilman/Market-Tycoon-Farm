@@ -1772,48 +1772,55 @@ function _getContractPriceFallbackMap(ss, missingTids) {
   return fallbackMap;
 }
 
-/**
- * NEW: Wraps _getContractPriceFallbackMap to cache expensive Tier 3 prices.
- */
 function _getContractPricesCached(ss, missingTids) {
   const log = LoggerEx.withTag('CONTRACT_CACHE');
+  if (!missingTids || missingTids.length === 0) return new Map();
+
   const cache = CacheService.getScriptCache();
-  const cacheKey = 'CONTRACT_FALLBACK_PRICES_V1'; // Static key for all items
-  const CACHE_TTL = 3600; // Cache these fallback prices for 1 hour
+  const CACHE_TTL = 3600;
+  const prefix = 'tid_p_'; // Short prefix to save bytes
 
-  // 1. Check for cached fallback map
-  const cachedJson = cache.get(cacheKey);
-  let cachedFallbackMap = new Map();
+  // 1. ATOMIC FETCH: Get all available cached items in ONE call
+  // CacheService.getAll handles multiple keys much faster than individual .get() calls
+  const cacheKeys = missingTids.map(tid => prefix + tid);
+  const cachedData = cache.getAll(cacheKeys);
+  
+  const resultsMap = new Map();
+  const stillMissingTids = [];
 
-  if (cachedJson) {
-    // Rebuild the Map from the cached JSON array
-    const parsedArray = JSON.parse(cachedJson);
-    cachedFallbackMap = new Map(parsedArray);
-    log.info(`[CONTRACT_CACHE] Loaded ${cachedFallbackMap.size} fallback prices from cache.`);
+  // 2. SORT: What do we have vs. what do we need?
+  missingTids.forEach(tid => {
+    const val = cachedData[prefix + tid];
+    if (val) {
+      resultsMap.set(Number(tid), JSON.parse(val));
+    } else {
+      stillMissingTids.add(tid);
+    }
+  });
+
+  if (resultsMap.size > 0) {
+    log.info(`Cache hit: ${resultsMap.size} items.`);
   }
 
-  // 2. Identify TIDs *still* missing after checking local and cache
-  const finalMissingTids = missingTids.filter(tid => !cachedFallbackMap.has(tid));
+  // 3. API FALLBACK: Fetch remaining from Tier 3
+  if (stillMissingTids.length > 0) {
+    log.info(`Cache miss: Fetching ${stillMissingTids.length} items from API.`);
+    const apiResults = _getContractPriceFallbackMap(ss, stillMissingTids);
 
-  if (finalMissingTids.length > 0) {
-    log.info(`[CONTRACT_CACHE] Running API for ${finalMissingTids.length} uncached items.`);
+    if (apiResults && apiResults.size > 0) {
+      const toCache = {};
+      apiResults.forEach((val, tid) => {
+        resultsMap.set(tid, val);
+        // Prepare for batch write to cache
+        toCache[prefix + tid] = JSON.stringify(val);
+      });
 
-    // 3. Run the slow, API-dependent function only for items still missing
-    const newFallbackMap = _getContractPriceFallbackMap(ss, finalMissingTids);
-
-    if (newFallbackMap.size > 0) {
-      // 4. Merge new results with the cache
-      newFallbackMap.forEach((v, k) => cachedFallbackMap.set(k, v));
-
-      // 5. Store the entire merged map back into the cache
-      const jsonToCache = JSON.stringify(Array.from(cachedFallbackMap.entries()));
-      cache.put(cacheKey, jsonToCache, CACHE_TTL);
-      log.info(`[CONTRACT_CACHE] Cached and merged ${newFallbackMap.size} new prices. Total cached: ${cachedFallbackMap.size}.`);
+      // 4. BATCH WRITE: Save new results to cache in one go
+      cache.putAll(toCache, CACHE_TTL);
     }
   }
 
-  // 6. Return the consolidated map for lookup
-  return cachedFallbackMap;
+  return resultsMap;
 }
 
 /**
@@ -1861,146 +1868,92 @@ function _buildContractPriceMap_(ss) {
 // ==========================================================================================
 
 
-/**
- * Recalculates unit costs for contracts in the Material/Sales Ledger.
- * This is the final step in the COGS pipeline, now using tiered fallbacks.
- */
 function rebuildContractUnitCosts(ss) {
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const log = LoggerEx.withTag('CONTRACT_UNIT_COST');
   const LEDGER_BUY_SHEET = 'Material_Ledger';
 
-  // --- 1. BUILD REQUIRED LOOKUP MAPS ---
   const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
-  const refMap = _buildRefPriceMap_(ss); // Tier 1: Local Tracker Prices
+  const refMap = _buildRefPriceMap_(ss); 
   const priceMap = _buildContractPriceMap_(ss);
 
-  // --- 2. READ RAW DATA (Contract Items) & COLLECT ALL UNIQUE TIDS ---
   const ci = _getData_(ss, 'Contract Items (RAW)');
-  if (ci.rows.length === 0) {
-    log.warn('rebuildContractUnitCosts: Skipping, RAW contract data is empty.');
-    return 0;
-  }
+  if (!ci || ci.rows.length === 0) return 0;
 
   const itemsByCid = new Map();
-  const allUniqueContractTids = new Set();
-  const cICol = {
-    contract_id: ci.h['contract_id'],
-    type_id: ci.h['type_id'],
-    quantity: ci.h['quantity'],
-    is_included: ci.h['is_included']
-  };
+  const allUniqueTids = new Set();
+  
+  // Cache header indices to avoid repeated property lookups in the loop
+  const { contract_id: hCid, type_id: hTid, quantity: hQty, is_included: hInc } = ci.h;
 
+  // PASS 0: Grouping & Unique TID collection
   ci.rows.forEach(row => {
-    const cid = String(row[cICol.contract_id]);
-    if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
-
-    const qty = Number(row[cICol.quantity] || 0);
-    if (String(row[cICol.is_included]).toUpperCase() === 'TRUE' && qty > 0) {
-      const tid = Number(row[cICol.type_id]);
-      itemsByCid.get(cid).push({ tid: tid, qty: qty });
-      allUniqueContractTids.add(tid);
+    const qty = Number(row[hQty] || 0);
+    if (String(row[hInc]).toUpperCase() === 'TRUE' && qty > 0) {
+      const cid = String(row[hCid]);
+      const tid = Number(row[hTid]);
+      
+      if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
+      itemsByCid.get(cid).push({ tid, qty });
+      if (!refMap.has(tid)) allUniqueTids.add(tid);
     }
   });
 
-  // 3. Generate Fallback Map for Tids missing from Tier 1 (refMap)
-  const tidsMissingTier1 = Array.from(allUniqueContractTids).filter(tid => !refMap.has(tid));
-  const fallbackMap = _getContractPricesCached(ss, tidsMissingTier1);
+  // Fetch all fallbacks in ONE batch call
+  const fallbackMap = _getContractPricesCached(ss, Array.from(allUniqueTids));
 
-
-  // --- 4. CALCULATE UNIT COSTS (The Core Logic) ---
   const outRows = [];
-  let processedItems = 0;
-
   for (const [cid, items] of itemsByCid.entries()) {
-    const contractMeta = priceMap.get(cid);
-    if (!contractMeta) continue;
+    const meta = priceMap.get(cid);
+    if (!meta) continue;
 
-    const totalContractValue = contractMeta.price + contractMeta.collateral - contractMeta.reward;
+    const totalContractValue = meta.price + meta.collateral - meta.reward;
     let totalReferenceValue = 0;
 
-    // Pass 1: Calculate total reference value (needed for allocation factor)
-    for (const { tid, qty } of items) {
-
-      // TIERED PRICING: Check Tier 1 (refMap) then Fallback Map
-      let refPriceObj = refMap.get(tid) || fallbackMap.get(tid);
-      const refPrice = refPriceObj?.buy || 0;
-
-      if (refPrice > 0) {
-        totalReferenceValue += refPrice * qty;
-      }
-    }
+    // PASS 1: Resolve Prices & Calculate Total Reference Value
+    items.forEach(item => {
+      const priceObj = refMap.get(item.tid) || fallbackMap.get(item.tid);
+      item.resolvedPrice = priceObj?.buy || 0; // Store price directly on object
+      totalReferenceValue += (item.resolvedPrice * item.qty);
+    });
 
     const pricePerRefUnit = (totalReferenceValue > 0) ? (totalContractValue / totalReferenceValue) : 0;
     const simpleVolumeSplit = (items.length > 0) ? (totalContractValue / items.length) : 0;
 
-    // Pass 2: Apply allocation logic
-    for (const { tid, qty } of items) {
+    // PASS 2: Final Cost Calculation
+    items.forEach(item => {
       let unitCost = 0;
-
-      // TIERED PRICING: Get the best available price for this item
-      let refPriceObj = refMap.get(tid) || fallbackMap.get(tid);
-      const refPrice = refPriceObj?.buy || 0;
-
-      // FIX: Using local variable 'allocMode' consistently (was fixed from ALLOC_MODE)
-      if (allocMode === 'REF' && totalReferenceValue > 0) {
-
-        if (refPrice > 0) {
-          // Cost = Reference Price * Allocation Factor
-          unitCost = refPrice * pricePerRefUnit;
-        } else {
-          // Item was unpriced even with fallbacks; fall back to simple volume split.
-          unitCost = simpleVolumeSplit / qty;
-        }
+      if (allocMode === 'REF' && totalReferenceValue > 0 && item.resolvedPrice > 0) {
+        unitCost = item.resolvedPrice * pricePerRefUnit;
       } else {
-        // FALLBACK/VOLUME Mode: Cost = TotalValue / TotalItems (Simple averaging)
-        unitCost = simpleVolumeSplit / qty;
+        // Fallback to volume split if price is missing or mode is VOLUME
+        unitCost = simpleVolumeSplit / item.qty;
       }
 
-      // --- WRITE NEW LEDGER ROW OBJECT (for MaterialLedger.upsert) ---
       outRows.push({
         source: "CONTRACT",
-        char: contractMeta.char,
+        char: meta.char,
         contract_id: cid,
-        type_id: tid,
-
-        // CRITICAL FIX: Pass the quantity back so it isn't overwritten with 0
-        qty: qty,
-
+        type_id: item.tid,
+        qty: item.qty,
         unit_value_filled: unitCost,
       });
-      processedItems++;
-    }
+    });
   }
 
-  if (processedItems === 0) {
-    log.log('rebuildContractUnitCosts', { status: 'Skipped: No items found for costing.' });
-    return 0;
-  }
+  if (outRows.length === 0) return 0;
 
   // --- 5. SHEET WRITE OPERATION ---
-  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
-  const keys = ['source', 'char', 'contract_id', 'type_id'];
-
-  // FIX: PAUSE SHEET CALCULATIONS TO PREVENT TIMEOUT
-  // var needsWakeUp = pauseSheet(ss);
-
-  let count = 0;
   try {
-    const upsertResult = MaterialLedger.upsert(keys, outRows);
-    count = upsertResult.rows; // FIX: Extract the count from the object
-
-    log.log('rebuildContractUnitCosts', { appended_or_updated: count, processed: processedItems });
-    return count;
-
+    const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
+    const keys = ['source', 'char', 'contract_id', 'type_id'];
+    const result = MaterialLedger.upsert(keys, outRows);
+    
+    log.info(`Upserted ${result.rows} rows to ${LEDGER_BUY_SHEET}.`);
+    return result.rows;
   } catch (e) {
     log.error('rebuildContractUnitCosts WRITE FAILED', e.message);
     throw e;
-  } finally {
-    // Moved to ML upsert
-    // if (needsWakeUp) {
-    //  wakeUpSheet(ss);
-    //}
   }
 }
 
