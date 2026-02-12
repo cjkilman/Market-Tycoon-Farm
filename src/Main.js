@@ -108,21 +108,38 @@ function triggerRestockSync() {
 }
 
 function respondToEdit(e) {
+  // 1. EXIT IMMEDIATELY if the event object or range is missing (e.g. if run from editor)
   if (!e || !e.range) return;
-  const sheet = e.range.getSheet();
+
+  // 2. USE EVENT OBJECT PROPERTIES for speed (Avoid getActiveSpreadsheet() and getSheet())
+  const range = e.range;
+  const col = range.columnStart;
+  const row = range.rowStart;
+
+  // Pre-filter by column to avoid expensive A1Notation/Name lookups on unrelated edits
+  if (col > 2) return; 
+
+  const sheet = range.getSheet();
   const sheetName = sheet.getName();
-  const cellA1 = e.range.getA1Notation();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 3. CACHE CONSTANTS (Moved outside conditional logic for clarity)
   const SHEET_BUY = 'Need To Buy';
-  const CELLS_BUY = ['B5', 'B7', 'B9', 'B11', 'B13', 'B14', 'B19', 'B21', 'B22', 'B26'];
-
   const SHEET_RESTOCK = 'Restock Items On Hand';
-  const CELLS_RESTOCK = ['B6', 'B8', 'B10', 'B12', 'B14', 'B15', 'B17', 'B18', 'B20', 'B21', 'B23', 'B25', 'B27', 'B28', 'B33', 'B36', 'B39', 'B42', 'A39'];
 
-  if (sheetName === SHEET_BUY && CELLS_BUY.includes(cellA1)) {
-    generateRestockQuery(ss);
-  } else if (sheetName === SHEET_RESTOCK && CELLS_RESTOCK.includes(cellA1)) {
-    generateRestockItemsOnHand(ss);
+  // 4. OPTIMIZE CHECKING LOGIC
+  // Use column/row checks where possible; only call getA1Notation() if necessary
+  const cellA1 = range.getA1Notation();
+
+  if (sheetName === SHEET_BUY) {
+    const CELLS_BUY = ['B5', 'B7', 'B9', 'B11', 'B13', 'B14', 'B19', 'B21', 'B22', 'B26'];
+    if (CELLS_BUY.includes(cellA1)) {
+      generateRestockQuery(e.source); // Use e.source instead of getActiveSpreadsheet()
+    }
+  } else if (sheetName === SHEET_RESTOCK) {
+    const CELLS_RESTOCK = ['B6', 'B8', 'B10', 'B12', 'B14', 'B15', 'B17', 'B18', 'B20', 'B21', 'B23', 'B25', 'B27', 'B28', 'B33', 'B36', 'B39', 'B42', 'A39'];
+    if (CELLS_RESTOCK.includes(cellA1)) {
+      generateRestockItemsOnHand(e.source);
+    }
   }
 }
 

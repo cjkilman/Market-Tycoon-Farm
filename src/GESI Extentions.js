@@ -1772,55 +1772,48 @@ function _getContractPriceFallbackMap(ss, missingTids) {
   return fallbackMap;
 }
 
+/**
+ * NEW: Wraps _getContractPriceFallbackMap to cache expensive Tier 3 prices.
+ */
 function _getContractPricesCached(ss, missingTids) {
   const log = LoggerEx.withTag('CONTRACT_CACHE');
-  if (!missingTids || missingTids.length === 0) return new Map();
-
   const cache = CacheService.getScriptCache();
-  const CACHE_TTL = 3600;
-  const prefix = 'tid_p_'; // Short prefix to save bytes
+  const cacheKey = 'CONTRACT_FALLBACK_PRICES_V1'; // Static key for all items
+  const CACHE_TTL = 3600; // Cache these fallback prices for 1 hour
 
-  // 1. ATOMIC FETCH: Get all available cached items in ONE call
-  // CacheService.getAll handles multiple keys much faster than individual .get() calls
-  const cacheKeys = missingTids.map(tid => prefix + tid);
-  const cachedData = cache.getAll(cacheKeys);
-  
-  const resultsMap = new Map();
-  const stillMissingTids = [];
+  // 1. Check for cached fallback map
+  const cachedJson = cache.get(cacheKey);
+  let cachedFallbackMap = new Map();
 
-  // 2. SORT: What do we have vs. what do we need?
-  missingTids.forEach(tid => {
-    const val = cachedData[prefix + tid];
-    if (val) {
-      resultsMap.set(Number(tid), JSON.parse(val));
-    } else {
-      stillMissingTids.add(tid);
-    }
-  });
-
-  if (resultsMap.size > 0) {
-    log.info(`Cache hit: ${resultsMap.size} items.`);
+  if (cachedJson) {
+    // Rebuild the Map from the cached JSON array
+    const parsedArray = JSON.parse(cachedJson);
+    cachedFallbackMap = new Map(parsedArray);
+    log.info(`[CONTRACT_CACHE] Loaded ${cachedFallbackMap.size} fallback prices from cache.`);
   }
 
-  // 3. API FALLBACK: Fetch remaining from Tier 3
-  if (stillMissingTids.length > 0) {
-    log.info(`Cache miss: Fetching ${stillMissingTids.length} items from API.`);
-    const apiResults = _getContractPriceFallbackMap(ss, stillMissingTids);
+  // 2. Identify TIDs *still* missing after checking local and cache
+  const finalMissingTids = missingTids.filter(tid => !cachedFallbackMap.has(tid));
 
-    if (apiResults && apiResults.size > 0) {
-      const toCache = {};
-      apiResults.forEach((val, tid) => {
-        resultsMap.set(tid, val);
-        // Prepare for batch write to cache
-        toCache[prefix + tid] = JSON.stringify(val);
-      });
+  if (finalMissingTids.length > 0) {
+    log.info(`[CONTRACT_CACHE] Running API for ${finalMissingTids.length} uncached items.`);
 
-      // 4. BATCH WRITE: Save new results to cache in one go
-      cache.putAll(toCache, CACHE_TTL);
+    // 3. Run the slow, API-dependent function only for items still missing
+    const newFallbackMap = _getContractPriceFallbackMap(ss, finalMissingTids);
+
+    if (newFallbackMap.size > 0) {
+      // 4. Merge new results with the cache
+      newFallbackMap.forEach((v, k) => cachedFallbackMap.set(k, v));
+
+      // 5. Store the entire merged map back into the cache
+      const jsonToCache = JSON.stringify(Array.from(cachedFallbackMap.entries()));
+      cache.put(cacheKey, jsonToCache, CACHE_TTL);
+      log.info(`[CONTRACT_CACHE] Cached and merged ${newFallbackMap.size} new prices. Total cached: ${cachedFallbackMap.size}.`);
     }
   }
 
-  return resultsMap;
+  // 6. Return the consolidated map for lookup
+  return cachedFallbackMap;
 }
 
 /**
