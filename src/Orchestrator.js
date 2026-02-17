@@ -246,15 +246,25 @@ function masterOrchestrator() {
 
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
-  const PROP_KEY_CONTRACT_LEASE = 'contractJobLeaseUntil';
   
-  // STANDARD INTERVAL (60 Minutes) - Default for Loot, Contracts, Industry
+  // 1. GLOBAL LOCK CHECK
+  // Respect the existing Market Data Job states to prevent RAM collisions
+  const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
+  const manualSyncActive = SCRIPT_PROP.getProperty('MANUAL_SYNC_ACTIVE'); // New Flag
+
+  if (marketDataStep === 'PROCESSING' || marketDataStep === 'NEW_RUN' || manualSyncActive === 'TRUE') {
+    console.warn("[Maintenance] Aborted: High-Priority Market Job or Manual Sync is occupying RAM.");
+    return;
+  }
+
+    // STANDARD INTERVAL (60 Minutes) - Default for Loot, Contracts, Industry
   const STANDARD_INTERVAL_MS = 3600000; 
   
   // JOURNAL INTERVAL (30 Minutes) - Specific override for Ledger Import
   const JOURNAL_INTERVAL_MS = 1800000; 
 
+  // 2. QUEUE CONFIG
+  const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
   const JOB_QUEUE = [
     'runLootDeltaPhase',
     'Ledger_Import_CorpJournal',
@@ -263,7 +273,7 @@ function runMaintenanceJobs() {
     'cacheAllCorporateAssetsTrigger'
   ];
 
-  const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
+
   if (marketDataStep === STATE_FLAGS.FINALIZING) return;
 
   const NOW_MS = new Date().getTime();
