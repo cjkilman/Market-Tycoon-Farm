@@ -119,15 +119,39 @@ function generateProjectedCostTable(ss) {
     return [target.typeID, target.name, unitCost, Array.from(sources).join("/"), new Date()];
   });
 
-  // --- 5. OUTPUT ---
+ // --- 5. OUTPUT & MAINTENANCE (THE "STATION SERVICE") ---
   const outSheet = ss.getSheetByName("Projected_Build_Costs");
-  outSheet.clearContents(); // Clear content but keep formatting
-  outSheet.getRange(1, 1).setValue("Type ID"); // Ensure headers are present
-  outSheet.getRange(1, 1, 1, 5).setValues([["Type ID", "Item Name", "Cost", "Source Tier", "Updated"]]);
+  if (!outSheet) {
+    LOG.error("Sheet 'Projected_Build_Costs' not found.");
+    return;
+  }
+
+  // 1. Clear contents and formatting to keep the sheet light
+  outSheet.clearContents(); 
   
+  // 2. Define specific output headers (Don't reuse headers from the Overview sheet)
+  const outputHeaders = [["Type ID", "Item Name", "Cost", "Source Tier", "Updated"]];
+  outSheet.getRange(1, 1, 1, 5).setValues(outputHeaders);
+  
+  // 3. Write Data in one single batch (Fastest method)
   if (outputRows.length > 0) {
     outSheet.getRange(2, 1, outputRows.length, 5).setValues(outputRows);
   }
-  
+
+  // 4. TRIM BLANK ROWS: This physically removes the lag-inducing empty space
+  const maxRows = outSheet.getMaxRows();
+  const lastRowWithData = outputRows.length + 1; // Data rows + Header
+
+  // If we have more than 5 extra rows, purge them to optimize the calculation engine
+  if (maxRows > lastRowWithData + 5) {
+    try {
+      // Deleting rows forces the spreadsheet to "compact" its internal memory
+      outSheet.deleteRows(lastRowWithData + 1, maxRows - lastRowWithData);
+      LOG.info(`Trimmed ${maxRows - lastRowWithData} excess rows. Sheet is now compact.`);
+    } catch (e) {
+      LOG.warn("Row trim skipped (might be already compact): " + e.message);
+    }
+  }
+  outSheet.getRange(2, 5, outputRows.length, 1).setNumberFormat("yyyy-mm-dd hh:mm");
   LOG.info(`Optimization complete. Processed ${outputRows.length} Manufacturing items.`);
 }

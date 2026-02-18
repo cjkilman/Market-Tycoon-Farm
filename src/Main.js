@@ -2,9 +2,215 @@
 // Posted Buy orders labled Quantity Left
 // Market Order Book is Listed Volume
 
+/**
+ * BREAKS CIRCULAR LOOPS: Snapshots Market Overview data into the ProductionList.
+ * Run this to update your build targets without triggering a dependency error.
+ */
+function snapshotMarketRatios() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const overviewSheet = ss.getSheetByName("Market Overview");
+  const prodSheet = ss.getSheetByName("ProductionList ");
+  
+  // 1. Grab the live ratios from the Overview (Static Pull)
+  const overviewData = overviewSheet.getDataRange().getValues();
+  const ratioMap = new Map(overviewData.map(r => [r[0], r[34]])); // type_id and Saturation/Ratio
+  
+  // 2. Map them to the Production List
+  const prodData = prodSheet.getRange("B6:D" + prodSheet.getLastRow()).getValues();
+  const updatedRatios = prodData.map(row => {
+    const typeID = row[0]; // Product ID
+    return [ratioMap.get(typeID) || 0];
+  });
+  
+  // 3. Write them as hard values (Breaks the loop)
+  prodSheet.getRange(6, 4, updatedRatios.length, 1).setValues(updatedRatios);
+  
+  ss.toast("Market Ratios Snapshotted. Circular Dependency Cleared.", "Engine Room");
+}
 
+/**
+ * HARDENED BOM ENGINE: Dynamic column mapping to prevent crashes.
+ */
+function generateFullBOMData(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Engine') : console;
+  const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
 
+  // --- 1. Load Data ---
+  const prodSheet = ss.getSheetByName("ProductionList ");
+  const sdeMatSheet = ss.getSheetByName("SDE_industryActivityMaterials");
+  const sdeProdSheet = ss.getSheetByName("SDE_industryActivityProducts");
+  
+  if (!prodSheet || !sdeMatSheet || !sdeProdSheet) return;
 
+  const prodRaw = prodSheet.getDataRange().getValues();
+  const pHeaders = prodRaw[4]; // Assumes headers on Row 5
+  const prodData = prodRaw.slice(5);
+
+  // --- 2. DYNAMIC MAPPING ---
+  const pCol = {
+    prodID: pHeaders.indexOf("Product ID"),
+    bpID:   pHeaders.indexOf("Blueprint Type ID"),
+    me:     pHeaders.indexOf("Material Efficiency (ME)"),
+    runs:   pHeaders.indexOf("Total Runs")
+  };
+
+  const productToBpMap = new Map();
+  sdeProdSheet.getDataRange().getValues().forEach(r => { 
+    if (Number(r[1]) === 1) productToBpMap.set(Number(r[2]), Number(r[0])); 
+  });
+
+  const jobMap = new Map();
+  prodData.forEach(row => {
+    const pID = Number(row[pCol.prodID]);
+    const manualVal = clean(row[pCol.bpID]);
+    let bpID = (manualVal > 0 && manualVal < 1000000) ? manualVal : productToBpMap.get(pID);
+    
+    if (bpID) {
+      const runs = clean(row[pCol.runs]);
+      const me = row[pCol.me] === "" ? 10 : clean(row[pCol.me]);
+      jobMap.set(bpID, { me, runs: (jobMap.get(bpID)?.runs || 0) + runs });
+    }
+  });
+
+  // --- 3. Process Materials ---
+  const sdeMatData = sdeMatSheet.getDataRange().getValues();
+  const outputRows = [];
+  for (let i = 1; i < sdeMatData.length; i++) {
+    const sdeBpID = Number(sdeMatData[i][0]);
+    if (sdeMatData[i][1] === 1 && jobMap.has(sdeBpID)) {
+      const job = jobMap.get(sdeBpID);
+      const adjQty = Number(sdeMatData[i][3]) * ((100 - job.me) / 100);
+      outputRows.push([sdeBpID, 1, Number(sdeMatData[i][2]), Number(sdeMatData[i][3]), job.me, job.runs, adjQty, Math.ceil(adjQty * job.runs)]);
+    }
+  }
+
+  // --- 4. Output ---
+  const outSheet = ss.getSheetByName("Full_BOM_Data");
+  outSheet.clearContents();
+  outSheet.getRange(1, 1, 1, 8).setValues([["BP ID", "Act ID", "Mat ID", "Base Qty", "ME", "Runs", "Adj Qty", "Total Req"]]);
+  if (outputRows.length > 0) outSheet.getRange(2, 1, outputRows.length, 8).setValues(outputRows);
+  
+  LOG.info(`BOM Fixed: Processed ${outputRows.length} lines.`);
+}
+
+/**
+ * NITRO CONSOLIDATOR: Generates a 100% static requirement and shopping list.
+ * Logic: Aggregates BOM, calculates Shopping List/Cost, and outputs static values.
+ */
+function generateConsolidatedRequirements(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Consolidator') : console;
+  
+  // Helper to handle ISK strings and ensure clean numbers
+  const clean = (v) => {
+    if (typeof v === 'number') return v;
+    if (!v) return 0;
+    return parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
+  };
+
+  // --- 1. Load All Data into RAM ---
+  const getValues = (name) => {
+    const sh = ss.getSheetByName(name);
+    return sh ? sh.getDataRange().getValues() : [];
+  };
+
+  const bomDataRaw = getValues("Full_BOM_Data");
+  const sdeData = getValues("SDE_invTypes");
+  const blendedCostData = getValues("Blended_Cost");
+  const marketRawData = getValues("Market_Data_Raw");
+  const hangarData = getValues("MaterialHangar");
+
+  if (bomDataRaw.length < 2) return;
+
+  // --- 2. Build Lookup Maps (O(1) Access) ---
+  const nameMap = new Map(sdeData.map(r => [Number(r[0]), r[2]]));
+  
+  // FIXED: Total Quantity is Column E (index 4) in your MaterialHangar
+  const hangarMap = new Map();
+  hangarData.forEach(r => {
+    const id = Number(r[1]);
+    if (id) hangarMap.set(id, (hangarMap.get(id) || 0) + clean(r[4]));
+  });
+  
+  // Tiered Cost Map: Blended first, then Market Raw (buy_max * 1.11)
+  const costMap = new Map();
+  marketRawData.forEach(r => { 
+    const price = clean(r[5]);
+    if (price > 0) costMap.set(Number(r[1]), price * 1.11); 
+  });
+  blendedCostData.forEach(r => { 
+    const price = clean(r[2]);
+    if (price > 0) costMap.set(Number(r[0]), price); 
+  });
+
+  // --- 3. Aggregate Requirements ---
+  const aggregation = {}; 
+
+  for (let i = 1; i < bomDataRaw.length; i++) {
+    const id = Number(bomDataRaw[i][2]); // Column C
+    if (!id) continue;
+    
+    const qty = clean(bomDataRaw[i][7]); // Column H
+    
+    if (!aggregation[id]) {
+      const unitCost = costMap.get(id) || 0;
+      const onHand = hangarMap.get(id) || 0;
+      aggregation[id] = {
+        id: id,
+        name: nameMap.get(id) || "Unknown",
+        totalReq: 0,
+        onHand: onHand,
+        unitCost: unitCost
+      };
+    }
+    aggregation[id].totalReq += qty;
+  }
+
+  // --- 4. Logic Processing (Replaces your ARRAYFORMULAs) ---
+  const outputRows = Object.values(aggregation)
+    .map(item => {
+      // Logic: IF((Req - Stock) > 0, Req - Stock, 0)
+      const shoppingList = Math.max(0, item.totalReq - item.onHand);
+      const shoppingCost = shoppingList * item.unitCost;
+
+      return [
+        item.id, 
+        item.name, 
+        item.totalReq, 
+        item.onHand, 
+        item.unitCost, 
+        shoppingList, 
+        shoppingCost
+      ];
+    })
+    .sort((a, b) => b[2] - a[2]); // Sort by Total Required DESC
+
+  // --- 5. Output & Station Service ---
+  const outSheet = ss.getSheetByName("Consolidated_Requirements");
+  if (!outSheet) return;
+
+  outSheet.clearContents();
+  const headers = [["Type ID", "Material Name", "Total Required", "On Hand", "Unit Cost", "Shopping List", "Shopping Cost"]];
+  outSheet.getRange(1, 1, 1, 7).setValues(headers);
+
+  if (outputRows.length > 0) {
+    outSheet.getRange(2, 1, outputRows.length, 7).setValues(outputRows);
+    
+    // Formatting: Make it readable
+    outSheet.getRange(2, 5, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\""); // Unit Cost
+    outSheet.getRange(2, 7, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\""); // Total Cost
+  }
+
+  // Trim the hull
+  const maxRows = outSheet.getMaxRows();
+  const lastDataRow = outputRows.length + 1;
+  if (maxRows > lastDataRow + 5) {
+    outSheet.deleteRows(lastDataRow + 1, maxRows - lastDataRow);
+  }
+
+  LOG.info(`BOM Consolidated: ${outputRows.length} materials. Static Shopping List generated.`);
+}
 
 // Global Property Service
 const SCRIPT_PROPS = PropertiesService.getScriptProperties();
@@ -153,110 +359,171 @@ function respondToEdit(e) {
 function generateRestockQuery(ss, preLoadedData) {
   const TARGET_SHEET_NAME = 'Need To Buy';
   const DATA_SHEET_NAME = 'MarketOverviewData';
+  const ITEM_LIST_NAME = 'Item List'; 
   const AUDIT_SHEET_NAME = 'Audit items';
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
   const auditSheet = ss.getSheetByName(AUDIT_SHEET_NAME);
+  const itemListSheet = ss.getSheetByName(ITEM_LIST_NAME);
 
-  if (!sheet || !dataSheet || !auditSheet) return;
+  if (!sheet || !dataSheet || !auditSheet || !itemListSheet) return;
 
-  // --- BATCH DATA LOAD (Speed Move #1) ---
-  // Load everything into memory at once to avoid repeated API calls
-const rawDataValues = preLoadedData || dataSheet.getDataRange().getValues();
-  const headers = rawDataValues[2]; // Headers are on Row 3 (index 2)
-  const marketRows = rawDataValues.slice(3); // Data starts on Row 4
+  // --- HELPER: Clean Number Parser ---
+  const parseNum = (v) => {
+    if (typeof v === 'number') return v;
+    if (!v) return 0;
+    const cleanStr = String(v).replace(/[^0-9.-]/g, ''); 
+    return parseFloat(cleanStr) || 0;
+  };
 
+  // --- BATCH DATA LOAD ---
+  const rawDataValues = preLoadedData || dataSheet.getDataRange().getValues();
+  const headers = rawDataValues[2]; 
+  const marketRows = rawDataValues.slice(3); 
+
+  // --- LOAD ITEM LIST GOALS (The Safety Check - e.g., 3.9M) ---
+  const itemListValues = itemListSheet.getDataRange().getValues();
+  const goalMap = new Map();
+  // Assuming Item Name is Col B (index 1) and Goal is Col C (index 2)
+  itemListValues.slice(1).forEach(r => {
+    const name = String(r[1]).trim(); 
+    const goal = parseNum(r[2]);      
+    if (name) goalMap.set(name, goal);
+  });
+
+  // --- AUDIT MAP ---
   const auditValues = auditSheet.getDataRange().getValues();
-  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), r[1]]));
+  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]).trim(), r[1]]));
 
-  // --- PRE-PROCESS FILTERS (Speed Move #2) ---
+  // --- SETTINGS (Mapping to your Need To Buy Sheet) ---
   const filters = sheet.getRange('B5:B26').getValues();
+  
+  // B5: Min Days (The Trigger - e.g., 30)
+  const minDays = parseNum(filters[0][0]) || 0;
+  
+  // B7: Target Days (The Goal - e.g., 31)
+  const targetDays = parseNum(filters[2][0]) || 31; 
+  
+  // B9: Minimal Margin
+  let rawMargin = parseNum(filters[4][0]); 
+  const minMargin = (rawMargin > 1) ? rawMargin / 100 : rawMargin;
+
   const cfg = {
-    minDays: parseFloat(filters[0][0]) || 0,
-    targetDays: parseFloat(filters[2][0]) || 0,
-    minMargin: parseFloat(filters[4][0]) || 0,
+    minDays: minDays,
+    targetDays: targetDays,
+    minMargin: minMargin || 0,
+    limit: filters[14][0] === "No Limit" ? 5000 : parseInt(filters[14][0]) || 5000,
+    ignoreGroups: (filters[21][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
     groups: (filters[6][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
     sortDir: (filters[8][0] || "ASC").toUpperCase(),
-    sortCol: (filters[9][0] || "Item Name").trim(),
-    limit: filters[14][0] === "No Limit" ? 5000 : parseInt(filters[14][0]) || 5000,
-    ignoreGroups: (filters[21][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s)
+    sortCol: (filters[9][0] || "Item Name").trim()
   };
 
-  const getIdx = (name) => headers.indexOf(name);
   const col = {
-    name: getIdx("Item Name"),
-    group: getIdx("Group"),
-    warehouse: getIdx("Warehouse Qty"),
-    action: getIdx("Buy Action"),
-    vel: getIdx("Effective Daily Velocity (u/d)"),
-    margin: getIdx("Margin"),
-    effCost: getIdx("Effective Cost"),
-    mfgCost: getIdx("Manufacturing Unit Cost"),
-    hubBuy: getIdx("Hub Median Buy"),
-    totalMkt: getIdx("Total Market Quantity"),
-    vol30: getIdx("30-day traded volume"),
-    // Inventory components
-    qLeft: getIdx("Quantity Left"),
-    jobs: getIdx("Active Jobs"),
-    buyQty: getIdx("Listed Volume (Feed Buy)"),
-    deliv: getIdx("Deliveries")
+    name: headers.indexOf("Item Name"),        
+    group: headers.indexOf("Group"),           
+    qLeft: headers.indexOf("Quantity Left"),   
+    jobs: headers.indexOf("Active Jobs"),      
+    deliv: headers.indexOf("Deliveries"),      
+    mfgCost: headers.indexOf("Manufacturing Unit Cost"), 
+    vol30: headers.indexOf("30-day traded volume"), 
+    vel: headers.indexOf("Effective Daily Velocity (u/d)"), 
+    warehouse: headers.indexOf("Warehouse Qty"), 
+    totalMkt: headers.indexOf("Total Market Quantity"), 
+    hubBuy: headers.indexOf("Hub Median Buy"),   
+    effCost: headers.indexOf("Effective Cost"),  
+    margin: headers.indexOf("Margin"),           
+    action: headers.indexOf("Buy Action")        
   };
 
-  // --- PROCESS DATA IN-MEMORY ---
   let results = [];
   marketRows.forEach(row => {
-    const name = String(row[col.name] || "");
-    if (!name || auditMap.get(name) !== true) return; // The Audit Gate
+    const name = String(row[col.name] || "").trim();
+    if (!name) return;
 
-    const action = String(row[col.action] || "");
-    if (action === "" || /SKIP|HOLD/i.test(action)) return;
+    if (auditMap.get(name) !== true) return; 
 
     const group = String(row[col.group] || "").toLowerCase().trim();
     if (cfg.ignoreGroups.includes(group)) return;
     if (cfg.groups.length > 0 && !cfg.groups.includes(group)) return;
 
-    const velocity = Number(row[col.vel]) || 0;
-    // Current Broken Logic in generateRestockQuery
-    // --- FIX FOR NEED TO BUY SHEET ---
-    // Remove col.buyQty (Market Order Book) from your personal inventory count
-    const currentStock = (Number(row[col.warehouse]) || 0) +
-      (Number(row[col.qLeft]) || 0) + // Your personal Buy Orders
-      (Number(row[col.jobs]) || 0) +  // Your Active Manufacturing
-      (Number(row[col.deliv]) || 0);  // Your Deliveries
+    // --- STOCK & VELOCITY ---
+    const whQty = parseNum(row[col.warehouse]);
+    const qLeft = parseNum(row[col.qLeft]); 
+    const jobs = parseNum(row[col.jobs]);   
+    const deliv = parseNum(row[col.deliv]); 
+    
+    // Total Inventory = Warehouse + Buy Orders + Manufacturing + Deliveries
+    const currentStock = whQty + qLeft + jobs + deliv;
+    const velocity = parseNum(row[col.vel]);
 
-    const restockNeed = Math.round((velocity * cfg.targetDays) - currentStock);
+    // --- LOGIC: THE RED LINE ---
+    // Trigger: Do we have less than 30 Days (B5) of stock?
+    const triggerLevel = Math.ceil(velocity * cfg.minDays);
+
+    // If stock is healthy (above 30 days), STOP here.
+    if (currentStock > triggerLevel) return;
+
+    // --- CALCULATE BUY GOAL ---
+    // 1. Dynamic: Velocity * 31 Days (B7)
+    const dynamicTarget = Math.ceil(velocity * cfg.targetDays);
+    // 2. Static: Safety Goal from Item List (e.g., 3.9M)
+    const safetyGoal = goalMap.get(name) || 0;
+    
+    // Use the LARGER of the two targets
+    const finalGoal = Math.max(dynamicTarget, safetyGoal);
+
+    const restockNeed = Math.round(finalGoal - currentStock);
     if (restockNeed <= 0) return;
 
-    const margin = Number(row[col.margin]) || 0;
-    if (margin < cfg.minMargin) return;
+    // --- MARGIN CHECK ---
+    let itemMargin = parseNum(row[col.margin]);
+    if (itemMargin > 1 && itemMargin <= 100 && cfg.minMargin <= 1) itemMargin = itemMargin / 100;
+    if (itemMargin < cfg.minMargin) return;
 
-    // Price Selection (LCM)
-    const cost = Number(row[col.effCost]) || Number(row[col.mfgCost]) || Number(row[col.hubBuy]) || 0;
+    // --- ACTION CHECK ---
+    // If inventory is critical (triggered above), we ignore "HOLD" signals from the market.
+    const rawAction = String(row[col.action] || "");
+    const finalAction = (/SKIP|HOLD/i.test(rawAction)) ? "FORCE RESTOCK" : rawAction;
+
+    const cost = parseNum(row[col.effCost]) || parseNum(row[col.mfgCost]) || parseNum(row[col.hubBuy]) || 0;
 
     results.push({
-      data: [name, restockNeed, cost, restockNeed * cost, Number(row[col.totalMkt]) || 0, Number(row[col.vol30]) || 0, 0, Number(row[col.warehouse]) || 0, margin, action],
-      sortKey: name // Default sort
+      data: [
+        name, 
+        restockNeed, 
+        cost, 
+        restockNeed * cost, 
+        parseNum(row[col.totalMkt]), 
+        parseNum(row[col.vol30]),    
+        0, 
+        whQty, 
+        itemMargin, 
+        finalAction 
+      ],
+      sortKey: name
     });
   });
 
-  // --- SORTING ---
+  // --- SORT & WRITE ---
   results.sort((a, b) => {
     const modifier = cfg.sortDir === "ASC" ? 1 : -1;
     return a.sortKey.localeCompare(b.sortKey) * modifier;
   });
 
-  // --- BATCH WRITE (Speed Move #3) ---
   const output = results.slice(0, cfg.limit).map(r => r.data);
-  const clearRange = sheet.getRange(5, 3, Math.max(1, sheet.getLastRow()), 10);
-  clearRange.clearContent();
+  const maxRows = sheet.getMaxRows();
+  
+  if (maxRows >= 5) {
+      sheet.getRange(5, 3, maxRows - 4, 10).clearContent();
+  }
 
   if (output.length > 0) {
     sheet.getRange(5, 3, output.length, 10).setValues(output);
   }
 }
-
 /**
  * OPTIMIZED: generateDumpToBuyOrder(ss)
  * Purpose: Strategic Liquidation with Column D "Replacement NOW", Header Fix, and Zero-Masking.
