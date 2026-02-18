@@ -332,6 +332,20 @@ function cacheAllCorporateAssetsWorker() {
     }
 }
 
+/* Add this to your maintenance script to 'snap' the hangar range */
+function updateHangarNamedRange() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName("MaterialHangar");
+    if (!sh) return;
+
+    const lastRow = sh.getLastRow();
+    // Snaps from Row 1 to the end of your data (Columns A through E)
+    const newRange = sh.getRange(1, 1, lastRow, 5);
+
+    ss.setNamedRange("NR_MATERIAL_HANGAR", newRange);
+    console.log(`Hangar Snapped: NR_MATERIAL_HANGAR is now ${lastRow} rows.`);
+}
+
 function finalizeAssetCacheJob() {
     const funcName = 'finalizeAssetCacheJob';
     const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('ASSET_FINALIZER') : console);
@@ -371,6 +385,9 @@ function finalizeAssetCacheJob() {
         ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
         log.info('[Finalizer] Performing ATOMIC SWAP.');
+
+        // Add this at the very bottom of your asset caching function
+        updateHangarNamedRange();
 
         const repairMap = {
             [CACHE_NAMED_RANGE]: `A3:H`

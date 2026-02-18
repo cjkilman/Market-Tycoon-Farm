@@ -65,6 +65,190 @@ function _getColIndexMap(headers, requiredHeaders) {
   return col;
 }
 
+/**
+ * HARDENED BOM ENGINE: Dynamic column mapping to prevent crashes.
+ */
+function generateFullBOMData(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Engine') : console;
+  const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
+
+  // --- 1. Load Data ---
+  const prodSheet = ss.getSheetByName("ProductionList ");
+  const sdeMatSheet = ss.getSheetByName("SDE_industryActivityMaterials");
+  const sdeProdSheet = ss.getSheetByName("SDE_industryActivityProducts");
+  
+  if (!prodSheet || !sdeMatSheet || !sdeProdSheet) return;
+
+  const prodRaw = prodSheet.getDataRange().getValues();
+  const pHeaders = prodRaw[4]; // Assumes headers on Row 5
+  const prodData = prodRaw.slice(5);
+
+  // --- 2. DYNAMIC MAPPING ---
+  const pCol = {
+    prodID: pHeaders.indexOf("Product ID"),
+    bpID:   pHeaders.indexOf("Blueprint Type ID"),
+    me:     pHeaders.indexOf("Material Efficiency (ME)"),
+    runs:   pHeaders.indexOf("Total Runs")
+  };
+
+  const productToBpMap = new Map();
+  sdeProdSheet.getDataRange().getValues().forEach(r => { 
+    if (Number(r[1]) === 1) productToBpMap.set(Number(r[2]), Number(r[0])); 
+  });
+
+  const jobMap = new Map();
+  prodData.forEach(row => {
+    const pID = Number(row[pCol.prodID]);
+    const manualVal = clean(row[pCol.bpID]);
+    let bpID = (manualVal > 0 && manualVal < 1000000) ? manualVal : productToBpMap.get(pID);
+    
+    if (bpID) {
+      const runs = clean(row[pCol.runs]);
+      const me = row[pCol.me] === "" ? 10 : clean(row[pCol.me]);
+      jobMap.set(bpID, { me, runs: (jobMap.get(bpID)?.runs || 0) + runs });
+    }
+  });
+
+  // --- 3. Process Materials ---
+  const sdeMatData = sdeMatSheet.getDataRange().getValues();
+  const outputRows = [];
+  for (let i = 1; i < sdeMatData.length; i++) {
+    const sdeBpID = Number(sdeMatData[i][0]);
+    if (sdeMatData[i][1] === 1 && jobMap.has(sdeBpID)) {
+      const job = jobMap.get(sdeBpID);
+      const adjQty = Number(sdeMatData[i][3]) * ((100 - job.me) / 100);
+      outputRows.push([sdeBpID, 1, Number(sdeMatData[i][2]), Number(sdeMatData[i][3]), job.me, job.runs, adjQty, Math.ceil(adjQty * job.runs)]);
+    }
+  }
+
+  // --- 4. Output ---
+  const outSheet = ss.getSheetByName("Full_BOM_Data");
+  outSheet.clearContents();
+  outSheet.getRange(1, 1, 1, 8).setValues([["BP ID", "Act ID", "Mat ID", "Base Qty", "ME", "Runs", "Adj Qty", "Total Req"]]);
+  if (outputRows.length > 0) outSheet.getRange(2, 1, outputRows.length, 8).setValues(outputRows);
+  
+  LOG.info(`BOM Fixed: Processed ${outputRows.length} lines.`);
+}
+
+/**
+ * NITRO CONSOLIDATOR: Generates a 100% static requirement and shopping list.
+ * Logic: Aggregates BOM, calculates Shopping List/Cost, and outputs static values.
+ */
+function generateConsolidatedRequirements(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Consolidator') : console;
+  
+  // Helper to handle ISK strings and ensure clean numbers
+  const clean = (v) => {
+    if (typeof v === 'number') return v;
+    if (!v) return 0;
+    return parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
+  };
+
+  // --- 1. Load All Data into RAM ---
+  const getValues = (name) => {
+    const sh = ss.getSheetByName(name);
+    return sh ? sh.getDataRange().getValues() : [];
+  };
+
+  const bomDataRaw = getValues("Full_BOM_Data");
+  const sdeData = getValues("SDE_invTypes");
+  const blendedCostData = getValues("Blended_Cost");
+  const marketRawData = getValues("Market_Data_Raw");
+  const hangarData = getValues("MaterialHangar");
+
+  if (bomDataRaw.length < 2) return;
+
+  // --- 2. Build Lookup Maps (O(1) Access) ---
+  const nameMap = new Map(sdeData.map(r => [Number(r[0]), r[2]]));
+  
+  // FIXED: Total Quantity is Column E (index 4) in your MaterialHangar
+  const hangarMap = new Map();
+  hangarData.forEach(r => {
+    const id = Number(r[1]);
+    if (id) hangarMap.set(id, (hangarMap.get(id) || 0) + clean(r[4]));
+  });
+  
+  // Tiered Cost Map: Blended first, then Market Raw (buy_max * 1.11)
+  const costMap = new Map();
+  marketRawData.forEach(r => { 
+    const price = clean(r[5]);
+    if (price > 0) costMap.set(Number(r[1]), price * 1.11); 
+  });
+  blendedCostData.forEach(r => { 
+    const price = clean(r[2]);
+    if (price > 0) costMap.set(Number(r[0]), price); 
+  });
+
+  // --- 3. Aggregate Requirements ---
+  const aggregation = {}; 
+
+  for (let i = 1; i < bomDataRaw.length; i++) {
+    const id = Number(bomDataRaw[i][2]); // Column C
+    if (!id) continue;
+    
+    const qty = clean(bomDataRaw[i][7]); // Column H
+    
+    if (!aggregation[id]) {
+      const unitCost = costMap.get(id) || 0;
+      const onHand = hangarMap.get(id) || 0;
+      aggregation[id] = {
+        id: id,
+        name: nameMap.get(id) || "Unknown",
+        totalReq: 0,
+        onHand: onHand,
+        unitCost: unitCost
+      };
+    }
+    aggregation[id].totalReq += qty;
+  }
+
+  // --- 4. Logic Processing (Replaces your ARRAYFORMULAs) ---
+  const outputRows = Object.values(aggregation)
+    .map(item => {
+      // Logic: IF((Req - Stock) > 0, Req - Stock, 0)
+      const shoppingList = Math.max(0, item.totalReq - item.onHand);
+      const shoppingCost = shoppingList * item.unitCost;
+
+      return [
+        item.id, 
+        item.name, 
+        item.totalReq, 
+        item.onHand, 
+        item.unitCost, 
+        shoppingList, 
+        shoppingCost
+      ];
+    })
+    .sort((a, b) => b[2] - a[2]); // Sort by Total Required DESC
+
+  // --- 5. Output & Station Service ---
+  const outSheet = ss.getSheetByName("Consolidated_Requirements");
+  if (!outSheet) return;
+
+  outSheet.clearContents();
+  const headers = [["Type ID", "Material Name", "Total Required", "On Hand", "Unit Cost", "Shopping List", "Shopping Cost"]];
+  outSheet.getRange(1, 1, 1, 7).setValues(headers);
+
+  if (outputRows.length > 0) {
+    outSheet.getRange(2, 1, outputRows.length, 7).setValues(outputRows);
+    
+    // Formatting: Make it readable
+    outSheet.getRange(2, 5, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\""); // Unit Cost
+    outSheet.getRange(2, 7, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\""); // Total Cost
+  }
+
+  // Trim the hull
+  const maxRows = outSheet.getMaxRows();
+  const lastDataRow = outputRows.length + 1;
+  if (maxRows > lastDataRow + 5) {
+    outSheet.deleteRows(lastDataRow + 1, maxRows - lastDataRow);
+  }
+
+  LOG.info(`BOM Consolidated: ${outputRows.length} materials. Static Shopping List generated.`);
+}
+
 // ----------------------------------------------------------------------
 // --- MASTER ADD-ON INTEGRATION ---
 // ----------------------------------------------------------------------
