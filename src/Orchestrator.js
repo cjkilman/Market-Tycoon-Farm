@@ -2,7 +2,7 @@
   getMasterBatchFromControlTable, withSheetLock, getOrCreateSheet, 
 cacheAllCorporateAssetsTrigger, triggerLedgerImportCycle, fuzAPI, _fetchProcessedLootData, 
 runLootLedgerDelta, Ledger_Import_CorpJournal, syncContracts, runIndustryLedgerPhase,
-  runLootDeltaPhase, runContractLedgerPhase, runAllLedgerImports, LoggerEx, writeDataToSheet, guardedSheetTransaction, atomicSwapAndFlush, deleteTriggersByName, pauseSheet, wakeUpSheet, prepareTempSheet */
+  runLootDeltaPhase, runContractLedgerPhase,  LoggerEx, writeDataToSheet, guardedSheetTransaction, atomicSwapAndFlush, deleteTriggersByName, pauseSheet, wakeUpSheet, prepareTempSheet */
 
 // Global variable to track recursion depth for this lock type
 var EXECUTION_LOCK_DEPTH_TRY = 0;
@@ -59,6 +59,50 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
     console.log(`Created trigger for ${functionName} in ~${Math.round(delayMs / 60000)} min.`);
   } catch (e) {
     console.error(`Failed to create trigger: ${e.message}`);
+  }
+}
+
+/**
+ * Grabs Regional Pricing from Market Price Tracker.
+ * ESI limits 1 type_ID per request so we keep it centralized for URL Fetch App
+ */
+function syncESIRegionData() {
+  const log = LoggerEx.withTag('REGION_SYNC');
+  const sourceId = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
+  const targetSheetName = "ESI_Region";
+  const NAMED_RANGE_NAME = "ESI_Region_Data"; // Change this to your actual Named Range name
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const targetSheet = ss.getSheetByName(targetSheetName);
+  
+  if (!targetSheet) return;
+
+  try {
+    const sourceData = SpreadsheetApp.openById(sourceId)
+                        .getSheetByName("Publish_ESI_Region_market_orders")
+                        .getDataRange()
+                        .getValues();
+    
+    // 1. CLEAR & WRITE
+    targetSheet.clearContents(); 
+    const newRange = targetSheet.getRange(1, 1, sourceData.length, sourceData[0].length);
+    newRange.setValues(sourceData);
+    
+    // 2. UPDATE NAMED RANGE (The "Range Stretcher")
+    // This tells the whole workbook exactly where the new data lives.
+    ss.setNamedRange(NAMED_RANGE_NAME, newRange);
+    log.info(`Named Range '${NAMED_RANGE_NAME}' updated to ${sourceData.length} rows.`);
+
+    // 3. THE TRIM
+    const lastRow = sourceData.length;
+    const currentMax = targetSheet.getMaxRows();
+    if (currentMax > lastRow) {
+      targetSheet.deleteRows(lastRow + 1, currentMax - lastRow);
+    }
+    
+    log.info("ESI_Region: Sync & Named Range Update Complete.");
+  } catch (e) {
+    log.error("ESI_Region Sync Error: " + e.message);
   }
 }
 
@@ -243,114 +287,88 @@ function masterOrchestrator() {
   executeWithTryLock(runMaintenanceJobs, 'runMaintenanceJobs');
 }
 
+function forceResetMaint() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('BOM_MAINTENANCE_LEASE');
+  props.deleteProperty('LAST_RUN_generateFullBOMData');
+  props.setProperty('MAINTENANCE_QUEUE_INDEX', '0');
+  console.log("State cleared. BOM Engine is now next in queue.");
+}
 
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   
-  // 1. GLOBAL LOCK CHECK
-  // Respect the existing Market Data Job states to prevent RAM collisions
+  // 1. Priority Lock: Maintenance must yield to active Market Data syncs
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
-  const manualSyncActive = SCRIPT_PROP.getProperty('MANUAL_SYNC_ACTIVE'); // New Flag
-
-  if (marketDataStep === 'PROCESSING' || marketDataStep === 'NEW_RUN' || manualSyncActive === 'TRUE') {
-    console.warn("[Maintenance] Aborted: High-Priority Market Job or Manual Sync is occupying RAM.");
+  const manualSync = SCRIPT_PROP.getProperty('MANUAL_SYNC_ACTIVE');
+  if (marketDataStep === 'PROCESSING' || marketDataStep === 'NEW_RUN' || marketDataStep === 'FINALIZING' || manualSync === 'TRUE') {
+    console.warn("[Maintenance] Aborted: Market Engine or Manual Sync is active.");
     return;
   }
 
-    // STANDARD INTERVAL (60 Minutes) - Default for Loot, Contracts, Industry
-  const STANDARD_INTERVAL_MS = 3600000; 
+  const NOW_MS = new Date().getTime();
+  const STANDARD_INTERVAL = 3600000; // 60m default
   
-  // JOURNAL INTERVAL (30 Minutes) - Specific override for Ledger Import
-  const JOURNAL_INTERVAL_MS = 1800000; 
-
-  // 2. QUEUE CONFIG
-  const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
+  // 2. Job Registry with targeted intervals
   const JOB_QUEUE = [
-    'runLootDeltaPhase',
-    'Ledger_Import_CorpJournal',
-    'runContractLedgerPhase',
-    'runIndustryLedgerPhase',
-    'cacheAllCorporateAssetsTrigger'
+    { name: 'generateFullBOMData', interval: 2700000, lease: 1200000 }, // 45m run / 20m lease
+    { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
+    { name: 'Ledger_Import_CorpJournal', interval: 1800000 }, // 30m
+    { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
+    { name: 'runIndustryLedgerPhase', interval: STANDARD_INTERVAL },
+    { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL }
   ];
 
+  const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
+  let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
+  if (currentIndex >= JOB_QUEUE.length) currentIndex = 0;
 
-  if (marketDataStep === STATE_FLAGS.FINALIZING) return;
+  let iterations = 0;
+  while (iterations < JOB_QUEUE.length) {
+    const job = JOB_QUEUE[currentIndex];
+    const lastRunKey = 'LAST_RUN_' + job.name;
+    const lastRunTs = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
+    const isDue = (NOW_MS - lastRunTs) >= job.interval;
 
-  const NOW_MS = new Date().getTime();
-
-  let startIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
-  if (startIndex >= JOB_QUEUE.length) startIndex = 0;
-
-  let currentIndex = startIndex;
-  let jobExecuted = false;
-
-  // --- LOOP THROUGH ALL JOBS, STARTING AT startIndex ---
-  do {
-    const currentJobName = JOB_QUEUE[currentIndex];
-    const lastRunKey = PROP_KEY_LAST_RUN_TS + currentJobName;
-    const lastRunTimestamp = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
-
-    // --- DYNAMIC INTERVAL CHECK ---
-    let requiredInterval = STANDARD_INTERVAL_MS;
-    if (currentJobName === 'Ledger_Import_CorpJournal') {
-        requiredInterval = JOURNAL_INTERVAL_MS;
-    }
-
-    let isJobDue = (NOW_MS - lastRunTimestamp) >= requiredInterval;
-    let isLeaseExpired = true; // Assume true unless check proves otherwise
-
-    // 1. LEASE CHECK (Bypasses time check if lease is active)
-    if (currentJobName === 'runContractSync') {
-      const LEASE_UNTIL = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CONTRACT_LEASE) || '0', 10);
-      isLeaseExpired = (LEASE_UNTIL <= NOW_MS);
-
-      if (!isLeaseExpired) {
-        console.warn(`[Maintenance] Skipping ${currentJobName}: Lease active.`);
-        // Job is skipped due to lease, advance to next job immediately and continue loop
+    // 3. Lease Management: If the job is due, the lease is ignored/cleared.
+    if (job.name === 'generateFullBOMData') {
+      const activeLease = parseInt(SCRIPT_PROP.getProperty('BOM_MAINTENANCE_LEASE') || '0', 10);
+      if (isDue) {
+        SCRIPT_PROP.deleteProperty('BOM_MAINTENANCE_LEASE');
+      } else if (activeLease > NOW_MS) {
         currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
+        iterations++;
         continue;
       }
     }
 
-    // 2. INTERVAL CHECK (Only proceed if the job is due and lease is expired)
-    if (isJobDue) {
-      console.log(`[Maintenance] Executing: ${currentJobName} (Interval: ${Math.round(requiredInterval/60000)}m)`);
+    // 4. Execution Logic
+    if (isDue) {
+      console.log(`[Maintenance] Dispatching: ${job.name}`);
+      
+      if (job.lease) {
+        SCRIPT_PROP.setProperty('BOM_MAINTENANCE_LEASE', (NOW_MS + job.lease).toString());
+      }
 
       try {
-        const fn = this[currentJobName];
+        // Fallback check for function scope
+        const fn = this[job.name] || eval(job.name); 
         if (typeof fn === 'function') {
           fn();
-
-          // CRITICAL: Update state only on successful execution
           SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-          currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
-          SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, currentIndex.toString());
-          jobExecuted = true;
-          return; // Exit after running one job (Time Slicing)
-        } else {
-          console.warn(`[Maintenance] Function not found: ${currentJobName}. Advancing pointer.`);
+          SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, ((currentIndex + 1) % JOB_QUEUE.length).toString());
+          console.log(`[Maintenance] ${job.name} completed successfully.`);
+          return; // One job per Orchestrator tick to save RAM
         }
       } catch (e) {
-        console.error(`[Maintenance] Failed: ${e.message}. Advancing pointer.`);
+        console.error(`[Maintenance] Critical Failure in ${job.name}: ${e.message}`);
       }
     }
 
-    // Advance pointer if job was not due (interval check failed) or failed to run for non-time reasons
     currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
-
-  } while (currentIndex !== startIndex); // Stop after checking the entire queue once.
-
-  if (!jobExecuted) {
-    console.log("Maintenance cycle finished: No jobs were due to run.");
+    iterations++;
   }
-}
-
-function updateMarketDataSheet() {
-
-  const funcName = 'updateMarketDataSheet';
-  const result = executeWithTryLock(_updateMarketDataSheetWorker, funcName);
-  if (result === null) console.warn(`${funcName} skipped (Lock).`);
-  return result;
+  console.log("Maintenance Cycle: All jobs are currently within their interval windows.");
 }
 
 /**
@@ -552,6 +570,7 @@ function finalizeMarketDataUpdate() {
     let swapSuccess = (transactionResult.success && transactionResult.state.success);
 
     if (swapSuccess) {
+      syncESIRegionData();
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
 

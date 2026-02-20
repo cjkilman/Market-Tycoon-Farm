@@ -1,3 +1,16 @@
+
+/**
+ * TRIGGER-READY WRAPPER
+ * Point your timed trigger at this function.
+ */
+function trigger_generateProjectedCostTable() {
+  // Use getActiveSpreadsheet() for bound scripts
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Call your main logic
+  generateProjectedCostTable(ss);
+}
+
 /**
  * OPTIMIZED: generateProjectedCostTable(ss)
  * Logic: 3-tier fallback with "Manufacturing" Group Filter.

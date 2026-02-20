@@ -95,6 +95,9 @@ var _cachedAuthNames = null;
 // NEW: Cache for character ID map
 var _cachedCharIdMap = null;
 
+
+
+
 // ==========================================================================================
 // UTILITIES (GAS-SAFE)
 // ==========================================================================================
@@ -189,6 +192,216 @@ function resetLootSnapshot() {
     Logger.log("⚠️ Could not acquire lock. Try again.");
   }
 }
+
+/**
+ * PROCESS INTERNAL BUFFER (De-duplication Enforced)
+ * Reads the hidden buffer sheet, filters out duplicates that already exist 
+ * in Sales_Ledger, and writes valid paired/timed-out transactions.
+ */
+function processInternalBuffer(ss) {
+  const log = LoggerEx.withTag('BUFFER_PROC');
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1. Get Sheets
+  const bufferSheet = ss.getSheetByName("_Internal_Ledger_Buffer");
+  const ledgerSheet = ss.getSheetByName("Sales_Ledger");
+
+  if (!bufferSheet || !ledgerSheet) {
+    log.error("Missing Buffer or Ledger sheet.");
+    return;
+  }
+
+  // 2. LOAD EXISTING IDs (The "Stop-Loss" Fix)
+  // We read the existing Sales_Ledger to ensure we never write a duplicate ID.
+  // 'contract_id' is in Column G (Index 6)
+  const ledgerData = ledgerSheet.getDataRange().getValues();
+  const existingIds = new Set();
+  const CONTRACT_ID_INDEX = 6; 
+
+  // Start at 1 to skip header
+  for (let i = 1; i < ledgerData.length; i++) {
+    const id = String(ledgerData[i][CONTRACT_ID_INDEX]);
+    if (id && id !== "") existingIds.add(id);
+  }
+
+  // 3. LOAD BUFFER DATA
+  const bufferData = bufferSheet.getDataRange().getValues();
+  const bufferHeader = bufferData.shift(); // Remove header row
+  // Buffer structure: [id, data_json, ts]
+
+  const readyToPost = [];
+  const keptInBuffer = [];
+  const NOW = new Date().getTime();
+  const MAX_WAIT = 3600000; // 1 hour timeout
+  const authToon = getCorpAuthChar(ss);
+
+  // 4. PROCESS BUFFER ROWS
+  bufferData.forEach(row => {
+    const id = String(row[0]);
+    if (!id) return;
+
+    let entry;
+    try {
+      entry = JSON.parse(row[1]);
+    } catch (e) {
+      log.warn(`Corrupt JSON in buffer for ID ${id}, discarding.`);
+      return; // Discard corrupt data
+    }
+
+    const ts = Number(row[2]);
+    const age = NOW - ts;
+
+    // DECISION LOGIC: Is it ready? (Paired with tax OR timed out)
+    if (entry.status === 'PAIRED' || age > MAX_WAIT) {
+      
+      // --- CRITICAL DE-DUPLICATION CHECK ---
+      if (existingIds.has(id)) {
+        log.info(`[DUPE PROTECTION] Skipping ID ${id} - already in Sales_Ledger.`);
+        // We do NOT add to readyToPost, and we do NOT add to keptInBuffer.
+        // This effectively deletes it from the buffer.
+        return; 
+      }
+
+      // Mark as seen to prevent duplicates within this specific batch
+      existingIds.add(id);
+
+      // Calculate Tax (Real or Estimated if timed out)
+      const actualTax = entry.status === 'PAIRED' ? entry.tax : (Math.abs(entry.data.amount) * 0.036);
+
+      readyToPost.push({
+        date: entry.data.date,
+        type_id: String(entry.data.first_party_id), // Usually the buyer ID
+        qty: -1, // Sales are negative inventory
+        unit_value: entry.data.amount, // Gross Amount
+        unit_value_filled: entry.data.amount - actualTax, // Net Amount
+        source: 'JOURNAL',
+        contract_id: id,
+        char: authToon
+      });
+
+    } else {
+      // Not ready yet, keep waiting in buffer
+      keptInBuffer.push(row);
+    }
+  });
+
+  // 5. ATOMIC WRITE TO LEDGER
+  if (readyToPost.length > 0) {
+    const SalesLedger = ML.forSheet("Sales_Ledger");
+    // upsert matches keys to update or insert. 
+    // Since we filtered dupes above, this is safe.
+    SalesLedger.upsert(['contract_id'], readyToPost);
+    log.info(`Durable Sync: Released ${readyToPost.length} items from buffer.`);
+  }
+
+  // 6. UPDATE BUFFER SHEET
+  // Only write back if the count changed (meaning we processed or deleted something)
+  if (bufferData.length !== keptInBuffer.length) {
+    // Clear the whole sheet (except header)
+    if (bufferSheet.getMaxRows() > 1) {
+        bufferSheet.getRange(2, 1, bufferSheet.getMaxRows() - 1, bufferSheet.getMaxColumns()).clearContent();
+    }
+    
+    // Write back the remaining items
+    if (keptInBuffer.length > 0) {
+      bufferSheet.getRange(2, 1, keptInBuffer.length, keptInBuffer[0].length).setValues(keptInBuffer);
+    }
+    
+    log.info(`Buffer Sheet updated. ${keptInBuffer.length} items remaining.`);
+  }
+}
+
+function diagnoseSalesLedger() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Sales_Ledger");
+  const data = sheet.getDataRange().getValues();
+  const log = [];
+
+  // Assuming standard columns based on your snippets:
+  // Col 0: Date, Col 3: Qty (D), Col 8: Unit Value Filled (I)
+  // Adjust indices if your sheet is different (0-based)
+  const QTY_COL = 3; 
+  const PRICE_COL = 8; 
+
+  let totalRevenue = 0;
+  const transactions = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const qty = Number(row[QTY_COL]);
+    const price = Number(String(row[PRICE_COL]).replace(/[^0-9.-]/g, ''));
+    
+    // Revenue is negative of (Qty * Price) because Qty is negative for sales
+    const lineRevenue = -(qty * price); 
+
+    if (lineRevenue > 0) {
+      totalRevenue += lineRevenue;
+      transactions.push({
+        row: i + 1,
+        date: row[0],
+        item: row[2] || row[1], // Name or ID
+        qty: qty,
+        price: price,
+        total: lineRevenue
+      });
+    }
+  }
+
+  // Sort by highest value
+  transactions.sort((a, b) => b.total - a.total);
+
+  log.push(`Total Calculated Revenue: ${totalRevenue.toLocaleString()} ISK`);
+  log.push("--- TOP 5 OFFENDERS ---");
+  
+  for (let k = 0; k < Math.min(5, transactions.length); k++) {
+    const t = transactions[k];
+    log.push(`Row ${t.row}: ${t.item} | Qty: ${t.qty} * Price: ${t.price.toLocaleString()} = ${t.total.toLocaleString()} ISK`);
+  }
+
+  console.log(log.join("\n"));
+  if (typeof SpreadsheetApp !== 'undefined') SpreadsheetApp.getUi().alert(log.join("\n"));
+}
+
+function RESET_AND_REBUILD_SALES_LEDGER() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = LoggerEx.withTag('SALES_NUKE');
+  
+  // 1. CLEAR SHEETS
+  const salesSheet = ss.getSheetByName("Sales_Ledger");
+  const bufferSheet = ss.getSheetByName("_Internal_Ledger_Buffer");
+  
+  if (salesSheet) {
+    salesSheet.getRange(2, 1, salesSheet.getMaxRows(), salesSheet.getMaxColumns()).clearContent();
+    LOG.info("✅ Sales_Ledger wiped.");
+  }
+  
+  if (bufferSheet) {
+    bufferSheet.getRange(2, 1, bufferSheet.getMaxRows(), bufferSheet.getMaxColumns()).clearContent();
+    LOG.info("✅ Internal Buffer wiped.");
+  }
+
+  // 2. RESET MEMORY (Properties)
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('CORP_JOURNAL_DIV_RESUME');
+  props.deleteProperty('CORP_JOURNAL_LAST_TRANSACTION_ID');
+  props.deleteProperty('LEDGER_PENDING_BUFFER'); // Delete old buffer shards
+  LOG.info("✅ ESI Memory wiped. System is effectively 'New'.");
+
+  // 3. RUN FRESH IMPORT
+  LOG.info("🚀 Starting Fresh 30-Day Import...");
+  try {
+    // Force a 30-day lookback
+    Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 });
+    
+    // Also run the processor to move items from Buffer -> Ledger
+    processInternalBuffer(ss);
+    
+    LOG.info("✅ REBUILD COMPLETE. Check Sales_Ledger for clean data.");
+  } catch (e) {
+    LOG.error("❌ Error during rebuild: " + e.message);
+  }
+}
+
 /**
  * Reads external loot sheet, filters for non-null items, and sorts the result.
  * This completely replaces the slow QUERY(IMPORTRANGE()) formula.
@@ -547,7 +760,83 @@ function _charIdMap(ss) {
   return charIdMap;
 }
 
+/**
+ * DURABLE BUFFER PARSER
+ * Defeats ESI Lag by holding transactions until taxes arrive.
+ */
+function processJournalDurable(ss) {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const BUFFER_KEY = 'LEDGER_PENDING_BUFFER';
+  
+  // 1. Load the "Waiting Room" from previous runs
+  let pendingBuffer = JSON.parse(SCRIPT_PROP.getProperty(BUFFER_KEY) || '{}');
+  
+  // 2. Fetch fresh data from ESI (Division 3)
+  const journalEntries = GESI.corporations_corporation_wallets_division_journal(3); 
 
+  journalEntries.forEach(entry => {
+    const refId = entry.id;
+
+    if (entry.ref_type === 'market_transaction') {
+      // It's a sale! Put it in the waiting room if we haven't seen it
+      if (!pendingBuffer[refId]) {
+        pendingBuffer[refId] = {
+          data: entry,
+          tax: 0,
+          status: 'WAITING',
+          ts: new Date().getTime()
+        };
+      }
+    } 
+    else if (entry.ref_type === 'transaction_tax') {
+      // It's a tax! Find its twin in the waiting room
+      const parentId = entry.context_id; 
+      if (pendingBuffer[parentId]) {
+        pendingBuffer[parentId].tax = Math.abs(entry.amount);
+        pendingBuffer[parentId].status = 'PAIRED';
+      }
+    }
+  });
+
+  // 3. Decide what is ready for the Ledger
+  const finalizedRows = [];
+  const nextBuffer = {};
+  const NOW = new Date().getTime();
+  const MAX_WAIT_MS = 3600000; // 1 Hour (Plenty of time for ESI lag)
+
+  Object.keys(pendingBuffer).forEach(id => {
+    const item = pendingBuffer[id];
+    const age = NOW - item.ts;
+
+    if (item.status === 'PAIRED' || age > MAX_WAIT_MS) {
+      // Ready to post! If it aged out without a tax, use an estimate (0.036)
+      const finalTax = item.status === 'PAIRED' ? item.tax : (Math.abs(item.data.amount) * 0.036);
+      
+      finalizedRows.push({
+        date: item.data.date,
+        type_id: 'MARKET_TX', // We'll look up the name in the next step
+        qty: 1,
+        unit_value: item.data.amount,
+        unit_value_filled: item.data.amount - finalTax,
+        source: 'JOURNAL',
+        contract_id: id,
+        char: item.data.first_party_id // Attribution
+      });
+    } else {
+      // Still waiting for the tax twin... keep it in the buffer
+      nextBuffer[id] = item;
+    }
+  });
+
+  // 4. Save the "Waiting Room" for the next pulse
+  SCRIPT_PROP.setProperty(BUFFER_KEY, JSON.stringify(nextBuffer));
+
+  // 5. Atomic Write to Sales Ledger (Zero Duplicates)
+  if (finalizedRows.length > 0) {
+    ML.forSheet("Sales_Ledger").upsert(['contract_id'], finalizedRows);
+    log.info(`Durable Sync: Finalized ${finalizedRows.length} transactions.`);
+  }
+}
 
 // ==========================================================================================
 // NORMALIZERS
@@ -900,6 +1189,54 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
   return count;
 }
 
+/**
+ * PERMANENT SHARDING (PropertiesService)
+ * Mirror of Utility logic but for permanent storage.
+ * Uses 8000 byte chunks to stay safely under the 9KB individual property limit.
+ */
+function _chunkAndPut_Permanent(key, content) {
+  const props = PropertiesService.getScriptProperties();
+  const MAX_SIZE = 8000; 
+
+  const chunks = [];
+  let offset = 0;
+  while (offset < content.length) {
+    chunks.push(content.substr(offset, MAX_SIZE));
+    offset += MAX_SIZE;
+  }
+
+  const payload = {};
+  chunks.forEach((c, i) => { payload[key + "_" + i] = c; });
+  payload[key + "_chunks"] = chunks.length.toString();
+
+  props.setProperties(payload);
+  return true;
+}
+
+function _getAndDechunk_Permanent(key) {
+  const props = PropertiesService.getScriptProperties();
+  const countStr = props.getProperty(key + "_chunks");
+
+  if (!countStr) return props.getProperty(key);
+
+  const count = parseInt(countStr, 10);
+  let full = "";
+  for (let i = 0; i < count; i++) {
+    const part = props.getProperty(key + "_" + i);
+    if (!part) return null;
+    full += part;
+  }
+  return full;
+}
+
+function emergencyPropertyCleanup() {
+  const props = PropertiesService.getScriptProperties();
+  const allKeys = props.getKeys();
+  // Find all shards related to the ledger buffer
+  const shards = allKeys.filter(k => k.startsWith('LEDGER_PENDING_BUFFER'));
+  shards.forEach(k => props.deleteProperty(k));
+  console.log(`✅ Cleanup Complete. Deleted ${shards.length} property shards. Quota restored.`);
+}
 
 /** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Symmetric Ping-Pong Cache) =====================
  * Imports corporate market transactions for Division 3.
@@ -915,6 +1252,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS';
   const CACHE_KEY_BUYS  = 'CORP_JOURNAL_HANDOFF_BUYS';
   const CACHE_KEY_ANCHOR = 'CORP_JOURNAL_HANDOFF_ANCHOR';
+  const LAST_ID_KEY = 'CORP_JOURNAL_LAST_TRANSACTION_ID';
   
   // 60 Minutes Cache (Survives the 30 Minute wait)
   const CACHE_TTL = 3600; 
@@ -923,7 +1261,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
 
   const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions';
-  const BUY_SOURCE = String(opts.sourceName || 'JOURNAL').toUpperCase();
+  const SOURCE_NAME = String(opts.sourceName || 'JOURNAL').toUpperCase();
   const SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
   const MS_PER_DAY = 86400000;
   const cutoff = new Date(Date.now() - SINCE_DAYS * MS_PER_DAY);
@@ -931,18 +1269,20 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const authToon = getCorpAuthChar(ss);
 
   // Load Anchor
-  const rawFromId = SCRIPT_PROP.getProperty(CORP_JOURNAL_LAST_ID);
+  const rawFromId = SCRIPT_PROP.getProperty(LAST_ID_KEY);
   let currentFromId = null;
   if (rawFromId && !isNaN(rawFromId)) currentFromId = Number(rawFromId);
 
   // Load Phase
-  const currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
+  let currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
   log.info(`Starting Corp Journal Import. Current Phase: ${currentPhase}`);
 
   // Setup Ledgers
-  const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
-  const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
-  const keys = ['source', 'contract_id'];
+  const MaterialLedger = ML.forSheet('Material_Ledger'); // Buys go here
+  const SalesLedger = ML.forSheet('Sales_Ledger');       // Sells go here
+  
+  // Select Active Ledger based on Phase
+  const activeLedger = (currentPhase === 'BUYS') ? MaterialLedger : SalesLedger;
 
   // --- VARIABLES ---
   let targetRows = []; // The rows we want to process NOW
@@ -1043,6 +1383,8 @@ function Ledger_Import_CorpJournal(ss, opts) {
       
       if (isNaN(finalUnitValue) || finalUnitValue === 0) {
           // Fallback: If 'price' or 'amount' represents the TOTAL
+          // Note: ESI market transactions usually provide unit_price, but journal provides amount
+          // This ensures we handle both shapes if the parser changes.
           const totalAmount = Number(e.price || e.amount || 0);
           finalUnitValue = Math.abs(totalAmount) / qty;
       }
@@ -1050,9 +1392,9 @@ function Ledger_Import_CorpJournal(ss, opts) {
       const row = {
         date: d,
         type_id: Number(e.type_id || 0),
-        qty: isBuy ? qty : -qty, // Positive for Buy, Negative for Sell
+        qty: isBuy ? qty : -qty, // Positive for Buy (Stock IN), Negative for Sell (Stock OUT)
         unit_value: '',
-        source: BUY_SOURCE,
+        source: SOURCE_NAME,
         contract_id: String(e.transaction_id || e.id),
         char: authToon,
         unit_value_filled: finalUnitValue
@@ -1080,58 +1422,38 @@ function Ledger_Import_CorpJournal(ss, opts) {
         if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
       }
     }
-  } 
+  }
 
   // =========================================================================
-  // LOGIC BLOCK 3: PROCESS THE DATA
+  // LOGIC BLOCK 3: ATOMIC WRITE & PHASE FLIP
   // =========================================================================
-  let resultCount = 0;
+  if (targetRows.length > 0) {
+    try {
+      // DEDUPLICATION CHECK (Optional but recommended)
+      // Since upsert handles updates by key, we rely on 'contract_id' being unique.
+      const result = activeLedger.upsert(['contract_id'], targetRows);
+      
+      log.info(`Phase ${currentPhase}: Processed ${result.rows} rows into ${currentPhase === 'BUYS' ? 'Material_Ledger' : 'Sales_Ledger'}.`);
+      
+      // Update Anchor only if we processed new data
+      if (newestTransactionId) {
+        SCRIPT_PROP.setProperty(LAST_ID_KEY, newestTransactionId);
+      }
 
-  if (targetRows && targetRows.length > 0) {
-    if (currentPhase === 'BUYS') {
-      log.info(`Processing ${targetRows.length} BUY transactions...`);
-      const res = MaterialLedger.upsert(keys, targetRows);
-      resultCount = res.rows;
-    } else {
-      log.info(`Processing ${targetRows.length} SELL transactions...`);
-      const res = SalesLedger.upsert(keys, targetRows);
-      resultCount = res.rows;
+    } catch (e) {
+      log.error(`Ledger Write Failed: ${e.message}`);
+      throw e; // Don't flip phase if write fails!
     }
   } else {
-    log.info(`No transactions found for Phase: ${currentPhase}`);
+    log.info(`Phase ${currentPhase}: No rows to process.`);
   }
 
-  // =========================================================================
-  // LOGIC BLOCK 4: TRANSITION & CLEANUP
-  // =========================================================================
-  if (currentPhase === 'BUYS') {
-    // Switch to Phase 2
-    SCRIPT_PROP.setProperty(PHASE_KEY, 'SELLS');
-    
-    // Clear the Buy cache (we just used it)
-    _deleteShardedData(CACHE_KEY_BUYS);
-
-    log.info("Phase 'BUYS' complete. Transitioning to 'SELLS'.py");
-    return { status: "SUCCESS_BUYS", count: resultCount };
-  } 
-  else {
-    // Phase 2 Complete. Update Anchor.
-    if (newestTransactionId) {
-       SCRIPT_PROP.setProperty(CORP_JOURNAL_LAST_ID, String(newestTransactionId));
-       log.log(`Cycle Complete. Anchor Updated: ${newestTransactionId}`);
-    }
-    
-    // Switch back to Phase 1
-    SCRIPT_PROP.setProperty(PHASE_KEY, 'BUYS');
-    
-    // Clear the Sell cache (we just used it)
-    _deleteShardedData(CACHE_KEY_SELLS);
-    _deleteShardedData(CACHE_KEY_ANCHOR);
-
-    log.info("Phase 'SELLS' complete. Transitioning to 'BUYS'.");
-    return { status: "SUCCESS_SELLS", count: resultCount };
-  }
+  // FLIP PHASE FOR NEXT RUN
+  const nextPhase = (currentPhase === 'BUYS') ? 'SELLS' : 'BUYS';
+  SCRIPT_PROP.setProperty(PHASE_KEY, nextPhase);
+  log.info(`Phase Complete. Switched to ${nextPhase} for next execution.`);
 }
+
 
 /**
  * NEW: Helper function to run all loot delta processing steps
@@ -2089,8 +2411,8 @@ function triggerContractUnitCostsFinalization() {
 }
 
 /**
- * NEW: Master orchestrator function to run all ledger imports.
- * ASSUMES executeLocked() has already acquired the lock before calling this.
+ * Master orchestrator function to run all ledger imports.
+ * OBSOLETE: this Monolithic Time Beast kept  for Historical reference
  */
 function runAllLedgerImports() {
   const log = LoggerEx.withTag('MASTER_SYNC');

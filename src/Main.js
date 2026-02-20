@@ -45,9 +45,9 @@ function onOpen() {
 function triggerRestockSync() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const props = PropertiesService.getScriptProperties();
-  
+
   ss.toast("🚀 Nitro Sync: Locking RAM...", "Engine Room", 5);
-  
+
   try {
     // Set a lock so Maintenance Jobs don't start and cause a timeout
     props.setProperty('MANUAL_SYNC_ACTIVE', 'TRUE');
@@ -60,7 +60,7 @@ function triggerRestockSync() {
     generateRestockQuery(ss, fullData);
     generateRestockItemsOnHand(ss, fullData);
     generateDumpToBuyOrder(ss, fullData);
-
+    generateConsolidatedRequirements(ss);
     ss.toast("✅ Sync Complete. Releasing Lock.", "Engine Room", 3);
   } catch (e) {
     ss.toast("❌ Sync failed: " + e.message, "Engine Room Error");
@@ -77,7 +77,7 @@ function respondToEdit(e) {
   // SPEED GATE: Only trigger if it's been at least 2 seconds since the last edit
   const now = new Date().getTime();
   const lastRun = parseInt(SCRIPT_PROPS.getProperty('LAST_EDIT_TS') || '0');
-  if (now - lastRun < 2000) return; 
+  if (now - lastRun < 2000) return;
   SCRIPT_PROPS.setProperty('LAST_EDIT_TS', now.toString());
 
   const col = e.range.columnStart;
@@ -91,58 +91,44 @@ function respondToEdit(e) {
   }
 }
 
-function generateRestockQuery(ss, preLoadedData) {
+/**
+ * Generates List to Set up Buy orders or Manufacturing Jobs due to low inventory.
+ * Strictly calculates restock need as: (Velocity * Target Days) - Current Total Stock.
+ */
+function generateRestockQuery(ss, fullData) {
   const TARGET_SHEET_NAME = 'Need To Buy';
   const DATA_SHEET_NAME = 'MarketOverviewData';
-  const ITEM_LIST_NAME = 'Item List'; 
   const AUDIT_SHEET_NAME = 'Audit items';
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
   const auditSheet = ss.getSheetByName(AUDIT_SHEET_NAME);
-  const itemListSheet = ss.getSheetByName(ITEM_LIST_NAME);
 
-  if (!sheet || !dataSheet || !auditSheet || !itemListSheet) return;
+  if (!sheet || !dataSheet || !auditSheet) return;
 
   // --- HELPER: Clean Number Parser ---
   const parseNum = (v) => {
     if (typeof v === 'number') return v;
     if (!v) return 0;
-    const cleanStr = String(v).replace(/[^0-9.-]/g, ''); 
+    const cleanStr = String(v).replace(/[^0-9.-]/g, '');
     return parseFloat(cleanStr) || 0;
   };
 
   // --- BATCH DATA LOAD ---
-  const rawDataValues = preLoadedData || dataSheet.getDataRange().getValues();
+  const rawDataValues = fullData || dataSheet.getDataRange().getValues();
   const headers = rawDataValues[2]; 
-  const marketRows = rawDataValues.slice(3); 
-
-  // --- LOAD ITEM LIST GOALS (The Safety Check - e.g., 3.9M) ---
-  const itemListValues = itemListSheet.getDataRange().getValues();
-  const goalMap = new Map();
-  // Assuming Item Name is Col B (index 1) and Goal is Col C (index 2)
-  itemListValues.slice(1).forEach(r => {
-    const name = String(r[1]).trim(); 
-    const goal = parseNum(r[2]);      
-    if (name) goalMap.set(name, goal);
-  });
+  const marketRows = rawDataValues.slice(3);
 
   // --- AUDIT MAP ---
   const auditValues = auditSheet.getDataRange().getValues();
   const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]).trim(), r[1]]));
 
-  // --- SETTINGS (Mapping to your Need To Buy Sheet) ---
+  // --- SETTINGS (Mapping to Need To Buy B-Column) ---
   const filters = sheet.getRange('B5:B26').getValues();
-  
-  // B5: Min Days (The Trigger - e.g., 30)
-  const minDays = parseNum(filters[0][0]) || 0;
-  
-  // B7: Target Days (The Goal - e.g., 31)
-  const targetDays = parseNum(filters[2][0]) || 31; 
-  
-  // B9: Minimal Margin
-  let rawMargin = parseNum(filters[4][0]); 
+  const minDays = parseNum(filters[0][0]) || 0;    // B5: Trigger Threshold
+  const targetDays = parseNum(filters[2][0]) || 31; // B7: The Goal Total
+  let rawMargin = parseNum(filters[4][0]);
   const minMargin = (rawMargin > 1) ? rawMargin / 100 : rawMargin;
 
   const cfg = {
@@ -152,97 +138,86 @@ function generateRestockQuery(ss, preLoadedData) {
     limit: filters[14][0] === "No Limit" ? 5000 : parseInt(filters[14][0]) || 5000,
     ignoreGroups: (filters[21][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
     groups: (filters[6][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
-    sortDir: (filters[8][0] || "ASC").toUpperCase(),
-    sortCol: (filters[9][0] || "Item Name").trim()
+    sortDir: (filters[8][0] || "ASC").toUpperCase()
   };
 
   const col = {
-    name: headers.indexOf("Item Name"),        
-    group: headers.indexOf("Group"),           
-    qLeft: headers.indexOf("Quantity Left"),   
-    jobs: headers.indexOf("Active Jobs"),      
-    deliv: headers.indexOf("Deliveries"),      
-    mfgCost: headers.indexOf("Manufacturing Unit Cost"), 
-    vol30: headers.indexOf("30-day traded volume"), 
-    vel: headers.indexOf("Effective Daily Velocity (u/d)"), 
-    warehouse: headers.indexOf("Warehouse Qty"), 
-    totalMkt: headers.indexOf("Total Market Quantity"), 
-    hubBuy: headers.indexOf("Hub Median Buy"),   
-    effCost: headers.indexOf("Effective Cost"),  
-    margin: headers.indexOf("Margin"),           
-    action: headers.indexOf("Buy Action")        
+    name: headers.indexOf("Item Name"),
+    group: headers.indexOf("Group"),
+    qLeft: headers.indexOf("Quantity Left"),        // Personal Buy Orders
+    sellQty: headers.indexOf("Posted Sell Quantuty"), // Personal Sell Orders (Source Typo)
+    jobs: headers.indexOf("Active Jobs"),
+    deliv: headers.indexOf("Deliveries"),
+    mfgCost: headers.indexOf("Manufacturing Unit Cost"),
+    vol30: headers.indexOf("30-day traded volume"),
+    vel: headers.indexOf("Effective Daily Velocity (u/d)"),
+    warehouse: headers.indexOf("Warehouse Qty"),
+    totalMkt: headers.indexOf("Total Market Quantity"),
+    effCost: headers.indexOf("Effective Cost"),
+    margin: headers.indexOf("Margin"),
+    action: headers.indexOf("Buy Action")
   };
 
   let results = [];
   marketRows.forEach(row => {
     const name = String(row[col.name] || "").trim();
-    if (!name) return;
-
-    if (auditMap.get(name) !== true) return; 
+    if (!name || auditMap.get(name) !== true) return;
 
     const group = String(row[col.group] || "").toLowerCase().trim();
     if (cfg.ignoreGroups.includes(group)) return;
     if (cfg.groups.length > 0 && !cfg.groups.includes(group)) return;
 
-    // --- STOCK & VELOCITY ---
+    // --- CURRENT STOCK CALCULATION ---
     const whQty = parseNum(row[col.warehouse]);
-    const qLeft = parseNum(row[col.qLeft]); 
-    const jobs = parseNum(row[col.jobs]);   
-    const deliv = parseNum(row[col.deliv]); 
-    
-    // Total Inventory = Warehouse + Buy Orders + Manufacturing + Deliveries
-    const currentStock = whQty + qLeft + jobs + deliv;
+    const qLeft = parseNum(row[col.qLeft]);
+    const sQty = parseNum(row[col.sellQty]);
+    const jobs = parseNum(row[col.jobs]);
+    const deliv = parseNum(row[col.deliv]);
+
+    // Everything currently owned/posted/in-flight
+    const currentStock = whQty + qLeft + sQty + jobs + deliv;
     const velocity = parseNum(row[col.vel]);
 
-    // --- LOGIC: THE RED LINE ---
-    // Trigger: Do we have less than 30 Days (B5) of stock?
+    // --- TRIGGER LOGIC ---
+    // If you have less than 'Min Days' (e.g., 30) of stock, trigger restock
     const triggerLevel = Math.ceil(velocity * cfg.minDays);
-
-    // If stock is healthy (above 30 days), STOP here.
     if (currentStock > triggerLevel) return;
 
-    // --- CALCULATE BUY GOAL ---
-    // 1. Dynamic: Velocity * 31 Days (B7)
-    const dynamicTarget = Math.ceil(velocity * cfg.targetDays);
-    // 2. Static: Safety Goal from Item List (e.g., 3.9M)
-    const safetyGoal = goalMap.get(name) || 0;
-    
-    // Use the LARGER of the two targets
-    const finalGoal = Math.max(dynamicTarget, safetyGoal);
+    // --- TARGET CALCULATION ---
+    // Total amount needed to fulfill the Target Days (e.g., 31)
+    const finalGoal = Math.ceil(velocity * cfg.targetDays);
 
+    // The "Difference" needed to reach that target
     const restockNeed = Math.round(finalGoal - currentStock);
     if (restockNeed <= 0) return;
 
-    // --- MARGIN CHECK ---
+    // --- FILTERS & ACTIONS ---
     let itemMargin = parseNum(row[col.margin]);
-    if (itemMargin > 1 && itemMargin <= 100 && cfg.minMargin <= 1) itemMargin = itemMargin / 100;
+    if (itemMargin > 1 && itemMargin <= 100 && cfg.minMargin <= 1) itemMargin /= 100;
     if (itemMargin < cfg.minMargin) return;
 
-    // --- ACTION CHECK ---
-    // If inventory is critical (triggered above), we ignore "HOLD" signals from the market.
     const rawAction = String(row[col.action] || "");
     const finalAction = (/SKIP|HOLD/i.test(rawAction)) ? "FORCE RESTOCK" : rawAction;
-
-    const cost = parseNum(row[col.effCost]) || parseNum(row[col.mfgCost]) || parseNum(row[col.hubBuy]) || 0;
+    const cost = parseNum(row[col.effCost]) || parseNum(row[col.mfgCost]) || 0;
 
     results.push({
       data: [
-        name, 
-        restockNeed, 
-        cost, 
-        restockNeed * cost, 
-        parseNum(row[col.totalMkt]), 
-        parseNum(row[col.vol30]),    
-        0, 
-        whQty, 
-        itemMargin, 
-        finalAction 
+        name,
+        restockNeed,
+        cost,
+        restockNeed * cost,
+        parseNum(row[col.totalMkt]),
+        parseNum(row[col.vol30]),
+        0, // Placeholder
+        whQty,
+        itemMargin,
+        finalAction
       ],
       sortKey: name
     });
   });
 
-  // --- SORT & WRITE ---
+  // --- SORT & OUTPUT ---
   results.sort((a, b) => {
     const modifier = cfg.sortDir === "ASC" ? 1 : -1;
     return a.sortKey.localeCompare(b.sortKey) * modifier;
@@ -250,16 +225,19 @@ function generateRestockQuery(ss, preLoadedData) {
 
   const output = results.slice(0, cfg.limit).map(r => r.data);
   const maxRows = sheet.getMaxRows();
-  
+
   if (maxRows >= 5) {
-      sheet.getRange(5, 3, maxRows - 4, 10).clearContent();
+    sheet.getRange(5, 3, maxRows - 4, 10).clearContent();
   }
 
   if (output.length > 0) {
     sheet.getRange(5, 3, output.length, 10).setValues(output);
   }
 }
+
+
 /**
+ * Generates List for Dumping Profitable Overstocks to Buy Ordwers
  * OPTIMIZED: generateDumpToBuyOrder(ss)
  * Purpose: Strategic Liquidation with Column D "Replacement NOW", Header Fix, and Zero-Masking.
  * Layout: C: Item | D: Build Now | E: Eff Cost | F: Median Buy | G: Margin | H: Qty | I: Total ISK
@@ -399,43 +377,47 @@ function generateDumpToBuyOrder(ss) {
   ss.toast("Strategic Recovery complete. Meta-modules now show blank Build Costs for readability.", "Forensic Engine");
 }
 
+
+/**
+ * REFINED: generateRestockItemsOnHand(ss)
+ * HARD FILTER: Explicitly excludes "SATURATED" and "SKIP" items from the freighter list.
+ */
 function generateRestockItemsOnHand(ss) {
   const TARGET_SHEET = 'Restock Items On Hand';
   const DATA_SHEET = 'MarketOverviewData';
   const AUDIT_SHEET = 'Audit items';
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('Restock') : console;
+  
   const sheet = ss.getSheetByName(TARGET_SHEET);
   const dataSheet = ss.getSheetByName(DATA_SHEET);
   const auditSheet = ss.getSheetByName(AUDIT_SHEET);
 
   if (!sheet || !dataSheet || !auditSheet) return;
 
-  const clean = (v) => {
-    if (typeof v === 'number') return v;
-    return parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
-  };
+  const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
 
-  // --- SETTINGS & FILTERS ---
+  // --- 1. SETTINGS ---
   const bCol = sheet.getRange("A1:B45").getValues();
-  const seedDays = clean(bCol[39][0]) || 4;
-  const minROI = clean(bCol[8][1]);
+  const seedDays = clean(bCol[39][0]) || 4; 
+  const minROI = clean(bCol[8][1]);         
   const minOrderValue = 1000000;
-
-  // Pull Deviation Setting (e.g., 0.0001 for 0.01%) from A6
   const priceDeviationPct = clean(sheet.getRange("A6").getValue());
 
+  // --- 2. LOAD DATA ---
   const rawDataValues = dataSheet.getDataRange().getValues();
-  const headers = rawDataValues[2];
+  const headers = rawDataValues[2]; 
   const rawData = rawDataValues.slice(3);
 
-  // --- INITIALIZE AUDIT MAP ---
   const auditValues = auditSheet.getDataRange().getValues();
-  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), r[1]]));
+  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), String(r[1]).toUpperCase() === 'TRUE']));
 
   const getIdx = (name) => {
     let i = headers.indexOf(name);
-    return (i === -1 && name === "Posted Sell Quantuty") ? headers.indexOf("Quantity Left") : i;
+    if (i === -1 && name === "Posted Sell Quantuty") i = headers.indexOf("Quantity Left");
+    if (i === -1 && name === "Acquisition (30d)") i = headers.indexOf("Acquisition Velocity (u/d)");
+    return i;
   };
 
   const col = {
@@ -445,95 +427,98 @@ function generateRestockItemsOnHand(ss) {
     whQty: getIdx("Warehouse Qty"),
     effVel: getIdx("Effective Daily Velocity (u/d)"),
     hubSell: getIdx("Hub Sell Price"),
-    medROI: getIdx("Median ROI"),
     sellAct: getIdx("Sell Action"),
     hubBuy: getIdx("Hub Buy Price"),
     mktQty: getIdx("Total Market Quantity"),
     effCost: getIdx("Effective Cost"),
-    mfgCost: getIdx("Manufacturing Unit Cost"),
-    condition: getIdx("Condition")
+    mfgCost: getIdx("Manufacturing Unit Cost")
   };
 
   const OUT_HEADERS = [
-    "Item Name", "Posting Price", "Hub Sell Price", "Quantity", "Total Value", "Delta Sell", "Delta Buy",
+    ["Item Name", "Posting Price", "Hub Sell Price", "Quantity", "Total Value", "Delta Sell", "Delta Buy",
     "Warehouse Level", "Pending Orders", "Total Market Quantity", "Warehouse Qty", "Acquisition (30d)",
     "Effective Daily Velocity (u/d)", "30-day traded volume", "Listed Volume (Feed Sell)",
-    "Feed Days of Book", "Hub Median Buy", "Effective Cost", "Sell Action", "Buy Action", "Sell Quantity"
+    "Feed Days of Book", "Hub Median Buy", "Effective Cost", "Sell Action", "Buy Action", "Sell Quantity"]
   ];
 
   let resultRows = [];
 
+  // --- 3. LOGIC LOOP ---
   for (let r of rawData) {
     const rawName = String(r[col.item] || "");
     if (!rawName) continue;
 
-    const action = String(r[col.sellAct] || "");
+    const action = String(r[col.sellAct] || "").toUpperCase();
+    
+    // --- THE HARD GATE: EXIT ON SATURATED OR SKIP ---
+    // If the Overview has already flagged this as Saturated, we don't even look at the numbers.
+    if (action.includes("SATURATED") || action.includes("SKIP") || action.includes("HOLD") || action.includes("IGNORE")) {
+      continue;
+    }
+
     const warehouseStock = clean(r[col.whQty]);
     const currentMarket = clean(r[col.sellQty]);
-    const activeJobs = clean(r[col.jobs]); // Add this to track what is being built
     const velocity = clean(r[col.effVel]);
     const targetGoal = clean(r[col.targetGoal]);
 
+    // Audit Bypass: Only proceed if the item passes the Audit sheet check.
+    if (auditMap.get(rawName) !== true) continue;
 
-
-    const condition = String(r[col.condition] || "");
-    const isEmpty = currentMarket === 0 || /Empty/i.test(condition);
-
-    if (/SKIP|HOLD|IGNORE/i.test(action) || action === "") {
-      if (!(isEmpty && warehouseStock > 0)) continue;
-    }
-
-    if (auditMap.get(rawName) !== true && !isEmpty) continue;
-
-    // --- QUANTITY LOGIC ---
+    // --- QUANTITY CALCULATION ---
     let targetNeeded = velocity * seedDays;
-    if (targetGoal > 0) {
-      targetNeeded = Math.min(targetNeeded, targetGoal);
-    }
+    if (targetGoal > 0) targetNeeded = Math.min(targetNeeded, targetGoal);
 
     let gap = Math.max(0, targetNeeded - currentMarket);
     let finalQuantity = Math.round(Math.min(gap, warehouseStock));
 
     if (finalQuantity <= 0) continue;
 
-    // --- PRICING LOGIC WITH DEVIATION ---
+    // --- PRICING ---
     const hubSell = clean(r[col.hubSell]);
     const baseCost = clean(r[col.effCost]) || clean(r[col.mfgCost]);
-
-    // 1. Calculate the Undercut Price (Hub Sell - 0.01%)
     let undercutPrice = hubSell * (1 - priceDeviationPct);
-
-    // 2. Determine Floor Price based on minROI
     const floorPrice = baseCost * (1 + minROI);
-
-    // 3. Final Posting Price: Use the undercut, but never go below the floor
     let postPrice = Math.max(undercutPrice, floorPrice);
-
-    // 4. Round to 2 decimal places for EVE
     postPrice = Math.round(postPrice * 100) / 100;
 
     const totalOrderValue = finalQuantity * postPrice;
-
-    if (totalOrderValue < minOrderValue && !isEmpty) continue;
+    
+    // Value Threshold check
+    if (totalOrderValue < minOrderValue && currentMarket !== 0) continue;
 
     resultRows.push([
       rawName, postPrice, hubSell, finalQuantity, totalOrderValue,
       r[getIdx("Delta Sell")], r[getIdx("Delta Buy")], r[getIdx("Warehouse Level")],
       r[getIdx("Pending Orders")], r[col.mktQty], warehouseStock,
-      r[getIdx("Acquisition (30d)")], velocity, r[getIdx("30-day traded volume")],
+      r[getIdx("Acquisition Velocity (u/d)")], velocity, r[getIdx("30-day traded volume")],
       r[getIdx("Listed Volume (Feed Sell)")], r[getIdx("Feed Days of Book")],
       clean(r[col.hubBuy]), baseCost, action, r[getIdx("Buy Action")], currentMarket
     ]);
   }
 
-  // BATCH WRITE
-  const maxRows = Math.max(1, sheet.getLastRow());
-  sheet.getRange(3, 3, maxRows, 21).clearContent();
-  sheet.getRange(3, 3, 1, 21).setValues([OUT_HEADERS]).setFontWeight("bold");
+  // --- 4. OUTPUT ---
+  const lastRowWithData = sheet.getLastRow();
+  if (lastRowWithData >= 3) {
+    sheet.getRange(3, 3, lastRowWithData, 21).clearContent();
+  }
+  
+  sheet.getRange(3, 3, 1, 21).setValues(OUT_HEADERS).setFontWeight("bold");
 
   if (resultRows.length > 0) {
     sheet.getRange(4, 3, resultRows.length, 21).setValues(resultRows);
+    sheet.getRange(4, 4, resultRows.length, 2).setNumberFormat("#,##0.00 \"ISK\""); 
+    sheet.getRange(4, 7, resultRows.length, 1).setNumberFormat("#,##0.00 \"ISK\""); 
+    sheet.getRange(4, 20, resultRows.length, 1).setNumberFormat("#,##0.00 \"ISK\""); 
   }
+
+  // Trim rows to prevent sheet bloat/lag
+  const maxRows = sheet.getMaxRows();
+  const endRow = resultRows.length + 5; 
+  if (maxRows > endRow && endRow > 10) {
+      sheet.deleteRows(endRow + 1, maxRows - endRow);
+  }
+
+  LOG.info(`Restock Table Cleansed: ${resultRows.length} items added (Saturated items purged).`);
 }
 
 

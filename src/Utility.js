@@ -197,10 +197,6 @@ function pauseSheet(ss) {
 /**
  * [WAKE UP] - Resumes heavy formulas via Helper Cells.
  * Toggles Utility!B3:D3 to 1.
- */
-/**
- * [WAKE UP] - Resumes heavy formulas via Helper Cells.
- * Toggles Utility!B3:D3 to 1.
  * UPDATED: Handles Trigger Event Object correctly.
  */
 function wakeUpSheet(ss) {

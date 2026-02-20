@@ -4,8 +4,11 @@
  * This module is the Industry Ledger Add-on, built for robust COGS accounting.
  * It includes sharding utilities to bypass the Google Apps Script Cache limit.
  *
- * FIX APPLIED: Added strict Activity ID filtering to prevent Invention materials (Datacores)
- * from polluting Manufacturing job costs.
+ * FIX APPLIED:
+ * 1. generateFullBOMData: Now calculates Blueprint Cycles strictly from 'Build Target' / 'Units Per Run'.
+ * - Ignores 'Total Runs' column to prevent 100x multiplier errors.
+ * - Fixes header mapping for 'Type ID'.
+ * 2. generateConsolidatedRequirements: Fixed Hangar column indices (Col B=ID, Col E=Qty).
  */
 
 // --- GLOBAL CONSTANTS ---
@@ -45,8 +48,6 @@ function _getNamedOr_(arg1, arg2, arg3) {
   } catch (e) { return fallback; }
 }
 
-
-
 // ----------------------------------------------------------------------
 // --- CORE UTILITY: DYNAMIC HEADER MAPPING ---
 // ----------------------------------------------------------------------
@@ -66,10 +67,12 @@ function _getColIndexMap(headers, requiredHeaders) {
 }
 
 /**
- * HARDENED BOM ENGINE: Dynamic column mapping to prevent crashes.
+ * NITRO BOM ENGINE (NUCLEAR OPTION)
+ * Ignores 'Units Per Run' from the sheet and forces SDE lookup.
+ * Fixes the 9.8B Tritanium bug permanently.
  */
 function generateFullBOMData(ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Engine') : console;
   const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
 
@@ -77,36 +80,59 @@ function generateFullBOMData(ss) {
   const prodSheet = ss.getSheetByName("ProductionList ");
   const sdeMatSheet = ss.getSheetByName("SDE_industryActivityMaterials");
   const sdeProdSheet = ss.getSheetByName("SDE_industryActivityProducts");
-  
+
   if (!prodSheet || !sdeMatSheet || !sdeProdSheet) return;
 
   const prodRaw = prodSheet.getDataRange().getValues();
-  const pHeaders = prodRaw[4]; // Assumes headers on Row 5
+  const pHeaders = prodRaw[4]; 
   const prodData = prodRaw.slice(5);
 
-  // --- 2. DYNAMIC MAPPING ---
   const pCol = {
-    prodID: pHeaders.indexOf("Product ID"),
+    prodID: pHeaders.indexOf("Type ID"),
     bpID:   pHeaders.indexOf("Blueprint Type ID"),
     me:     pHeaders.indexOf("Material Efficiency (ME)"),
-    runs:   pHeaders.indexOf("Total Runs")
+    target: pHeaders.indexOf("Build Target (Qty)")
   };
 
-  const productToBpMap = new Map();
-  sdeProdSheet.getDataRange().getValues().forEach(r => { 
-    if (Number(r[1]) === 1) productToBpMap.set(Number(r[2]), Number(r[0])); 
-  });
+  // --- 2. BUILD SDE MAP (The "Truth" Database) ---
+  // Maps Product ID -> { BlueprintID, YieldQty }
+  // This bypasses the need for the sheet to have correct columns.
+  const productMetaMap = new Map();
+  const sdeProdData = sdeProdSheet.getDataRange().getValues();
+  
+  // Skip header, assuming Row 1 is header
+  for (let i = 1; i < sdeProdData.length; i++) {
+    const r = sdeProdData[i];
+    // Check for Activity 1 (Manufacturing)
+    if (Number(r[1]) === 1) {
+      const bpID = Number(r[0]);      // Col A
+      const productID = Number(r[2]); // Col C
+      const quantity = Number(r[3]);  // Col D (Yield)
+      
+      productMetaMap.set(productID, { bpID: bpID, qty: quantity });
+    }
+  }
 
   const jobMap = new Map();
+  
   prodData.forEach(row => {
     const pID = Number(row[pCol.prodID]);
-    const manualVal = clean(row[pCol.bpID]);
-    let bpID = (manualVal > 0 && manualVal < 1000000) ? manualVal : productToBpMap.get(pID);
+    const buildTarget = clean(row[pCol.target]);
     
-    if (bpID) {
-      const runs = clean(row[pCol.runs]);
+    // LOOKUP from SDE (The Fix)
+    const meta = productMetaMap.get(pID);
+    
+    if (meta && buildTarget > 0) {
+      const bpID = meta.bpID;
+      const unitsPerRun = meta.qty || 1; // Force SDE value (e.g., 100)
+      
+      // Calculate TRUE cycles
+      const runs = Math.ceil(buildTarget / unitsPerRun);
       const me = row[pCol.me] === "" ? 10 : clean(row[pCol.me]);
-      jobMap.set(bpID, { me, runs: (jobMap.get(bpID)?.runs || 0) + runs });
+      
+      if (runs > 0) {
+        jobMap.set(bpID, { me, runs: (jobMap.get(bpID)?.runs || 0) + runs });
+      }
     }
   });
 
@@ -117,8 +143,22 @@ function generateFullBOMData(ss) {
     const sdeBpID = Number(sdeMatData[i][0]);
     if (sdeMatData[i][1] === 1 && jobMap.has(sdeBpID)) {
       const job = jobMap.get(sdeBpID);
-      const adjQty = Number(sdeMatData[i][3]) * ((100 - job.me) / 100);
-      outputRows.push([sdeBpID, 1, Number(sdeMatData[i][2]), Number(sdeMatData[i][3]), job.me, job.runs, adjQty, Math.ceil(adjQty * job.runs)]);
+      const baseQty = Number(sdeMatData[i][3]);
+      const adjQty = baseQty * ((100 - job.me) / 100);
+      
+      // Total Req = (Mat Per Run) * (True Cycles)
+      const totalReq = Math.ceil(adjQty * job.runs);
+
+      outputRows.push([
+          sdeBpID, 
+          1, 
+          Number(sdeMatData[i][2]), 
+          baseQty, 
+          job.me, 
+          job.runs, 
+          adjQty, 
+          totalReq
+      ]);
     }
   }
 
@@ -126,9 +166,12 @@ function generateFullBOMData(ss) {
   const outSheet = ss.getSheetByName("Full_BOM_Data");
   outSheet.clearContents();
   outSheet.getRange(1, 1, 1, 8).setValues([["BP ID", "Act ID", "Mat ID", "Base Qty", "ME", "Runs", "Adj Qty", "Total Req"]]);
-  if (outputRows.length > 0) outSheet.getRange(2, 1, outputRows.length, 8).setValues(outputRows);
+  if (outputRows.length > 0) {
+    outSheet.getRange(2, 1, outputRows.length, 8).setValues(outputRows);
+    outSheet.getRange(2, 8, outputRows.length, 1).setNumberFormat("#,##0");
+  }
   
-  LOG.info(`BOM Fixed: Processed ${outputRows.length} lines.`);
+  LOG.info(`BOM NUCLEAR FIX: Processed ${outputRows.length} lines using SDE yields.`);
 }
 
 /**
@@ -136,17 +179,15 @@ function generateFullBOMData(ss) {
  * Logic: Aggregates BOM, calculates Shopping List/Cost, and outputs static values.
  */
 function generateConsolidatedRequirements(ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Consolidator') : console;
-  
-  // Helper to handle ISK strings and ensure clean numbers
+
   const clean = (v) => {
     if (typeof v === 'number') return v;
     if (!v) return 0;
     return parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
   };
 
-  // --- 1. Load All Data into RAM ---
   const getValues = (name) => {
     const sh = ss.getSheetByName(name);
     return sh ? sh.getDataRange().getValues() : [];
@@ -160,36 +201,36 @@ function generateConsolidatedRequirements(ss) {
 
   if (bomDataRaw.length < 2) return;
 
-  // --- 2. Build Lookup Maps (O(1) Access) ---
   const nameMap = new Map(sdeData.map(r => [Number(r[0]), r[2]]));
-  
-  // FIXED: Total Quantity is Column E (index 4) in your MaterialHangar
+
+  // FIX APPLIED: Reading Type ID from Col B (index 1) and Total Qty from Col E (index 4)
   const hangarMap = new Map();
   hangarData.forEach(r => {
-    const id = Number(r[1]);
-    if (id) hangarMap.set(id, (hangarMap.get(id) || 0) + clean(r[4]));
-  });
-  
-  // Tiered Cost Map: Blended first, then Market Raw (buy_max * 1.11)
-  const costMap = new Map();
-  marketRawData.forEach(r => { 
-    const price = clean(r[5]);
-    if (price > 0) costMap.set(Number(r[1]), price * 1.11); 
-  });
-  blendedCostData.forEach(r => { 
-    const price = clean(r[2]);
-    if (price > 0) costMap.set(Number(r[0]), price); 
+    const id = Number(r[1]); // Column B: Type ID
+    const qty = clean(r[4]); // Column E: Total Quantity
+    if (id) {
+      hangarMap.set(id, (hangarMap.get(id) || 0) + qty);
+    }
   });
 
-  // --- 3. Aggregate Requirements ---
-  const aggregation = {}; 
+  const costMap = new Map();
+  marketRawData.forEach(r => {
+    const price = clean(r[5]);
+    if (price > 0) costMap.set(Number(r[1]), price * 1.11);
+  });
+  blendedCostData.forEach(r => {
+    const price = clean(r[2]);
+    if (price > 0) costMap.set(Number(r[0]), price);
+  });
+
+  const aggregation = {};
 
   for (let i = 1; i < bomDataRaw.length; i++) {
     const id = Number(bomDataRaw[i][2]); // Column C
     if (!id) continue;
-    
+
     const qty = clean(bomDataRaw[i][7]); // Column H
-    
+
     if (!aggregation[id]) {
       const unitCost = costMap.get(id) || 0;
       const onHand = hangarMap.get(id) || 0;
@@ -204,26 +245,23 @@ function generateConsolidatedRequirements(ss) {
     aggregation[id].totalReq += qty;
   }
 
-  // --- 4. Logic Processing (Replaces your ARRAYFORMULAs) ---
   const outputRows = Object.values(aggregation)
     .map(item => {
-      // Logic: IF((Req - Stock) > 0, Req - Stock, 0)
       const shoppingList = Math.max(0, item.totalReq - item.onHand);
       const shoppingCost = shoppingList * item.unitCost;
 
       return [
-        item.id, 
-        item.name, 
-        item.totalReq, 
-        item.onHand, 
-        item.unitCost, 
-        shoppingList, 
-        shoppingCost
+        item.id,
+        item.name,
+        item.totalReq,
+        item.onHand,
+        item.unitCost,
+        item.shoppingList,
+        item.shoppingCost
       ];
     })
-    .sort((a, b) => b[2] - a[2]); // Sort by Total Required DESC
+    .sort((a, b) => b[2] - a[2]);
 
-  // --- 5. Output & Station Service ---
   const outSheet = ss.getSheetByName("Consolidated_Requirements");
   if (!outSheet) return;
 
@@ -233,20 +271,11 @@ function generateConsolidatedRequirements(ss) {
 
   if (outputRows.length > 0) {
     outSheet.getRange(2, 1, outputRows.length, 7).setValues(outputRows);
-    
-    // Formatting: Make it readable
-    outSheet.getRange(2, 5, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\""); // Unit Cost
-    outSheet.getRange(2, 7, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\""); // Total Cost
+    outSheet.getRange(2, 5, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\"");
+    outSheet.getRange(2, 7, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\"");
   }
 
-  // Trim the hull
-  const maxRows = outSheet.getMaxRows();
-  const lastDataRow = outputRows.length + 1;
-  if (maxRows > lastDataRow + 5) {
-    outSheet.deleteRows(lastDataRow + 1, maxRows - lastDataRow);
-  }
-
-  LOG.info(`BOM Consolidated: ${outputRows.length} materials. Static Shopping List generated.`);
+  LOG.info(`BOM Consolidated: ${outputRows.length} materials. Hangar Stock Synced.`);
 }
 
 // ----------------------------------------------------------------------
@@ -326,7 +355,7 @@ function runBpcCreationLedger() {
 
   const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(BPC_JOB_KEY) || '[]'));
   const newBpcJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_COPYING, INDUSTRY_ACTIVITY_INVENTION]);
-  
+
   if (newBpcJobs.length === 0) {
     LOG_INDUSTRY.info("No new BPC creation jobs.");
     return;
@@ -382,14 +411,14 @@ function runBpcCreationLedger() {
   for (const [bpID, data] of bpcCostMap.entries()) {
     // Get existing totals
     const existing = historyData[bpID] || { totalCost: 0, totalRuns: 0 };
-    
+
     // Add new batch to existing totals
     existing.totalCost += data.totalCost;
     existing.totalRuns += data.totalRuns;
-    
+
     // Save back to history object
     historyData[bpID] = existing;
-    
+
     // Calculate TRUE weighted average
     finalWAC[bpID] = existing.totalCost / existing.totalRuns;
   }
@@ -416,7 +445,7 @@ function runIndustryLedgerUpdate() {
   const nameMap = _getSdeNameMap(ss);
   const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
   const newJobs = _getNewCompletedJobs(ss, processedJobIds, [INDUSTRY_ACTIVITY_MANUFACTURING]);
-  
+
   if (newJobs.length === 0) {
     LOG_INDUSTRY.info("No new manufacturing jobs.");
     return;
@@ -498,9 +527,9 @@ function runIndustryLedgerUpdate() {
 
     const totalActualCost = totalMaterialCostForAllRuns + totalJobInstallationCost + amortizationSurcharge;
     const totalUnitsProduced = product.quantity * job.runs;
-    
+
     if (totalUnitsProduced === 0) continue;
-    
+
     const unitManufacturingCost = totalActualCost / totalUnitsProduced;
 
     // --- DETAILED DEBUG LOGGING ---
@@ -541,7 +570,7 @@ function runIndustryLedgerUpdate() {
 
 function _getBlendedCostMap(ss, requiredMaterialIds) {
   const sheet = ss.getSheetByName("Blended_Cost");
-  
+
   // FIX: Using standardized local _getNamedOr_
   const BROKER_FEE_RATE = Number(_getNamedOr_('FEE_RATE', 0.03));
   const TRANSACTION_TAX_RATE = Number(_getNamedOr_('TAX_RATE', 0.075));
@@ -584,9 +613,9 @@ function _getBlendedCostMap(ss, requiredMaterialIds) {
       res.forEach(item => {
         const cost = _extractMetric_(item, 'buy', 'max');
         if (cost > 0) {
-           const finalCost = cost * ACQUISITION_MULTIPLIER;
-           allItemCosts.set(item.type_id, finalCost);
-           LOG_INDUSTRY.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3) + Fee: ${finalCost}`);
+          const finalCost = cost * ACQUISITION_MULTIPLIER;
+          allItemCosts.set(item.type_id, finalCost);
+          LOG_INDUSTRY.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3) + Fee: ${finalCost}`);
         }
       });
     } catch (e) { console.error("Fuzzwork Tier 3 failed", e); }
@@ -603,7 +632,7 @@ function _getBpoAmortizationMap(ss) {
   const sdePriceMap = _getSdeBasePriceMap(ss);
   const blendedCostMap = _getBlendedCostMap(ss);
   const marketMedianMap = _getMarketMedianMap(ss);
-  
+
   const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
   if (sheet.getLastRow() < 2) return amortMap;
 
@@ -647,7 +676,7 @@ function _getBpoAmortizationMap(ss) {
     });
 
   } catch (e) { LOG_INDUSTRY.error(e.message); }
-  
+
   return amortMap;
 }
 
@@ -669,45 +698,45 @@ function _getSdeMaps(ss) {
     const matData = matSheet.getRange(2, 1, matSheet.getLastRow() - 1, matSheet.getMaxColumns()).getValues();
     const prodData = prodSheet.getRange(2, 1, prodSheet.getLastRow() - 1, prodSheet.getMaxColumns()).getValues();
 
-    for(const r of matData) {
+    for (const r of matData) {
       const act = Number(r[matCol.activityID]);
       // FIX: Capture both, but store the activity ID so we can filter later!
       if (act === INDUSTRY_ACTIVITY_MANUFACTURING || act === INDUSTRY_ACTIVITY_INVENTION) {
         const bp = Number(r[matCol.typeID]);
         if (!res.sdeMatMap.has(bp)) res.sdeMatMap.set(bp, []);
         // Store Activity ID in the object
-        res.sdeMatMap.get(bp).push({ 
-          materialTypeID: Number(r[matCol.materialTypeID]), 
+        res.sdeMatMap.get(bp).push({
+          materialTypeID: Number(r[matCol.materialTypeID]),
           quantity: Number(r[matCol.quantity]),
-          activityID: act 
+          activityID: act
         });
       }
     }
-    for(const r of prodData) {
+    for (const r of prodData) {
       const act = Number(r[prodCol.activityID]);
       if (act === INDUSTRY_ACTIVITY_MANUFACTURING) {
-        res.sdeProdMap.set(Number(r[prodCol.typeID]), { 
-          productTypeID: Number(r[prodCol.productTypeID]), 
-          quantity: Number(r[prodCol.quantity]) 
+        res.sdeProdMap.set(Number(r[prodCol.typeID]), {
+          productTypeID: Number(r[prodCol.productTypeID]),
+          quantity: Number(r[prodCol.quantity])
         });
       }
     }
-  } catch(e) { console.warn("SDE Parse Error", e); }
+  } catch (e) { console.warn("SDE Parse Error", e); }
   return res;
 }
 
 function _getSdeNameMap(ss) {
   const sheet = ss.getSheetByName("SDE_invTypes");
   const map = new Map();
-  if(!sheet) return map;
+  if (!sheet) return map;
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   try {
     const col = _getColIndexMap(headers, ['typeID', 'typeName']);
     const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
-    for(const r of data) {
+    for (const r of data) {
       map.set(Number(r[col.typeID]), r[col.typeName]);
     }
-  } catch(e) {}
+  } catch (e) { }
   return map;
 }
 
@@ -716,17 +745,17 @@ function _getMarketMedianMap(ss) {
   const map = new Map();
   if (!sheet) return map;
   try {
-    const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const colId = headers.indexOf('type_id_filtered');
     const colMed = headers.indexOf('Median Sell');
     if (colId === -1 || colMed === -1) return map;
-    
-    const data = sheet.getRange(2,1,sheet.getLastRow()-1, sheet.getLastColumn()).getValues();
+
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
     data.forEach(r => {
       const val = Number(String(r[colMed]).replace(/[^0-9.]/g, ''));
       if (val > 0) map.set(r[colId], val);
     });
-  } catch(e){}
+  } catch (e) { }
   return map;
 }
 
@@ -735,15 +764,15 @@ function _getSdeBasePriceMap(ss) {
   const map = new Map();
   if (!sheet) return map;
   try {
-    const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const colId = headers.indexOf('typeID');
     const colP = headers.indexOf('basePrice');
     const data = sheet.getDataRange().getValues();
-    for(let i=1; i<data.length; i++) {
+    for (let i = 1; i < data.length; i++) {
       const p = Number(data[i][colP]);
-      if(p>0) map.set(Number(data[i][colId]), p);
+      if (p > 0) map.set(Number(data[i][colId]), p);
     }
-  } catch(e){}
+  } catch (e) { }
   return map;
 }
 
@@ -802,12 +831,12 @@ function _getCorporateJobsRaw(forceRefresh) {
   // 3. Execution (Cache Miss OR Force Refresh)
   try {
     console.log(`[CorpJobs] Fetching live data... (Reason: ${forceRefresh ? "Force Refresh" : "Cache Miss"})`);
-    
+
     const rawObjects = GESI.invokeRaw(ENDPOINT, {
-        include_completed: true,
-        name: authToon,
-        show_column_headings: false,
-        version: null
+      include_completed: true,
+      name: authToon,
+      show_column_headings: false,
+      version: null
     });
 
     if (!Array.isArray(rawObjects)) {
@@ -817,7 +846,7 @@ function _getCorporateJobsRaw(forceRefresh) {
 
     // 4. Update Cache (So the next 50 reads are fast)
     _chunkAndPut(CACHE_KEY, JSON.stringify(rawObjects), CACHE_TTL);
-    
+
     return rawObjects;
   } catch (e) {
     console.error(`[CorpJobs] ESI Fetch Failed: ${e.message}`);
@@ -830,12 +859,12 @@ function _getCorporateJobsRaw(forceRefresh) {
 function _getBpoAttributesMapFromEsi() {
   const rawObjects = _getCorporateBlueprintsRaw(false);
   const attributesMap = new Map();
-  if(!rawObjects) return attributesMap;
+  if (!rawObjects) return attributesMap;
 
   for (const bpObj of rawObjects) {
     attributesMap.set(Number(bpObj.type_id), {
-        material_efficiency: Number(bpObj.material_efficiency),
-        time_efficiency: Number(bpObj.time_efficiency)
+      material_efficiency: Number(bpObj.material_efficiency),
+      time_efficiency: Number(bpObj.time_efficiency)
     });
   }
   return attributesMap;
@@ -854,10 +883,10 @@ function _getCorporateBlueprintsRaw(forceRefresh) {
   try {
     const rawObjects = GESI.invokeRaw(ENDPOINT, { name: authToon, show_column_headings: false, version: null });
     if (Array.isArray(rawObjects)) {
-       _chunkAndPut(cacheKey, JSON.stringify(rawObjects), BPO_RAW_CACHE_TTL);
-       return rawObjects;
+      _chunkAndPut(cacheKey, JSON.stringify(rawObjects), BPO_RAW_CACHE_TTL);
+      return rawObjects;
     }
-  } catch (e) {}
+  } catch (e) { }
   return null;
 }
 
@@ -866,15 +895,15 @@ function _getConfigPresetRuns(ss) {
   const CONFIG_HEADERS = ['bp_type_id', 'preset_runs'];
   const presetMap = new Map();
   const sheet = getOrCreateSheet(ss, CONFIG_NAME, CONFIG_HEADERS);
-  
+
   if (sheet.getLastRow() >= 2) {
-    const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const col = _getColIndexMap(headers, CONFIG_HEADERS);
-    const data = sheet.getRange(2,1,sheet.getLastRow()-1, sheet.getLastColumn()).getValues();
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
     data.forEach(r => {
       const id = Number(r[col.bp_type_id]);
       const runs = Number(r[col.preset_runs]);
-      if(id>0 && runs>0) presetMap.set(id, runs);
+      if (id > 0 && runs > 0) presetMap.set(id, runs);
     });
   }
   return presetMap;
@@ -893,10 +922,10 @@ function resetIndustryLedgerProperties() {
   props.deleteProperty(INDUSTRY_JOB_KEY);
   props.deleteProperty(BPC_JOB_KEY);
   props.deleteProperty(BPC_WAC_KEY);
-  
+
   // ADD THIS LINE:
-  props.deleteProperty('BpcHistoryData'); 
-  
+  props.deleteProperty('BpcHistoryData');
+
   console.log("Industry Ledger Properties Reset.");
 }
 
@@ -909,52 +938,52 @@ function resetIndustryLedgerProperties() {
  * @customfunction
  */
 function GESI_CORP_JOBS_CACHED(name, include_completed) {
-    // NOTE: GLOBAL_STATE_KEY must be accessible. Assuming it's defined elsewhere.
-    const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
-    
-    // START LOGGING & PARAM CHECK
-    Logger.log(`[CIJ_SHEET] START: Name='${name}', Completed=${include_completed}`);
+  // NOTE: GLOBAL_STATE_KEY must be accessible. Assuming it's defined elsewhere.
+  const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
 
-    if (!name) {
-        Logger.log('[CIJ_SHEET] FAIL: Name is missing.');
-        return [['Error: Auth name required']];
+  // START LOGGING & PARAM CHECK
+  Logger.log(`[CIJ_SHEET] START: Name='${name}', Completed=${include_completed}`);
+
+  if (!name) {
+    Logger.log('[CIJ_SHEET] FAIL: Name is missing.');
+    return [['Error: Auth name required']];
+  }
+
+  // ROBUST MAINTENANCE CHECK
+  const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
+
+  if (systemState === 'MAINTENANCE') {
+    Logger.log(`[CIJ_SHEET] ABORT: System is in MAINTENANCE mode.`);
+    return [['MAINTENANCE_ACTIVE']];
+  }
+
+  // 1. Fetch data from the *shared* cache handled by _getCorporateJobsRaw.
+  // NOTE: We pass 'false' to force the helper to read from the cache only (no live API call).
+  const rawData = _getCorporateJobsRaw(false);
+
+  if (!rawData || rawData.length === 0) {
+    Logger.log('[CIJ_SHEET] WARN: No data found in shared cache. Returning cache instruction.');
+    return [['DATA_NOT_CACHED'], ['Run Industry Ledger script to refresh cache.']];
+  }
+
+  // 2. Format output for Google Sheets (array of objects -> array of arrays).
+  try {
+    const headerRow = Object.keys(rawData[0] || {});
+
+    if (headerRow.length === 0) {
+      Logger.log('[CIJ_SHEET] ERROR: Raw data object structure is invalid (no headers).');
+      return [['ERROR: Invalid Data Structure']];
     }
-    
-    // ROBUST MAINTENANCE CHECK
-    const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
 
-    if (systemState === 'MAINTENANCE') {
-        Logger.log(`[CIJ_SHEET] ABORT: System is in MAINTENANCE mode.`);
-        return [['MAINTENANCE_ACTIVE']];
-    }
-    
-    // 1. Fetch data from the *shared* cache handled by _getCorporateJobsRaw.
-    // NOTE: We pass 'false' to force the helper to read from the cache only (no live API call).
-    const rawData = _getCorporateJobsRaw(false); 
+    // Map the array of objects to an array of arrays for sheet compatibility
+    const values = rawData.map(obj => headerRow.map(key => obj[key]));
 
-    if (!rawData || rawData.length === 0) {
-        Logger.log('[CIJ_SHEET] WARN: No data found in shared cache. Returning cache instruction.');
-        return [['DATA_NOT_CACHED'], ['Run Industry Ledger script to refresh cache.']];
-    }
+    Logger.log(`[CIJ_SHEET] SUCCESS: Returning ${values.length} jobs.`);
 
-    // 2. Format output for Google Sheets (array of objects -> array of arrays).
-    try {
-        const headerRow = Object.keys(rawData[0] || {});
-        
-        if (headerRow.length === 0) {
-            Logger.log('[CIJ_SHEET] ERROR: Raw data object structure is invalid (no headers).');
-            return [['ERROR: Invalid Data Structure']];
-        }
-
-        // Map the array of objects to an array of arrays for sheet compatibility
-        const values = rawData.map(obj => headerRow.map(key => obj[key]));
-
-        Logger.log(`[CIJ_SHEET] SUCCESS: Returning ${values.length} jobs.`);
-
-        // Return the headers and the values
-        return [headerRow, ...values];
-    } catch (e) {
-        Logger.log(`[CIJ_SHEET] ERROR: Formatting failed: ${e.message}`);
-        return [['ERROR', `Formatting failed: ${e.message}`]];
-    }
+    // Return the headers and the values
+    return [headerRow, ...values];
+  } catch (e) {
+    Logger.log(`[CIJ_SHEET] ERROR: Formatting failed: ${e.message}`);
+    return [['ERROR', `Formatting failed: ${e.message}`]];
+  }
 }
