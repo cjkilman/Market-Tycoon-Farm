@@ -1238,13 +1238,8 @@ function emergencyPropertyCleanup() {
   console.log(`✅ Cleanup Complete. Deleted ${shards.length} property shards. Quota restored.`);
 }
 
-/** ===== JOURNAL -> Material_Ledger & Sales_Ledger (Symmetric Ping-Pong Cache) =====================
- * Imports corporate market transactions for Division 3.
- * Refactored to use Utility.js for cache management.
- */
 function Ledger_Import_CorpJournal(ss, opts) {
   const log = LoggerEx.withTag('CORP_TXN');
-  const t = log.startTimer('Ledger_Import_CorpJournal_Setup');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
   // --- CONFIGURATION ---
@@ -1252,14 +1247,15 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS';
   const CACHE_KEY_BUYS  = 'CORP_JOURNAL_HANDOFF_BUYS';
   const CACHE_KEY_ANCHOR = 'CORP_JOURNAL_HANDOFF_ANCHOR';
-  const LAST_ID_KEY = 'CORP_JOURNAL_LAST_TRANSACTION_ID';
   
-  // 60 Minutes Cache (Survives the 30 Minute wait)
+  // Independent Persistent Anchors
+  const LAST_ID_BUYS = 'CORP_JOURNAL_LAST_ID_BUYS';
+  const LAST_ID_SELLS = 'CORP_JOURNAL_LAST_ID_SELLS';
+  
   const CACHE_TTL = 3600; 
 
   opts = opts || {};
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-
   const GESI_FUNC_NAME = 'corporations_corporation_wallets_division_transactions';
   const SOURCE_NAME = String(opts.sourceName || 'JOURNAL').toUpperCase();
   const SINCE_DAYS = Math.max(0, Number(opts.sinceDays || 30));
@@ -1268,95 +1264,71 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const TARGET_DIVISION = 3;
   const authToon = getCorpAuthChar(ss);
 
-  // Load Anchor
-  const rawFromId = SCRIPT_PROP.getProperty(LAST_ID_KEY);
-  let currentFromId = null;
-  if (rawFromId && !isNaN(rawFromId)) currentFromId = Number(rawFromId);
-
-  // Load Phase
   let currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
   log.info(`Starting Corp Journal Import. Current Phase: ${currentPhase}`);
-
-  // Setup Ledgers
-  const MaterialLedger = ML.forSheet('Material_Ledger'); // Buys go here
-  const SalesLedger = ML.forSheet('Sales_Ledger');       // Sells go here
   
-  // Select Active Ledger based on Phase
+  // Load the anchor specific to the current phase's ledger
+  const persistentAnchorKey = (currentPhase === 'BUYS') ? LAST_ID_BUYS : LAST_ID_SELLS;
+  const rawFromId = SCRIPT_PROP.getProperty(persistentAnchorKey);
+  let currentFromId = (rawFromId && !isNaN(rawFromId)) ? Number(rawFromId) : null;
+
+  const MaterialLedger = ML.forSheet('Material_Ledger');
+  const SalesLedger = ML.forSheet('Sales_Ledger');
   const activeLedger = (currentPhase === 'BUYS') ? MaterialLedger : SalesLedger;
 
-  // --- VARIABLES ---
-  let targetRows = []; // The rows we want to process NOW
+  let targetRows = [];
   let newestTransactionId = null;
   let dataLoadedFromCache = false;
 
-  // =========================================================================
-  // LOGIC BLOCK 1: CHECK CACHE (Using Utility.js)
-  // =========================================================================
-  if (currentPhase === 'BUYS') {
-    // Phase 1: Did Phase 2 leave us a gift?
-    const cachedBuys = _getAndDechunk(CACHE_KEY_BUYS);
-    if (cachedBuys) {
-      log.info(`[CACHE HIT] Found cached BUY rows from previous run.`);
-      targetRows = JSON.parse(cachedBuys);
-      dataLoadedFromCache = true;
-      
-      const cachedAnchor = _getAndDechunk(CACHE_KEY_ANCHOR);
-      if (cachedAnchor) newestTransactionId = cachedAnchor;
-    }
-  } else {
-    // Phase 2: Did Phase 1 leave us a gift?
-    const cachedSells = _getAndDechunk(CACHE_KEY_SELLS);
-    if (cachedSells) {
-      log.info(`[CACHE HIT] Found cached SELL rows from previous run.`);
-      targetRows = JSON.parse(cachedSells);
-      dataLoadedFromCache = true;
-      
-      const cachedAnchor = _getAndDechunk(CACHE_KEY_ANCHOR);
-      if (cachedAnchor) newestTransactionId = cachedAnchor;
-    }
+  // --- LOGIC BLOCK 1: CHECK CACHE ---
+  const handoffKey = (currentPhase === 'BUYS') ? CACHE_KEY_BUYS : CACHE_KEY_SELLS;
+  const cachedData = _getAndDechunk(handoffKey);
+  if (cachedData) {
+    log.info(`[CACHE HIT] Found cached ${currentPhase} rows from previous run.`);
+    targetRows = JSON.parse(cachedData);
+    dataLoadedFromCache = true;
+    const cachedAnchor = _getAndDechunk(CACHE_KEY_ANCHOR);
+    if (cachedAnchor) newestTransactionId = cachedAnchor;
   }
 
-  // =========================================================================
-  // LOGIC BLOCK 2: FRESH FETCH (IF CACHE MISSED)
-  // =========================================================================
+  // --- LOGIC BLOCK 2: FRESH FETCH (ON CACHE MISS) ---
   if (!dataLoadedFromCache) {
     log.warn(`[CACHE MISS] Fetching fresh data from ESI for Phase: ${currentPhase}`);
-
     let allCorpTransactions = [];
     let fetchMore = true;
-    let tempFromId = currentFromId;
+    let tempFromId = null; 
 
-    // --- A. THE FETCH LOOP ---
     do {
       try {
         const rawEntries = GESI.invokeRaw(GESI_FUNC_NAME, {
-            division: TARGET_DIVISION, from_id: tempFromId, name: authToon,
-            show_column_headings: false, version: null
+            division: TARGET_DIVISION, 
+            from_id: tempFromId, 
+            name: authToon,
+            show_column_headings: false, 
+            version: null
         });
 
         if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
           fetchMore = false; break;
         }
 
-        allCorpTransactions.push(...rawEntries);
-        const oldestEntry = rawEntries[rawEntries.length - 1];
-        const oldestDate = new Date(oldestEntry.date);
-        
-        // Safety Check: Infinite Loops
-        if (tempFromId && tempFromId === oldestEntry.transaction_id) {
-           fetchMore = false; break;
+        let reachedAnchor = false;
+        for (const entry of rawEntries) {
+          if (currentFromId && entry.transaction_id <= currentFromId) {
+            reachedAnchor = true;
+            break;
+          }
+          allCorpTransactions.push(entry);
         }
 
-        if (oldestDate.getTime() < cutoff.getTime()) {
+        if (reachedAnchor || rawEntries.length < 100) {
            fetchMore = false;
         } else {
-           tempFromId = oldestEntry.transaction_id;
+           tempFromId = rawEntries[rawEntries.length - 1].transaction_id;
         }
         Utilities.sleep(50);
       } catch (e) {
-        // Force the error to reveal its secrets
-        const msg = e.message || JSON.stringify(e);
-        log.error("ESI Fetch Error: " + msg);
+        log.error("ESI Fetch Error: " + e.message);
         fetchMore = false;
       }
     } while (fetchMore);
@@ -1365,7 +1337,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
       newestTransactionId = String(allCorpTransactions[0].transaction_id);
     }
 
-    // --- B. PARSE INTO BUYS AND SELLS (FIXED MATH) ---
+    // --- PARSE INTO BUYS AND SELLS ---
     const freshBuys = [];
     const freshSells = [];
 
@@ -1374,25 +1346,13 @@ function Ledger_Import_CorpJournal(ss, opts) {
       if (isNaN(d.getTime()) || d.getTime() < cutoff.getTime()) continue;
 
       const isBuy = e.is_buy === true;
-      const qty = Math.abs(Number(e.quantity || 1)); // Ensure positive quantity for division
-
-      // --- MATH FIX: Calculate Unit Value Safely ---
-      // 1. Try explicit unit_price from ESI.
-      // 2. If missing, fall back to total price / quantity.
-      let finalUnitValue = Number(e.unit_price);
-      
-      if (isNaN(finalUnitValue) || finalUnitValue === 0) {
-          // Fallback: If 'price' or 'amount' represents the TOTAL
-          // Note: ESI market transactions usually provide unit_price, but journal provides amount
-          // This ensures we handle both shapes if the parser changes.
-          const totalAmount = Number(e.price || e.amount || 0);
-          finalUnitValue = Math.abs(totalAmount) / qty;
-      }
+      const qty = Math.abs(Number(e.quantity || 1));
+      const finalUnitValue = Number(e.unit_price || 0);
 
       const row = {
         date: d,
         type_id: Number(e.type_id || 0),
-        qty: isBuy ? qty : -qty, // Positive for Buy (Stock IN), Negative for Sell (Stock OUT)
+        qty: isBuy ? qty : -qty,
         unit_value: '',
         source: SOURCE_NAME,
         contract_id: String(e.transaction_id || e.id),
@@ -1403,10 +1363,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
       if (isBuy) freshBuys.push(row); else freshSells.push(row);
     }
 
-    // --- C. DISTRIBUTE & CACHE (THE PING PONG) ---
-    // Using Utility._chunkAndPut for safe storage
     if (currentPhase === 'BUYS') {
-      // Phase 1: Eat Buys, Cache Sells
       targetRows = freshBuys;
       if (freshSells.length > 0) {
         log.info(`Caching ${freshSells.length} SELL rows for Phase 2.`);
@@ -1414,7 +1371,6 @@ function Ledger_Import_CorpJournal(ss, opts) {
         if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
       }
     } else {
-      // Phase 2: Eat Sells, Cache Buys
       targetRows = freshSells;
       if (freshBuys.length > 0) {
         log.info(`Caching ${freshBuys.length} BUY rows for next Phase 1.`);
@@ -1424,25 +1380,18 @@ function Ledger_Import_CorpJournal(ss, opts) {
     }
   }
 
-  // =========================================================================
-  // LOGIC BLOCK 3: ATOMIC WRITE & PHASE FLIP
-  // =========================================================================
+  // --- LOGIC BLOCK 3: WRITE & UPDATE ANCHOR ---
   if (targetRows.length > 0) {
     try {
-      // DEDUPLICATION CHECK (Optional but recommended)
-      // Since upsert handles updates by key, we rely on 'contract_id' being unique.
       const result = activeLedger.upsert(['contract_id'], targetRows);
+      log.info(`Phase ${currentPhase}: Processed ${result.rows} rows into ledger.`);
       
-      log.info(`Phase ${currentPhase}: Processed ${result.rows} rows into ${currentPhase === 'BUYS' ? 'Material_Ledger' : 'Sales_Ledger'}.`);
-      
-      // Update Anchor only if we processed new data
       if (newestTransactionId) {
-        SCRIPT_PROP.setProperty(LAST_ID_KEY, newestTransactionId);
+        SCRIPT_PROP.setProperty(persistentAnchorKey, newestTransactionId);
       }
-
     } catch (e) {
       log.error(`Ledger Write Failed: ${e.message}`);
-      throw e; // Don't flip phase if write fails!
+      return; // Stop here; don't flip phase if write fails
     }
   } else {
     log.info(`Phase ${currentPhase}: No rows to process.`);

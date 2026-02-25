@@ -310,10 +310,11 @@ function runMaintenanceJobs() {
   const STANDARD_INTERVAL = 3600000; // 60m default
   
   // 2. Job Registry with targeted intervals
-  const JOB_QUEUE = [
-    { name: 'generateFullBOMData', interval: 2700000, lease: 1200000 }, // 45m run / 20m lease
+const JOB_QUEUE = [
+    { name: 'generateFullBOMData', interval: 2700000, lease: 1200000 },
     { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
-    { name: 'Ledger_Import_CorpJournal', interval: 1800000 }, // 30m
+    { name: 'Ledger_Import_CorpJournal', interval: 1800000 },
+    { name: 'processInternalBuffer', interval: 600000 }, // <--- ADD THIS LINE (Every 10 mins)
     { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'runIndustryLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL }

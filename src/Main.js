@@ -410,20 +410,16 @@ function generateRestockItemsOnHand(ss) {
   const headers = rawDataValues[2]; 
   const rawData = rawDataValues.slice(3);
 
+  // MISSING FUNCTION ADDED HERE: Find column index by header name
+  const getIdx = (name) => headers.indexOf(name);
+
   const auditValues = auditSheet.getDataRange().getValues();
   const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), String(r[1]).toUpperCase() === 'TRUE']));
-
-  const getIdx = (name) => {
-    let i = headers.indexOf(name);
-    if (i === -1 && name === "Posted Sell Quantuty") i = headers.indexOf("Quantity Left");
-    if (i === -1 && name === "Acquisition (30d)") i = headers.indexOf("Acquisition Velocity (u/d)");
-    return i;
-  };
 
   const col = {
     item: getIdx("Item Name"),
     targetGoal: getIdx("Target"),
-    sellQty: getIdx("Posted Sell Quantuty"),
+    sellQty: getIdx("Posted Sell Quantuty"), // Matches your exact header spelling
     whQty: getIdx("Warehouse Qty"),
     effVel: getIdx("Effective Daily Velocity (u/d)"),
     hubSell: getIdx("Hub Sell Price"),
@@ -520,7 +516,6 @@ function generateRestockItemsOnHand(ss) {
 
   LOG.info(`Restock Table Cleansed: ${resultRows.length} items added (Saturated items purged).`);
 }
-
 
 function ON_SDE_START() {
   const ui = SpreadsheetApp.getUi();
