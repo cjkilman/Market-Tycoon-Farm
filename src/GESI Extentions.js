@@ -532,6 +532,7 @@ function getCharNamesFast() {
 
 // Resolve corp auth character (override -> GESI.name -> NamedRange/Utility -> first authed)
 function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
+  var log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('GESI') : console;
   // --- PHASE 1: FASTEST EXIT (In-Memory Cache / Persistent Property) ---
   if (_cachedAuthChar) {
     return _cachedAuthChar;
@@ -545,10 +546,16 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
     return persistedChar;
   }
 
+// --- CUSTOM FUNCTION SAFETY CHECK ---
   // If we are in a custom function and have no cache, DO NOT try the slow path.
-  // It will just cause the cell to stay on "Loading..."
-  if (!ss && typeof SpreadsheetApp !== 'undefined' && !SpreadsheetApp.getActiveRange()) {
-     return (GESI && GESI.name) || ''; 
+  if (!ss) {
+    try {
+      // This explicitly throws an error when run from a sheet cell
+      SpreadsheetApp.getActiveRange(); 
+    } catch (e) {
+      // The error proves we are in a custom function! Bail out fast.
+      return (GESI && GESI.name) || ''; 
+    }
   }
 
   // --- PHASE 2: EXPENSIVE RESOLUTION (Sheet I/O / API Calls) ---
@@ -563,7 +570,7 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
   const t = GESI_LOG.startTimer('getCorpAuthChar_SlowPath');
 
   try {
-    var log = LoggerEx.withTag('GESI');
+
     const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet(); // Fallback if ss is null/undefined
     log.info("Checking for Authized Corp Character (SLOW PATH)");
 
