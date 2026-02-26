@@ -104,19 +104,16 @@ var _cachedCharIdMap = null;
 
 function FORCE_RESET_CACHES() {
   const props = PropertiesService.getScriptProperties();
-
-  // 1. DELETE THE "CJ KILMAN" LOCK
-  // This forces lines 280-350 in your code to actually run again and read the sheet.
   props.deleteProperty('GESI_PERSISTED_CORP_AUTH_CHAR');
-
-  // 2. RESET THE JOURNAL ANCHORS
-  // This forces a fresh 30-day fetch instead of trying to resume from a broken point.
+  
+  // RESET ALL JOURNAL ANCHORS
   props.deleteProperty('CORP_JOURNAL_DIV_RESUME');
   props.deleteProperty('CORP_JOURNAL_LAST_TRANSACTION_ID');
-  props.deleteProperty('CORP_JOURNAL_PHASE'); // Resets the "Buy/Sell" Ping Pong phase
+  props.deleteProperty('CORP_JOURNAL_LAST_ID_BUYS');  // New
+  props.deleteProperty('CORP_JOURNAL_LAST_ID_SELLS'); // New
+  props.deleteProperty('CORP_JOURNAL_PHASE'); 
 
-  console.log("✅ CACHE FLUSHED.");
-  console.log("The system has forgotten 'CJ Kilman'. Next run will read 'Jason Kilman' from the sheet.");
+  console.log("✅ ALL CACHES AND ANCHORS FLUSHED.");
 }
 
 /**
@@ -902,6 +899,38 @@ function _normalizeCharContracts(res, names, idNameMap) { // NOTE: idNameMap is 
   return tuples;
 }
 
+/**
+ * Automatically sizes the Named Ranges to fit exactly the data present.
+ * Prevents "Infinite Range" lag while ensuring no data is left behind.
+ */
+function updateLedgerNamedRanges(ss) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const log = LoggerEx.withTag('NAMED_RANGES');
+
+  try {
+    // 1. Resize Sales Ledger
+    const salesSheet = ss.getSheetByName("Sales_Ledger");
+    if (salesSheet) {
+      const lastRow = Math.max(2, salesSheet.getLastRow()); 
+      // Assuming 9 columns (A through I)
+      const salesRange = salesSheet.getRange(2, 1, lastRow - 1, 9); 
+      ss.setNamedRange("NR_SALES_LEDGER", salesRange);
+    }
+
+    // 2. Resize Material Ledger
+    const matSheet = ss.getSheetByName("Material_Ledger");
+    if (matSheet) {
+      const lastRow = Math.max(2, matSheet.getLastRow());
+      const matRange = matSheet.getRange(2, 1, lastRow - 1, 9);
+      ss.setNamedRange("NR_MATERIAL_LEDGER", matRange);
+    }
+    
+    log.info("Ledger Named Ranges successfully snapped to exact data boundaries.");
+  } catch (e) {
+    log.error("Failed to update Named Ranges: " + e.message);
+  }
+}
+
 
 // Corp list: same mapping, but force auth name (corp lists usually lack char names)
 function _normalizeCorpContracts(res, corpAuthName) {
@@ -1242,16 +1271,14 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const log = LoggerEx.withTag('CORP_TXN');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  // --- CONFIGURATION ---
+  // --- CONFIGURATION (CACHE BUSTED) ---
   const PHASE_KEY = 'CORP_JOURNAL_PHASE';
-  const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS';
-  const CACHE_KEY_BUYS  = 'CORP_JOURNAL_HANDOFF_BUYS';
-  const CACHE_KEY_ANCHOR = 'CORP_JOURNAL_HANDOFF_ANCHOR';
+  const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS_V2'; 
+  const CACHE_KEY_BUYS  = 'CORP_JOURNAL_HANDOFF_BUYS_V2';  
+  const CACHE_KEY_ANCHOR = 'CORP_JOURNAL_HANDOFF_ANCHOR_V2';
   
-  // Independent Persistent Anchors
   const LAST_ID_BUYS = 'CORP_JOURNAL_LAST_ID_BUYS';
   const LAST_ID_SELLS = 'CORP_JOURNAL_LAST_ID_SELLS';
-  
   const CACHE_TTL = 3600; 
 
   opts = opts || {};
@@ -1267,7 +1294,6 @@ function Ledger_Import_CorpJournal(ss, opts) {
   let currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
   log.info(`Starting Corp Journal Import. Current Phase: ${currentPhase}`);
   
-  // Load the anchor specific to the current phase's ledger
   const persistentAnchorKey = (currentPhase === 'BUYS') ? LAST_ID_BUYS : LAST_ID_SELLS;
   const rawFromId = SCRIPT_PROP.getProperty(persistentAnchorKey);
   let currentFromId = (rawFromId && !isNaN(rawFromId)) ? Number(rawFromId) : null;
@@ -1284,16 +1310,16 @@ function Ledger_Import_CorpJournal(ss, opts) {
   const handoffKey = (currentPhase === 'BUYS') ? CACHE_KEY_BUYS : CACHE_KEY_SELLS;
   const cachedData = _getAndDechunk(handoffKey);
   if (cachedData) {
-    log.info(`[CACHE HIT] Found cached ${currentPhase} rows from previous run.`);
+    log.info(`[CACHE HIT] Found cached ${currentPhase} rows.`);
     targetRows = JSON.parse(cachedData);
     dataLoadedFromCache = true;
     const cachedAnchor = _getAndDechunk(CACHE_KEY_ANCHOR);
     if (cachedAnchor) newestTransactionId = cachedAnchor;
   }
 
-  // --- LOGIC BLOCK 2: FRESH FETCH (ON CACHE MISS) ---
+  // --- LOGIC BLOCK 2: FRESH FETCH ---
   if (!dataLoadedFromCache) {
-    log.warn(`[CACHE MISS] Fetching fresh data from ESI for Phase: ${currentPhase}`);
+    log.warn(`[CACHE MISS] Fetching fresh ESI data for Phase: ${currentPhase}`);
     let allCorpTransactions = [];
     let fetchMore = true;
     let tempFromId = null; 
@@ -1301,31 +1327,31 @@ function Ledger_Import_CorpJournal(ss, opts) {
     do {
       try {
         const rawEntries = GESI.invokeRaw(GESI_FUNC_NAME, {
-            division: TARGET_DIVISION, 
-            from_id: tempFromId, 
-            name: authToon,
-            show_column_headings: false, 
-            version: null
+            division: TARGET_DIVISION, from_id: tempFromId, name: authToon,
+            show_column_headings: false, version: null
         });
-
-        if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
-          fetchMore = false; break;
-        }
+        if (!Array.isArray(rawEntries) || rawEntries.length === 0) break;
 
         let reachedAnchor = false;
         for (const entry of rawEntries) {
+          // Stop if we hit the anchor
           if (currentFromId && entry.transaction_id <= currentFromId) {
             reachedAnchor = true;
             break;
           }
+          // Stop if we hit data older than our 30-day cutoff limit
+          const entryDate = new Date(entry.date);
+          if (entryDate.getTime() < cutoff.getTime()) {
+            reachedAnchor = true;
+            break; 
+          }
+          
           allCorpTransactions.push(entry);
         }
-
-        if (reachedAnchor || rawEntries.length < 100) {
-           fetchMore = false;
-        } else {
-           tempFromId = rawEntries[rawEntries.length - 1].transaction_id;
-        }
+        
+        if (reachedAnchor || rawEntries.length < 100) fetchMore = false;
+        else tempFromId = rawEntries[rawEntries.length - 1].transaction_id;
+        
         Utilities.sleep(50);
       } catch (e) {
         log.error("ESI Fetch Error: " + e.message);
@@ -1337,7 +1363,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
       newestTransactionId = String(allCorpTransactions[0].transaction_id);
     }
 
-    // --- PARSE INTO BUYS AND SELLS ---
+    // --- PARSING LOGIC ---
     const freshBuys = [];
     const freshSells = [];
 
@@ -1347,7 +1373,12 @@ function Ledger_Import_CorpJournal(ss, opts) {
 
       const isBuy = e.is_buy === true;
       const qty = Math.abs(Number(e.quantity || 1));
-      const finalUnitValue = Number(e.unit_price || 0);
+      let finalUnitValue = Number(e.unit_price);
+      
+      if (isNaN(finalUnitValue) || finalUnitValue === 0) {
+          const totalAmount = Number(e.price || e.amount || 0);
+          finalUnitValue = Math.abs(totalAmount) / qty;
+      }
 
       const row = {
         date: d,
@@ -1366,14 +1397,12 @@ function Ledger_Import_CorpJournal(ss, opts) {
     if (currentPhase === 'BUYS') {
       targetRows = freshBuys;
       if (freshSells.length > 0) {
-        log.info(`Caching ${freshSells.length} SELL rows for Phase 2.`);
         _chunkAndPut(CACHE_KEY_SELLS, JSON.stringify(freshSells), CACHE_TTL);
         if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
       }
     } else {
       targetRows = freshSells;
       if (freshBuys.length > 0) {
-        log.info(`Caching ${freshBuys.length} BUY rows for next Phase 1.`);
         _chunkAndPut(CACHE_KEY_BUYS, JSON.stringify(freshBuys), CACHE_TTL);
         if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
       }
@@ -1384,23 +1413,22 @@ function Ledger_Import_CorpJournal(ss, opts) {
   if (targetRows.length > 0) {
     try {
       const result = activeLedger.upsert(['contract_id'], targetRows);
-      log.info(`Phase ${currentPhase}: Processed ${result.rows} rows into ledger.`);
-      
+      log.info(`Phase ${currentPhase}: Processed ${result.rows} rows.`);
       if (newestTransactionId) {
         SCRIPT_PROP.setProperty(persistentAnchorKey, newestTransactionId);
       }
     } catch (e) {
       log.error(`Ledger Write Failed: ${e.message}`);
-      return; // Stop here; don't flip phase if write fails
+      return;
     }
-  } else {
-    log.info(`Phase ${currentPhase}: No rows to process.`);
   }
 
-  // FLIP PHASE FOR NEXT RUN
+// >>> ADD THIS LINE RIGHT HERE <<<
+  updateLedgerNamedRanges(ss);
+
   const nextPhase = (currentPhase === 'BUYS') ? 'SELLS' : 'BUYS';
   SCRIPT_PROP.setProperty(PHASE_KEY, nextPhase);
-  log.info(`Phase Complete. Switched to ${nextPhase} for next execution.`);
+  log.info(`Phase Complete. Switched to ${nextPhase}.`);
 }
 
 

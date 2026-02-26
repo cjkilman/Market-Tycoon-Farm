@@ -237,10 +237,8 @@ function generateRestockQuery(ss, fullData) {
 
 
 /**
- * Generates List for Dumping Profitable Overstocks to Buy Ordwers
- * OPTIMIZED: generateDumpToBuyOrder(ss)
+ * Generates List for Dumping Profitable Overstocks to Buy Orders
  * Purpose: Strategic Liquidation with Column D "Replacement NOW", Header Fix, and Zero-Masking.
- * Layout: C: Item | D: Build Now | E: Eff Cost | F: Median Buy | G: Margin | H: Qty | I: Total ISK
  */
 function generateDumpToBuyOrder(ss) {
   const TARGET_SHEET = 'Dump to Buy';
@@ -253,6 +251,10 @@ function generateDumpToBuyOrder(ss) {
   const corpOrdersSheet = ss.getSheetByName(CORP_ORDERS_SHEET);
 
   if (!sheet || !dataSheet) return;
+
+  // --- HELPER: Clean Number Parser ---
+  // This prevents the "toFixed is not a function" error when the sheet passes text
+  const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
 
   // --- 1. TAX & BROKER FEE ---
   let rateMultiplier = 1.046;
@@ -281,7 +283,7 @@ function generateDumpToBuyOrder(ss) {
 
     for (let i = 2; i < corpData.length; i++) {
       if (corpData[i][bIdx] === true || corpData[i][bIdx] === "TRUE") {
-        corpBuyPrices.add(`${corpData[i][tIdx]}_${parseFloat(corpData[i][pIdx]).toFixed(2)}`);
+        corpBuyPrices.add(`${corpData[i][tIdx]}_${clean(corpData[i][pIdx]).toFixed(2)}`);
       }
     }
   }
@@ -320,16 +322,17 @@ function generateDumpToBuyOrder(ss) {
     const group = String(r[col.group] || "").toLowerCase().trim();
     if (!showAll && group !== filterGroupName) continue;
 
-    const daysOfInv = r[col.daysInv] || 0;
+    const daysOfInv = clean(r[col.daysInv]);
     if (daysOfInv < filterMinDays) continue;
 
-    const hubBuy = r[col.medianBuy] || 0;
+    // FIX: Using clean() prevents the crash
+    const hubBuy = clean(r[col.medianBuy]);
     if (hubBuy < MIN_VALID_COST) continue;
 
     if (corpBuyPrices.has(`${r[col.id]}_${hubBuy.toFixed(2)}`)) continue;
 
-    const effCost = r[col.effCost] || 0;
-    const buildNow = r[col.buildNow] || 0;
+    const effCost = clean(r[col.effCost]);
+    const buildNow = clean(r[col.buildNow]);
 
     // Reality Floor Logic
     let realityFloor = 0;
@@ -345,11 +348,11 @@ function generateDumpToBuyOrder(ss) {
     const margin = (netProceeds - realityFloor) / realityFloor;
 
     if (margin >= filterMinMargin) {
-      const qty = r[col.whQty] || 0;
+      const qty = clean(r[col.whQty]);
       if (qty > 0) {
         dumpResults.push([
           name,
-          buildNow <= 0 ? "" : buildNow, // READABILITY: Mask zero build costs as blank
+          buildNow <= 0 ? "" : buildNow, 
           effCost,
           hubBuy,
           margin,
@@ -378,10 +381,6 @@ function generateDumpToBuyOrder(ss) {
 }
 
 
-/**
- * REFINED: generateRestockItemsOnHand(ss)
- * HARD FILTER: Explicitly excludes "SATURATED" and "SKIP" items from the freighter list.
- */
 function generateRestockItemsOnHand(ss) {
   const TARGET_SHEET = 'Restock Items On Hand';
   const DATA_SHEET = 'MarketOverviewData';
@@ -398,32 +397,33 @@ function generateRestockItemsOnHand(ss) {
 
   const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
 
-  // --- 1. SETTINGS ---
+  // --- 1. SETTINGS & THRESHOLDS ---
   const bCol = sheet.getRange("A1:B45").getValues();
   const seedDays = clean(bCol[39][0]) || 4; 
-  const minROI = clean(bCol[8][1]);         
-  const minOrderValue = 1000000;
-  const priceDeviationPct = clean(sheet.getRange("A6").getValue());
+  const minROI = clean(bCol[8][1]) || 0;         
+  const minOrderValue = 1000000; // 1M ISK Floor
+  const priceDeviationPct = clean(sheet.getRange("A6").getValue()) || 0;
 
-  // --- 2. LOAD DATA ---
+  // --- 2. BATCH LOAD DATA ---
   const rawDataValues = dataSheet.getDataRange().getValues();
   const headers = rawDataValues[2]; 
   const rawData = rawDataValues.slice(3);
 
-  // MISSING FUNCTION ADDED HERE: Find column index by header name
   const getIdx = (name) => headers.indexOf(name);
 
+  // FIX: String-Safe Audit Map (Converts text "TRUE" to actual true)
   const auditValues = auditSheet.getDataRange().getValues();
   const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), String(r[1]).toUpperCase() === 'TRUE']));
 
   const col = {
     item: getIdx("Item Name"),
     targetGoal: getIdx("Target"),
-    sellQty: getIdx("Posted Sell Quantuty"), // Matches your exact header spelling
+    sellQty: getIdx("Posted Sell Quantuty"), 
     whQty: getIdx("Warehouse Qty"),
     effVel: getIdx("Effective Daily Velocity (u/d)"),
     hubSell: getIdx("Hub Sell Price"),
     sellAct: getIdx("Sell Action"),
+    customPrice: getIdx("Custom Price"), // BOT DEFENSE MAP
     hubBuy: getIdx("Hub Buy Price"),
     mktQty: getIdx("Total Market Quantity"),
     effCost: getIdx("Effective Cost"),
@@ -431,36 +431,35 @@ function generateRestockItemsOnHand(ss) {
   };
 
   const OUT_HEADERS = [
-    ["Item Name", "Posting Price", "Hub Sell Price", "Quantity", "Total Value", "Delta Sell", "Delta Buy",
+    "Item Name", "Posting Price", "Hub Sell Price", "Quantity", "Total Value", "Delta Sell", "Delta Buy",
     "Warehouse Level", "Pending Orders", "Total Market Quantity", "Warehouse Qty", "Acquisition (30d)",
     "Effective Daily Velocity (u/d)", "30-day traded volume", "Listed Volume (Feed Sell)",
-    "Feed Days of Book", "Hub Median Buy", "Effective Cost", "Sell Action", "Buy Action", "Sell Quantity"]
+    "Feed Days of Book", "Hub Median Buy", "Effective Cost", "Sell Action", "Buy Action", "Sell Quantity"
   ];
 
   let resultRows = [];
 
-  // --- 3. LOGIC LOOP ---
+  // --- 3. MAIN PROCESSING LOOP ---
   for (let r of rawData) {
     const rawName = String(r[col.item] || "");
     if (!rawName) continue;
 
     const action = String(r[col.sellAct] || "").toUpperCase();
     
-    // --- THE HARD GATE: EXIT ON SATURATED OR SKIP ---
-    // If the Overview has already flagged this as Saturated, we don't even look at the numbers.
+    // HARD GATE: Exit on Saturated/Skip
     if (action.includes("SATURATED") || action.includes("SKIP") || action.includes("HOLD") || action.includes("IGNORE")) {
       continue;
     }
+
+    // HARD GATE: Audit Sheet Safety Check
+    if (auditMap.get(rawName) !== true) continue;
 
     const warehouseStock = clean(r[col.whQty]);
     const currentMarket = clean(r[col.sellQty]);
     const velocity = clean(r[col.effVel]);
     const targetGoal = clean(r[col.targetGoal]);
 
-    // Audit Bypass: Only proceed if the item passes the Audit sheet check.
-    if (auditMap.get(rawName) !== true) continue;
-
-    // --- QUANTITY CALCULATION ---
+    // Calculate Restock Quantity
     let targetNeeded = velocity * seedDays;
     if (targetGoal > 0) targetNeeded = Math.min(targetNeeded, targetGoal);
 
@@ -469,18 +468,27 @@ function generateRestockItemsOnHand(ss) {
 
     if (finalQuantity <= 0) continue;
 
-    // --- PRICING ---
-    const hubSell = clean(r[col.hubSell]);
-    const baseCost = clean(r[col.effCost]) || clean(r[col.mfgCost]);
-    let undercutPrice = hubSell * (1 - priceDeviationPct);
-    const floorPrice = baseCost * (1 + minROI);
-    let postPrice = Math.max(undercutPrice, floorPrice);
-    postPrice = Math.round(postPrice * 100) / 100;
-
-    const totalOrderValue = finalQuantity * postPrice;
+    // --- PRICING & BOT DEFENSE ---
+    let postPrice = 0;
+    const manualPrice = clean(r[col.customPrice]);
+    const hubSell = clean(r[col.hubSell]); 
+    const baseCost = clean(r[col.effCost]) || clean(r[col.mfgCost]); 
     
-    // Value Threshold check
-    if (totalOrderValue < minOrderValue && currentMarket !== 0) continue;
+    if (manualPrice > 0) {
+      // Use Custom Price (Ignores Bots)
+      postPrice = manualPrice;
+    } else {
+      // Normal Undercut vs Floor logic
+      let undercutPrice = hubSell * (1 - priceDeviationPct);
+      const floorPrice = baseCost * (1 + minROI);
+      postPrice = Math.max(undercutPrice, floorPrice);
+    }
+    
+    postPrice = Math.round(postPrice * 100) / 100;
+    const totalOrderValue = finalQuantity * postPrice; 
+    
+    // FIX: 1 Million ISK Threshold (Custom Priced items bypass this!)
+    if (manualPrice <= 0 && totalOrderValue < minOrderValue && currentMarket !== 0) continue;
 
     resultRows.push([
       rawName, postPrice, hubSell, finalQuantity, totalOrderValue,
@@ -492,29 +500,19 @@ function generateRestockItemsOnHand(ss) {
     ]);
   }
 
-  // --- 4. OUTPUT ---
-  const lastRowWithData = sheet.getLastRow();
-  if (lastRowWithData >= 3) {
-    sheet.getRange(3, 3, lastRowWithData, 21).clearContent();
+  // --- 4. BATCH CLEAR AND WRITE ---
+  const maxRows = Math.max(1, sheet.getLastRow());
+  if (maxRows >= 3) {
+    sheet.getRange(3, 3, maxRows, 21).clearContent();
   }
   
-  sheet.getRange(3, 3, 1, 21).setValues(OUT_HEADERS).setFontWeight("bold");
+  sheet.getRange(3, 3, 1, 21).setValues([OUT_HEADERS]).setFontWeight("bold");
 
   if (resultRows.length > 0) {
     sheet.getRange(4, 3, resultRows.length, 21).setValues(resultRows);
-    sheet.getRange(4, 4, resultRows.length, 2).setNumberFormat("#,##0.00 \"ISK\""); 
-    sheet.getRange(4, 7, resultRows.length, 1).setNumberFormat("#,##0.00 \"ISK\""); 
-    sheet.getRange(4, 20, resultRows.length, 1).setNumberFormat("#,##0.00 \"ISK\""); 
+  } else {
+    LOG.info("Restock Sheet Blanked: All items filtered out by Audit, Saturated tags, or ISK thresholds.");
   }
-
-  // Trim rows to prevent sheet bloat/lag
-  const maxRows = sheet.getMaxRows();
-  const endRow = resultRows.length + 5; 
-  if (maxRows > endRow && endRow > 10) {
-      sheet.deleteRows(endRow + 1, maxRows - endRow);
-  }
-
-  LOG.info(`Restock Table Cleansed: ${resultRows.length} items added (Saturated items purged).`);
 }
 
 function ON_SDE_START() {

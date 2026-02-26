@@ -38,6 +38,64 @@ const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
 // ... [Keep scheduleOneTimeTrigger, deleteTriggersByName, _resetMarketDataJobState unchanged] ...
 // (Assumed lines 35-100 are standard helpers)
 
+
+/**
+ * Replaces IMPORTRANGE. Fetches static market prices from the external hub.
+ * This completely kills the continuous recalculation loop caused by live linking.
+ */
+function fetchFilteredPricesSync(ss) {
+  const LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PRICE_SYNC') : console;
+  
+  // --- CONFIGURATION ---
+  const SOURCE_SHEET_ID = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
+  const SOURCE_RANGE = "'filtered prices'!E7:L750";
+  const TARGET_SHEET_NAME = "market price Tracker"; // Change to whatever you want
+  
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  try {
+    LOG.info("Connecting to external price database...");
+    
+    // 1. Fetch the data from the external sheet
+    const sourceBook = SpreadsheetApp.openById(SOURCE_SHEET_ID);
+    const rawValues = sourceBook.getRange(SOURCE_RANGE).getValues();
+    
+    if (!rawValues || rawValues.length === 0) {
+      LOG.warn("Fetch aborted: No data found in the source range.");
+      return;
+    }
+
+    // 2. Prepare the Target Sheet
+    let targetSheet = ss.getSheetByName(TARGET_SHEET_NAME);
+    if (!targetSheet) {
+      targetSheet = ss.insertSheet(TARGET_SHEET_NAME);
+      LOG.info(`Created new target sheet: ${TARGET_SHEET_NAME}`);
+    }
+
+    // 3. Optional: Filter out completely empty rows to save memory
+    // (Assuming Column A of the fetched data is the Item Name or ID)
+    const cleanValues = rawValues.filter(row => row[0] !== "" && row[0] != null);
+    const dataToWrite = cleanValues.length > 0 ? cleanValues : rawValues;
+
+    // 4. Wipe old data and write the fresh snapshot
+    targetSheet.clearContents(); // Clears everything for a fresh paste
+    targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length).setValues(dataToWrite);
+    
+    // 5. Trim excess rows (The same optimization you used in the ML Ledger)
+    const maxRows = targetSheet.getMaxRows();
+    if (maxRows > dataToWrite.length) {
+      targetSheet.deleteRows(dataToWrite.length + 1, maxRows - dataToWrite.length);
+    }
+    
+    LOG.info(`Price Sync Complete. Wrote ${dataToWrite.length} rows.`);
+    ss.toast("✅ External Prices Synced", "Engine Room", 3);
+
+  } catch (e) {
+    LOG.error("Failed to sync external prices: " + e.message);
+    ss.toast("❌ Price Sync Failed", "Engine Room Error");
+  }
+}
+
 /**
  * Helper to create a new one-time "retry" trigger.
  */
@@ -66,13 +124,13 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
  * Grabs Regional Pricing from Market Price Tracker.
  * ESI limits 1 type_ID per request so we keep it centralized for URL Fetch App
  */
-function syncESIRegionData() {
+function syncESIRegionData(ss) {
   const log = LoggerEx.withTag('REGION_SYNC');
   const sourceId = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
   const targetSheetName = "ESI_Region";
   const NAMED_RANGE_NAME = "ESI_Region_Data"; // Change this to your actual Named Range name
   
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const targetSheet = ss.getSheetByName(targetSheetName);
   
   if (!targetSheet) return;
@@ -571,7 +629,8 @@ function finalizeMarketDataUpdate() {
     let swapSuccess = (transactionResult.success && transactionResult.state.success);
 
     if (swapSuccess) {
-      syncESIRegionData();
+      fetchFilteredPricesSync(ss_inner)
+      syncESIRegionData(ss_inner);
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
 
