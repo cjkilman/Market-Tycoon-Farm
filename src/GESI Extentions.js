@@ -545,6 +545,12 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
     return persistedChar;
   }
 
+  // If we are in a custom function and have no cache, DO NOT try the slow path.
+  // It will just cause the cell to stay on "Loading..."
+  if (!ss && typeof SpreadsheetApp !== 'undefined' && !SpreadsheetApp.getActiveRange()) {
+     return (GESI && GESI.name) || ''; 
+  }
+
   // --- PHASE 2: EXPENSIVE RESOLUTION (Sheet I/O / API Calls) ---
   const SAFE_CONSOLE_SHIM = {
     log: console.log,
@@ -899,37 +905,7 @@ function _normalizeCharContracts(res, names, idNameMap) { // NOTE: idNameMap is 
   return tuples;
 }
 
-/**
- * Automatically sizes the Named Ranges to fit exactly the data present.
- * Prevents "Infinite Range" lag while ensuring no data is left behind.
- */
-function updateLedgerNamedRanges(ss) {
-  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  const log = LoggerEx.withTag('NAMED_RANGES');
 
-  try {
-    // 1. Resize Sales Ledger
-    const salesSheet = ss.getSheetByName("Sales_Ledger");
-    if (salesSheet) {
-      const lastRow = Math.max(2, salesSheet.getLastRow()); 
-      // Assuming 9 columns (A through I)
-      const salesRange = salesSheet.getRange(2, 1, lastRow - 1, 9); 
-      ss.setNamedRange("NR_SALES_LEDGER", salesRange);
-    }
-
-    // 2. Resize Material Ledger
-    const matSheet = ss.getSheetByName("Material_Ledger");
-    if (matSheet) {
-      const lastRow = Math.max(2, matSheet.getLastRow());
-      const matRange = matSheet.getRange(2, 1, lastRow - 1, 9);
-      ss.setNamedRange("NR_MATERIAL_LEDGER", matRange);
-    }
-    
-    log.info("Ledger Named Ranges successfully snapped to exact data boundaries.");
-  } catch (e) {
-    log.error("Failed to update Named Ranges: " + e.message);
-  }
-}
 
 
 // Corp list: same mapping, but force auth name (corp lists usually lack char names)
@@ -1423,8 +1399,6 @@ function Ledger_Import_CorpJournal(ss, opts) {
     }
   }
 
-// >>> ADD THIS LINE RIGHT HERE <<<
-  updateLedgerNamedRanges(ss);
 
   const nextPhase = (currentPhase === 'BUYS') ? 'SELLS' : 'BUYS';
   SCRIPT_PROP.setProperty(PHASE_KEY, nextPhase);

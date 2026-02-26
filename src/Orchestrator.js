@@ -45,21 +45,21 @@ const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
  */
 function fetchFilteredPricesSync(ss) {
   const LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PRICE_SYNC') : console;
-  
+
   // --- CONFIGURATION ---
   const SOURCE_SHEET_ID = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
   const SOURCE_RANGE = "'filtered prices'!E7:L750";
   const TARGET_SHEET_NAME = "market price Tracker"; // Change to whatever you want
-  
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  
+
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+
   try {
     LOG.info("Connecting to external price database...");
-    
+
     // 1. Fetch the data from the external sheet
     const sourceBook = SpreadsheetApp.openById(SOURCE_SHEET_ID);
     const rawValues = sourceBook.getRange(SOURCE_RANGE).getValues();
-    
+
     if (!rawValues || rawValues.length === 0) {
       LOG.warn("Fetch aborted: No data found in the source range.");
       return;
@@ -80,13 +80,13 @@ function fetchFilteredPricesSync(ss) {
     // 4. Wipe old data and write the fresh snapshot
     targetSheet.clearContents(); // Clears everything for a fresh paste
     targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length).setValues(dataToWrite);
-    
+
     // 5. Trim excess rows (The same optimization you used in the ML Ledger)
     const maxRows = targetSheet.getMaxRows();
     if (maxRows > dataToWrite.length) {
       targetSheet.deleteRows(dataToWrite.length + 1, maxRows - dataToWrite.length);
     }
-    
+
     LOG.info(`Price Sync Complete. Wrote ${dataToWrite.length} rows.`);
     ss.toast("✅ External Prices Synced", "Engine Room", 3);
 
@@ -129,23 +129,23 @@ function syncESIRegionData(ss) {
   const sourceId = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
   const targetSheetName = "ESI_Region";
   const NAMED_RANGE_NAME = "ESI_Region_Data"; // Change this to your actual Named Range name
-  
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const targetSheet = ss.getSheetByName(targetSheetName);
-  
+
   if (!targetSheet) return;
 
   try {
     const sourceData = SpreadsheetApp.openById(sourceId)
-                        .getSheetByName("Publish_ESI_Region_market_orders")
-                        .getDataRange()
-                        .getValues();
-    
+      .getSheetByName("Publish_ESI_Region_market_orders")
+      .getDataRange()
+      .getValues();
+
     // 1. CLEAR & WRITE
-    targetSheet.clearContents(); 
+    targetSheet.clearContents();
     const newRange = targetSheet.getRange(1, 1, sourceData.length, sourceData[0].length);
     newRange.setValues(sourceData);
-    
+
     // 2. UPDATE NAMED RANGE (The "Range Stretcher")
     // This tells the whole workbook exactly where the new data lives.
     ss.setNamedRange(NAMED_RANGE_NAME, newRange);
@@ -157,7 +157,7 @@ function syncESIRegionData(ss) {
     if (currentMax > lastRow) {
       targetSheet.deleteRows(lastRow + 1, currentMax - lastRow);
     }
-    
+
     log.info("ESI_Region: Sync & Named Range Update Complete.");
   } catch (e) {
     log.error("ESI_Region Sync Error: " + e.message);
@@ -355,7 +355,7 @@ function forceResetMaint() {
 
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  
+
   // 1. Priority Lock: Maintenance must yield to active Market Data syncs
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
   const manualSync = SCRIPT_PROP.getProperty('MANUAL_SYNC_ACTIVE');
@@ -366,9 +366,9 @@ function runMaintenanceJobs() {
 
   const NOW_MS = new Date().getTime();
   const STANDARD_INTERVAL = 3600000; // 60m default
-  
+
   // 2. Job Registry with targeted intervals
-const JOB_QUEUE = [
+  const JOB_QUEUE = [
     { name: 'generateFullBOMData', interval: 2700000, lease: 1200000 },
     { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
     { name: 'Ledger_Import_CorpJournal', interval: 1800000 },
@@ -404,14 +404,14 @@ const JOB_QUEUE = [
     // 4. Execution Logic
     if (isDue) {
       console.log(`[Maintenance] Dispatching: ${job.name}`);
-      
+
       if (job.lease) {
         SCRIPT_PROP.setProperty('BOM_MAINTENANCE_LEASE', (NOW_MS + job.lease).toString());
       }
 
       try {
         // Fallback check for function scope
-        const fn = this[job.name] || eval(job.name); 
+        const fn = this[job.name] || eval(job.name);
         if (typeof fn === 'function') {
           fn();
           SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
@@ -438,161 +438,175 @@ const JOB_QUEUE = [
 function updateMarketDataSheet() {
   if (isSdeJobRunning()) {
     console.warn("ABORT: SDE Update in progress. Parking Market Tycoon.");
-    return; 
+    return;
   }
 
   if (!isEngineRunning_()) {
     console.warn("ABORT: Engine is parked. Market Tycoon skipping fetch.");
     return;
   }
-  const START_TIME = new Date().getTime();
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  const PROP_KEY_STEP = 'marketDataJobStep';
-  const PROP_KEY_WRITE_INDEX = 'marketDataNextWriteRow';
-  const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize';
-  const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
-  const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS';
-
-  SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
-
-  const COLUMN_COUNT = 9;
-  const START_ROW = 2;
-  const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
-
-  var ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
-  const masterRequests = getMasterBatchFromControlTable(ss_anchor);
-
-  let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
-
-  // --- Phase 1: NEW_RUN (SURGICAL PAUSE) ---
-  if (currentStep === STATE_FLAGS.NEW_RUN || !masterRequests || masterRequests.length === 0) {
-    console.log(`State: ${STATE_FLAGS.NEW_RUN}.`);
-
-    if (!masterRequests || masterRequests.length === 0) {
-      _resetMarketDataJobState(new Error("Control Table empty"));
-      return;
-    }
-
-    const setupResult = guardedSheetTransaction(() => {
-      const result = prepareTempSheet(ss_anchor, tempSheetName, DATA_SHEET_HEADERS);
-      if (!result.success) {
-        throw new Error(result.error || "Unknown Prep Failure");
-      }
-      if (result.state) {
-        result.state.hideSheet();
-      }
-      return true;
-    }, 60000);
-
-    if (!setupResult.success) {
-      console.warn(`[Worker] Sheet prep failed: ${setupResult.error}`);
-      scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
-      return;
-    }
-
-    SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, '0');
-    SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
-    currentStep = 'PROCESSING';
-    SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'PROCESSING');
-
-    scheduleOneTimeTrigger('updateMarketDataSheet', 1000);
+  // --- THE BOUNCER: STRICT SCRIPT LOCK ---
+  // Prevents the Orchestrator "Nudge" and Time-Driven triggers from overlapping.
+  const scriptLock = LockService.getScriptLock();
+  if (!scriptLock.tryLock(1000)) { // Fail fast (1 second)
+    console.warn("ABORT: updateMarketDataSheet is already running. Bouncing overlapping trigger.");
     return;
   }
 
-  // --- Phase 2: WRITE (Nitro Mode - LIVE/UNPAUSED) ---
-  if (currentStep === 'PROCESSING' || currentStep === 'WRITE') {
+  try {
+    const START_TIME = new Date().getTime();
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-    const masterRequests_stable = getMasterBatchFromControlTable(ss_anchor);
-    let allRowsToWrite = [];
+    const PROP_KEY_STEP = 'marketDataJobStep';
+    const PROP_KEY_WRITE_INDEX = 'marketDataNextWriteRow';
+    const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize';
+    const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
+    const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS';
 
-    try {
-      const marketDataCrates = fuzAPI.getDataForRequests(masterRequests_stable);
-      const currentTimeStamp = new Date();
-      marketDataCrates.forEach(crate => {
-        if (crate && crate.fuzObjects) {
-          crate.fuzObjects.forEach(item => {
-            if (item && item.type_id != null) {
-              allRowsToWrite.push([
-                "", item.type_id,
-                crate.market_type || '', crate.market_id || '',
-                item.sell?.min ?? '', item.buy?.max ?? '',
-                item.sell?.volume ?? 0, item.buy?.volume ?? 0,
-                currentTimeStamp
-              ]);
-            }
-          });
-        }
-      });
+    SCRIPT_PROP.setProperty(PROP_KEY_MARKET_LAST_RUN, START_TIME.toString());
 
-      if (allRowsToWrite.length === 0) {
-        console.error("Worker: allRowsToWrite is empty! Aborting write to prevent data wipe.");
-        _resetMarketDataJobState(new Error("Zero rows returned from API - Aborted Write"));
+    const COLUMN_COUNT = 9;
+    const START_ROW = 2;
+    const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
+
+    var ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+    const masterRequests = getMasterBatchFromControlTable(ss_anchor);
+
+    let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
+
+    // --- Phase 1: NEW_RUN (SURGICAL PAUSE) ---
+    if (currentStep === STATE_FLAGS.NEW_RUN || !masterRequests || masterRequests.length === 0) {
+      console.log(`State: ${STATE_FLAGS.NEW_RUN}.`);
+
+      if (!masterRequests || masterRequests.length === 0) {
+        _resetMarketDataJobState(new Error("Control Table empty"));
         return;
       }
-    } catch (e) {
-      scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2);
+
+      const setupResult = guardedSheetTransaction(() => {
+        const result = prepareTempSheet(ss_anchor, tempSheetName, DATA_SHEET_HEADERS);
+        if (!result.success) {
+          throw new Error(result.error || "Unknown Prep Failure");
+        }
+        if (result.state) {
+          result.state.hideSheet();
+        }
+        return true;
+      }, 60000);
+
+      if (!setupResult.success) {
+        console.warn(`[Worker] Sheet prep failed: ${setupResult.error}`);
+        scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS);
+        return;
+      }
+
+      SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, '0');
+      SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
+      currentStep = 'PROCESSING';
+      SCRIPT_PROP.setProperty(PROP_KEY_STEP, 'PROCESSING');
+
+      scheduleOneTimeTrigger('updateMarketDataSheet', 1000);
       return;
     }
 
-    ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
+    // --- Phase 2: WRITE (Nitro Mode - LIVE/UNPAUSED) ---
+    if (currentStep === 'PROCESSING' || currentStep === 'WRITE') {
 
-    let writeState = {
-      logInfo: console.log, logError: console.error, logWarn: console.warn,
-      nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
-      ss: ss_anchor,
-      metrics: { startTime: START_TIME },
-      config: {
-        ...(typeof NITRO_CONFIG !== 'undefined' ? NITRO_CONFIG : {}),
-        MAX_CELLS_PER_CHUNK: 40000,
-        MAX_CHUNK_SIZE: 2000,
-        currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000')
+      const masterRequests_stable = getMasterBatchFromControlTable(ss_anchor);
+      let allRowsToWrite = [];
+
+      try {
+        const marketDataCrates = fuzAPI.getDataForRequests(masterRequests_stable);
+        const currentTimeStamp = new Date();
+        marketDataCrates.forEach(crate => {
+          if (crate && crate.fuzObjects) {
+            crate.fuzObjects.forEach(item => {
+              if (item && item.type_id != null) {
+                allRowsToWrite.push([
+                  "", item.type_id,
+                  crate.market_type || '', crate.market_id || '',
+                  item.sell?.min ?? '', item.buy?.max ?? '',
+                  item.sell?.volume ?? 0, item.buy?.volume ?? 0,
+                  currentTimeStamp
+                ]);
+              }
+            });
+          }
+        });
+
+        if (allRowsToWrite.length === 0) {
+          console.error("Worker: allRowsToWrite is empty! Aborting write to prevent data wipe.");
+          _resetMarketDataJobState(new Error("Zero rows returned from API - Aborted Write"));
+          return;
+        }
+      } catch (e) {
+        scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2);
+        return;
       }
-    };
 
-    const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
+      ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
-    if (writeResult.success) {
-      console.log("Write SUCCESS. Transitioning to FINALIZING.");
-      SCRIPT_PROP.setProperty(PROP_KEY_STEP, STATE_FLAGS.FINALIZING);
-      SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
-      SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
-      SCRIPT_PROP.deleteProperty(PROP_KEY_WRITE_INDEX);
-      scheduleOneTimeTrigger('finalizeMarketDataUpdate', RESCHEDULE_DELAY_MS);
-    }
-    else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" || (writeResult.error && writeResult.error.includes("timed out"))) {
-      const reason = writeResult.error ? writeResult.error : "Predictive Bailout";
-      console.warn(`Write phase interrupted. Reason: ${reason}. Rescheduling.`);
+      let writeState = {
+        logInfo: console.log, logError: console.error, logWarn: console.warn,
+        nextBatchIndex: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_WRITE_INDEX) || '0'),
+        ss: ss_anchor,
+        metrics: { startTime: START_TIME },
+        config: {
+          ...(typeof NITRO_CONFIG !== 'undefined' ? NITRO_CONFIG : {}),
+          MAX_CELLS_PER_CHUNK: 40000,
+          MAX_CHUNK_SIZE: 2000,
+          currentChunkSize: parseInt(SCRIPT_PROP.getProperty(PROP_KEY_CHUNK_SIZE) || '1000')
+        }
+      };
 
-      const nextIndex = writeResult.state.nextBatchIndex.toString();
-      let nextChunkSize = writeResult.state.config.currentChunkSize;
+      const writeResult = writeDataToSheet(tempSheetName, allRowsToWrite, START_ROW, 1, writeState);
 
-      if (writeResult.error) {
-        nextChunkSize = Math.max(100, Math.floor(nextChunkSize / 2)); 
+      if (writeResult.success) {
+        console.log("Write SUCCESS. Transitioning to FINALIZING.");
+        SCRIPT_PROP.setProperty(PROP_KEY_STEP, STATE_FLAGS.FINALIZING);
+        SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
+        SCRIPT_PROP.deleteProperty(PROP_KEY_CHUNK_SIZE);
+        SCRIPT_PROP.deleteProperty(PROP_KEY_WRITE_INDEX);
+        scheduleOneTimeTrigger('finalizeMarketDataUpdate', RESCHEDULE_DELAY_MS);
       }
+      else if (writeResult.bailout_reason === "PREDICTIVE_BAILOUT" || (writeResult.error && writeResult.error.includes("timed out"))) {
+        const reason = writeResult.error ? writeResult.error : "Predictive Bailout";
+        console.warn(`Write phase interrupted. Reason: ${reason}. Rescheduling.`);
 
-      SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
-      SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize.toString());
-      Utilities.sleep(1000);
-      scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
-    }
-    else {
-      // --- CRITICAL FIX START ---
-      if (writeResult.error && (writeResult.error.includes("Lock Failed") || writeResult.error.includes("Lock timeout"))) {
-        console.warn("Lock Conflict detected. Pausing for Sheet to breathe. DO NOT RESET.");
-        
-        // Preserve the current index so it picks up where it left off
-        const nextIndex = (writeResult.state.nextBatchIndex || 0).toString();
+        const nextIndex = writeResult.state.nextBatchIndex.toString();
+        let nextChunkSize = writeResult.state.config.currentChunkSize;
+
+        if (writeResult.error) {
+          nextChunkSize = Math.max(100, Math.floor(nextChunkSize / 2));
+        }
+
         SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
-        
-        // Force a 30-second delay to allow Google Sheets to finish calculations
-        scheduleOneTimeTrigger('updateMarketDataSheet', 30000); 
-      } else {
-        // Only reset on actual data corruption or API failures
-        _resetMarketDataJobState(new Error(`Write Failure: ${writeResult.error}`));
+        SCRIPT_PROP.setProperty(PROP_KEY_CHUNK_SIZE, nextChunkSize.toString());
+        Utilities.sleep(1000);
+        scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
       }
-      // --- CRITICAL FIX END ---
+      else {
+        // --- CRITICAL FIX START ---
+        if (writeResult.error && (writeResult.error.includes("Lock Failed") || writeResult.error.includes("Lock timeout"))) {
+          console.warn("Lock Conflict detected. Pausing for Sheet to breathe. DO NOT RESET.");
+
+          // Preserve the current index so it picks up where it left off
+          const nextIndex = (writeResult.state.nextBatchIndex || 0).toString();
+          SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
+
+          // Force a 30-second delay to allow Google Sheets to finish calculations
+          scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
+        } else {
+          // Only reset on actual data corruption or API failures
+          _resetMarketDataJobState(new Error(`Write Failure: ${writeResult.error}`));
+        }
+        // --- CRITICAL FIX END ---
+      }
     }
+  } finally {
+    // ALWAYS release the script lock so the next trigger can run
+    scriptLock.releaseLock();
   }
 }
 
@@ -620,8 +634,18 @@ function finalizeMarketDataUpdate() {
     const repairMap = { ['NR_MARKET_DATA']: 'A:G' };
 
     const transactionResult = guardedSheetTransaction(() => {
-      // Uses the new "Hot Swap" (Overwrite) logic, now includes Named Range update
-      return atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
+      // --- START ANESTHESIA ---
+
+      // 1. Perform the Atomic Swap (Hot Swap)
+      const swapRes = atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
+
+      // 2. Sync External Prices and Region Data while locked
+      // This prevents the sheet from waking up and calculating until all data is fresh.
+      fetchFilteredPricesSync(ss_inner);
+      syncESIRegionData(ss_inner);
+
+      return swapRes;
+      // --- END ANESTHESIA ---
     }, 60000);
 
 
@@ -629,8 +653,7 @@ function finalizeMarketDataUpdate() {
     let swapSuccess = (transactionResult.success && transactionResult.state.success);
 
     if (swapSuccess) {
-      fetchFilteredPricesSync(ss_inner)
-      syncESIRegionData(ss_inner);
+
       _resetMarketDataJobState(null);
       console.log("SUCCESS: Finalization complete.");
 
