@@ -96,7 +96,19 @@ var _cachedAuthNames = null;
 var _cachedCharIdMap = null;
 
 
+function FORCE_WAKEUP_FORMULAS() {
+  // Pass the spreadsheet directly to completely bypass any custom function traps
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const authName = getCorpAuthChar(ss);
 
+  // Double-check the save
+  if (authName) {
+    PropertiesService.getScriptProperties().setProperty('GESI_PERSISTED_CORP_AUTH_CHAR', authName);
+    console.log("✅ SUCCESS: Saved " + authName + " to the Fast-Path Cache.");
+  } else {
+    console.error("❌ FAILED: Could not find Corp Auth Character.");
+  }
+}
 
 // ==========================================================================================
 // UTILITIES (GAS-SAFE)
@@ -105,13 +117,13 @@ var _cachedCharIdMap = null;
 function FORCE_RESET_CACHES() {
   const props = PropertiesService.getScriptProperties();
   props.deleteProperty('GESI_PERSISTED_CORP_AUTH_CHAR');
-  
+
   // RESET ALL JOURNAL ANCHORS
   props.deleteProperty('CORP_JOURNAL_DIV_RESUME');
   props.deleteProperty('CORP_JOURNAL_LAST_TRANSACTION_ID');
   props.deleteProperty('CORP_JOURNAL_LAST_ID_BUYS');  // New
   props.deleteProperty('CORP_JOURNAL_LAST_ID_SELLS'); // New
-  props.deleteProperty('CORP_JOURNAL_PHASE'); 
+  props.deleteProperty('CORP_JOURNAL_PHASE');
 
   console.log("✅ ALL CACHES AND ANCHORS FLUSHED.");
 }
@@ -213,7 +225,7 @@ function processInternalBuffer(ss) {
   // 'contract_id' is in Column G (Index 6)
   const ledgerData = ledgerSheet.getDataRange().getValues();
   const existingIds = new Set();
-  const CONTRACT_ID_INDEX = 6; 
+  const CONTRACT_ID_INDEX = 6;
 
   // Start at 1 to skip header
   for (let i = 1; i < ledgerData.length; i++) {
@@ -250,13 +262,13 @@ function processInternalBuffer(ss) {
 
     // DECISION LOGIC: Is it ready? (Paired with tax OR timed out)
     if (entry.status === 'PAIRED' || age > MAX_WAIT) {
-      
+
       // --- CRITICAL DE-DUPLICATION CHECK ---
       if (existingIds.has(id)) {
         log.info(`[DUPE PROTECTION] Skipping ID ${id} - already in Sales_Ledger.`);
         // We do NOT add to readyToPost, and we do NOT add to keptInBuffer.
         // This effectively deletes it from the buffer.
-        return; 
+        return;
       }
 
       // Mark as seen to prevent duplicates within this specific batch
@@ -296,106 +308,152 @@ function processInternalBuffer(ss) {
   if (bufferData.length !== keptInBuffer.length) {
     // Clear the whole sheet (except header)
     if (bufferSheet.getMaxRows() > 1) {
-        bufferSheet.getRange(2, 1, bufferSheet.getMaxRows() - 1, bufferSheet.getMaxColumns()).clearContent();
+      bufferSheet.getRange(2, 1, bufferSheet.getMaxRows() - 1, bufferSheet.getMaxColumns()).clearContent();
     }
-    
+
     // Write back the remaining items
     if (keptInBuffer.length > 0) {
       bufferSheet.getRange(2, 1, keptInBuffer.length, keptInBuffer[0].length).setValues(keptInBuffer);
     }
-    
+
     log.info(`Buffer Sheet updated. ${keptInBuffer.length} items remaining.`);
   }
 }
 
-function diagnoseSalesLedger() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Sales_Ledger");
-  const data = sheet.getDataRange().getValues();
-  const log = [];
-
-  // Assuming standard columns based on your snippets:
-  // Col 0: Date, Col 3: Qty (D), Col 8: Unit Value Filled (I)
-  // Adjust indices if your sheet is different (0-based)
-  const QTY_COL = 3; 
-  const PRICE_COL = 8; 
-
-  let totalRevenue = 0;
-  const transactions = [];
-
-  for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    const qty = Number(row[QTY_COL]);
-    const price = Number(String(row[PRICE_COL]).replace(/[^0-9.-]/g, ''));
-    
-    // Revenue is negative of (Qty * Price) because Qty is negative for sales
-    const lineRevenue = -(qty * price); 
-
-    if (lineRevenue > 0) {
-      totalRevenue += lineRevenue;
-      transactions.push({
-        row: i + 1,
-        date: row[0],
-        item: row[2] || row[1], // Name or ID
-        qty: qty,
-        price: price,
-        total: lineRevenue
-      });
-    }
-  }
-
-  // Sort by highest value
-  transactions.sort((a, b) => b.total - a.total);
-
-  log.push(`Total Calculated Revenue: ${totalRevenue.toLocaleString()} ISK`);
-  log.push("--- TOP 5 OFFENDERS ---");
+/**
+ * CALCULATE ESI CACHE TTL
+ * Returns seconds remaining until ESI refresh.
+ */
+function _getEsiCacheTTL(response) {
+  const headers = response.getHeaders();
+  const expires = headers['Expires'] || headers['expires'];
   
-  for (let k = 0; k < Math.min(5, transactions.length); k++) {
-    const t = transactions[k];
-    log.push(`Row ${t.row}: ${t.item} | Qty: ${t.qty} * Price: ${t.price.toLocaleString()} = ${t.total.toLocaleString()} ISK`);
-  }
+  if (!expires) return 3600; // Default to 1 hour if header is missing
 
-  console.log(log.join("\n"));
-  if (typeof SpreadsheetApp !== 'undefined') SpreadsheetApp.getUi().alert(log.join("\n"));
+  const now = new Date().getTime();
+  const expiry = new Date(expires).getTime();
+  const secondsLeft = Math.floor((expiry - now) / 1000);
+
+  // Google CacheService limit is 21600 (6 hours). ESI is usually 3600.
+  return Math.max(0, Math.min(secondsLeft, 21600));
 }
 
-function RESET_AND_REBUILD_SALES_LEDGER() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const LOG = LoggerEx.withTag('SALES_NUKE');
-  
-  // 1. CLEAR SHEETS
-  const salesSheet = ss.getSheetByName("Sales_Ledger");
-  const bufferSheet = ss.getSheetByName("_Internal_Ledger_Buffer");
-  
-  if (salesSheet) {
-    salesSheet.getRange(2, 1, salesSheet.getMaxRows(), salesSheet.getMaxColumns()).clearContent();
-    LOG.info("✅ Sales_Ledger wiped.");
-  }
-  
-  if (bufferSheet) {
-    bufferSheet.getRange(2, 1, bufferSheet.getMaxRows(), bufferSheet.getMaxColumns()).clearContent();
-    LOG.info("✅ Internal Buffer wiped.");
+/**
+ * THE FINAL V12 FERRARI ENGINE - CORPORATION ORDERS
+ * Complete Version: Dynamic Paging, ESI-Synced Cache, and Strict Data Typing.
+ */
+function _fetchCorpOrdersConcurrently(authName) {
+  const SCRIPT_NAME = '_fetchCorpOrdersConcurrently';
+  const client = GESI.getClient().setFunction('corporations_corporation_orders');
+  const cache = CacheService.getUserCache();
+  const cacheKey = "CORP_ORDERS_" + authName;
+
+  // 1. HEADER DEFINITION (Matches your sheet structure precisely)
+  const STANDARD_ORDER_HEADERS = [
+    "duration", "escrow", "is_buy", "issued", "issued_by",
+    "location_id", "min_volume", "order_id", "price", "range",
+    "region_id", "type_id", "volume_remain", "volume_total", "wallet_division"
+  ];
+
+  // 2. CACHE CHECK - Skips API if ESI hasn't refreshed yet
+  const cachedData = cache.get(cacheKey);
+  if (cachedData) {
+    console.log(`[CACHE] Serving fresh data from CacheService for ${authName}.`);
+    return JSON.parse(cachedData);
   }
 
-  // 2. RESET MEMORY (Properties)
-  const props = PropertiesService.getScriptProperties();
-  props.deleteProperty('CORP_JOURNAL_DIV_RESUME');
-  props.deleteProperty('CORP_JOURNAL_LAST_TRANSACTION_ID');
-  props.deleteProperty('LEDGER_PENDING_BUFFER'); // Delete old buffer shards
-  LOG.info("✅ ESI Memory wiped. System is effectively 'New'.");
+  let allOrders = [STANDARD_ORDER_HEADERS];
+  let rawObjects = [];
+  let corpId = 0;
 
-  // 3. RUN FRESH IMPORT
-  LOG.info("🚀 Starting Fresh 30-Day Import...");
+  // 3. RESOLVE CORP ID
   try {
-    // Force a 30-day lookback
-    Ledger_Import_CorpJournal(ss, { division: 3, sinceDays: 30 });
-    
-    // Also run the processor to move items from Buffer -> Ledger
-    processInternalBuffer(ss);
-    
-    LOG.info("✅ REBUILD COMPLETE. Check Sales_Ledger for clean data.");
+    const charData = GESI.getCharacterData(authName);
+    if (charData) corpId = charData.corporation_id;
   } catch (e) {
-    LOG.error("❌ Error during rebuild: " + e.message);
+    console.error(`[${SCRIPT_NAME}] Could not resolve Corp ID.`);
+  }
+  if (!corpId) return allOrders;
+
+  // 4. THE STRICT FORMATTER (Handles types, dates, and boolean strings)
+  const formatRow = (obj) => {
+    return STANDARD_ORDER_HEADERS.map(key => {
+      const val = obj[key];
+
+      // DATE: Force real JS Date Object so Sheets can do math on them
+      if (key === "issued") return val ? new Date(val) : "";
+
+      // BOOLEAN: Normalizes is_buy_order vs is_buy into literal "TRUE"/"FALSE" strings
+      // This is vital for your (buys = "TRUE") filter in the LET formula.
+      if (key === "is_buy") {
+        const buyFlag = obj.hasOwnProperty('is_buy_order') ? obj.is_buy_order : obj.is_buy;
+        return (buyFlag === true || buyFlag === 1 || String(buyFlag).toLowerCase() === "true") ? "TRUE" : "FALSE";
+      }
+
+      // FLOATS: Forced precision for Price and Escrow
+      if (key === "price" || key === "escrow") return val !== undefined ? parseFloat(val) : 0.0;
+
+      // INTEGERS: Forced whole numbers for Volumes and TypeIDs
+      if (["volume_remain", "volume_total", "min_volume", "duration", "type_id", "wallet_division"].includes(key)) {
+        return val !== undefined ? parseInt(val, 10) : 0;
+      }
+
+      // STRINGS: IDs as strings to prevent Scientific Notation rounding errors
+      if (["location_id", "order_id", "issued_by", "range", "region_id"].includes(key)) {
+        return val !== undefined ? String(val) : "";
+      }
+
+      return val !== undefined ? val : "";
+    });
+  };
+
+  try {
+    // 5. FETCH PAGE 1 - Establishes cache sync and page count
+    const req1 = client.buildRequest({ corporation_id: corpId, page: 1, name: authName });
+    const resp1 = UrlFetchApp.fetch(req1.url, { method: 'get', headers: req1.headers, muteHttpExceptions: true });
+
+    if (resp1.getResponseCode() !== 200) throw new Error("ESI HTTP Error " + resp1.getResponseCode());
+
+    const page1Data = JSON.parse(resp1.getContentText());
+    rawObjects = rawObjects.concat(page1Data);
+
+    // 6. SYNC CACHE TTL WITH ESI HEADERS
+    const headers = resp1.getHeaders();
+    const expires = headers['Expires'] || headers['expires'];
+    let ttl = 3600; // Default 1 hour
+    if (expires) {
+      const now = new Date().getTime();
+      const expiry = new Date(expires).getTime();
+      ttl = Math.max(1, Math.min(Math.floor((expiry - now) / 1000), 21600));
+    }
+
+    // 7. PARALLEL PAGING - Fetches every single order in existence for the corp
+    const maxPages = Number(headers['X-Pages'] || headers['x-pages']) || 1;
+    if (maxPages > 1) {
+      const requests = [];
+      for (let p = 2; p <= maxPages; p++) {
+        const req = client.buildRequest({ corporation_id: corpId, page: p, name: authName });
+        requests.push({ url: req.url, method: 'get', headers: req.headers, muteHttpExceptions: true });
+      }
+      const responses = UrlFetchApp.fetchAll(requests);
+      responses.forEach(res => {
+        if (res.getResponseCode() === 200) rawObjects = rawObjects.concat(JSON.parse(res.getContentText()));
+      });
+    }
+
+    console.log(`[SUCCESS] Retrieved ${rawObjects.length} orders. ESI Refresh in ${ttl}s.`);
+
+    // 8. FINAL MAPPING AND CACHING
+    const finalOutput = allOrders.concat(rawObjects.map(obj => formatRow(obj)));
+    
+    // Store in cache to prevent hitting ESI until the next refresh
+    cache.put(cacheKey, JSON.stringify(finalOutput), ttl);
+    
+    return finalOutput;
+
+  } catch (e) {
+    console.error(`[CRITICAL] Engine failure: ${e.message}`);
+    return allOrders;
   }
 }
 
@@ -546,15 +604,15 @@ function getCorpAuthChar(ss) { // ADDED ss ARGUMENT
     return persistedChar;
   }
 
-// --- CUSTOM FUNCTION SAFETY CHECK ---
+  // --- CUSTOM FUNCTION SAFETY CHECK ---
   // If we are in a custom function and have no cache, DO NOT try the slow path.
   if (!ss) {
     try {
       // This explicitly throws an error when run from a sheet cell
-      SpreadsheetApp.getActiveRange(); 
+      SpreadsheetApp.getActiveRange();
     } catch (e) {
       // The error proves we are in a custom function! Bail out fast.
-      return (GESI && GESI.name) || ''; 
+      return (GESI && GESI.name) || '';
     }
   }
 
@@ -777,12 +835,12 @@ function _charIdMap(ss) {
 function processJournalDurable(ss) {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const BUFFER_KEY = 'LEDGER_PENDING_BUFFER';
-  
+
   // 1. Load the "Waiting Room" from previous runs
   let pendingBuffer = JSON.parse(SCRIPT_PROP.getProperty(BUFFER_KEY) || '{}');
-  
+
   // 2. Fetch fresh data from ESI (Division 3)
-  const journalEntries = GESI.corporations_corporation_wallets_division_journal(3); 
+  const journalEntries = GESI.corporations_corporation_wallets_division_journal(3);
 
   journalEntries.forEach(entry => {
     const refId = entry.id;
@@ -797,10 +855,10 @@ function processJournalDurable(ss) {
           ts: new Date().getTime()
         };
       }
-    } 
+    }
     else if (entry.ref_type === 'transaction_tax') {
       // It's a tax! Find its twin in the waiting room
-      const parentId = entry.context_id; 
+      const parentId = entry.context_id;
       if (pendingBuffer[parentId]) {
         pendingBuffer[parentId].tax = Math.abs(entry.amount);
         pendingBuffer[parentId].status = 'PAIRED';
@@ -821,7 +879,7 @@ function processJournalDurable(ss) {
     if (item.status === 'PAIRED' || age > MAX_WAIT_MS) {
       // Ready to post! If it aged out without a tax, use an estimate (0.036)
       const finalTax = item.status === 'PAIRED' ? item.tax : (Math.abs(item.data.amount) * 0.036);
-      
+
       finalizedRows.push({
         date: item.data.date,
         type_id: 'MARKET_TX', // We'll look up the name in the next step
@@ -1208,7 +1266,7 @@ function _runLootDeltaImport(ss, lootData, asOfDate, sourceLabel, writeNegatives
  */
 function _chunkAndPut_Permanent(key, content) {
   const props = PropertiesService.getScriptProperties();
-  const MAX_SIZE = 8000; 
+  const MAX_SIZE = 8000;
 
   const chunks = [];
   let offset = 0;
@@ -1256,13 +1314,13 @@ function Ledger_Import_CorpJournal(ss, opts) {
 
   // --- CONFIGURATION (CACHE BUSTED) ---
   const PHASE_KEY = 'CORP_JOURNAL_PHASE';
-  const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS_V2'; 
-  const CACHE_KEY_BUYS  = 'CORP_JOURNAL_HANDOFF_BUYS_V2';  
+  const CACHE_KEY_SELLS = 'CORP_JOURNAL_HANDOFF_SELLS_V2';
+  const CACHE_KEY_BUYS = 'CORP_JOURNAL_HANDOFF_BUYS_V2';
   const CACHE_KEY_ANCHOR = 'CORP_JOURNAL_HANDOFF_ANCHOR_V2';
-  
+
   const LAST_ID_BUYS = 'CORP_JOURNAL_LAST_ID_BUYS';
   const LAST_ID_SELLS = 'CORP_JOURNAL_LAST_ID_SELLS';
-  const CACHE_TTL = 3600; 
+  const CACHE_TTL = 3600;
 
   opts = opts || {};
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -1276,7 +1334,7 @@ function Ledger_Import_CorpJournal(ss, opts) {
 
   let currentPhase = SCRIPT_PROP.getProperty(PHASE_KEY) || 'BUYS';
   log.info(`Starting Corp Journal Import. Current Phase: ${currentPhase}`);
-  
+
   const persistentAnchorKey = (currentPhase === 'BUYS') ? LAST_ID_BUYS : LAST_ID_SELLS;
   const rawFromId = SCRIPT_PROP.getProperty(persistentAnchorKey);
   let currentFromId = (rawFromId && !isNaN(rawFromId)) ? Number(rawFromId) : null;
@@ -1305,13 +1363,13 @@ function Ledger_Import_CorpJournal(ss, opts) {
     log.warn(`[CACHE MISS] Fetching fresh ESI data for Phase: ${currentPhase}`);
     let allCorpTransactions = [];
     let fetchMore = true;
-    let tempFromId = null; 
+    let tempFromId = null;
 
     do {
       try {
         const rawEntries = GESI.invokeRaw(GESI_FUNC_NAME, {
-            division: TARGET_DIVISION, from_id: tempFromId, name: authToon,
-            show_column_headings: false, version: null
+          division: TARGET_DIVISION, from_id: tempFromId, name: authToon,
+          show_column_headings: false, version: null
         });
         if (!Array.isArray(rawEntries) || rawEntries.length === 0) break;
 
@@ -1326,15 +1384,15 @@ function Ledger_Import_CorpJournal(ss, opts) {
           const entryDate = new Date(entry.date);
           if (entryDate.getTime() < cutoff.getTime()) {
             reachedAnchor = true;
-            break; 
+            break;
           }
-          
+
           allCorpTransactions.push(entry);
         }
-        
+
         if (reachedAnchor || rawEntries.length < 100) fetchMore = false;
         else tempFromId = rawEntries[rawEntries.length - 1].transaction_id;
-        
+
         Utilities.sleep(50);
       } catch (e) {
         log.error("ESI Fetch Error: " + e.message);
@@ -1357,10 +1415,10 @@ function Ledger_Import_CorpJournal(ss, opts) {
       const isBuy = e.is_buy === true;
       const qty = Math.abs(Number(e.quantity || 1));
       let finalUnitValue = Number(e.unit_price);
-      
+
       if (isNaN(finalUnitValue) || finalUnitValue === 0) {
-          const totalAmount = Number(e.price || e.amount || 0);
-          finalUnitValue = Math.abs(totalAmount) / qty;
+        const totalAmount = Number(e.price || e.amount || 0);
+        finalUnitValue = Math.abs(totalAmount) / qty;
       }
 
       const row = {
@@ -1381,13 +1439,13 @@ function Ledger_Import_CorpJournal(ss, opts) {
       targetRows = freshBuys;
       if (freshSells.length > 0) {
         _chunkAndPut(CACHE_KEY_SELLS, JSON.stringify(freshSells), CACHE_TTL);
-        if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
+        if (newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
       }
     } else {
       targetRows = freshSells;
       if (freshBuys.length > 0) {
         _chunkAndPut(CACHE_KEY_BUYS, JSON.stringify(freshBuys), CACHE_TTL);
-        if(newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
+        if (newestTransactionId) _chunkAndPut(CACHE_KEY_ANCHOR, newestTransactionId, CACHE_TTL);
       }
     }
   }
@@ -2147,7 +2205,7 @@ function rebuildContractUnitCosts(ss) {
   const LEDGER_BUY_SHEET = 'Material_Ledger';
 
   const allocMode = String(_getNamedOr_('setting_contract_alloc_mode', 'REF')).toUpperCase();
-  const refMap = _buildRefPriceMap_(ss); 
+  const refMap = _buildRefPriceMap_(ss);
   const priceMap = _buildContractPriceMap_(ss);
 
   const ci = _getData_(ss, 'Contract Items (RAW)');
@@ -2155,7 +2213,7 @@ function rebuildContractUnitCosts(ss) {
 
   const itemsByCid = new Map();
   const allUniqueTids = new Set();
-  
+
   // Cache header indices to avoid repeated property lookups in the loop
   const { contract_id: hCid, type_id: hTid, quantity: hQty, is_included: hInc } = ci.h;
 
@@ -2165,7 +2223,7 @@ function rebuildContractUnitCosts(ss) {
     if (String(row[hInc]).toUpperCase() === 'TRUE' && qty > 0) {
       const cid = String(row[hCid]);
       const tid = Number(row[hTid]);
-      
+
       if (!itemsByCid.has(cid)) itemsByCid.set(cid, []);
       itemsByCid.get(cid).push({ tid, qty });
       if (!refMap.has(tid)) allUniqueTids.add(tid);
@@ -2221,7 +2279,7 @@ function rebuildContractUnitCosts(ss) {
     const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
     const keys = ['source', 'char', 'contract_id', 'type_id'];
     const result = MaterialLedger.upsert(keys, outRows);
-    
+
     log.info(`Upserted ${result.rows} rows to ${LEDGER_BUY_SHEET}.`);
     return result.rows;
   } catch (e) {
@@ -2279,10 +2337,6 @@ function resetCorpJournalImport() {
   }
 }
 
-/**
- * MONOLITH BREAKER: Consumes segregated data and runs ledger posts conditionally.
- * Solves the timeout by skipping the unnecessary 2-minute sales write.
- */
 /**
  * MONOLITH BREAKER: Consumes segregated data and runs ledger posts conditionally.
  * Implements a 1-hour lease to manage long execution cycles.
@@ -2445,3 +2499,6 @@ function triggerLedgerImportCycle() {
     console.log(`${FUNC_NAME} execution initiated successfully (or was already running nested).`);
   }
 }
+
+
+

@@ -300,7 +300,7 @@ function runIndustryLedgerPhase(ss) {
   if (phase === 0) {
     try {
       log.info('Phase 0: Fetching ESI Corp Jobs...');
-      _getCorporateJobsRaw(true);
+      _getCorporateJobsRaw(false);
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '1');
       phase = 1;
     } catch (e) {

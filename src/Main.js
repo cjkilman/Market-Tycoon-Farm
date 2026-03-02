@@ -41,6 +41,76 @@ function onOpen() {
 }
 
 
+function NUKE_LOADING_ISSUES() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const authToon = getCorpAuthChar(ss);
+  
+  if (!authToon) {
+    console.error("❌ Could not find authorized character.");
+    return;
+  }
+  console.log(`Starting Precision Data Injection for ${authToon}...`);
+// --- 1. OVERWRITE CORP ORDERS (Target: B2) ---
+  try {
+    const orderSheet = ss.getSheetByName("CorpOrdersCalc");
+    if (orderSheet) {
+      console.log("Igniting true concurrent fetch for Corp Orders...");
+      const fullData = _fetchCorpOrdersConcurrently(authToon);
+      
+      if (fullData && fullData.length > 1) { // >1 because row 0 is headers
+        const numRows = fullData.length;
+        const numCols = fullData[0].length;
+        const lastRow = Math.max(orderSheet.getLastRow(), 2);
+        
+        // Clear ONLY the data zone, then write
+        orderSheet.getRange(2, 2, lastRow, numCols).clearContent();
+        orderSheet.getRange(2, 2, numRows, numCols).setValues(fullData);
+        console.log(`[SUCCESS] Wrote ${numRows - 1} flawlessly aligned Corp Orders precisely to B2.`);
+      } else {
+        console.log("[WARN] No active corp orders found to write.");
+      }
+    }
+  } catch(e) { 
+    console.error("[ERROR] Corp Orders Injection Failed: " + e.message); 
+  }
+
+  // --- 2. OVERWRITE CORP JOBS (Target: C1) ---
+  try {
+    const jobsSheet = ss.getSheetByName("ESI Corp Jobs");
+    if (jobsSheet) {
+      const rawJobs = _getCorporateJobsRaw(false); 
+      
+      if (rawJobs && rawJobs.length > 0) {
+        // THE FIX: Hardcode the exact alphabetized headers so columns NEVER shift
+        const STANDARD_JOB_HEADERS = [
+          "activity_id", "blueprint_id", "blueprint_location_id", "blueprint_type_id",
+          "completed_character_id", "completed_date", "cost", "duration", "end_date",
+          "facility_id", "installer_id", "job_id", "licensed_runs", "location_id",
+          "output_location_id", "pause_date", "probability", "product_type_id",
+          "runs", "start_date", "status", "successful_runs"
+        ];
+
+        // THE FIX 2: Map the data using null instead of "" to prevent QUERY errors
+        const rows = rawJobs.map(obj => STANDARD_JOB_HEADERS.map(key => obj[key] !== undefined ? obj[key] : null));
+        const fullData = [STANDARD_JOB_HEADERS, ...rows];
+        
+        const numRows = fullData.length;
+        const numCols = STANDARD_JOB_HEADERS.length;
+        const lastRow = Math.max(jobsSheet.getLastRow(), 1);
+        
+        // Clear ONLY the GESI output zone (C1 downwards)
+        jobsSheet.getRange(1, 3, lastRow, numCols).clearContent();
+        
+        // Write fresh data exactly at C1
+        jobsSheet.getRange(1, 3, numRows, numCols).setValues(fullData);
+        console.log(`✅ Wrote ${rows.length} Corp Jobs flawlessly to C1.`);
+      }
+    }
+  } catch(e) { 
+    console.error("❌ Corp Jobs Injection Failed: " + e.message); 
+  }
+}
+
 
 function triggerRestockSync() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -56,11 +126,14 @@ function triggerRestockSync() {
     // Speed Move: Load the entire market state into memory once
     const fullData = dataSheet.getDataRange().getValues();
 
-    // Pass the pre-loaded data to the sub-functions
-    generateRestockQuery(ss, fullData);
-    generateRestockItemsOnHand(ss, fullData);
-    generateDumpToBuyOrder(ss, fullData);
+    // 1. RECONCILIATION: Generate Dump list FIRST and capture the Ban List
+    const dumpedItems = generateDumpToBuyOrder(ss, fullData) || new Set();
+
+    // 2. Pass the Ban List to the restock functions so they ignore dumped items
+    generateRestockQuery(ss, fullData, dumpedItems);
+    generateRestockItemsOnHand(ss, fullData, dumpedItems);
     generateConsolidatedRequirements(ss);
+    
     ss.toast("✅ Sync Complete. Releasing Lock.", "Engine Room", 3);
   } catch (e) {
     ss.toast("❌ Sync failed: " + e.message, "Engine Room Error");
@@ -84,163 +157,27 @@ function respondToEdit(e) {
   if (col > 2) return; // Ignore edits outside columns A and B
 
   const sheetName = e.range.getSheet().getName();
+  
+  // RECONCILIATION: Always fetch the Dump list before updating Buy lists
   if (sheetName === 'Need To Buy') {
-    generateRestockQuery(e.source);
+    const dumpedItems = generateDumpToBuyOrder(e.source) || new Set();
+    generateRestockQuery(e.source, null, dumpedItems);
   } else if (sheetName === 'Restock Items On Hand') {
-    generateRestockItemsOnHand(e.source);
+    const dumpedItems = generateDumpToBuyOrder(e.source) || new Set();
+    generateRestockItemsOnHand(e.source, null, dumpedItems);
+  } else if (sheetName === 'Dump to Buy') {
+    // If you edit the Dump sheet itself, update it, then instantly sync the Buy sheets
+    const dumpedItems = generateDumpToBuyOrder(e.source) || new Set();
+    generateRestockQuery(e.source, null, dumpedItems);
+    generateRestockItemsOnHand(e.source, null, dumpedItems);
   }
 }
-
-/**
- * Generates List to Set up Buy orders or Manufacturing Jobs due to low inventory.
- * Strictly calculates restock need as: (Velocity * Target Days) - Current Total Stock.
- */
-function generateRestockQuery(ss, fullData) {
-  const TARGET_SHEET_NAME = 'Need To Buy';
-  const DATA_SHEET_NAME = 'MarketOverviewData';
-  const AUDIT_SHEET_NAME = 'Audit items';
-
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
-  const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
-  const auditSheet = ss.getSheetByName(AUDIT_SHEET_NAME);
-
-  if (!sheet || !dataSheet || !auditSheet) return;
-
-  // --- HELPER: Clean Number Parser ---
-  const parseNum = (v) => {
-    if (typeof v === 'number') return v;
-    if (!v) return 0;
-    const cleanStr = String(v).replace(/[^0-9.-]/g, '');
-    return parseFloat(cleanStr) || 0;
-  };
-
-  // --- BATCH DATA LOAD ---
-  const rawDataValues = fullData || dataSheet.getDataRange().getValues();
-  const headers = rawDataValues[2]; 
-  const marketRows = rawDataValues.slice(3);
-
-  // --- AUDIT MAP ---
-  const auditValues = auditSheet.getDataRange().getValues();
-  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]).trim(), r[1]]));
-
-  // --- SETTINGS (Mapping to Need To Buy B-Column) ---
-  const filters = sheet.getRange('B5:B26').getValues();
-  const minDays = parseNum(filters[0][0]) || 0;    // B5: Trigger Threshold
-  const targetDays = parseNum(filters[2][0]) || 31; // B7: The Goal Total
-  let rawMargin = parseNum(filters[4][0]);
-  const minMargin = (rawMargin > 1) ? rawMargin / 100 : rawMargin;
-
-  const cfg = {
-    minDays: minDays,
-    targetDays: targetDays,
-    minMargin: minMargin || 0,
-    limit: filters[14][0] === "No Limit" ? 5000 : parseInt(filters[14][0]) || 5000,
-    ignoreGroups: (filters[21][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
-    groups: (filters[6][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
-    sortDir: (filters[8][0] || "ASC").toUpperCase()
-  };
-
-  const col = {
-    name: headers.indexOf("Item Name"),
-    group: headers.indexOf("Group"),
-    qLeft: headers.indexOf("Quantity Left"),        // Personal Buy Orders
-    sellQty: headers.indexOf("Posted Sell Quantuty"), // Personal Sell Orders (Source Typo)
-    jobs: headers.indexOf("Active Jobs"),
-    deliv: headers.indexOf("Deliveries"),
-    mfgCost: headers.indexOf("Manufacturing Unit Cost"),
-    vol30: headers.indexOf("30-day traded volume"),
-    vel: headers.indexOf("Effective Daily Velocity (u/d)"),
-    warehouse: headers.indexOf("Warehouse Qty"),
-    totalMkt: headers.indexOf("Total Market Quantity"),
-    effCost: headers.indexOf("Effective Cost"),
-    margin: headers.indexOf("Margin"),
-    action: headers.indexOf("Buy Action")
-  };
-
-  let results = [];
-  marketRows.forEach(row => {
-    const name = String(row[col.name] || "").trim();
-    if (!name || auditMap.get(name) !== true) return;
-
-    const group = String(row[col.group] || "").toLowerCase().trim();
-    if (cfg.ignoreGroups.includes(group)) return;
-    if (cfg.groups.length > 0 && !cfg.groups.includes(group)) return;
-
-    // --- CURRENT STOCK CALCULATION ---
-    const whQty = parseNum(row[col.warehouse]);
-    const qLeft = parseNum(row[col.qLeft]);
-    const sQty = parseNum(row[col.sellQty]);
-    const jobs = parseNum(row[col.jobs]);
-    const deliv = parseNum(row[col.deliv]);
-
-    // Everything currently owned/posted/in-flight
-    const currentStock = whQty + qLeft + sQty + jobs + deliv;
-    const velocity = parseNum(row[col.vel]);
-
-    // --- TRIGGER LOGIC ---
-    // If you have less than 'Min Days' (e.g., 30) of stock, trigger restock
-    const triggerLevel = Math.ceil(velocity * cfg.minDays);
-    if (currentStock > triggerLevel) return;
-
-    // --- TARGET CALCULATION ---
-    // Total amount needed to fulfill the Target Days (e.g., 31)
-    const finalGoal = Math.ceil(velocity * cfg.targetDays);
-
-    // The "Difference" needed to reach that target
-    const restockNeed = Math.round(finalGoal - currentStock);
-    if (restockNeed <= 0) return;
-
-    // --- FILTERS & ACTIONS ---
-    let itemMargin = parseNum(row[col.margin]);
-    if (itemMargin > 1 && itemMargin <= 100 && cfg.minMargin <= 1) itemMargin /= 100;
-    if (itemMargin < cfg.minMargin) return;
-
-    const rawAction = String(row[col.action] || "");
-    const finalAction = (/SKIP|HOLD/i.test(rawAction)) ? "FORCE RESTOCK" : rawAction;
-    const cost = parseNum(row[col.effCost]) || parseNum(row[col.mfgCost]) || 0;
-
-    results.push({
-      data: [
-        name,
-        restockNeed,
-        cost,
-        restockNeed * cost,
-        parseNum(row[col.totalMkt]),
-        parseNum(row[col.vol30]),
-        0, // Placeholder
-        whQty,
-        itemMargin,
-        finalAction
-      ],
-      sortKey: name
-    });
-  });
-
-  // --- SORT & OUTPUT ---
-  results.sort((a, b) => {
-    const modifier = cfg.sortDir === "ASC" ? 1 : -1;
-    return a.sortKey.localeCompare(b.sortKey) * modifier;
-  });
-
-  const output = results.slice(0, cfg.limit).map(r => r.data);
-  const maxRows = sheet.getMaxRows();
-
-  if (maxRows >= 5) {
-    sheet.getRange(5, 3, maxRows - 4, 10).clearContent();
-  }
-
-  if (output.length > 0) {
-    sheet.getRange(5, 3, output.length, 10).setValues(output);
-  }
-}
-
 
 /**
  * Generates List for Dumping Profitable Overstocks to Buy Orders
- * Purpose: Strategic Liquidation with Column D "Replacement NOW", Header Fix, and Zero-Masking.
+ * RECONCILIATION PATCH: Now returns a Set() of dumped items to ban from Buy lists.
  */
-function generateDumpToBuyOrder(ss) {
+function generateDumpToBuyOrder(ss, fullData) {
   const TARGET_SHEET = 'Dump to Buy';
   const DATA_SHEET = 'MarketOverviewData';
   const CORP_ORDERS_SHEET = 'CorpOrdersCalc';
@@ -250,29 +187,25 @@ function generateDumpToBuyOrder(ss) {
   const dataSheet = ss.getSheetByName(DATA_SHEET);
   const corpOrdersSheet = ss.getSheetByName(CORP_ORDERS_SHEET);
 
-  if (!sheet || !dataSheet) return;
+  const dumpedItems = new Set(); // <--- THE BAN LIST
 
-  // --- HELPER: Clean Number Parser ---
-  // This prevents the "toFixed is not a function" error when the sheet passes text
+  if (!sheet || !dataSheet) return dumpedItems;
+
   const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
 
-  // --- 1. TAX & BROKER FEE ---
   let rateMultiplier = 1.046;
   const fee = ss.getRangeByName("FEE_RATE")?.getValue() || 0.01;
   const tax = ss.getRangeByName("TAX_RATE")?.getValue() || 0.036;
   rateMultiplier = (1 + Number(fee) + Number(tax));
 
-  // --- 2. CONTROL PANE ---
   const bParams = sheet.getRange("B5:B11").getValues();
   const filterMinDays = parseFloat(bParams[0][0]) || 0;
   const filterMinMargin = parseFloat(bParams[4][0]) || 0;
   const filterGroupName = String(bParams[6][0] || "").toLowerCase().trim();
 
-  // --- 3. HEADER FIX (C4:I4) ---
   const headerLabels = [["Item Name", "Manufacturing Projected Cost", "Effective Cost", "Hub Median Buy", "Forensic Margin", "Warehouse Qty", "Total Dump ISK"]];
   sheet.getRange("C4:I4").setValues(headerLabels).setFontWeight("bold").setBackground("#f3f3f3");
 
-  // --- 4. CORP SAFETY (O(1) Lookup) ---
   const corpBuyPrices = new Set();
   if (corpOrdersSheet) {
     const corpData = corpOrdersSheet.getDataRange().getValues();
@@ -288,15 +221,14 @@ function generateDumpToBuyOrder(ss) {
     }
   }
 
-  // --- 5. COLUMN MAPPING ---
-  const fullData = dataSheet.getDataRange().getValues();
+  const sourceData = fullData || dataSheet.getDataRange().getValues();
   let hIdx = -1;
   for (let i = 0; i < 10; i++) {
-    if (fullData[i].indexOf("Item Name") > -1) { hIdx = i; break; }
+    if (sourceData[i].indexOf("Item Name") > -1) { hIdx = i; break; }
   }
-  if (hIdx === -1) return;
+  if (hIdx === -1) return dumpedItems;
 
-  const headers = fullData[hIdx];
+  const headers = sourceData[hIdx];
   const col = {
     id: headers.indexOf("type_id"),
     item: headers.indexOf("Item Name"),
@@ -308,12 +240,11 @@ function generateDumpToBuyOrder(ss) {
     daysInv: headers.indexOf("Days of Inventory")
   };
 
-  const rawData = fullData.slice(hIdx + 1);
+  const rawData = sourceData.slice(hIdx + 1);
   const dumpResults = [];
   const MIN_VALID_COST = 5.00;
   const showAll = (!filterGroupName || filterGroupName === "manufacturing");
 
-  // --- 6. SCAN DATA ---
   for (let i = 0; i < rawData.length; i++) {
     const r = rawData[i];
     const name = r[col.item];
@@ -325,7 +256,6 @@ function generateDumpToBuyOrder(ss) {
     const daysOfInv = clean(r[col.daysInv]);
     if (daysOfInv < filterMinDays) continue;
 
-    // FIX: Using clean() prevents the crash
     const hubBuy = clean(r[col.medianBuy]);
     if (hubBuy < MIN_VALID_COST) continue;
 
@@ -334,7 +264,6 @@ function generateDumpToBuyOrder(ss) {
     const effCost = clean(r[col.effCost]);
     const buildNow = clean(r[col.buildNow]);
 
-    // Reality Floor Logic
     let realityFloor = 0;
     if (buildNow > MIN_VALID_COST) {
       realityFloor = effCost > buildNow ? effCost : buildNow;
@@ -359,15 +288,16 @@ function generateDumpToBuyOrder(ss) {
           qty,
           (hubBuy * qty)
         ]);
+        
+        dumpedItems.add(name); // <--- RECORD ITEM AS BANNED FROM BUYING
       }
     }
   }
 
-  // --- 7. SORT & BATCH WRITE ---
   dumpResults.sort((a, b) => b[4] - a[4]);
 
   const START_ROW = 5;
-  const maxRows = sheet.getMaxRows();
+  const maxRows = Math.max(sheet.getMaxRows(), START_ROW);
   if (maxRows >= START_ROW) {
     sheet.getRange(START_ROW, 3, maxRows - (START_ROW - 1), 7).clearContent();
   }
@@ -377,11 +307,138 @@ function generateDumpToBuyOrder(ss) {
     sheet.getRange(START_ROW, 7, dumpResults.length, 1).setNumberFormat("0.00%");
   }
 
-  ss.toast("Strategic Recovery complete. Meta-modules now show blank Build Costs for readability.", "Forensic Engine");
+  return dumpedItems; // <--- PASS BAN LIST TO ORCHESTRATOR
 }
 
 
-function generateRestockItemsOnHand(ss) {
+/**
+ * Generates List to Set up Buy orders or Manufacturing Jobs due to low inventory.
+ * RECONCILIATION PATCH: Ignores items found in dumpedItems Set.
+ */
+function generateRestockQuery(ss, fullData, dumpedItems = new Set()) {
+  const TARGET_SHEET_NAME = 'Need To Buy';
+  const DATA_SHEET_NAME = 'MarketOverviewData';
+  const AUDIT_SHEET_NAME = 'Audit items';
+
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
+  const dataSheet = ss.getSheetByName(DATA_SHEET_NAME);
+  const auditSheet = ss.getSheetByName(AUDIT_SHEET_NAME);
+
+  if (!sheet || !dataSheet || !auditSheet) return;
+
+  const parseNum = (v) => {
+    if (typeof v === 'number') return v;
+    if (!v) return 0;
+    const cleanStr = String(v).replace(/[^0-9.-]/g, '');
+    return parseFloat(cleanStr) || 0;
+  };
+
+  const rawDataValues = fullData || dataSheet.getDataRange().getValues();
+  const headers = rawDataValues[2]; 
+  const marketRows = rawDataValues.slice(3);
+
+  const auditValues = auditSheet.getDataRange().getValues();
+  const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]).trim(), r[1]]));
+
+  const filters = sheet.getRange('B5:B26').getValues();
+  const minDays = parseNum(filters[0][0]) || 0;    
+  const targetDays = parseNum(filters[2][0]) || 31; 
+  let rawMargin = parseNum(filters[4][0]);
+  const minMargin = (rawMargin > 1) ? rawMargin / 100 : rawMargin;
+
+  const cfg = {
+    minDays: minDays,
+    targetDays: targetDays,
+    minMargin: minMargin || 0,
+    limit: filters[14][0] === "No Limit" ? 5000 : parseInt(filters[14][0]) || 5000,
+    ignoreGroups: (filters[21][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
+    groups: (filters[6][0] || "").toLowerCase().split(',').map(s => s.trim()).filter(s => s),
+    sortDir: (filters[8][0] || "ASC").toUpperCase()
+  };
+
+  const col = {
+    name: headers.indexOf("Item Name"),
+    group: headers.indexOf("Group"),
+    qLeft: headers.indexOf("Quantity Left"),        
+    sellQty: headers.indexOf("Posted Sell Quantuty"), 
+    jobs: headers.indexOf("Active Jobs"),
+    deliv: headers.indexOf("Deliveries"),
+    mfgCost: headers.indexOf("Manufacturing Unit Cost"),
+    vol30: headers.indexOf("30-day traded volume"),
+    vel: headers.indexOf("Effective Daily Velocity (u/d)"),
+    warehouse: headers.indexOf("Warehouse Qty"),
+    totalMkt: headers.indexOf("Total Market Quantity"),
+    effCost: headers.indexOf("Effective Cost"),
+    margin: headers.indexOf("Margin"),
+    action: headers.indexOf("Buy Action")
+  };
+
+  let results = [];
+  marketRows.forEach(row => {
+    const name = String(row[col.name] || "").trim();
+    if (!name || auditMap.get(name) !== true) return;
+    
+    // --- RECONCILIATION FIX ---
+    // If it's being dumped, DO NOT put it on the Need To Buy list
+    if (dumpedItems.has(name)) return;
+
+    const group = String(row[col.group] || "").toLowerCase().trim();
+    if (cfg.ignoreGroups.includes(group)) return;
+    if (cfg.groups.length > 0 && !cfg.groups.includes(group)) return;
+
+    const whQty = parseNum(row[col.warehouse]);
+    const qLeft = parseNum(row[col.qLeft]);
+    const sQty = parseNum(row[col.sellQty]);
+    const jobs = parseNum(row[col.jobs]);
+    const deliv = parseNum(row[col.deliv]);
+
+    const currentStock = whQty + qLeft + sQty + jobs + deliv;
+    const velocity = parseNum(row[col.vel]);
+
+    const triggerLevel = Math.ceil(velocity * cfg.minDays);
+    if (currentStock > triggerLevel) return;
+
+    const finalGoal = Math.ceil(velocity * cfg.targetDays);
+    const restockNeed = Math.round(finalGoal - currentStock);
+    if (restockNeed <= 0) return;
+
+    let itemMargin = parseNum(row[col.margin]);
+    if (itemMargin > 1 && itemMargin <= 100 && cfg.minMargin <= 1) itemMargin /= 100;
+    if (itemMargin < cfg.minMargin) return;
+
+    const rawAction = String(row[col.action] || "");
+    const finalAction = (/SKIP|HOLD/i.test(rawAction)) ? "FORCE RESTOCK" : rawAction;
+    const cost = parseNum(row[col.effCost]) || parseNum(row[col.mfgCost]) || 0;
+
+    results.push({
+      data: [
+        name, restockNeed, cost, restockNeed * cost, parseNum(row[col.totalMkt]),
+        parseNum(row[col.vol30]), 0, whQty, itemMargin, finalAction
+      ],
+      sortKey: name
+    });
+  });
+
+  results.sort((a, b) => {
+    const modifier = cfg.sortDir === "ASC" ? 1 : -1;
+    return a.sortKey.localeCompare(b.sortKey) * modifier;
+  });
+
+  const output = results.slice(0, cfg.limit).map(r => r.data);
+  const maxRows = Math.max(sheet.getMaxRows(), 5);
+
+  if (maxRows >= 5) {
+    sheet.getRange(5, 3, maxRows - 4, 10).clearContent();
+  }
+
+  if (output.length > 0) {
+    sheet.getRange(5, 3, output.length, 10).setValues(output);
+  }
+}
+
+
+function generateRestockItemsOnHand(ss, fullData, dumpedItems = new Set()) {
   const TARGET_SHEET = 'Restock Items On Hand';
   const DATA_SHEET = 'MarketOverviewData';
   const AUDIT_SHEET = 'Audit items';
@@ -397,21 +454,17 @@ function generateRestockItemsOnHand(ss) {
 
   const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
 
-  // --- 1. SETTINGS & THRESHOLDS ---
   const bCol = sheet.getRange("A1:B45").getValues();
   const seedDays = clean(bCol[39][0]) || 4; 
   const minROI = clean(bCol[8][1]) || 0;         
-  const minOrderValue = 1000000; // 1M ISK Floor
+  const minOrderValue = 1000000; 
   const priceDeviationPct = clean(sheet.getRange("A6").getValue()) || 0;
 
-  // --- 2. BATCH LOAD DATA ---
-  const rawDataValues = dataSheet.getDataRange().getValues();
+  const rawDataValues = fullData || dataSheet.getDataRange().getValues();
   const headers = rawDataValues[2]; 
   const rawData = rawDataValues.slice(3);
 
   const getIdx = (name) => headers.indexOf(name);
-
-  // FIX: String-Safe Audit Map (Converts text "TRUE" to actual true)
   const auditValues = auditSheet.getDataRange().getValues();
   const auditMap = new Map(auditValues.slice(1).map(r => [String(r[0]), String(r[1]).toUpperCase() === 'TRUE']));
 
@@ -423,7 +476,7 @@ function generateRestockItemsOnHand(ss) {
     effVel: getIdx("Effective Daily Velocity (u/d)"),
     hubSell: getIdx("Hub Sell Price"),
     sellAct: getIdx("Sell Action"),
-    customPrice: getIdx("Custom Price"), // BOT DEFENSE MAP
+    customPrice: getIdx("Custom Price"), 
     hubBuy: getIdx("Hub Buy Price"),
     mktQty: getIdx("Total Market Quantity"),
     effCost: getIdx("Effective Cost"),
@@ -439,19 +492,19 @@ function generateRestockItemsOnHand(ss) {
 
   let resultRows = [];
 
-  // --- 3. MAIN PROCESSING LOOP ---
   for (let r of rawData) {
     const rawName = String(r[col.item] || "");
     if (!rawName) continue;
 
+    // --- RECONCILIATION FIX ---
+    // If it's being dumped, DO NOT put it on the Restock list
+    if (dumpedItems.has(rawName)) continue;
+
     const action = String(r[col.sellAct] || "").toUpperCase();
-    
-    // HARD GATE: Exit on Saturated/Skip
     if (action.includes("SATURATED") || action.includes("SKIP") || action.includes("HOLD") || action.includes("IGNORE")) {
       continue;
     }
 
-    // HARD GATE: Audit Sheet Safety Check
     if (auditMap.get(rawName) !== true) continue;
 
     const warehouseStock = clean(r[col.whQty]);
@@ -459,7 +512,6 @@ function generateRestockItemsOnHand(ss) {
     const velocity = clean(r[col.effVel]);
     const targetGoal = clean(r[col.targetGoal]);
 
-    // Calculate Restock Quantity
     let targetNeeded = velocity * seedDays;
     if (targetGoal > 0) targetNeeded = Math.min(targetNeeded, targetGoal);
 
@@ -468,17 +520,14 @@ function generateRestockItemsOnHand(ss) {
 
     if (finalQuantity <= 0) continue;
 
-    // --- PRICING & BOT DEFENSE ---
     let postPrice = 0;
     const manualPrice = clean(r[col.customPrice]);
     const hubSell = clean(r[col.hubSell]); 
     const baseCost = clean(r[col.effCost]) || clean(r[col.mfgCost]); 
     
     if (manualPrice > 0) {
-      // Use Custom Price (Ignores Bots)
       postPrice = manualPrice;
     } else {
-      // Normal Undercut vs Floor logic
       let undercutPrice = hubSell * (1 - priceDeviationPct);
       const floorPrice = baseCost * (1 + minROI);
       postPrice = Math.max(undercutPrice, floorPrice);
@@ -487,7 +536,6 @@ function generateRestockItemsOnHand(ss) {
     postPrice = Math.round(postPrice * 100) / 100;
     const totalOrderValue = finalQuantity * postPrice; 
     
-    // FIX: 1 Million ISK Threshold (Custom Priced items bypass this!)
     if (manualPrice <= 0 && totalOrderValue < minOrderValue && currentMarket !== 0) continue;
 
     resultRows.push([
@@ -500,7 +548,6 @@ function generateRestockItemsOnHand(ss) {
     ]);
   }
 
-  // --- 4. BATCH CLEAR AND WRITE ---
   const maxRows = Math.max(1, sheet.getLastRow());
   if (maxRows >= 3) {
     sheet.getRange(3, 3, maxRows, 21).clearContent();
@@ -510,8 +557,6 @@ function generateRestockItemsOnHand(ss) {
 
   if (resultRows.length > 0) {
     sheet.getRange(4, 3, resultRows.length, 21).setValues(resultRows);
-  } else {
-    LOG.info("Restock Sheet Blanked: All items filtered out by Audit, Saturated tags, or ISK thresholds.");
   }
 }
 
