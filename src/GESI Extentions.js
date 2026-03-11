@@ -203,6 +203,38 @@ function resetLootSnapshot() {
 }
 
 /**
+ * Helper to call GESI with exponential backoff for rate limits.
+ * Protects against HTTP 429 "Bandwidth quota exceeded" errors.
+ */
+function _invokeGesiWithRetry(endpoint, params, maxRetries = 3) {
+  let attempt = 0;
+  let delayMs = 2000; // Start with a 2-second delay if rate limited
+  
+  while (attempt < maxRetries) {
+    try {
+      return GESI.invokeRaw(endpoint, params);
+    } catch (e) {
+      attempt++;
+      const errorMsg = e.message || String(e);
+      
+      // Only retry on rate limit / bandwidth errors
+      if (errorMsg.includes("Bandwidth quota exceeded") || errorMsg.includes("429")) {
+        if (attempt >= maxRetries) throw e; // Give up if max retries hit
+        
+        const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('GESI_RETRY') : console;
+        log.warn(`Rate limit hit for ${params.name || 'API'}. Retrying in ${delayMs}ms... (Attempt ${attempt} of ${maxRetries})`);
+        
+        Utilities.sleep(delayMs);
+        delayMs *= 2; // Exponential backoff (2s, 4s, 8s...)
+      } else {
+        // Throw immediately for auth drops (e.g., "Access not granted")
+        throw e;
+      }
+    }
+  }
+}
+
+/**
  * PROCESS INTERNAL BUFFER (De-duplication Enforced)
  * Reads the hidden buffer sheet, filters out duplicates that already exist 
  * in Sales_Ledger, and writes valid paired/timed-out transactions.
@@ -1573,19 +1605,21 @@ function syncContracts(ss, charIdMap) {
 
   const seenCids = new Set();
 
-  // ---------------- PHASE 1 & 2: MULTI-STATUS FETCH ----------------
+ // ---------------- PHASE 1 & 2: MULTI-STATUS FETCH ----------------
   CONTRACT_STATUSES.forEach(status => {
 
     // --- 1 & 2: Fetch Char & Corp Data ---
     const allCharContractsRaw = [];
     allNames.forEach(charName => {
       try {
-        const contracts = GESI.invokeRaw(EP_LIST_CHAR, {
+        // FIX: Use the retry wrapper instead of direct GESI.invokeRaw
+        const contracts = _invokeGesiWithRetry(EP_LIST_CHAR, {
           name: charName,
           status: status,
           show_column_headings: false,
           version: null
         });
+        
         // CRITICAL FIX: Always push the result array (empty or full) to maintain alignment
         // with the index position of charName in allNames.
         allCharContractsRaw.push(contracts || []);
@@ -1593,24 +1627,32 @@ function syncContracts(ss, charIdMap) {
           LoggerEx.debug("charName: " + charName + " contracts: " + JSON.stringify(contracts));
         }
 
+        // FIX: Add a small baseline pause to prevent hammering the API too fast
+        Utilities.sleep(400); 
+
       } catch (e) {
         // LOG THE SPECIFIC CHARACTER THAT FAILED
         log.error(`[SyncContracts] FAILED to fetch contracts for character: ${charName}. Error: ${e.message}`);
-
-        // OPTION A: Fail hard (re-throw) if you want the job to stop
-        //throw new Error(`Auth Error for ${charName}: ${e.message}`);
 
         // OPTION B: (Recommended) Push empty array and continue, so other chars still sync
         allCharContractsRaw.push([]);
       }
 
     });
-    const resCorp = GESI.invokeRaw(EP_LIST_CORP, {
-      status: status,
-      name: authToon,
-      show_column_headings: false,
-      version: null
-    });
+    
+    // FIX: Wrap the Corp fetch in the retry handler and try-catch too
+    let resCorp = [];
+    try {
+      resCorp = _invokeGesiWithRetry(EP_LIST_CORP, {
+        status: status,
+        name: authToon,
+        show_column_headings: false,
+        version: null
+      });
+      Utilities.sleep(400); // Baseline pause
+    } catch (e) {
+      log.error(`[SyncContracts] FAILED to fetch CORP contracts. Error: ${e.message}`);
+    }
 
     // --- 3. NORMALIZE & AGGREGATE RESULTS ---
     var tuplesChar = _normalizeCharContracts(allCharContractsRaw, allNames, idNameMap);
@@ -1630,7 +1672,10 @@ function syncContracts(ss, charIdMap) {
 
       if (!cid || seenCids.has(cid)) continue;
       if (cid > maxContractId) maxContractId = cid;
-      // --- Determine Buy or Sale Status ---
+     // --- Determine Buy, Sale, or Internal Transfer Status ---
+      // NEW: Check if both parties are in your character map
+      const isInternalTransfer = idNameMap[String(c.issuer_id)] && idNameMap[String(c.acceptor_id)];
+      
       const isSale = (c.status === 'finished' || c.status === 'completed') &&
         (c.issuer_id === myCharId);
 
@@ -1648,12 +1693,14 @@ function syncContracts(ss, charIdMap) {
       const items = normalizeItemRows(itemsRaw);
 
       // --- PUSH TO SEGREGATED AND COMBINED ARRAYS ---
-      if (isSale) {
-        outC_Sale.push(contractRow);
-        // NOTE: Sales ledger is complex. We push the full row for later allocation.
-      } else {
-        // Assume the Material Ledger handles Buys (Item Exchange where we are acceptor)
-        outC_Buy.push(contractRow);
+      // NEW: Only push to ledgers if it is NOT an internal transport contract
+      if (!isInternalTransfer) {
+        if (isSale) {
+          outC_Sale.push(contractRow);
+        } else {
+          // Assume the Material Ledger handles Buys (Item Exchange where we are acceptor)
+          outC_Buy.push(contractRow);
+        }
       }
 
       // Push raw contract/item data to combined arrays for raw sheet overwrite
@@ -2390,7 +2437,7 @@ function runContractLedgerPhase(ss) {
       SCRIPT_PROP.setProperty(PROP_KEY_LAST_CONTRACT_ID, String(syncResult.maxContractId));
       log.info(`Saved new last processed Contract ID: ${syncResult.maxContractId}`);
     }
-    // --- STEP 5: COST ALLOCATION (COGS) ---
+   // --- STEP 5: COST ALLOCATION (COGS) ---
     try {
       log.info('Decoupling COGS finalization to asynchronous trigger.');
       triggerContractUnitCostsFinalization();
@@ -2400,6 +2447,9 @@ function runContractLedgerPhase(ss) {
 
     // --- RELEASE LEASE ON SUCCESS ---
     SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
+    
+    // FIX: Explicitly set the timestamp so the COGS finalizer passes its dependency check
+    SCRIPT_PROP.setProperty('MAINTENANCE_LAST_RUN_TS_runContractLedgerPhase', String(new Date().getTime()));
 
   } catch (e) {
     log.error('runContractLedgerPhase FAILED', e.message);

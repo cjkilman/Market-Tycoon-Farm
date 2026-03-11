@@ -131,7 +131,7 @@ function triggerRestockSync() {
 
     // 2. Pass the Ban List to the restock functions so they ignore dumped items
     generateRestockQuery(ss, fullData, dumpedItems);
-    generateRestockItemsOnHand(ss, fullData, dumpedItems);
+    generateRestockItemsOnHand(ss, fullData);
     generateConsolidatedRequirements(ss);
     
     ss.toast("✅ Sync Complete. Releasing Lock.", "Engine Room", 3);
@@ -163,8 +163,8 @@ function respondToEdit(e) {
     const dumpedItems = generateDumpToBuyOrder(e.source) || new Set();
     generateRestockQuery(e.source, null, dumpedItems);
   } else if (sheetName === 'Restock Items On Hand') {
-    const dumpedItems = generateDumpToBuyOrder(e.source) || new Set();
-    generateRestockItemsOnHand(e.source, null, dumpedItems);
+
+    generateRestockItemsOnHand(e.source, null);
   } else if (sheetName === 'Dump to Buy') {
     // If you edit the Dump sheet itself, update it, then instantly sync the Buy sheets
     const dumpedItems = generateDumpToBuyOrder(e.source) || new Set();
@@ -438,7 +438,7 @@ function generateRestockQuery(ss, fullData, dumpedItems = new Set()) {
 }
 
 
-function generateRestockItemsOnHand(ss, fullData, dumpedItems = new Set()) {
+function generateRestockItemsOnHand(ss, fullData) {
   const TARGET_SHEET = 'Restock Items On Hand';
   const DATA_SHEET = 'MarketOverviewData';
   const AUDIT_SHEET = 'Audit items';
@@ -456,7 +456,7 @@ function generateRestockItemsOnHand(ss, fullData, dumpedItems = new Set()) {
 
   const bCol = sheet.getRange("A1:B45").getValues();
   const seedDays = clean(bCol[39][0]) || 4; 
-  const minROI = clean(bCol[8][1]) || 0;         
+  const minROI = clean(bCol[8][1]) || 0;          
   const minOrderValue = 1000000; 
   const priceDeviationPct = clean(sheet.getRange("A6").getValue()) || 0;
 
@@ -495,10 +495,6 @@ function generateRestockItemsOnHand(ss, fullData, dumpedItems = new Set()) {
   for (let r of rawData) {
     const rawName = String(r[col.item] || "");
     if (!rawName) continue;
-
-    // --- RECONCILIATION FIX ---
-    // If it's being dumped, DO NOT put it on the Restock list
-    if (dumpedItems.has(rawName)) continue;
 
     const action = String(r[col.sellAct] || "").toUpperCase();
     if (action.includes("SATURATED") || action.includes("SKIP") || action.includes("HOLD") || action.includes("IGNORE")) {
