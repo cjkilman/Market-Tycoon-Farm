@@ -29,6 +29,8 @@ const BPO_RAW_CACHE_TTL = 3600; // 1 hour TTL
 
 const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('IndustryLedger') : console);
 
+const CORP_ID = '98626262'; // Market-Tycoon Corp ID
+
 // ----------------------------------------------------------------------
 // --- LOCAL HELPER: ROBUST NAMED RANGE LOOKUP ---
 // ----------------------------------------------------------------------
@@ -179,109 +181,99 @@ function generateFullBOMData(ss) {
  * Logic: Aggregates BOM, calculates Shopping List/Cost, and outputs static values.
  */
 function generateConsolidatedRequirements(ss) {
+  const TARGET_SHEET_NAME = 'Consolidated_Requirements';
+  const SOURCE_SHEET_NAME = 'Manufaturing Inputs Effective Cost';
+  
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Consolidator') : console;
+  const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
+  const sourceSheet = ss.getSheetByName(SOURCE_SHEET_NAME);
+  
+  if (!sheet || !sourceSheet) return;
 
-  const clean = (v) => {
-    if (typeof v === 'number') return v;
-    if (!v) return 0;
-    return parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
+  const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
+
+  const rawData = sourceSheet.getDataRange().getValues();
+  const headers = rawData[0];
+  const dataRows = rawData.slice(1);
+
+  const col = {
+    id: headers.indexOf("Type ID"),
+    cost: headers.indexOf("Effective Cost"), // Your WAG
+    name: headers.indexOf("Type Name"),
+    bufferPct: headers.indexOf("Buffer Status (%)"),
+    deficit31d: headers.indexOf("Need to Buy (31d)"),
+    daysOnHand: headers.indexOf("Days on Hand")
   };
 
-  const getValues = (name) => {
-    const sh = ss.getSheetByName(name);
-    return sh ? sh.getDataRange().getValues() : [];
-  };
+  const OUT_HEADERS = [
+    "Material Name", "Buffer Status", "Total 31-Day Deficit", 
+    "Daily Siphon Target", "WAG (Max Buy Price)", "Logistics Action"
+  ];
 
-  const bomDataRaw = getValues("Full_BOM_Data");
-  const sdeData = getValues("SDE_invTypes");
-  const blendedCostData = getValues("Blended_Cost");
-  const marketRawData = getValues("Market_Data_Raw");
-  const hangarData = getValues("MaterialHangar");
+  let results = [];
 
-  if (bomDataRaw.length < 2) return;
+  // Standardize the timeframe to smooth out the buys (e.g., acquire the 31-day deficit over 15 days)
+  const acquisitionDays = 15; 
 
-  const nameMap = new Map(sdeData.map(r => [Number(r[0]), r[2]]));
+  for (let r of dataRows) {
+    const name = String(r[col.name] || "").trim();
+    if (!name) continue;
 
-  // FIX APPLIED: Reading Type ID from Col B (index 1) and Total Qty from Col E (index 4)
-  const hangarMap = new Map();
-  hangarData.forEach(r => {
-    const id = Number(r[1]); // Column B: Type ID
-    const qty = clean(r[4]); // Column E: Total Quantity
-    if (id) {
-      hangarMap.set(id, (hangarMap.get(id) || 0) + qty);
+    const deficit = clean(r[col.deficit31d]);
+    const buffer = clean(r[col.bufferPct]) || 0;
+    
+    // Only trigger if we actually have a deficit
+    if (deficit > 0) {
+      const wagCost = clean(r[col.cost]);
+      
+      // Calculate the covert daily buy amount
+      const dailyTarget = Math.ceil(deficit / acquisitionDays);
+      
+      let action = "STANDBY";
+      let urgency = buffer;
+
+      if (urgency <= 0.15) {
+        action = "CRITICAL: MAX RANGE SAFE SIPHON";
+      } else if (urgency <= 0.30) {
+        action = "ACTIVE: DEPLOY MICRO-HUB ORDERS";
+      } else {
+        action = "PASSIVE: DRIP FEED";
+      }
+
+      results.push({
+        data: [
+          name, 
+          buffer, 
+          deficit, 
+          dailyTarget, 
+          wagCost, 
+          action
+        ],
+        sortKey: urgency // Sort by most critical buffer
+      });
     }
-  });
-
-  const costMap = new Map();
-  marketRawData.forEach(r => {
-    const price = clean(r[5]);
-    if (price > 0) costMap.set(Number(r[1]), price * 1.11);
-  });
-  blendedCostData.forEach(r => {
-    const price = clean(r[2]);
-    if (price > 0) costMap.set(Number(r[0]), price);
-  });
-
-  const aggregation = {};
-
-  for (let i = 1; i < bomDataRaw.length; i++) {
-    const id = Number(bomDataRaw[i][2]); // Column C
-    if (!id) continue;
-
-    const qty = clean(bomDataRaw[i][7]); // Column H
-
-    if (!aggregation[id]) {
-      const unitCost = costMap.get(id) || 0;
-      const onHand = hangarMap.get(id) || 0;
-      aggregation[id] = {
-        id: id,
-        name: nameMap.get(id) || "Unknown",
-        totalReq: 0,
-        onHand: onHand,
-        unitCost: unitCost
-      };
-    }
-    aggregation[id].totalReq += qty;
   }
 
-  const outputRows = Object.values(aggregation)
-    .map(item => {
-      const shoppingList = Math.max(0, item.totalReq - item.onHand);
-      const shoppingCost = shoppingList * item.unitCost;
+  // Sort lowest buffer to the top
+  results.sort((a, b) => a.sortKey - b.sortKey);
+  const output = results.map(r => r.data);
 
-      return [
-        item.id,
-        item.name,
-        item.totalReq,
-        item.onHand,
-        item.unitCost,
-        item.shoppingList,
-        item.shoppingCost
-      ];
-    })
-    .sort((a, b) => b[2] - a[2]);
-
-  const outSheet = ss.getSheetByName("Consolidated_Requirements");
-  if (!outSheet) return;
-
-  outSheet.clearContents();
-  const headers = [["Type ID", "Material Name", "Total Required", "On Hand", "Unit Cost", "Shopping List", "Shopping Cost"]];
-  outSheet.getRange(1, 1, 1, 7).setValues(headers);
-
-  if (outputRows.length > 0) {
-    outSheet.getRange(2, 1, outputRows.length, 7).setValues(outputRows);
-    outSheet.getRange(2, 5, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\"");
-    outSheet.getRange(2, 7, outputRows.length, 1).setNumberFormat("#,##0.00\" ISK\"");
+  // Write to sheet
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, OUT_HEADERS.length).setValues([OUT_HEADERS]).setFontWeight("bold");
+  
+  if (output.length > 0) {
+    sheet.getRange(2, 1, output.length, OUT_HEADERS.length).setValues(output);
+    // Format the WAG column to ISK and Buffer to %
+    sheet.getRange(2, 5, output.length, 1).setNumberFormat("#,##0.00 [$ISK]");
+    sheet.getRange(2, 2, output.length, 1).setNumberFormat("0.00%");
+    sheet.getRange(2, 3, output.length, 2).setNumberFormat("#,##0");
   }
-
-  LOG.info(`BOM Consolidated: ${outputRows.length} materials. Hangar Stock Synced.`);
 }
 
 // ----------------------------------------------------------------------
 // --- MASTER ADD-ON INTEGRATION ---
 // ----------------------------------------------------------------------
-
 function runIndustryLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -339,10 +331,82 @@ function runIndustryLedgerPhase(ss) {
   }
 }
 
+function fetchAllCorpBlueprints(corporationId) {
+  const cacheKey = "corp_bps_" + corporationId;
+  const cachedData = getLargeCache(cacheKey);
+  
+  if (cachedData) {
+    console.log("Using Cached Blueprint Data (Freshness: < 1hr)");
+    return cachedData;
+  }
+
+  console.log("Cache Expired. Fetching fresh data from ESI...");
+  let allBlueprints = [];
+  let page = 1;
+  let keepFetching = true;
+
+  while (keepFetching) {
+    // RATE LIMITING: A 100ms pause is "polite" to the ESI Error Limit
+    Utilities.sleep(100); 
+
+    try {
+      let response = GESI.corporations_corporation_blueprints(corporationId, page);
+
+      if (response && response.length > 0) {
+        allBlueprints = allBlueprints.concat(response);
+        if (response.length < 1000) {
+          keepFetching = false;
+        } else {
+          page++;
+        }
+      } else {
+        keepFetching = false;
+      }
+    } catch (e) {
+      // If we hit a 420 or 5xx, we stop immediately to avoid "Error Limiting"
+      console.error("ESI Error on page " + page + ": " + e.message);
+      keepFetching = false;
+    }
+  }
+
+  // Save the massive haul to cache
+  putLargeCache(cacheKey, allBlueprints);
+  return allBlueprints;
+}
+
+/**
+ * Using the existing V12 Fetch-All Ferrari logic and 
+ * the 8KB Shard-Chucker (CacheService) to audit the hangar.
+ */
+function syncCorpBlueprintsV12() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const CACHE_KEY = "CORP_BPS_FULL_AUDIT";
+  
+  // 1. Try to pull from your existing _getAndDechunk tool
+  let allBlueprints = _getAndDechunk(CACHE_KEY);
+  
+  if (!allBlueprints) {
+    console.log("Cache empty. Powering up the V12 Ferrari...");
+    
+    // 2. Use your existing fetchAllCorpBlueprints logic
+    // (Assuming it loops through pages until response.length < 1000)
+    allBlueprints = fetchAllCorpBlueprints(CORP_ID); 
+    
+    // 3. Stash it using your _chunkAndPut (8KB chunks)
+    // 21600 seconds = 6 hours (or match ESI's 3600 cache)
+    _chunkAndPut(CACHE_KEY, allBlueprints, 3600);
+    console.log("Hangar haul sharded and cached.");
+  } else {
+    console.log("Hangar data retrieved from Shard-Chucker.");
+  }
+
+  // 4. Proceed to update Config_BPC_Runs...
+  _updateBpoConfigFromAudit(allBlueprints);
+}
+
 // ----------------------------------------------------------------------
 // --- STAGE 1: BPC Cost Calculation ---
 // ----------------------------------------------------------------------
-
 function runBpcCreationLedger() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();

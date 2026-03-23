@@ -17,7 +17,9 @@ function trigger_generateProjectedCostTable() {
  * Optimizations: O(1) Indexing, Early Exit, Memory-Resident Processing.
  */
 function generateProjectedCostTable(ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ProjectedCost') : console;
   
   // --- 1. Load Constants & Pricing Maps ---
