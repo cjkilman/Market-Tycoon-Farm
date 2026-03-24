@@ -61,20 +61,6 @@ function getReprocessValue(typeIDs, stationYield, playerSkill) {
 }
 
 
-// Get the total skill/implant multiplier for Jason Kilman
-function getCharacterMeltMultiplier() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const profile = ss.getSheetByName("Character_Profile").getDataRange().getValues();
-  
-  // Basic math: (Repro * Repro Eff * Specific Skill * Implant)
-  // These indices assume your CSV structure: Name (0), Level (1), Multiplier (2)
-  let totalMult = 1.0;
-  for (let i = 1; i < profile.length; i++) {
-    totalMult *= parseFloat(profile[i][2]);
-  }
-  return totalMult;
-}
-
 // Get the base yield for a specific location
 function getStructureBaseYield(locationNickname) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -147,15 +133,44 @@ function runReprocessingAudit(ss) {
   PropertiesService.getScriptProperties().setProperty('PROJECTED_SCRAP_MINERALS', JSON.stringify(projectedMinerals));
 }
 
+// Get the total skill/implant multiplier for Jason Kilman (Loot/Modules Only)
+function getCharacterMeltMultiplier() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const profile = ss.getSheetByName("Character_Profile").getDataRange().getValues();
+  
+  let totalMult = 1.0;
+  
+  // Whitelist: ONLY apply skills/implants relevant to melting scrapmetal
+  const activeScrapSkills = [
+    "Reprocessing",
+    "Reprocessing Efficiency",
+    "Scrapmetal Processing",
+    "Zainou 'Beancounter' RX-810"
+  ];
+  
+  for (let i = 1; i < profile.length; i++) {
+    const skillName = String(profile[i][0]).trim();
+    const val = parseFloat(profile[i][2]);
+    
+    // Safety check: Only multiply if it's on the whitelist
+    if (activeScrapSkills.includes(skillName) && !isNaN(val) && val > 0) {
+      totalMult *= val;
+    }
+  }
+  return totalMult;
+}
+
 /**
  * REPROCESSING INTERFACE EVALUATOR & COMMITTER
  * Reads a pasted inventory list, evaluates profitability against Blended Costs,
- * and commits the resulting minerals to the Material Ledger.
+ * and commits to the Material Ledger. Includes detailed execution logging.
  */
 function evaluateReprocessingInterface() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const ui = SpreadsheetApp.getUi();
   const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('REPRO_EVAL') : console;
+  
+  log.info("=== Starting Reprocessing Evaluation ===");
   
   // Sheet Names
   const INTERFACE_SHEET = "Preproceeing Interface"; 
@@ -166,7 +181,7 @@ function evaluateReprocessingInterface() {
   
   const sheet = ss.getSheetByName(INTERFACE_SHEET);
   if (!sheet) {
-    log.error("Could not find sheet: " + INTERFACE_SHEET);
+    log.error("CRITICAL: Could not find sheet: " + INTERFACE_SHEET);
     return;
   }
   
@@ -174,9 +189,15 @@ function evaluateReprocessingInterface() {
 
   // 1. Data Lookups
   const rawData = sheet.getDataRange().getValues();
-  const headers = rawData[1]; // Row 2 contains "Item, Qty, Type..."
-  const itemIdx = headers.indexOf("Item");
-  const qtyIdx = headers.indexOf("Qty");
+  
+  const headerRowIndex = 2;
+  const headers = rawData.length > headerRowIndex ? rawData[headerRowIndex] : [];
+  
+  const itemIdx = headers.indexOf("Item") !== -1 ? headers.indexOf("Item") : 1; 
+  const qtyIdx = headers.indexOf("Qty") !== -1 ? headers.indexOf("Qty") : 2;
+  const typeIdx = headers.indexOf("Type") !== -1 ? headers.indexOf("Type") : 3;
+
+  log.info(`Column Mapping -> Item: ${itemIdx}, Qty: ${qtyIdx}, Type: ${typeIdx}`);
 
   // Type Map
   const typeData = ss.getSheetByName(SDE_TYPE_SHEET).getDataRange().getValues();
@@ -209,51 +230,66 @@ function evaluateReprocessingInterface() {
     materialMap.get(pId).push({ matID: Number(r[1]), qty: Number(r[2]) });
   });
 
+  log.info(`Data Loaded -> Types: ${typeMap.size}, Blended Costs: ${blendedMap.size}, Market Prices: ${marketMap.size}, Materials: ${materialMap.size}`);
+
   // 2. Jason Kilman's Efficiency Calculation
   let totalEfficiency = 0.50; // Fallback
   try {
     const baseYield = getStructureBaseYield("Domain Industry (Athanor)"); 
     const charMult = getCharacterMeltMultiplier(); 
     totalEfficiency = baseYield * charMult;
+    log.info(`Calculated Total Melt Efficiency: ${(totalEfficiency * 100).toFixed(2)}%`);
   } catch(e) {
-    log.warn("Using fallback efficiency. Could not load profile.");
+    log.warn("Using fallback efficiency (50%). Could not load profile.");
   }
 
   // 3. Process the Pasted Rows
   const OUT_HEADERS = ["Blended Unit Cost", "Total Input Cost", "Scrap Value (Amarr Buy)", "Net Profit", "Margin", "Action"];
   const outData = [];
-  const startRow = 2; // Data starts on Row 3 (index 2)
+  const startRow = 3; 
   
-  // LEDGER PREPARATION
   const ledgerEntries = [];
   const batchId = Utilities.getUuid().substring(0, 8);
   const todayStr = new Date().toISOString().split('T')[0];
+  
+  let processedCount = 0;
 
   for(let i = startRow; i < rawData.length; i++) {
     const row = rawData[i];
-    const itemName = String(row[itemIdx] || "").trim();
     const qty = parseFloat(String(row[qtyIdx] || "").replace(/[^0-9.-]/g, '')) || 0;
 
-    if (!itemName || qty <= 0) {
+    if (qty <= 0) {
         outData.push(["", "", "", "", "", ""]);
         continue;
     }
 
-    const typeInfo = typeMap.get(itemName.toLowerCase());
+    let typeInfo = null;
+    let lookupName = "";
+    
+    // SMART LOOKUP
+    if (typeIdx !== -1 && String(row[typeIdx]).trim() !== "") {
+        lookupName = String(row[typeIdx]).trim();
+        typeInfo = typeMap.get(lookupName.toLowerCase());
+    }
+    if (!typeInfo) {
+        lookupName = String(row[itemIdx] || "").trim();
+        typeInfo = typeMap.get(lookupName.toLowerCase());
+    }
+
     if(!typeInfo) {
+         log.warn(`Row ${i + 1}: Unrecognized Item -> "${lookupName}"`);
          outData.push(["Unrecognized Item", "", "", "", "", ""]);
          continue;
     }
 
+    processedCount++;
     const typeId = typeInfo.id;
     const portionSize = typeInfo.portion;
     const batchCount = qty / portionSize;
 
-    // Determine Input Costs
     const blendedUnitCost = blendedMap.get(typeId) || 0;
     const totalInputCost = blendedUnitCost * qty;
 
-    // Determine Output Value & Prepare Ledger Data
     const materials = materialMap.get(typeId) || [];
     let totalScrapValue = 0;
     const currentItemLedgerPayload = [];
@@ -268,9 +304,9 @@ function evaluateReprocessingInterface() {
            date: todayStr,
            type_id: mat.matID,
            qty: yieldQty,
-           unit_value: unitPrice, // Opportunity Cost scaling
+           unit_value: unitPrice, 
            source: "REPROCESSING",
-           contract_id: `REPRO-${batchId}-${typeId}`, // Unique ID binds the output to the source item
+           contract_id: `REPRO-${batchId}-${typeId}`, 
            char: "Jason Kilman"
          });
        }
@@ -280,34 +316,39 @@ function evaluateReprocessingInterface() {
     let margin = 0;
     if (totalInputCost > 0) margin = profit / totalInputCost;
 
-    // Logic Gate
     let action = "SELL RAW (LOSS)";
     if (totalInputCost === 0 && totalScrapValue > 0) {
        action = "REPROCESS (FREE LOOT)";
-       ledgerEntries.push(...currentItemLedgerPayload); // Queue for Ledger
+       ledgerEntries.push(...currentItemLedgerPayload);
     } else if (profit > 0) {
        action = "REPROCESS (PROFITABLE)";
-       ledgerEntries.push(...currentItemLedgerPayload); // Queue for Ledger
+       ledgerEntries.push(...currentItemLedgerPayload);
     }
+
+    log.info(`Row ${i + 1}: [${lookupName}] Qty: ${qty} | InCost: ${totalInputCost.toFixed(2)} | ScrapVal: ${totalScrapValue.toFixed(2)} | Profit: ${profit.toFixed(2)} | Action: ${action}`);
 
     outData.push([blendedUnitCost, totalInputCost, totalScrapValue, profit, margin, action]);
   }
 
-  // 4. Output to Sheet (Writes to Columns G through L)
-  const targetCol = headers.length + 1; // Dynamically find the first empty column after paste
+  log.info(`Evaluation Loop Complete. Processed ${processedCount} valid items. Ledger entries queued: ${ledgerEntries.length}`);
+
+  // 4. Output to Sheet
+  const targetCol = 9; 
+  const headerRow = 3; 
+  const dataRow = 4;   
   
-  const maxRows = Math.max(sheet.getMaxRows(), 3);
-  if (maxRows >= 3) {
-     sheet.getRange(2, targetCol, maxRows, OUT_HEADERS.length).clearContent();
+  const numRowsToClear = sheet.getMaxRows() - headerRow + 1;
+  if (numRowsToClear > 0) {
+     sheet.getRange(headerRow, targetCol, numRowsToClear, OUT_HEADERS.length).clearContent();
   }
 
-  sheet.getRange(2, targetCol, 1, OUT_HEADERS.length).setValues([OUT_HEADERS]).setFontWeight("bold").setBackground("#f3f3f3");
+  sheet.getRange(headerRow, targetCol, 1, OUT_HEADERS.length).setValues([OUT_HEADERS]).setFontWeight("bold").setBackground("#f3f3f3");
   
   if (outData.length > 0) {
-    const dataRange = sheet.getRange(3, targetCol, outData.length, OUT_HEADERS.length);
+    const dataRange = sheet.getRange(dataRow, targetCol, outData.length, OUT_HEADERS.length);
     dataRange.setValues(outData);
-    sheet.getRange(3, targetCol, outData.length, 4).setNumberFormat("#,##0.00 [$ISK]");
-    sheet.getRange(3, targetCol + 4, outData.length, 1).setNumberFormat("0.00%");
+    sheet.getRange(dataRow, targetCol, outData.length, 4).setNumberFormat("#,##0.00 [$ISK]");
+    sheet.getRange(dataRow, targetCol + 4, outData.length, 1).setNumberFormat("0.00%");
   }
   
   // 5. THE LEDGER COMMIT
@@ -319,20 +360,25 @@ function evaluateReprocessingInterface() {
     );
     
     if (response == ui.Button.YES) {
+      log.info("User selected YES to commit to ledger.");
       ss.toast("Committing to Material Ledger...", "Engine Room", 5);
       
-      // Ensure ML is defined (from MaterialLedger.js)
       if (typeof ML !== 'undefined') {
         ML.forSheet("Material_Ledger").upsertBy(['contract_id', 'type_id'], ledgerEntries);
-        ss.toast(`✅ Successfully committed ${ledgerEntries.length} yields to Blended Cost.`, "Engine Room", 5);
+        log.info("Successfully upserted data to Material Ledger via ML Engine.");
+        ss.toast(`Successfully committed ${ledgerEntries.length} yields to Blended Cost.`, "Engine Room", 5);
       } else {
-        log.error("Material Ledger (ML) class not found. Ensure MaterialLedger.js is loaded.");
+        log.error("CRITICAL: Material Ledger (ML) class not found during commit.");
         ui.alert('Error: Material Ledger script not found.');
       }
     } else {
+      log.info("User selected NO. Ledger commit cancelled.");
       ss.toast("Evaluation only. Ledger was NOT updated.", "Engine Room", 3);
     }
   } else {
+    log.info("No profitable items found. Bypassing ledger commit prompt.");
     ss.toast("Evaluation Complete! No profitable items to commit.", "Engine Room", 3);
   }
+  
+  log.info("=== Reprocessing Evaluation Finished ===");
 }

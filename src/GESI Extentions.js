@@ -942,9 +942,6 @@ function processJournalDurable(ss) {
 // NORMALIZERS
 //==========================================================================================
 
-// File: cjkilman/market-tycoon-farm/Market-Tycoon-Farm-dev/src/GESI Extentions.js
-
-// Normalize CONTRACT LIST results -> [{ ch, c }]
 // Normalize CONTRACT LIST results -> [{ ch, c }]
 function _normalizeCharContracts(res, names, idNameMap) { // NOTE: idNameMap is now required
   const LOG = Logger;
@@ -1001,9 +998,6 @@ function _normalizeCharContracts(res, names, idNameMap) { // NOTE: idNameMap is 
   LOG.log(`CHAR_NORM: Finished normalization. Generated ${tuples.length} tuples.`);
   return tuples;
 }
-
-
-
 
 // Corp list: same mapping, but force auth name (corp lists usually lack char names)
 function _normalizeCorpContracts(res, corpAuthName) {
