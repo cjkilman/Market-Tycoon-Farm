@@ -331,78 +331,70 @@ function runIndustryLedgerPhase(ss) {
   }
 }
 
+/**
+ * V12 Ferrari - Blueprint Edition (With Cache Protection)
+ */
 function fetchAllCorpBlueprints(corporationId) {
+  const authToon = getCorpAuthChar();
   const cacheKey = "corp_bps_" + corporationId;
-  const cachedData = getLargeCache(cacheKey);
   
-  if (cachedData) {
-    console.log("Using Cached Blueprint Data (Freshness: < 1hr)");
-    return cachedData;
-  }
-
-  console.log("Cache Expired. Fetching fresh data from ESI...");
-  let allBlueprints = [];
-  let page = 1;
-  let keepFetching = true;
-
-  while (keepFetching) {
-    // RATE LIMITING: A 100ms pause is "polite" to the ESI Error Limit
-    Utilities.sleep(100); 
-
-    try {
-      let response = GESI.corporations_corporation_blueprints(corporationId, page);
-
-      if (response && response.length > 0) {
-        allBlueprints = allBlueprints.concat(response);
-        if (response.length < 1000) {
-          keepFetching = false;
-        } else {
-          page++;
-        }
-      } else {
-        keepFetching = false;
-      }
-    } catch (e) {
-      // If we hit a 420 or 5xx, we stop immediately to avoid "Error Limiting"
-      console.error("ESI Error on page " + page + ": " + e.message);
-      keepFetching = false;
+  // 1. Check Shard-Chucker
+  const cachedJson = _getAndDechunk(cacheKey); 
+  if (cachedJson) {
+    const parsed = JSON.parse(cachedJson);
+    if (parsed.length > 0) {
+       console.log(`[CACHE] Serving ${parsed.length} blueprints for ${authToon}.`);
+       return parsed;
     }
   }
 
-  // Save the massive haul to cache
-  putLargeCache(cacheKey, allBlueprints);
-  return allBlueprints;
-}
+  console.log(`Ferrari launching... Fetching Corp ${corporationId} via ${authToon}`);
+  const client = GESI.getClient().setFunction('corporations_corporation_blueprints');
+  let rawObjects = [];
 
-/**
- * Using the existing V12 Fetch-All Ferrari logic and 
- * the 8KB Shard-Chucker (CacheService) to audit the hangar.
- */
-function syncCorpBlueprintsV12() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const CACHE_KEY = "CORP_BPS_FULL_AUDIT";
-  
-  // 1. Try to pull from your existing _getAndDechunk tool
-  let allBlueprints = _getAndDechunk(CACHE_KEY);
-  
-  if (!allBlueprints) {
-    console.log("Cache empty. Powering up the V12 Ferrari...");
+  try {
+    const req1 = client.buildRequest({ corporation_id: corporationId, page: 1, name: authToon });
+    const resp1 = UrlFetchApp.fetch(req1.url, { method: 'get', headers: req1.headers, muteHttpExceptions: true });
+
+    if (resp1.getResponseCode() !== 200) {
+      throw new Error(`ESI Error: ${resp1.getResponseCode()} - ${resp1.getContentText()}`);
+    }
+
+    const page1Data = JSON.parse(resp1.getContentText());
+    rawObjects = rawObjects.concat(page1Data);
+
+    const headers = resp1.getHeaders();
+    const maxPages = Number(headers['X-Pages'] || headers['x-pages']) || 1;
     
-    // 2. Use your existing fetchAllCorpBlueprints logic
-    // (Assuming it loops through pages until response.length < 1000)
-    allBlueprints = fetchAllCorpBlueprints(CORP_ID); 
-    
-    // 3. Stash it using your _chunkAndPut (8KB chunks)
-    // 21600 seconds = 6 hours (or match ESI's 3600 cache)
-    _chunkAndPut(CACHE_KEY, allBlueprints, 3600);
-    console.log("Hangar haul sharded and cached.");
-  } else {
-    console.log("Hangar data retrieved from Shard-Chucker.");
+    if (maxPages > 1) {
+      const requests = [];
+      for (let p = 2; p <= maxPages; p++) {
+        const req = client.buildRequest({ corporation_id: corporationId, page: p, name: authToon });
+        requests.push({ url: req.url, method: 'get', headers: req.headers, muteHttpExceptions: true });
+      }
+      const responses = UrlFetchApp.fetchAll(requests);
+      responses.forEach(res => {
+        if (res.getResponseCode() === 200) {
+          rawObjects = rawObjects.concat(JSON.parse(res.getContentText()));
+        }
+      });
+    }
+
+    // CRITICAL: Only cache if we actually got results!
+    if (rawObjects.length > 0) {
+      _chunkAndPut(cacheKey, JSON.stringify(rawObjects), 3600);
+      console.log(`[SUCCESS] Cached ${rawObjects.length} blueprints.`);
+    }
+
+    return rawObjects;
+
+  } catch (e) {
+    console.error(`[CRITICAL] Ferrari Engine stalled: ${e.message}`);
+    return []; // Return empty so the sheet update logic knows to stop
   }
-
-  // 4. Proceed to update Config_BPC_Runs...
-  _updateBpoConfigFromAudit(allBlueprints);
 }
+
+
 
 // ----------------------------------------------------------------------
 // --- STAGE 1: BPC Cost Calculation ---
@@ -687,6 +679,81 @@ function _getBlendedCostMap(ss, requiredMaterialIds) {
 
   return allItemCosts;
 }
+
+/**
+ * Phase 4: Hangar Audit (Dynamic ID Version)
+ */
+function syncCorpBlueprintsV12() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const authToon = getCorpAuthChar(ss); // Resolves "Jason Kilman"
+  
+  // DYNAMIC RESOLUTION: Pull the Corp ID directly from Jason's character data
+  const charData = GESI.getCharacterData(authToon);
+  if (!charData || !charData.corporation_id) {
+    console.error(`[CRITICAL] Could not find Corp ID for ${authToon}. Check GESI Auth.`);
+    return;
+  }
+  
+  const corpId = charData.corporation_id;
+  console.log(`Auditing Hangar for Corp: ${corpId} (${authToon})`);
+
+  // Use the Ferrari to get data (It now handles dynamic IDs)
+  const allBlueprints = fetchAllCorpBlueprints(corpId); 
+  
+  if (allBlueprints && allBlueprints.length > 0) {
+    _updateBpoConfigFromAudit(allBlueprints);
+  } else {
+    console.error("Audit aborted: No data returned from ESI or Cache.");
+  }
+}
+
+/**
+ * THE BRIDGE: Now with robust header mapping (Case-Insensitive)
+ */
+function _updateBpoConfigFromAudit(blueprints) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Config_BPC_Runs");
+  if (!sheet || !blueprints || blueprints.length === 0) return;
+
+  // 1. Audit the Hangar (runs === -1 are BPOs)
+  const auditMap = new Map();
+  blueprints.forEach(bp => {
+    if (bp.runs === -1) { 
+      const id = Number(bp.type_id);
+      auditMap.set(id, (auditMap.get(id) || 0) + 1);
+    }
+  });
+
+  // 2. Map the Sheet using your ROBUST helper
+  const rawData = sheet.getDataRange().getValues();
+  const headers = rawData[0];
+  
+  let col;
+  try {
+    // This helper (already in your script) handles case and spaces
+    col = _getColIndexMap(headers, ['bp_type_id', 'available_bpos']);
+  } catch (e) {
+    console.error("Critical: Sheet headers don't match. Please ensure you have 'bp_type_id' and 'available_bpos' columns.");
+    return;
+  }
+
+  // Check optional columns (ME/TE) without crashing if they are missing
+  const lowerHeaders = headers.map(h => String(h || '').toLowerCase().trim());
+  const meIdx = lowerHeaders.indexOf('max_me');
+  const teIdx = lowerHeaders.indexOf('max_te');
+
+  // 3. Update memory
+  const values = rawData.slice(1).map(row => {
+    const bpID = Number(row[col.bp_type_id]);
+    row[col.available_bpos] = auditMap.get(bpID) || 0;
+    return row;
+  });
+
+  // 4. One "Hammer Strike" write back to sheet
+  sheet.getRange(2, 1, values.length, headers.length).setValues(values);
+  console.log(`[SUCCESS] Hangar Audit: Synchronized ${auditMap.size} BPO types.`);
+}
+
 
 function _getBpoAmortizationMap(ss) {
   const AMORT_SHEET_NAME = "BPO_Amortization";

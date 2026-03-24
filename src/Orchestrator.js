@@ -122,13 +122,16 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
 
 /**
  * Grabs Regional Pricing from Market Price Tracker.
- * ESI limits 1 type_ID per request so we keep it centralized for URL Fetch App
+ * UPGRADED: Now pulls the widened 7-day and 5-day radar data.
  */
 function syncESIRegionData(ss) {
   const log = LoggerEx.withTag('REGION_SYNC');
   const sourceId = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
+  
+  // 1. CHANGED: Pointing to the newly upgraded pipeline sheet
+  const sourceSheetName = "Publish_ESI_Region"; 
   const targetSheetName = "ESI_Region";
-  const NAMED_RANGE_NAME = "ESI_Region_Data"; // Change this to your actual Named Range name
+  const NAMED_RANGE_NAME = "ESI_Region_Data"; 
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const targetSheet = ss.getSheetByName(targetSheetName);
@@ -137,21 +140,27 @@ function syncESIRegionData(ss) {
 
   try {
     const sourceData = SpreadsheetApp.openById(sourceId)
-      .getSheetByName("Publish_ESI_Region_market_orders")
+      .getSheetByName(sourceSheetName)
       .getDataRange()
       .getValues();
 
-    // 1. CLEAR & WRITE
+    // 2. SAFETY CATCH: Widen the destination sheet if the incoming data is wider
+    const requiredCols = sourceData[0].length;
+    const currentCols = targetSheet.getMaxColumns();
+    if (currentCols < requiredCols) {
+      targetSheet.insertColumnsAfter(currentCols, requiredCols - currentCols);
+    }
+
+    // 3. CLEAR & WRITE
     targetSheet.clearContents();
-    const newRange = targetSheet.getRange(1, 1, sourceData.length, sourceData[0].length);
+    const newRange = targetSheet.getRange(1, 1, sourceData.length, requiredCols);
     newRange.setValues(sourceData);
 
-    // 2. UPDATE NAMED RANGE (The "Range Stretcher")
-    // This tells the whole workbook exactly where the new data lives.
+    // 4. UPDATE NAMED RANGE (The "Range Stretcher")
     ss.setNamedRange(NAMED_RANGE_NAME, newRange);
-    log.info(`Named Range '${NAMED_RANGE_NAME}' updated to ${sourceData.length} rows.`);
+    log.info(`Named Range '${NAMED_RANGE_NAME}' updated to ${sourceData.length} rows and ${requiredCols} cols.`);
 
-    // 3. THE TRIM
+    // 5. THE TRIM
     const lastRow = sourceData.length;
     const currentMax = targetSheet.getMaxRows();
     if (currentMax > lastRow) {
