@@ -23,6 +23,7 @@
     "src/IndustryLedger.gs.js",
     "src/InventoryManager.js",
     "src/SDE_Job_Controller.gs.js",
+    "src/reprocessing subsystem.js",
     "src/Orchestrator.js",
     "src/Refresh.js",
     "src/test.js",

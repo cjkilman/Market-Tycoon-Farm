@@ -183,11 +183,11 @@ function generateFullBOMData(ss) {
 function generateConsolidatedRequirements(ss) {
   const TARGET_SHEET_NAME = 'Consolidated_Requirements';
   const SOURCE_SHEET_NAME = 'Manufaturing Inputs Effective Cost';
-  
+
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   const sourceSheet = ss.getSheetByName(SOURCE_SHEET_NAME);
-  
+
   if (!sheet || !sourceSheet) return;
 
   const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
@@ -198,22 +198,25 @@ function generateConsolidatedRequirements(ss) {
 
   const col = {
     id: headers.indexOf("Type ID"),
-    cost: headers.indexOf("Effective Cost"), // Your WAG
+    cost: headers.indexOf("Effective Cost"), 
     name: headers.indexOf("Type Name"),
     bufferPct: headers.indexOf("Buffer Status (%)"),
     deficit31d: headers.indexOf("Need to Buy (31d)"),
     daysOnHand: headers.indexOf("Days on Hand")
   };
 
-const OUT_HEADERS = [
-    "Material Name", "Buffer Status", "Total 31-Day Deficit", 
-    "Projected from Scrap", "Net Need to Buy", "Daily Siphon Target", 
+  const OUT_HEADERS = [
+    "Material Name", "Buffer Status", "Total 31-Day Deficit",
+    "Projected from Scrap", "Net Need to Buy", "Daily Siphon Target",
     "WAG (Max Buy Price)", "Logistics Action"
   ];
 
   let results = [];
 
- const scrapCache = JSON.parse(PropertiesService.getScriptProperties().getProperty('PROJECTED_SCRAP_MINERALS') || '{}');
+  const scrapCache = JSON.parse(PropertiesService.getScriptProperties().getProperty('PROJECTED_SCRAP_MINERALS') || '{}');
+  
+  // FIX: Define acquisitionDays to match the 31-day window
+  const acquisitionDays = 31;
 
   for (let r of dataRows) {
     const name = String(r[col.name] || "").trim();
@@ -222,15 +225,16 @@ const OUT_HEADERS = [
     const materialID = Number(r[col.id]);
     const scrapYield = Number(scrapCache[materialID] || 0);
     const rawDeficit = clean(r[col.deficit31d]);
-    
+
     // The Net Calculation
     const netDeficit = Math.max(0, rawDeficit - scrapYield);
     const buffer = clean(r[col.bufferPct]) || 0;
-    
+
     if (rawDeficit > 0 || scrapYield > 0) {
       const wagCost = clean(r[col.cost]);
+      // Math now works because acquisitionDays is defined
       const dailyTarget = Math.ceil(netDeficit / acquisitionDays);
-      
+
       let action = "STANDBY";
       if (buffer <= 0.15) action = "CRITICAL: MAX RANGE SAFE SIPHON";
       else if (buffer <= 0.30) action = "ACTIVE: DEPLOY MICRO-HUB ORDERS";
@@ -250,7 +254,7 @@ const OUT_HEADERS = [
   // Write to sheet
   sheet.clearContents();
   sheet.getRange(1, 1, 1, OUT_HEADERS.length).setValues([OUT_HEADERS]).setFontWeight("bold");
-  
+
   if (output.length > 0) {
     sheet.getRange(2, 1, output.length, OUT_HEADERS.length).setValues(output);
     // Format the WAG column to ISK and Buffer to %
@@ -259,7 +263,6 @@ const OUT_HEADERS = [
     sheet.getRange(2, 3, output.length, 2).setNumberFormat("#,##0");
   }
 }
-
 function runIndustryLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
