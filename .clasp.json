@@ -1,6 +1,7 @@
 {
-  "scriptId": "1_3_S-HvdtzKy7K7jqcNy9NDckrApBXV2_hyOhPXyi4u4sMYZNvrLUtst",
-  "rootDir": "src/",
+  "scriptId": "1nUUWbNkrS4yV--SCYH6igBeqdXyAdZ0486vM5K-E7_AfoPd5c3bQWJiC",
+  "rootDir": "src",
+  "projectId": "Default",
   "scriptExtensions": [
     ".js",
     ".gs"
@@ -11,6 +12,20 @@
   "jsonExtensions": [
     ".json"
   ],
-  "filePushOrder": [],
-  "skipSubdirectories": false
+  "filePushOrder": [
+    "src/Logger.js",
+    "src/Utility.js",
+    "src/project Time.js",
+    "src/GESI Extentions.js",
+    "src/fuzHelpers.js",
+    "src/fuzAPI_combined.js",
+    "src/MaterialLedger.js",
+    "src/IndustryLedger.gs.js",
+    "src/InventoryManager.js",
+    "src/SDE_Job_Controller.gs.js",
+    "src/Orchestrator.js",
+    "src/Refresh.js",
+    "src/test.js",
+    "src/Main.js"
+  ]
 }
