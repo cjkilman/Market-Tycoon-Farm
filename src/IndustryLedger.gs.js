@@ -86,13 +86,13 @@ function generateFullBOMData(ss) {
   if (!prodSheet || !sdeMatSheet || !sdeProdSheet) return;
 
   const prodRaw = prodSheet.getDataRange().getValues();
-  const pHeaders = prodRaw[4]; 
+  const pHeaders = prodRaw[4];
   const prodData = prodRaw.slice(5);
 
   const pCol = {
     prodID: pHeaders.indexOf("Type ID"),
-    bpID:   pHeaders.indexOf("Blueprint Type ID"),
-    me:     pHeaders.indexOf("Material Efficiency (ME)"),
+    bpID: pHeaders.indexOf("Blueprint Type ID"),
+    me: pHeaders.indexOf("Material Efficiency (ME)"),
     target: pHeaders.indexOf("Build Target (Qty)")
   };
 
@@ -101,7 +101,7 @@ function generateFullBOMData(ss) {
   // This bypasses the need for the sheet to have correct columns.
   const productMetaMap = new Map();
   const sdeProdData = sdeProdSheet.getDataRange().getValues();
-  
+
   // Skip header, assuming Row 1 is header
   for (let i = 1; i < sdeProdData.length; i++) {
     const r = sdeProdData[i];
@@ -110,28 +110,28 @@ function generateFullBOMData(ss) {
       const bpID = Number(r[0]);      // Col A
       const productID = Number(r[2]); // Col C
       const quantity = Number(r[3]);  // Col D (Yield)
-      
+
       productMetaMap.set(productID, { bpID: bpID, qty: quantity });
     }
   }
 
   const jobMap = new Map();
-  
+
   prodData.forEach(row => {
     const pID = Number(row[pCol.prodID]);
     const buildTarget = clean(row[pCol.target]);
-    
+
     // LOOKUP from SDE (The Fix)
     const meta = productMetaMap.get(pID);
-    
+
     if (meta && buildTarget > 0) {
       const bpID = meta.bpID;
       const unitsPerRun = meta.qty || 1; // Force SDE value (e.g., 100)
-      
+
       // Calculate TRUE cycles
       const runs = Math.ceil(buildTarget / unitsPerRun);
       const me = row[pCol.me] === "" ? 10 : clean(row[pCol.me]);
-      
+
       if (runs > 0) {
         jobMap.set(bpID, { me, runs: (jobMap.get(bpID)?.runs || 0) + runs });
       }
@@ -147,19 +147,19 @@ function generateFullBOMData(ss) {
       const job = jobMap.get(sdeBpID);
       const baseQty = Number(sdeMatData[i][3]);
       const adjQty = baseQty * ((100 - job.me) / 100);
-      
+
       // Total Req = (Mat Per Run) * (True Cycles)
       const totalReq = Math.ceil(adjQty * job.runs);
 
       outputRows.push([
-          sdeBpID, 
-          1, 
-          Number(sdeMatData[i][2]), 
-          baseQty, 
-          job.me, 
-          job.runs, 
-          adjQty, 
-          totalReq
+        sdeBpID,
+        1,
+        Number(sdeMatData[i][2]),
+        baseQty,
+        job.me,
+        job.runs,
+        adjQty,
+        totalReq
       ]);
     }
   }
@@ -172,7 +172,7 @@ function generateFullBOMData(ss) {
     outSheet.getRange(2, 1, outputRows.length, 8).setValues(outputRows);
     outSheet.getRange(2, 8, outputRows.length, 1).setNumberFormat("#,##0");
   }
-  
+
   LOG.info(`BOM NUCLEAR FIX: Processed ${outputRows.length} lines using SDE yields.`);
 }
 
@@ -183,11 +183,11 @@ function generateFullBOMData(ss) {
 function generateConsolidatedRequirements(ss) {
   const TARGET_SHEET_NAME = 'Consolidated_Requirements';
   const SOURCE_SHEET_NAME = 'Manufaturing Inputs Effective Cost';
-  
+
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   const sourceSheet = ss.getSheetByName(SOURCE_SHEET_NAME);
-  
+
   if (!sheet || !sourceSheet) return;
 
   const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
@@ -206,50 +206,39 @@ function generateConsolidatedRequirements(ss) {
   };
 
   const OUT_HEADERS = [
-    "Material Name", "Buffer Status", "Total 31-Day Deficit", 
-    "Daily Siphon Target", "WAG (Max Buy Price)", "Logistics Action"
+    "Material Name", "Buffer Status", "Total 31-Day Deficit",
+    "Projected from Scrap", "Net Need to Buy", "Daily Siphon Target",
+    "WAG (Max Buy Price)", "Logistics Action"
   ];
 
   let results = [];
 
-  // Standardize the timeframe to smooth out the buys (e.g., acquire the 31-day deficit over 15 days)
-  const acquisitionDays = 15; 
+  const scrapCache = JSON.parse(PropertiesService.getScriptProperties().getProperty('PROJECTED_SCRAP_MINERALS') || '{}');
 
   for (let r of dataRows) {
     const name = String(r[col.name] || "").trim();
     if (!name) continue;
 
-    const deficit = clean(r[col.deficit31d]);
-    const buffer = clean(r[col.bufferPct]) || 0;
-    
-    // Only trigger if we actually have a deficit
-    if (deficit > 0) {
-      const wagCost = clean(r[col.cost]);
-      
-      // Calculate the covert daily buy amount
-      const dailyTarget = Math.ceil(deficit / acquisitionDays);
-      
-      let action = "STANDBY";
-      let urgency = buffer;
+    const materialID = Number(r[col.id]);
+    const scrapYield = Number(scrapCache[materialID] || 0);
+    const rawDeficit = clean(r[col.deficit31d]);
 
-      if (urgency <= 0.15) {
-        action = "CRITICAL: MAX RANGE SAFE SIPHON";
-      } else if (urgency <= 0.30) {
-        action = "ACTIVE: DEPLOY MICRO-HUB ORDERS";
-      } else {
-        action = "PASSIVE: DRIP FEED";
-      }
+    // The Net Calculation
+    const netDeficit = Math.max(0, rawDeficit - scrapYield);
+    const buffer = clean(r[col.bufferPct]) || 0;
+
+    if (rawDeficit > 0 || scrapYield > 0) {
+      const wagCost = clean(r[col.cost]);
+      const dailyTarget = Math.ceil(netDeficit / acquisitionDays);
+
+      let action = "STANDBY";
+      if (buffer <= 0.15) action = "CRITICAL: MAX RANGE SAFE SIPHON";
+      else if (buffer <= 0.30) action = "ACTIVE: DEPLOY MICRO-HUB ORDERS";
+      else action = "PASSIVE: DRIP FEED";
 
       results.push({
-        data: [
-          name, 
-          buffer, 
-          deficit, 
-          dailyTarget, 
-          wagCost, 
-          action
-        ],
-        sortKey: urgency // Sort by most critical buffer
+        data: [name, buffer, rawDeficit, scrapYield, netDeficit, dailyTarget, wagCost, action],
+        sortKey: buffer
       });
     }
   }
@@ -261,7 +250,7 @@ function generateConsolidatedRequirements(ss) {
   // Write to sheet
   sheet.clearContents();
   sheet.getRange(1, 1, 1, OUT_HEADERS.length).setValues([OUT_HEADERS]).setFontWeight("bold");
-  
+
   if (output.length > 0) {
     sheet.getRange(2, 1, output.length, OUT_HEADERS.length).setValues(output);
     // Format the WAG column to ISK and Buffer to %
@@ -271,9 +260,6 @@ function generateConsolidatedRequirements(ss) {
   }
 }
 
-// ----------------------------------------------------------------------
-// --- MASTER ADD-ON INTEGRATION ---
-// ----------------------------------------------------------------------
 function runIndustryLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -285,49 +271,56 @@ function runIndustryLedgerPhase(ss) {
   }
   const START_TIME = new Date().getTime();
 
-  log.info('--- Starting Industry Ledger Phase ---');
+  log.info('--- Starting Rolling Thunder Sync ---');
 
   let phase = parseInt(SCRIPT_PROP.getProperty(INDUSTRY_JOB_PHASE) || '0', 10);
 
+  // Phase 0: Fetch ESI Jobs
   if (phase === 0) {
     try {
       log.info('Phase 0: Fetching ESI Corp Jobs...');
       _getCorporateJobsRaw(false);
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '1');
       phase = 1;
-    } catch (e) {
-      log.error('Phase 0 (Fetch) FAILED.', e);
-      return;
-    }
+    } catch (e) { log.error('Phase 0 FAILED.', e); return; }
   }
 
+  // Phase 1: BPC Ledger
   if (phase === 1) {
     if (Date.now() - START_TIME > SOFT_TIME_LIMIT_MS) return;
     try {
-      log.info('Phase 1: Running BPC Creation Ledger...');
+      log.info('Phase 1: BPC Creation Ledger...');
       runBpcCreationLedger(ss);
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '2');
       phase = 2;
-    } catch (e) {
-      log.error('Phase 1 FAILED:', e);
-    }
+    } catch (e) { log.error('Phase 1 FAILED:', e); }
   }
 
+  // Phase 2: Manufacturing Ledger
   if (phase === 2) {
     if (Date.now() - START_TIME > SOFT_TIME_LIMIT_MS) return;
     try {
-      log.info('Phase 2: Running Manufacturing Ledger Update...');
+      log.info('Phase 2: Manufacturing Ledger Update...');
       runIndustryLedgerUpdate(ss);
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '3');
       phase = 3;
-    } catch (e) {
-      log.error('Phase 2 FAILED:', e);
-    }
+    } catch (e) { log.error('Phase 2 FAILED:', e); }
   }
 
+  // NEW Phase 3: Reprocessing Forensic Audit
   if (phase === 3) {
+    if (Date.now() - START_TIME > SOFT_TIME_LIMIT_MS) return;
+    try {
+      log.info('Phase 3: Running Reprocessing Audit (MiningHanger)...');
+      runReprocessingAudit(ss);
+      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '4');
+      phase = 4;
+    } catch (e) { log.error('Phase 3 FAILED:', e); }
+  }
+
+  if (phase === 4) {
     SCRIPT_PROP.deleteProperty(INDUSTRY_JOB_PHASE);
-    log.info('Phase 3: Cleanup complete.');
+    log.info('Phase 4: Rolling Thunder Complete.');
   }
 }
 
@@ -337,14 +330,14 @@ function runIndustryLedgerPhase(ss) {
 function fetchAllCorpBlueprints(corporationId) {
   const authToon = getCorpAuthChar();
   const cacheKey = "corp_bps_" + corporationId;
-  
+
   // 1. Check Shard-Chucker
-  const cachedJson = _getAndDechunk(cacheKey); 
+  const cachedJson = _getAndDechunk(cacheKey);
   if (cachedJson) {
     const parsed = JSON.parse(cachedJson);
     if (parsed.length > 0) {
-       console.log(`[CACHE] Serving ${parsed.length} blueprints for ${authToon}.`);
-       return parsed;
+      console.log(`[CACHE] Serving ${parsed.length} blueprints for ${authToon}.`);
+      return parsed;
     }
   }
 
@@ -365,7 +358,7 @@ function fetchAllCorpBlueprints(corporationId) {
 
     const headers = resp1.getHeaders();
     const maxPages = Number(headers['X-Pages'] || headers['x-pages']) || 1;
-    
+
     if (maxPages > 1) {
       const requests = [];
       for (let p = 2; p <= maxPages; p++) {
@@ -686,20 +679,20 @@ function _getBlendedCostMap(ss, requiredMaterialIds) {
 function syncCorpBlueprintsV12() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const authToon = getCorpAuthChar(ss); // Resolves "Jason Kilman"
-  
+
   // DYNAMIC RESOLUTION: Pull the Corp ID directly from Jason's character data
   const charData = GESI.getCharacterData(authToon);
   if (!charData || !charData.corporation_id) {
     console.error(`[CRITICAL] Could not find Corp ID for ${authToon}. Check GESI Auth.`);
     return;
   }
-  
+
   const corpId = charData.corporation_id;
   console.log(`Auditing Hangar for Corp: ${corpId} (${authToon})`);
 
   // Use the Ferrari to get data (It now handles dynamic IDs)
-  const allBlueprints = fetchAllCorpBlueprints(corpId); 
-  
+  const allBlueprints = fetchAllCorpBlueprints(corpId);
+
   if (allBlueprints && allBlueprints.length > 0) {
     _updateBpoConfigFromAudit(allBlueprints);
   } else {
@@ -718,7 +711,7 @@ function _updateBpoConfigFromAudit(blueprints) {
   // 1. Audit the Hangar (runs === -1 are BPOs)
   const auditMap = new Map();
   blueprints.forEach(bp => {
-    if (bp.runs === -1) { 
+    if (bp.runs === -1) {
       const id = Number(bp.type_id);
       auditMap.set(id, (auditMap.get(id) || 0) + 1);
     }
@@ -727,7 +720,7 @@ function _updateBpoConfigFromAudit(blueprints) {
   // 2. Map the Sheet using your ROBUST helper
   const rawData = sheet.getDataRange().getValues();
   const headers = rawData[0];
-  
+
   let col;
   try {
     // This helper (already in your script) handles case and spaces

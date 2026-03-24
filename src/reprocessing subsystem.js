@@ -67,8 +67,8 @@ function getStructureBaseYield(locationNickname) {
 }
 
 /**
- * PHASE 3: REPROCESSING FORENSIC AUDIT
- * Scans MiningHanger, calculates mineral yields, and flags losses.
+ * REPROCESSING FORENSIC AUDIT
+ * Calculates mineral yields and flags losses in the MiningHanger.
  */
 function runReprocessingAudit(ss) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -77,33 +77,27 @@ function runReprocessingAudit(ss) {
   const sdeTypeSheet = ss.getSheetByName("SDE_invTypes");
   const priceSheet = ss.getSheetByName("Market_Data_Raw");
 
-  if (!hangerSheet || !sdeMatSheet) return;
+  if (!hangerSheet || !sdeMatSheet || !sdeTypeSheet) return;
 
-  // 1. Load Data into Memory Maps
-  const hangerRaw = hangerSheet.getDataRange().getValues();
-  const hangerData = hangerRaw.slice(1);
+  const hangerData = hangerSheet.getDataRange().getValues().slice(1);
   const sdeMatData = sdeMatSheet.getDataRange().getValues();
   const sdeTypeData = sdeTypeSheet.getDataRange().getValues();
-  const priceData = priceSheet.getDataRange().getValues();
+  const priceMap = new Map(priceSheet.getDataRange().getValues().map(r => [Number(r[1]), Number(r[5])]));
+  const portionMap = new Map(sdeTypeData.map(r => [Number(r[0]), Number(r[6]) || 1]));
 
-  // 2. Resolve Multipliers (Jason Kilman L5 + RX-810 + Structure)
-  const skillMult = 1.69; // Hardcoded or pull from Character_Profile
-  const facilityYield = 0.50; // Hardcoded or pull from Structure_Settings
-  const totalEfficiency = skillMult * facilityYield;
+  // Get Jason Kilman's Max Efficiency (L5 + RX-810)
+  // Assuming 1.69 total multiplier based on previous settings
+  const totalEfficiency = 0.50 * 1.69; 
 
-  const priceMap = new Map(priceData.map(r => [Number(r[1]), Number(r[5])])); // type_id -> buy_max
-  const portionMap = new Map(sdeTypeData.map(r => [Number(r[0]), Number(r[6]) || 1])); // type_id -> portionSize
-  
   const matYieldMap = new Map();
   sdeMatData.forEach(r => {
-    const bpID = Number(r[0]);
-    if (!matYieldMap.has(bpID)) matYieldMap.set(bpID, []);
-    matYieldMap.get(bpID).push({ id: Number(r[1]), qty: Number(r[2]) });
+    const parentID = Number(r[0]);
+    if (!matYieldMap.has(parentID)) matYieldMap.set(parentID, []);
+    matYieldMap.get(parentID).push({ id: Number(r[1]), qty: Number(r[2]) });
   });
 
-  // 3. Process Hanger and Calculate "Projected Yield" for Requirements
-  const projectedTotals = new Map();
-  const outputRows = [];
+  const projectedMinerals = {};
+  const hangerActions = [];
 
   hangerData.forEach(row => {
     const typeID = Number(row[1]);
@@ -117,26 +111,20 @@ function runReprocessingAudit(ss) {
     let totalMeltValue = 0;
     materials.forEach(mat => {
       const yieldQty = Math.floor(mat.qty * totalEfficiency * batchCount);
-      const price = priceMap.get(mat.id) || 0;
-      totalMeltValue += (yieldQty * price);
+      const unitPrice = priceMap.get(mat.id) || 0;
+      totalMeltValue += (yieldQty * unitPrice);
       
-      // Store for Consolidated_Requirements link
-      projectedTotals.set(mat.id, (projectedTotals.get(mat.id) || 0) + yieldQty);
+      // Store for requirements link
+      projectedMinerals[mat.id] = (projectedMinerals[mat.id] || 0) + yieldQty;
     });
 
     const marketValue = (priceMap.get(typeID) || 0) * qty;
     const action = (totalMeltValue < (marketValue * 0.8)) ? "!! LOSS WARNING !!" : "REPROCESS";
-
-    // Build output for MiningHanger (Col F = Action)
-    outputRows.push([action]);
+    hangerActions.push([action]);
   });
 
-  // 4. Update MiningHanger Actions
-  if (outputRows.length > 0) {
-    hangerSheet.getRange(2, 6, outputRows.length, 1).setValues(outputRows);
-  }
-
-  // 5. CACHE PROJECTED MINERALS (To be used by Nitro Consolidator)
-  const cache = PropertiesService.getScriptProperties();
-  cache.setProperty('PROJECTED_SCRAP_MINERALS', JSON.stringify(Object.fromEntries(projectedTotals)));
+  if (hangerActions.length > 0) hangerSheet.getRange(2, 6, hangerActions.length, 1).setValues(hangerActions);
+  
+  // Cache the results so the Consolidator can see them
+  PropertiesService.getScriptProperties().setProperty('PROJECTED_SCRAP_MINERALS', JSON.stringify(projectedMinerals));
 }
