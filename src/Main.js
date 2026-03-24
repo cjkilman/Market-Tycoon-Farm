@@ -11,7 +11,7 @@ const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 
 function GET_SDE_CONFIG() {
   return [
-    { name: "SDE_invTypes", file: "invTypes.csv", cols: ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice"] },
+    { name: "SDE_invTypes", file: "invTypes.csv", cols: ["typeID", "groupID", "typeName", "volume", "marketGroupID", "basePrice", "portionSize"] }, // Added portionSize
     { name: "SDE_invGroups", file: "invGroups.csv", cols: null },
     { name: "SDE_staStations", file: "staStations.csv", cols: null },
     { name: "SDE_industryActivityMaterials", file: "industryActivityMaterials.csv", cols: null },
