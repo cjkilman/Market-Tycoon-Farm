@@ -868,21 +868,61 @@ function _getSdeNameMap(ss) {
 }
 
 function _getMarketMedianMap(ss) {
-  const sheet = ss.getSheetByName("market price Tracker");
-  const map = new Map();
-  if (!sheet) return map;
-  try {
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const colId = headers.indexOf('type_id_filtered');
-    const colMed = headers.indexOf('Median Sell');
-    if (colId === -1 || colMed === -1) return map;
+  if(ss)
+    return getMarketPriceMapFor(ss,'Median Sell');
+  return new Map(); // Safety catch!
+ 
+}
 
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    data.forEach(r => {
-      const val = Number(String(r[colMed]).replace(/[^0-9.]/g, ''));
-      if (val > 0) map.set(r[colId], val);
-    });
-  } catch (e) { }
+function getMarketPriceMapFor(ss, Attribute) {
+  const map = new Map();
+  const NR_Prices = "NR_MARKET_DATA";
+  if (!Attribute) Attribute = "Median Sell"; 
+  
+  let data;
+  try {
+    // 1. Try treating it as a Named Range first
+    let range = ss.getRangeByName(NR_Prices);
+    
+    // 2. If it is not a Named Range, fall back to the actual Sheet Name
+    if (!range) {
+      const sheet = ss.getSheetByName("market price Tracker");
+      if (!sheet) {
+        console.warn("getMarketPriceMapFor: Could not find Named Range [" + NR_Prices + "] or fallback Sheet.");
+        return map; 
+      }
+      range = sheet.getDataRange();
+    }
+
+    data = range.getValues();
+    if (data.length < 2) {
+      console.warn("getMarketPriceMapFor: Data source is empty.");
+      return map; 
+    }
+
+    const headers = data[0];
+    
+    // Flexible ID finder (looks for "type_id_filtered" first, falls back to "type_id")
+    const colId = headers.indexOf("type_id_filtered") !== -1 ? headers.indexOf("type_id_filtered") : headers.indexOf("type_id");
+    const colMed = headers.indexOf(Attribute);
+    
+    if (colId === -1 || colMed === -1) {
+      console.warn("getMarketPriceMapFor: Missing required columns. Found ID col: " + colId + ", Attribute col: " + colMed);
+      return map;
+    }
+
+    // Start at 1 to skip headers
+    for (let i = 1; i < data.length; i++) {
+      const typeId = Number(data[i][colId]); 
+      const val = Number(String(data[i][colMed]).replace(/[^0-9.]/g, "")); 
+      
+      if (typeId > 0 && val > 0) map.set(typeId, val); 
+    }
+  } catch (e) { 
+    // The Informational Log you requested
+    console.error("CRITICAL ERROR in getMarketPriceMapFor (Attribute: " + Attribute + "): " + e.message + " at " + e.stack);
+  }
+  
   return map;
 }
 
