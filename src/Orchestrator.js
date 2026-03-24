@@ -381,10 +381,12 @@ function runMaintenanceJobs() {
     { name: 'generateFullBOMData', interval: 2700000, lease: 1200000 },
     { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
     { name: 'Ledger_Import_CorpJournal', interval: 1800000 },
-    { name: 'processInternalBuffer', interval: 600000 }, // <--- ADD THIS LINE (Every 10 mins)
+    { name: 'processInternalBuffer', interval: 600000 }, 
     { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'runIndustryLedgerPhase', interval: STANDARD_INTERVAL },
-    { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL }
+    { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL },
+    // --- NEW: Reprocessing Audit added to the 1-Hour Maintenance rotation ---
+    { name: 'runReprocessingAudit', interval: STANDARD_INTERVAL } 
   ];
 
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
