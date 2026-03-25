@@ -1,5 +1,8 @@
 /* eslint-disable no-console */
 /* eslint-disable no-unused-vars */
+/** Last Updated: 3/14/2026
+ * Changes, Swapped URL to Github Latest Release
+ */
 
 /**
  * SDE_Job_Controller.gs
