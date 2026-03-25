@@ -654,6 +654,10 @@ function finalizeMarketDataUpdate() {
       // This prevents the sheet from waking up and calculating until all data is fresh.
       fetchFilteredPricesSync(ss_inner);
       syncESIRegionData(ss_inner);
+      
+      // 3. REPRO ENGINE (The New "Tycoon" Step)
+      // Recalculate Melt Values using the fresh market data just swapped in.
+      generateReprocessedValueTable(ss_inner);
 
       return swapRes;
       // --- END ANESTHESIA ---

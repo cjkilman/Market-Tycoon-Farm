@@ -1,520 +1,352 @@
 
 /**
- * Standalone Trigger for Hangar Auditing.
- * Set this to run on its own timer (e.g., every 30 or 60 minutes)
- * to keep the Industry Ledger fast.
+ * TRIGGER-READY WRAPPER
+ * Point your timed trigger at this function.
  */
-function scheduledReprocessingAudit() {
-  const log = LoggerEx.withTag('HANGAR_AUDIT');
-  log.info('--- Starting Dedicated Reprocessing Audit ---');
-
-  try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    runReprocessingAudit(ss);
-    log.info('Reprocessing Audit Complete.');
-  } catch (e) {
-    log.error('Reprocessing Audit FAILED: ' + e.message);
-  }
-}
-
-
-/**
- * UNIVERSAL BLENDED DATA ENGINE
- * Builds a high-speed, in-memory Map of item values (Costs or Sales) from a Named Range.
- * Automatically sanitizes string inputs into raw numbers for accurate margin math.
- *
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - The active Google Spreadsheet object.
- * @param {string} rangeName - The target Named Range (e.g., "NR_BLENDED_COST" or "NR_BLENDED_SALES").
- * @returns {Map<number, number>} A Map where Key = TypeID (Number) and Value = Blended Price (Number).
- */
-function getBlendedMapFor(ss, rangeName) {
-  const map = new Map();
-
-  // Fail-safe: if no range name is passed, bail out
-  if (!rangeName) {
-    console.warn("getBlendedMapFor: No rangeName provided.");
-    return map;
-  }
-
-  try {
-    const range = ss.getRangeByName(rangeName);
-
-    if (!range) {
-      console.warn("getBlendedMapFor: Could not find Named Range [" + rangeName + "].");
-      return map;
-    }
-
-    const data = range.getValues();
-    if (data.length < 1) {
-      console.warn("getBlendedMapFor: Data source [" + rangeName + "] is empty.");
-      return map;
-    }
-
-    for (let i = 0; i < data.length; i++) {
-      // Assuming Column A (index 0) is TypeID and Column C (index 2) is the Value
-      const typeId = Number(data[i][0]);
-      const val = parseFloat(String(data[i][2]).replace(/[^0-9.-]/g, "")) || 0;
-
-      if (typeId > 0) {
-        map.set(typeId, val);
-      }
-    }
-  } catch (e) {
-    console.error("CRITICAL ERROR in getBlendedMapFor (" + rangeName + "): " + e.message + " at " + e.stack);
-  }
-
-  return map;
-}
-
-/**
- * ARRAY-COMPATIBLE REPROCESSING ENGINE
- * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - The active spreadsheet.
- * @param {number|number[][]} typeIDs - Single ID or Range of IDs.
- * @param {number} stationYield - Base yield (e.g., 0.50 or 0.54).
- * @param {number} playerSkill - Character multiplier (e.g., 1.15).
- * @returns {number[]} Array of ISK values per portion.
- */
-function getReprocessValue(ss, typeIDs, stationYield, playerSkill) {
-  // 1. Handle input flexibility
-  if (!Array.isArray(typeIDs)) {
-    typeIDs = [[typeIDs]];
-  }
-
-  // 2. USE THE FERRARI ENGINE (DRY Utility)
-  // This replaces 15 lines of manual sheet grabbing and looping
-  const priceMap = getMarketPriceMapFor(ss, 'buy_max');
-
-  // 3. Optimized Material Lookups
-  const matData = ss.getSheetByName("SDE_invTypeMaterials").getDataRange().getValues();
-  const typeData = ss.getSheetByName("SDE_invTypes").getDataRange().getValues();
-
-  const portionMap = new Map(typeData.map(r => [Number(r[0]), Number(r[6]) || 1]));
-
-  const materialMap = new Map();
-  matData.forEach(r => {
-    const pId = Number(r[0]);
-    if (!materialMap.has(pId)) materialMap.set(pId, []);
-    materialMap.get(pId).push({ matID: Number(r[1]), qty: Number(r[2]) });
-  });
-
-  // 4. Process the range with zero-latency lookups
-  return typeIDs.map(row => {
-    const typeID = Number(row[0]);
-    if (!typeID) return 0;
-
-    const materials = materialMap.get(typeID) || [];
-    const portionSize = portionMap.get(typeID) || 1;
-    let totalBatchIsk = 0;
-
-    materials.forEach(mat => {
-      const unitPrice = priceMap.get(Number(mat.matID)) || 0;
-      totalBatchIsk += (mat.qty * stationYield * playerSkill * unitPrice);
-    });
-
-    return totalBatchIsk / portionSize;
-  });
-}
-
-
-// Get the base yield for a specific location
-function getStructureBaseYield(locationNickname,ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const settings = ss.getSheetByName("Structure_Settings").getDataRange().getValues();
-
-  const match = settings.find(row => row[0] === locationNickname);
-  return match ? parseFloat(match[2]) : 0.50; // Default to 50% NPC station
-}
-
-/**
- * REPROCESSING FORENSIC AUDIT
- * Calculates mineral yields and flags losses in the MiningHanger.
- */
-function runReprocessingAudit(ss) {
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const hangerSheet = ss.getSheetByName("MiningHanger");
-  const sdeMatSheet = ss.getSheetByName("SDE_invTypeMaterials");
-  const sdeTypeSheet = ss.getSheetByName("SDE_invTypes");
-
-  if (!hangerSheet || !sdeMatSheet || !sdeTypeSheet) return;
-
-  const hangerData = hangerSheet.getDataRange().getValues().slice(1);
-  const sdeMatData = sdeMatSheet.getDataRange().getValues();
-  const sdeTypeData = sdeTypeSheet.getDataRange().getValues();
-  const priceMap = getMarketPriceMapFor(ss, 'buy_max');
-  const portionMap = new Map(sdeTypeData.map(r => [Number(r[0]), Number(r[6]) || 1]));
-
-  // Get Jason Kilman's Max Efficiency (L5 + RX-810)
-  // Assuming 1.69 total multiplier based on previous settings
-  const totalEfficiency = 0.50 * 1.69;
-
-  const matYieldMap = new Map();
-  sdeMatData.forEach(r => {
-    const parentID = Number(r[0]);
-    if (!matYieldMap.has(parentID)) matYieldMap.set(parentID, []);
-    matYieldMap.get(parentID).push({ id: Number(r[1]), qty: Number(r[2]) });
-  });
-
-  const projectedMinerals = {};
-  const hangerActions = [];
-
-  hangerData.forEach(row => {
-    const typeID = Number(row[1]);
-    const qty = Number(row[4]);
-    if (!typeID || qty <= 0) return;
-
-    const materials = matYieldMap.get(typeID) || [];
-    const portionSize = portionMap.get(typeID) || 1;
-    const batchCount = qty / portionSize;
-
-    // Use the engine
-    const melt = calculateMeltValue(materials, totalEfficiency, batchCount, priceMap);
-
-    // Update projections for the Consolidator
-    melt.yields.forEach(item => {
-      projectedMinerals[item.id] = (projectedMinerals[item.id] || 0) + item.qty;
-    });
-
-    const marketValue = (priceMap.get(typeID) || 0) * qty;
-    const action = (melt.totalValue < (marketValue * 0.8)) ? "!! LOSS WARNING !!" : "REPROCESS";
-    hangerActions.push([action]);
-  });
-
-  if (hangerActions.length > 0) hangerSheet.getRange(2, 6, hangerActions.length, 1).setValues(hangerActions);
-
-  // Cache the results so the Consolidator can see them
-  PropertiesService.getScriptProperties().setProperty('PROJECTED_SCRAP_MINERALS', JSON.stringify(projectedMinerals));
-}
-
-// Get the total skill/implant multiplier for Jason Kilman (Loot/Modules Only)
-function getCharacterMeltMultiplier() {
+function trigger_generateProjectedCostTable() {
+  // Use getActiveSpreadsheet() for bound scripts
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const profile = ss.getSheetByName("Character_Profile").getDataRange().getValues();
-
-  let totalMult = 1.0;
-
-  // Whitelist: ONLY apply skills/implants relevant to melting scrapmetal
-  const activeScrapSkills = [
-    "Reprocessing",
-    "Reprocessing Efficiency",
-    "Scrapmetal Processing",
-    "Zainou 'Beancounter' RX-810"
-  ];
-
-  for (let i = 1; i < profile.length; i++) {
-    const skillName = String(profile[i][0]).trim();
-    const val = parseFloat(profile[i][2]);
-
-    // Safety check: Only multiply if it's on the whitelist
-    if (activeScrapSkills.includes(skillName) && !isNaN(val) && val > 0) {
-      totalMult *= val;
-    }
-  }
-  return totalMult;
+  
+  // Call your main logic
+  generateProjectedCostTable(ss);
 }
 
 /**
- * CORE REPROCESSING MATH ENGINE (DRY)
- * Calculates the final ISK value for a single item's mineral yield.
- * * @param {Array} materials - Array of {matID, qty} from SDE.
- * @param {number} efficiency - Total multiplier (Base * Skills * Implants).
- * @param {number} batchCount - (Total Qty / Portion Size).
- * @param {Map} priceMap - Map of Material ID -> Price.
- * @returns {Object} {totalValue: number, yields: Array<{id, qty, value}>}
+ * OPTIMIZED: generateProjectedCostTable(ss)
+ * Logic: 3-tier fallback with "Manufacturing" Group Filter.
+ * Optimizations: O(1) Indexing, Early Exit, Memory-Resident Processing.
+ */
+function generateProjectedCostTable(ss) {
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ProjectedCost') : console;
+  
+  // --- 1. Load Constants & Pricing Maps ---
+  const ACTIVITY_MANUFACTURING = 1;
+  const ME_LEVEL = 10; 
+  const EST_INSTALL_RATE = 0.05; 
+  const ACQUISITION_MULTIPLIER = 1.11;
+
+  // A. Internal Stock Map (O(1) Map)
+  const costSheet = ss.getSheetByName("Manufaturing Inputs Effective Cost");
+  const costData = costSheet ? costSheet.getDataRange().getValues() : [];
+  const myCostMap = new Map(costData.slice(1).map(r => [Number(r[0]), parseFloat(String(r[1]).replace(/[^0-9.]/g, ''))]).filter(r => r[1] > 0));
+
+  // B. Market Cache Map (Market_Data_Raw)
+  const rawMarketSheet = ss.getSheetByName("Market_Data_Raw");
+  const rawMarketData = rawMarketSheet ? rawMarketSheet.getDataRange().getValues() : [];
+  const marketFeedMap = new Map();
+  if (rawMarketData.length > 1) {
+    for (let i = 1; i < rawMarketData.length; i++) {
+      const id = Number(rawMarketData[i][1]);
+      const buyMax = Number(rawMarketData[i][5]);
+      if (buyMax > 0) marketFeedMap.set(id, buyMax * ACQUISITION_MULTIPLIER);
+    }
+  }
+
+  // --- 2. SDE Mapping & API Prep ---
+  const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
+  const productToBpMap = new Map();
+  for (const [bpID, prodObj] of sdeProdMap.entries()) {
+      productToBpMap.set(prodObj.productTypeID, { bpID: bpID, yield: prodObj.quantity });
+  }
+
+  // Get MarketOverviewData into memory
+  const overviewSheet = ss.getSheetByName("MarketOverviewData");
+  const overviewData = overviewSheet.getDataRange().getValues();
+  const headers = overviewData[2]; // Headers are usually on row 3 (index 2)
+  
+  const col = {
+    id: headers.indexOf("type_id"),
+    name: headers.indexOf("Item Name"),
+    group: headers.indexOf("Group")
+  };
+
+  const missingForAPI = new Set();
+  const validTargets = [];
+
+  // --- 3. FILTER & API PREP ---
+  for (let i = 3; i < overviewData.length; i++) {
+    const row = overviewData[i];
+    const group = String(row[col.group] || "");
+    
+    // EARLY EXIT: Skip anything not in a Manufacturing group (kills Meta Module scrap math)
+    if (group.indexOf("Manufacturing") === -1) continue;
+
+    const typeID = Number(row[col.id]);
+    const prodData = productToBpMap.get(typeID);
+    if (!prodData) continue;
+
+    validTargets.push({ typeID, name: row[col.name], prodData });
+
+    const materials = sdeMatMap.get(prodData.bpID);
+    if (materials) {
+      materials.forEach(m => {
+        if (m.activityID === ACTIVITY_MANUFACTURING) {
+          if (!myCostMap.has(m.materialTypeID) && !marketFeedMap.has(m.materialTypeID)) {
+            missingForAPI.add(m.materialTypeID);
+          }
+        }
+      });
+    }
+  }
+
+  // C. API Fallback (Fuzzwork)
+  const apiMap = new Map();
+  if (missingForAPI.size > 0 && typeof fuzAPI !== 'undefined') {
+    try {
+      const res = fuzAPI.requestItems(10000002, 'region', Array.from(missingForAPI));
+      res.forEach(item => {
+        const p = _extractMetric_(item, 'buy', 'max');
+        if (p > 0) apiMap.set(item.type_id, p * ACQUISITION_MULTIPLIER);
+      });
+    } catch (e) { LOG.error("API Fail: " + e.message); }
+  }
+
+  // --- 4. CALCULATION LOOP ---
+  const outputRows = validTargets.map(target => {
+    const materials = sdeMatMap.get(target.prodData.bpID);
+    let totalBatchCost = 0;
+    const sources = new Set();
+
+    materials.forEach(m => {
+      if (m.activityID !== ACTIVITY_MANUFACTURING) return;
+      const qty = Math.max(1, Math.ceil(m.quantity * ((100 - ME_LEVEL) / 100)));
+      
+      let price = 0;
+      if (myCostMap.has(m.materialTypeID)) {
+        price = myCostMap.get(m.materialTypeID);
+        sources.add("Stock");
+      } else if (marketFeedMap.has(m.materialTypeID)) {
+        price = marketFeedMap.get(m.materialTypeID);
+        sources.add("Cache");
+      } else if (apiMap.has(m.materialTypeID)) {
+        price = apiMap.get(m.materialTypeID);
+        sources.add("API");
+      } else {
+        sources.add("ZERO");
+      }
+      totalBatchCost += (qty * price);
+    });
+
+    const unitCost = (totalBatchCost * (1 + EST_INSTALL_RATE)) / target.prodData.yield;
+    return [target.typeID, target.name, unitCost, Array.from(sources).join("/"), new Date()];
+  });
+
+ // --- 5. OUTPUT & MAINTENANCE (THE "STATION SERVICE") ---
+  const outSheet = ss.getSheetByName("Projected_Build_Costs");
+  if (!outSheet) {
+    LOG.error("Sheet 'Projected_Build_Costs' not found.");
+    return;
+  }
+
+  // 1. Clear contents and formatting to keep the sheet light
+  outSheet.clearContents(); 
+  
+  // 2. Define specific output headers (Don't reuse headers from the Overview sheet)
+  const outputHeaders = [["Type ID", "Item Name", "Cost", "Source Tier", "Updated"]];
+  outSheet.getRange(1, 1, 1, 5).setValues(outputHeaders);
+  
+  // 3. Write Data in one single batch (Fastest method)
+  if (outputRows.length > 0) {
+    outSheet.getRange(2, 1, outputRows.length, 5).setValues(outputRows);
+  }
+
+  // 4. TRIM BLANK ROWS: This physically removes the lag-inducing empty space
+  const maxRows = outSheet.getMaxRows();
+  const lastRowWithData = outputRows.length + 1; // Data rows + Header
+
+  // If we have more than 5 extra rows, purge them to optimize the calculation engine
+  if (maxRows > lastRowWithData + 5) {
+    try {
+      // Deleting rows forces the spreadsheet to "compact" its internal memory
+      outSheet.deleteRows(lastRowWithData + 1, maxRows - lastRowWithData);
+      LOG.info(`Trimmed ${maxRows - lastRowWithData} excess rows. Sheet is now compact.`);
+    } catch (e) {
+      LOG.warn("Row trim skipped (might be already compact): " + e.message);
+    }
+  }
+  outSheet.getRange(2, 5, outputRows.length, 1).setNumberFormat("yyyy-mm-dd hh:mm");
+  LOG.info(`Optimization complete. Processed ${outputRows.length} Manufacturing items.`);
+}
+
+/**
+ * SDE MATERIAL ENGINE (The Pantry)
+ * Key: Parent TypeID | Value: Array of { matID: number, qty: number }
+ */
+function getSdeMaterialMap(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("SDE_invTypeMaterials");
+  if (!sheet) return new Map();
+
+  const data = sheet.getDataRange().getValues();
+  const materialMap = new Map();
+  // Skip headers if the first cell is a string
+  const startRow = (isNaN(data[0][0])) ? 1 : 0;
+
+  for (let i = startRow; i < data.length; i++) {
+    const parentId = Number(data[i][0]);
+    if (!parentId) continue;
+
+    if (!materialMap.has(parentId)) materialMap.set(parentId, []);
+    materialMap.get(parentId).push({ 
+      matID: Number(data[i][1]), 
+      qty: Number(data[i][2]) 
+    });
+  }
+  return materialMap;
+}
+
+/**
+ * UNIVERSAL TYPE ENGINE (The Pantry)
+ */
+function getSdeTypeEngine(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("SDE_invTypes");
+  const byName = new Map();
+  const byId = new Map();
+  if (!sheet) return { byName, byId };
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const idIdx = headers.indexOf('typeID');
+  const nameIdx = headers.indexOf('typeName');
+  const portionIdx = headers.indexOf('portionSize');
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const id = Number(row[idIdx]);
+    const name = String(row[nameIdx]).trim().toLowerCase();
+    const portion = Number(row[portionIdx]) || 1;
+
+    if (id > 0) {
+      const typeObj = { id, name, portion };
+      byId.set(id, typeObj);
+      if (name !== "") byName.set(name, typeObj);
+    }
+  }
+  return { byName, byId };
+}
+
+/**
+ * CORE REPROCESSING MATH ENGINE (The Chef)
  */
 function calculateMeltValue(materials, efficiency, batchCount, priceMap) {
   let totalValue = 0;
   const yieldDetails = [];
 
   materials.forEach(mat => {
-    // EVE Math: Math.floor is the standard for final output quantities
     const yieldQty = Math.floor(mat.qty * efficiency * batchCount);
     const unitPrice = priceMap.get(Number(mat.matID)) || 0;
     const matValue = yieldQty * unitPrice;
 
     totalValue += matValue;
-
     if (yieldQty > 0) {
-      yieldDetails.push({
-        id: mat.matID,
-        qty: yieldQty,
-        value: matValue,
-        unitPrice: unitPrice
-      });
+      yieldDetails.push({ id: mat.matID, qty: yieldQty, value: matValue, unitPrice: unitPrice });
     }
   });
 
-  return {
-    totalValue: totalValue,
-    yields: yieldDetails
-  };
+  return { totalValue: totalValue, yields: yieldDetails };
 }
 
 /**
- * GROUP CATEGORY MAPPING
- * Maps GroupID -> CategoryID so the math engine knows what it's melting.
+ * REPROCESSED VALUE ENGINE (Sprinting & Compacting Version)
+ * Optimizations: Single-pass I/O, zero-latency caching, auto-trimming.
  */
-function getGroupCategoryMap(ss) {
-  const sheet = ss.getSheetByName("SDE_invGroups");
-  const map = new Map();
-  if (!sheet) return map;
-
-  const data = sheet.getDataRange().getValues();
-  // Assume Column A (0) is groupID, Column B (1) is categoryID
-  for (let i = 1; i < data.length; i++) {
-    map.set(Number(data[i][0]), Number(data[i][1]));
-  }
-  return map;
-}
-
-/**
- * MASTER SDE SEARCH ENGINE
- * Returns a Map keyed by lowercase Name for instant text-based lookups.
- * Includes ID and Portion Size for math operations.
- */
-function getSdeSearchMap(ss) {
-  const sheet = ss.getSheetByName("SDE_invTypes");
-  const map = new Map();
-  if (!sheet) return map;
-
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
+function generateReprocessedValueTable(ss) {
+  const start = new Date().getTime();
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ReproValue') : console;
   
-  const idIdx = headers.indexOf('typeID');
-  const nameIdx = headers.indexOf('typeName');
-  const portionIdx = headers.indexOf('portionSize');
-  const groupIdx = headers.indexOf('groupID');
+  LOG.info("--- Sprinting: Repro Table Generation ---");
 
-  for (let i = 1; i < data.length; i++) {
-    const name = String(data[i][nameIdx]).trim().toLowerCase();
-    const id = Number(data[i][idIdx]);
-    const portion = Number(data[i][portionIdx]) || 1;
-    const groupId = Number(data[i][groupIdx]);
+  // 1. BULK DATA LOAD
+  const overviewSheet = ss.getSheetByName("MarketOverviewData");
+  if (!overviewSheet) {
+    LOG.error("Source 'MarketOverviewData' not found.");
+    return;
+  }
+  const overviewData = overviewSheet.getDataRange().getValues();
+  
+  const marketMap = getMarketPriceMapFor(ss, 'buy_max'); 
+  const materialMap = getSdeMaterialMap(ss);            
+  const { byId: typeMap } = getSdeTypeEngine(ss);      
+  const totalEfficiency = 0.50 * 1.69; 
 
-    if (id > 0 && name !== "") {
-      map.set(name, { id, portion, groupId });
+  const headers = overviewData[2];
+  const colId = headers.indexOf("type_id");
+  const colName = headers.indexOf("Item Name");
+
+  // 2. RAM-RESIDENT REDUCTION
+  const outputRows = overviewData.slice(3).reduce((acc, row) => {
+    const typeID = Number(row[colId]);
+    if (!typeID) return acc;
+
+    const materials = materialMap.get(typeID);
+    const typeInfo = typeMap.get(typeID);
+    
+    if (materials && typeInfo) {
+      let totalValue = 0;
+      const batchCount = 1 / typeInfo.portion;
+      
+      for (const mat of materials) {
+        const yieldQty = Math.floor(mat.qty * totalEfficiency * batchCount);
+        totalValue += (yieldQty * (marketMap.get(Number(mat.matID)) || 0));
+      }
+
+      if (totalValue > 0) {
+        acc.push([typeID, row[colName], totalValue, new Date()]);
+      }
     }
-  }
-  return map;
-}
+    return acc;
+  }, []);
 
-/**
- * ORE SKILL ENGINE
- * Maps GroupIDs to specific Processing Skills from the Character Profile.
- * Category 25 (Asteroids) and 42 (Moon Ore).
- */
-function getOreSkillMultiplier(groupId,ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const profile = ss.getSheetByName("Character_Profile").getDataRange().getValues();
-  
-  // Mapping Groups to Skill Names
-  const skillMap = {
-    462: "Veldspar Processing",
-    460: "Scordite Processing",
-    459: "Pyroxeres Processing",
-    461: "Plagioclase Processing",
-    467: "Kernite Processing",
-    468: "Omber Processing",
-    469: "Jaspet Processing",
-    470: "Hemorphite Processing",
-    465: "Ice Processing", // Technically Category 465
-    // Add Moon Ore groups as needed
-  };
+  // 3. STATION SERVICE (One-shot Write)
+  const SHEET_NAME = "Reprocessed_Material_Values";
+  let outSheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
 
-  const targetSkill = skillMap[groupId] || "Reprocessing Efficiency";
-  
-  // Base Character Mults
-  let reprocessing = 1.0;
-  let efficiency = 1.0;
-  let specificSkill = 1.0;
-  let implant = 1.0;
-
-  for (let i = 1; i < profile.length; i++) {
-    const name = String(profile[i][0]).trim();
-    const val = parseFloat(profile[i][2]);
-    if (isNaN(val)) continue;
-
-    if (name === "Reprocessing") reprocessing = val;
-    if (name === "Reprocessing Efficiency") efficiency = val;
-    if (name === targetSkill) specificSkill = val;
-    if (name === "Zainou 'Beancounter' RX-810") implant = val;
-  }
-
-  // Ore Formula: (Skill1 * Skill2 * Skill3 * Implant)
-  return reprocessing * efficiency * specificSkill * implant;
-}
-
-/**
- * REPROCESSING INTERFACE EVALUATOR & COMMITTER
- * Reads a pasted inventory list, evaluates profitability against Blended Costs,
- * and commits to the Material Ledger.
- */
-function evaluateReprocessingInterface() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ui = SpreadsheetApp.getUi();
-  const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('REPRO_EVAL') : console;
-
-  log.info("=== Starting Reprocessing Evaluation ===");
-
-  const INTERFACE_SHEET = "Preproceeing Interface";
-  const SDE_MAT_SHEET = "SDE_invTypeMaterials";
-
-  const sheet = ss.getSheetByName(INTERFACE_SHEET);
-  if (!sheet) {
-    log.error("CRITICAL: Could not find sheet: " + INTERFACE_SHEET);
+  // Safety: If outputRows is 0, we don't want to clear headers and exit
+  if (outputRows.length === 0) {
+    LOG.warn("Zero reprocessable items found. Aborting write to protect sheet.");
     return;
   }
 
-  // --- UI TWEAK: CAPTURE STRUCTURE FROM C3 ---
-  const structureName = sheet.getRange("C3").getValue();
-  log.info(`Target Structure from C3: ${structureName}`);
-  ss.toast(`Analyzing inventory for ${structureName}...`, "Engine Room", 3);
+  outSheet.clearContents();
+  const finalPayload = [["Type ID", "Item Name", "Melt Value (Unit)", "Updated"], ...outputRows];
+  outSheet.getRange(1, 1, finalPayload.length, 4).setValues(finalPayload);
 
-  // 1. Data Lookups & Engine Initialization
-  const rawData = sheet.getDataRange().getValues();
-  const typeMap = getSdeSearchMap(ss);
-  const blendedMap = getBlendedMapFor(ss, "NR_BLENDED_COST");
-  const marketMap = getMarketPriceMapFor(ss, 'buy_max');
-  const groupToCatMap = getGroupCategoryMap(ss);
+ // 4. THE COMPACTOR (Purge Ghost Rows/Columns)
+  const lastRow = outSheet.getLastRow();
+  const lastCol = outSheet.getLastColumn();
+  
+  // Aggressive Row Trim
+  const currentMaxRows = outSheet.getMaxRows();
+  if (currentMaxRows > lastRow + 1) {
+    outSheet.deleteRows(lastRow + 2, currentMaxRows - (lastRow + 1));
+  }
 
-  const matData = ss.getSheetByName(SDE_MAT_SHEET).getDataRange().getValues();
-  const materialMap = new Map();
-  matData.forEach(r => {
-    const pId = Number(r[0]);
-    if (!materialMap.has(pId)) materialMap.set(pId, []);
-    materialMap.get(pId).push({ matID: Number(r[1]), qty: Number(r[2]) });
-  });
+  // Aggressive Column Trim (Fixed: deleteColumns)
+  const currentMaxCols = outSheet.getMaxColumns();
+  if (currentMaxCols > lastCol) {
+    outSheet.deleteColumns(lastCol + 1, currentMaxCols - lastCol);
+  }
 
-  // 2. Efficiency Calculation (SCRAPMETAL TRACK)
-  let scrapEfficiency = 0.50; 
+  // 5. NAMED RANGE SYNC
+  const RANGE_NAME = "NR_REPRO_VALUE_TABLE";
+  const finalRange = outSheet.getRange(1, 1, lastRow, lastCol);
+  
+  // Update logic: Remove old reference and set new one
   try {
-    const baseYield = getStructureBaseYield(structureName,ss);
-    const charMult = getCharacterMeltMultiplier();
-    scrapEfficiency = baseYield * charMult;
-   log.info(`Max Scrapmetal Efficiency: ${(scrapEfficiency * 100).toFixed(2)}% (Hard-capped at 50% base)`);
+    const existingRange = ss.getRangeByName(RANGE_NAME);
+    if (existingRange) {
+      ss.removeNamedRange(RANGE_NAME);
+    }
+    ss.setNamedRange(RANGE_NAME, finalRange);
   } catch (e) {
-    log.warn(`Lookup failed for [${structureName}]. Using 50% fallback.`);
+    LOG.warn("Named Range Sync Issue: " + e.message);
   }
 
-  // 3. Process the Pasted Rows
-  const OUT_HEADERS = ["Blended Unit Cost", "Total Input Cost", "Scrap Value (Amarr Buy)", "Net Profit", "Margin", "Action"];
-  const outData = [];
-  const headerRowIndex = 3; 
-  const startRow = 4; 
-
-  const ledgerEntries = [];
-  const batchId = Utilities.getUuid().substring(0, 8);
-  const todayStr = new Date().toISOString().split('T')[0];
-
-  const headers = rawData.length > headerRowIndex ? rawData[headerRowIndex] : [];
-  const itemIdx = headers.indexOf("Item") !== -1 ? headers.indexOf("Item") : 1;
-  const qtyIdx = headers.indexOf("Qty") !== -1 ? headers.indexOf("Qty") : 2;
-  const typeIdx = headers.indexOf("Type") !== -1 ? headers.indexOf("Type") : 3;
-
-  for (let i = startRow; i < rawData.length; i++) {
-    const row = rawData[i];
-    const qty = parseFloat(String(row[qtyIdx] || "").replace(/[^0-9.-]/g, '')) || 0;
-
-    if (qty <= 0) {
-      outData.push(["", "", "", "", "", ""]);
-      continue;
-    }
-
-    let lookupName = (String(row[itemIdx]).trim() || String(row[typeIdx]).trim()).toLowerCase();
-    let typeInfo = typeMap.get(lookupName);
-
-    if (!typeInfo) {
-      log.warn(`Row ${i + 1}: Unrecognized Item -> "${lookupName}"`);
-      outData.push(["Unrecognized Item", "", "", "", "", ""]);
-      continue;
-    }
-
-    const typeId = typeInfo.id;
-    const batchCount = qty / typeInfo.portion;
-
-    const blendedUnitCost = blendedMap.get(typeId) || 0;
-    const totalInputCost = blendedUnitCost * qty;
-
-    // --- FIX: DEFINE MATERIALS BEFORE RUNNING THE ENGINE ---
-    const materials = materialMap.get(typeId) || []; 
-    const catId = groupToCatMap.get(typeInfo.groupId);
-    let activeEfficiency = 0.50;
-
-    if (catId === 25 || catId === 42) {
-      // ORE TRACK: Uses the Structure Rig Bonus (C3) + Ore Skills
-      const baseYield = getStructureBaseYield(structureName, ss); 
-      activeEfficiency = baseYield * getOreSkillMultiplier(typeInfo.groupId, ss); 
-    } else {
-      // SCRAPMETAL TRACK: Hard-coded 50% Base (82.2% max)
-      activeEfficiency = 0.50 * getCharacterMeltMultiplier(); 
-    }
-
-    // RUN THE ENGINE
-    const melt = calculateMeltValue(materials, activeEfficiency, batchCount, marketMap);
-    const totalScrapValue = melt.totalValue;
-    const currentItemLedgerPayload = [];
-
-    melt.yields.forEach(item => {
-      currentItemLedgerPayload.push({
-        date: todayStr,
-        type_id: item.id,
-        qty: item.qty,
-        unit_value: item.unitPrice,
-        source: "REPROCESSING",
-        contract_id: `REPRO-${batchId}-${typeId}`,
-        char: "Jason Kilman"
-      });
-    });
-
-    const profit = totalScrapValue - totalInputCost;
-    let margin = totalInputCost > 0 ? profit / totalInputCost : 0;
-
-    let action = "SELL RAW (LOSS)";
-    if (totalInputCost === 0 && totalScrapValue > 0) {
-      action = "REPROCESS (FREE LOOT)";
-      ledgerEntries.push(...currentItemLedgerPayload);
-    } else if (profit > 0) {
-      action = "REPROCESS (PROFITABLE)";
-      ledgerEntries.push(...currentItemLedgerPayload);
-    }
-
-    outData.push([blendedUnitCost, totalInputCost, totalScrapValue, profit, margin, action]);
-  }
-
-  // 4. Output to Sheet
-  const targetCol = 9;
-  const headerRow = 4;
-  const dataRow = 5;
-
-  const numRowsToClear = sheet.getMaxRows() - headerRow + 1;
-  if (numRowsToClear > 0) {
-    sheet.getRange(headerRow, targetCol, numRowsToClear, OUT_HEADERS.length).clearContent();
-  }
-
-  sheet.getRange(headerRow, targetCol, 1, OUT_HEADERS.length)
-       .setValues([OUT_HEADERS]).setFontWeight("bold").setBackground("#f3f3f3");
-
-  if (outData.length > 0) {
-    const dataRange = sheet.getRange(dataRow, targetCol, outData.length, OUT_HEADERS.length);
-    dataRange.setValues(outData);
-    sheet.getRange(dataRow, targetCol, outData.length, 4).setNumberFormat("#,##0.00 [$ISK]");
-    sheet.getRange(dataRow, targetCol + 4, outData.length, 1).setNumberFormat("0.00%");
-  }
-
-  // 5. THE LEDGER COMMIT
-  if (ledgerEntries.length > 0) {
-    const response = ui.alert(
-      'Commit to Ledger?',
-      `Evaluation complete for ${structureName}.\n\nFound ${ledgerEntries.length} profitable yields.\nCommit to Material Ledger?`,
-      ui.ButtonSet.YES_NO
-    );
-
-    if (response == ui.Button.YES) {
-      if (typeof ML !== 'undefined') {
-        ML.forSheet("Material_Ledger").upsertBy(['contract_id', 'type_id'], ledgerEntries);
-        ss.toast(`Committed ${ledgerEntries.length} yields to Ledger.`, "Success", 5);
-      }
-    }
-  }
-
-  log.info("=== Reprocessing Evaluation Finished ===");
+  const end = new Date().getTime();
+  LOG.info(`Sprint Finished: ${outputRows.length} items in ${(end - start) / 1000}s. Named Range Synced.`);
 }
