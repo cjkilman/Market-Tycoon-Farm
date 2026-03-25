@@ -27,21 +27,28 @@ function getSS() {
 const sdeLib = () => {
   let _sheetCache = {};
 
- const downloadTextData = (csvFile) => {
+const downloadTextData = (csvFile) => {
     console.time("downloadTextData( csvFile:" + csvFile + " )");
-    const baseURL = 'https://raw.githubusercontent.com/cjkilman/eve-sde-dump/main/' + csvFile;
-    
+    const baseURL = 'https://github.com/cjkilman/eve-sde-converter/releases/latest/download/' + csvFile;
+
     try {
-      const csvContent = UrlFetchApp.fetch(baseURL).getContentText();
+      // Mute HTTP exceptions so we can read the actual 404/500 error codes
+      const response = UrlFetchApp.fetch(baseURL, { muteHttpExceptions: true });
+      const responseCode = response.getResponseCode();
+      
+      if (responseCode !== 200) {
+        throw new Error(`HTTP Error ${responseCode}: Could not fetch ${csvFile}. File may not exist in the latest release.`);
+      }
+
+      const csvContent = response.getContentText();
       console.timeEnd("downloadTextData( csvFile:" + csvFile + " )");
       return csvContent.trim().replace(/\n$/, "");
     } catch (e) {
-      // --- ABORT ON ERROR: Quota/Limit Detection ---
       if (e.message.includes('too many times') || e.message.includes('limit exceeded')) {
         console.error("CRITICAL: SDE Download hit Google Quota. Shutting down SDE Job.");
-        sde_job_KILL_ALL_TRIGGERS(); // Hard stop
+        sde_job_KILL_ALL_TRIGGERS(); 
       }
-      throw e; 
+      throw e;
     }
   };
 
@@ -97,14 +104,14 @@ const sdeLib = () => {
         if (mgValue === "" || mgValue === "null" || mgValue === "0") continue;
       }
 
-// --- UPDATED ESCAPE LOGIC ---
+      // --- UPDATED ESCAPE LOGIC ---
       let sanitizedRow = colIndices.map(idx => {
         let val = String(cols[idx] || "").trim();
 
         // 1. Check if it's a number (TypeIDs, Quantities, Prices)
         // We only convert to Number if it's not empty and is numeric
         if (val !== "" && !isNaN(val)) {
-          return Number(val); 
+          return Number(val);
         }
 
         // 2. Handle strings starting with ' (e.g., 'Accord' or 'Arbalest')
@@ -364,17 +371,17 @@ function tryCallHook(functionName) {
  */
 function sde_job_KILL_ALL_TRIGGERS() {
   const SCRIPT_PROPS = PropertiesService.getScriptProperties();
-  
+
   // 1. Delete the repeating SDE trigger to stop the loop
   ScriptApp.getProjectTriggers().forEach(t => {
     if (t.getHandlerFunction() === 'sde_job_PROCESS') {
       ScriptApp.deleteTrigger(t);
     }
   });
-  
+
   // 2. Clear the running flag so other workers know the job is dead
   SCRIPT_PROPS.deleteProperty('SDE_JOB_RUNNING');
-  
+
   console.error("SYSTEM: Emergency Shutdown. SDE triggers purged due to Quota exhaustion.");
 }
 
@@ -450,21 +457,21 @@ function sde_job_PROCESS() {
     _deleteTriggersFor('sde_job_PROCESS');
     ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(2000).create();
 
-} catch (e) {
+  } catch (e) {
     const errorMessage = e.message.toLowerCase();
 
     // --- NEW: QUOTA CHECK ---
     // If we hit the quota, we MUST kill all triggers immediately to stop the loop.
     if (errorMessage.includes("too many times") || errorMessage.includes("limit exceeded")) {
       console.error("ABORTING: Quota reached. Shutting down SDE Job.");
-      sde_job_KILL_ALL_TRIGGERS(); 
+      sde_job_KILL_ALL_TRIGGERS();
       return; // Do not schedule any further triggers
     }
 
     // Check for fatal errors that should NOT resume
     if (errorMessage.includes("csvtoarray") || errorMessage.includes("not found") || errorMessage.includes("critical")) {
       Logger.log(`FATAL ERROR in sde_job_PROCESS (Job ${jobIndex}): ${e.message}. Calling FINALIZE to abort.`);
-      sde_job_FINALIZE(); 
+      sde_job_FINALIZE();
 
     } else {
       // Assume it's a temporary timeout (like a network hiccup), re-trigger to attempt resume.
