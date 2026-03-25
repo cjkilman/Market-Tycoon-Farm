@@ -16,7 +16,8 @@ function GET_SDE_CONFIG() {
     { name: "SDE_staStations", file: "staStations.csv", cols: null },
     { name: "SDE_industryActivityMaterials", file: "industryActivityMaterials.csv", cols: null },
     { name: "SDE_industryActivityProducts", file: "industryActivityProducts.csv", cols: null },
-    { name: "SDE_invTypeMaterials" , file: "invTypeMaterials.csv", cols: null }
+    { name: "SDE_invTypeMaterials" , file: "invTypeMaterials.csv", cols: null },
+    { name: "SDE_Bonuses", file: "specializedReprocessingBonuses.csv", cols: null }
   ];
 }
 
