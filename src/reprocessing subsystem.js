@@ -229,8 +229,17 @@ function getSdeTypeEngine(ss) {
   return { byName, byId };
 }
 
+
 /**
- * CORE REPROCESSING MATH ENGINE (The Chef)
+ * CALCULATE MELT VALUE (Asset Floor Logic)
+ * Logic: Calculates the total market ISK value of an item's reprocessed materials.
+ * Handles EVE's "round down" yield mechanics and normalizes output to a single unit.
+ *
+ * @param {Array} materials - SDE material array [{matID, qty}, ...]
+ * @param {number} efficiency - Net reprocessing yield (e.g., 0.5 * 1.69)
+ * @param {number} batchCount - Processing multiplier (1 / portionSize)
+ * @param {Map} priceMap - Reference prices for minerals (e.g., Amarr Buy)
+ * @returns {Object} - {totalValue: number, yields: Array}
  */
 function calculateMeltValue(materials, efficiency, batchCount, priceMap) {
   let totalValue = 0;
@@ -248,6 +257,39 @@ function calculateMeltValue(materials, efficiency, batchCount, priceMap) {
   });
 
   return { totalValue: totalValue, yields: yieldDetails };
+}
+
+/**
+ * DERIVE EFFECTIVE MATERIAL COSTS
+ * Logic: Takes what you PAID for an item and distributes that cost 
+ * across the resulting minerals based on their relative market value.
+ * * @param {Array} materials - SDE material array [{matID, qty}, ...]
+ * @param {number} efficiency - Your repro efficiency (e.g., 0.5 * 1.69)
+ * @param {number} batchCount - 1 / portionSize
+ * @param {Map} priceMap - Current Amarr Buy prices for minerals
+ * @param {number} acquisitionCost - What you actually paid for the item (e.g., 1 ISK)
+ */
+function deriveEffectiveMaterialCosts(materials, efficiency, batchCount, priceMap, acquisitionCost) {
+  // 1. Calculate the actual Yields and the current Market "Melt Value"
+  // We use your existing math engine for this part
+  const melt = calculateMeltValue(materials, efficiency, batchCount, priceMap);
+  
+  if (melt.totalValue === 0) return [];
+
+  // 2. Calculate the Arbitrage Ratio (Cost vs. Value)
+  // Example: Paid 1 ISK / Worth 119 ISK = 0.0084 ratio
+  const costRatio = acquisitionCost / melt.totalValue;
+
+  // 3. Distribute the cost across each mineral yield
+  return melt.yields.map(y => {
+    return {
+      materialID: y.id,
+      yieldQty: y.qty,
+      marketUnitPrice: y.unitPrice,
+      // THE END GAME: This is your actual ISK cost for this specific mineral
+      effectiveUnitPrice: y.unitPrice * costRatio 
+    };
+  });
 }
 
 /**
