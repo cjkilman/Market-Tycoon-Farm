@@ -1,0 +1,41 @@
+function getMarketPriceMapFor(ss, Attribute) {
+  const map = new Map();
+  const NR_Prices = 'NR_MARKET_DATA';
+  if (!Attribute) Attribute = 'Median Sell'; 
+  
+  let data;
+  try {
+    // 1. Try treating 'sourceName' as a Named Range first
+    let range = ss.getRangeByName(NR_Prices);
+    
+    // 2. If it's not a Named Range, try grabbing the whole Sheet
+    if (!range) {
+      const sheet = ss.getSheetByName(NR_Prices);
+      if (!sheet) return map; // If both fail, return empty map
+      range = sheet.getDataRange();
+    }
+
+    data = range.getValues();
+    if (data.length < 2) return map; // Needs at least a header and one row of data
+
+    const headers = data[0];
+    
+    // Flexible ID finder (looks for 'type_id_filtered' first, falls back to 'type_id')
+    const colId = headers.indexOf('type_id_filtered') !== -1 ? headers.indexOf('type_id_filtered') : headers.indexOf('type_id');
+    const colMed = headers.indexOf(Attribute);
+    
+    if (colId === -1 || colMed === -1) return map;
+
+    // Start at 1 to skip headers
+    for (let i = 1; i < data.length; i++) {
+      const typeId = Number(data[i][colId]); 
+      const val = Number(String(data[i][colMed]).replace(/[^0-9.]/g, '')); 
+      
+      if (typeId > 0 && val > 0) map.set(typeId, val); 
+    }
+  } catch (e) { 
+    // Silent catch, returns empty map if data is completely broken
+  }
+  
+  return map;
+}

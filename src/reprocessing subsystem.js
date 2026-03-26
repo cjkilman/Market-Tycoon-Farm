@@ -374,17 +374,22 @@ function generateReprocessedValueTable(ss) {
     outSheet.deleteColumns(lastCol + 1, currentMaxCols - lastCol);
   }
 
-  // 5. NAMED RANGE SYNC
+// 5. NAMED RANGE SYNC (Silent Update)
   const RANGE_NAME = "NR_REPRO_VALUE_TABLE";
   const finalRange = outSheet.getRange(1, 1, lastRow, lastCol);
   
-  // Update logic: Remove old reference and set new one
   try {
-    const existingRange = ss.getRangeByName(RANGE_NAME);
-    if (existingRange) {
-      ss.removeNamedRange(RANGE_NAME);
+    // Look for the existing range object
+    const allNamedRanges = ss.getNamedRanges();
+    const existing = allNamedRanges.find(r => r.getName() === RANGE_NAME);
+
+    if (existing) {
+      // THE PRO MOVE: Re-point the existing name to the new range coordinates
+      // This prevents the #REF! blink in your formulas
+      existing.setRange(finalRange);
+    } else {
+      ss.setNamedRange(RANGE_NAME, finalRange);
     }
-    ss.setNamedRange(RANGE_NAME, finalRange);
   } catch (e) {
     LOG.warn("Named Range Sync Issue: " + e.message);
   }

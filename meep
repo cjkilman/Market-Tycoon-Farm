@@ -1,41 +1,13 @@
-=ARRAYFORMULA(
-IF(B4:B="","",
-LET(
- 
-  ms, N(IFERROR(INDEX(B$4:AQ,, MATCH("Hub Median Sell", B$3:AQ$3,0)),0)),
-  mb, N(IFERROR(INDEX(B$4:AQ,, MATCH("Hub Median Buy",  B$3:AQ$3,0)),0)),
-  hs, N(IFERROR(INDEX(B$4:AQ,, MATCH("Hub Sell Price",  B$3:AQ$3,0)),0)),
-
- 
-  ec, N(IFERROR(INDEX(B$4:AQ,, MATCH("Effective Cost",  B$3:AQ$3,0)),)),
-
-  
-  vol, N(IFNA(INDEX(B$4:AQ,, MATCH("30-day traded volume", B$3:AQ$3,0)), 0)),
-  lst, N(IFNA(INDEX(B$4:AQ,, MATCH("Listed Volume (Feed Sell)", B$3:AQ$3,0)), 0)),
-
-  
-  eps, N(EPS_PRICE),
-  sc,  N(SPREAD_CAP),
-  msc, MAX(1, N(MED_SPREAD_CAP)),
-  net, 1 - ( IF(N(FEE_RATE)>1, N(FEE_RATE)/100, N(FEE_RATE))
-            +IF(N(TAX_RATE)>1, N(TAX_RATE)/100, N(TAX_RATE)) ),
-  volOK, (vol>=N(MIN_VOL)) + (lst>=N(MIN_LISTED)),
-
-  
-  
-  hsu, IF(hs>eps, hs, ms*msc),
-  sellRefMed,  IF(ms<=mb*msc, ms, mb*msc),
-  tmpLive,     IF(hsu<=ms*msc, hsu, ms*msc),
-  sellRefLive, MIN(tmpLive, ec*sc),
-
-  baseMedOK,  (ms>eps) * (mb>eps) * (ec>eps),
-  baseLiveOK, (sellRefLive>eps) * (ec>eps),
-
-  medianROI,  IF(baseMedOK * volOK,  (sellRefMed*net  - ec)/ec, ),
-  marginLive, IF(baseLiveOK* volOK,  (sellRefLive*net - ec)/ec, ),
-
-  HSTACK(medianROI, marginLive)
-)))
-
-
-=If(Utility!D3 = 1, IF(setting_corp = False, "", corporations_corporation_assets(setting_director)) , 0)
+={"Reprocessed Value";
+  ARRAYFORMULA(IF($B4:$B="","",
+  LET(
+  ids, B4:B,
+  reproData, NR_REPRO_VALUE_TABLE,
+  reproIDs, INDEX(reproData,,1),
+  reproValues, INDEX(reproData,,3),
+  MAP(ids, LAMBDA(id, 
+    IF(id="",,
+      XLOOKUP(id, reproIDs, reproValues, 0)
+    )
+  ))
+)}
