@@ -37,6 +37,48 @@ var NITRO_CONFIG = {
 };
 
 /**
+ * Maps Market Settings from the Location List sheet.
+ * Patterned after _getSdeNameMap for consistency.
+ * Range: I5:J (Setting, Value)
+ */
+function getMarketSettingsMap(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Location List");
+  const map = new Map();
+  if (!sheet) return map;
+
+  // Get headers from the specific starting point (I5:J5)
+  const headers = sheet.getRange("I5:J5").getValues()[0];
+  
+  try {
+    // Reusing your _getColIndexMap pattern for 'Setting' and 'Value'
+    const col = _getColIndexMap(headers, ['Setting', 'Value']);
+    
+    // Get data starting from row 6 down to the last row of the settings block
+    // We limit the fetch to columns I and J
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 6) return map;
+    
+    const data = sheet.getRange(6, 9, lastRow - 5, 2).getValues(); 
+
+    for (const r of data) {
+      const key = r[col.Setting];
+      if (key) {
+        // Clean the value to ensure it's a usable number (patterned after your clean helper)
+        const val = (typeof r[col.Value] === 'number') ? r[col.Value] : 
+                    parseFloat(String(r[col.Value] || 0).replace(/[^0-9.-]/g, '')) || 0;
+        
+        map.set(key, val);
+      }
+    }
+  } catch (e) {
+    console.error("Error in getMarketSettingsMap: " + e.message);
+  }
+  
+  return map;
+}
+
+/**
  * [THE RACER] - Reuse/Reset Strategy.
  * Clears the sheet if it exists (Reuse). Creates if missing.
  * Wraps clear() in a try/catch because it can be flaky on massive sheets.

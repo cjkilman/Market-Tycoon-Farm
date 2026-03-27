@@ -171,3 +171,93 @@ function generateProjectedCostTable(ss) {
   LOG.info(`Optimization complete. Processed ${outputRows.length} Manufacturing items.`);
 }
 
+/**
+ * REPROCESSED VALUE ENGINE (Liquid Asset Style)
+ * Logic: Scans MarketOverviewData, filters for reprocessables, and outputs Melt Value.
+ * Aligning with "Projected_Build_Costs" for high-speed table generation.
+ */
+function generateReprocessedValueTable(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ReproValue') : console;
+  
+  LOG.info("--- Starting Reprocessed Value Table Generation ---");
+
+  // 1. DATA & ENGINES (The Pantry)
+  const marketMap = getMarketPriceMapFor(ss, 'buy_max'); // Current Mineral Prices
+  const materialMap = getSdeMaterialMap(ss);            // What minerals are inside?
+  const { byId: typeMap } = getSdeTypeEngine(ss);      // Name/Portion data
+  
+  // Jason Kilman Efficiency Standard
+  const totalEfficiency = 0.50 * 1.69; 
+
+  // 2. SOURCE DATA (MarketOverviewData)
+  const overviewSheet = ss.getSheetByName("MarketOverviewData");
+  if (!overviewSheet) return;
+  const overviewData = overviewSheet.getDataRange().getValues();
+  const headers = overviewData[2]; // Headers on Row 3
+  
+  const col = {
+    id: headers.indexOf("type_id"),
+    name: headers.indexOf("Item Name")
+  };
+
+  // 3. CALCULATION LOOP
+  const outputRows = [];
+  const startRow = 3; // Data starts at Row 4
+
+  for (let i = startRow; i < overviewData.length; i++) {
+    const row = overviewData[i];
+    const typeID = Number(row[col.id]);
+    const itemName = String(row[col.name]);
+    
+    if (!typeID) continue;
+
+    // Check if item is reprocessable (Must exist in SDE material map)
+    const materials = materialMap.get(typeID);
+    const typeInfo = typeMap.get(typeID);
+    
+    if (!materials || !typeInfo) continue; // Skip non-reprocessable items
+
+    // Run the Melt Math (Value per 1 unit)
+    // Portion size is critical: Value = (Melt of 1 Portion) / PortionSize
+    const melt = calculateMeltValue(materials, totalEfficiency, 1 / typeInfo.portion, marketMap);
+
+    if (melt.totalValue > 0) {
+      outputRows.push([
+        typeID,
+        itemName,
+        melt.totalValue, // ISK Value per Unit
+        new Date()
+      ]);
+    }
+  }
+
+  // 4. OUTPUT & MAINTENANCE (Projected_Build_Costs Style)
+  const outSheet = ss.getSheetByName("Reprocessed_Material_Values");
+  if (!outSheet) {
+    LOG.error("Sheet 'Reprocessed_Material_Values' not found.");
+    return;
+  }
+
+  // Clear and rewrite headers
+  outSheet.clearContents();
+  const outputHeaders = [["Type ID", "Item Name", "Melt Value (Unit)", "Updated"]];
+  outSheet.getRange(1, 1, 1, 4).setValues(outputHeaders);
+  
+  if (outputRows.length > 0) {
+    outSheet.getRange(2, 1, outputRows.length, 4).setValues(outputRows);
+    
+    // Formatting for speed
+    outSheet.getRange(2, 3, outputRows.length, 1);
+    outSheet.getRange(2, 4, outputRows.length, 1);
+  }
+
+  // 5. TRIM EXCESS (Lag Prevention)
+  const maxRows = outSheet.getMaxRows();
+  const dataRows = outputRows.length + 1;
+  if (maxRows > dataRows + 5) {
+    outSheet.deleteRows(dataRows + 1, maxRows - dataRows);
+  }
+
+  LOG.info(`Table complete. Processed ${outputRows.length} reprocessable items.`);
+}

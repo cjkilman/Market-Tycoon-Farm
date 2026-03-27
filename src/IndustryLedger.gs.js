@@ -852,31 +852,18 @@ function _getSdeMaps(ss) {
   return res;
 }
 
-/**
- * REFINED SDE NAME LOOKUP
- * Optimized to only pull necessary columns and skip the "Ghost Data" in the SDE.
- */
 function _getSdeNameMap(ss) {
   const sheet = ss.getSheetByName("SDE_invTypes");
   const map = new Map();
   if (!sheet) return map;
-
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  
-  const idIdx = headers.indexOf('typeID');
-  const nameIdx = headers.indexOf('typeName');
-
-  // Skip header, loop data
-  for (let i = 1; i < data.length; i++) {
-    const id = Number(data[i][idIdx]);
-    const name = String(data[i][nameIdx]);
-    
-    // Only map if it's a valid ID and not a "placeholder" name
-    if (id > 0 && name !== "") {
-      map.set(id, name);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  try {
+    const col = _getColIndexMap(headers, ['typeID', 'typeName']);
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
+    for (const r of data) {
+      map.set(Number(r[col.typeID]), r[col.typeName]);
     }
-  }
+  } catch (e) { }
   return map;
 }
 
