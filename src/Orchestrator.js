@@ -48,8 +48,8 @@ function fetchFilteredPricesSync(ss) {
 
   // --- CONFIGURATION ---
   const SOURCE_SHEET_ID = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
-  const SOURCE_RANGE = "'filtered prices'!E7:L750";
-  const TARGET_SHEET_NAME = "market price Tracker"; // Change to whatever you want
+  const SOURCE_RANGE = "'filtered prices'!E7:I";
+  const TARGET_SHEET_NAME = "market price Tracker"; 
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
 
@@ -72,22 +72,54 @@ function fetchFilteredPricesSync(ss) {
       LOG.info(`Created new target sheet: ${TARGET_SHEET_NAME}`);
     }
 
-    // 3. Optional: Filter out completely empty rows to save memory
-    // (Assuming Column A of the fetched data is the Item Name or ID)
-    const cleanValues = rawValues.filter(row => row[0] !== "" && row[0] != null);
-    const dataToWrite = cleanValues.length > 0 ? cleanValues : rawValues;
+    // 3. Clean Data and Enforce Strict Data Types
+    const cleanedData = [];
+    for (let i = 0; i < rawValues.length; i++) {
+      let row = rawValues[i];
+      let typeId = row[0];
 
-    // 4. Wipe old data and write the fresh snapshot
-    targetSheet.clearContents(); // Clears everything for a fresh paste
-    targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length).setValues(dataToWrite);
+      // Skip completely empty rows
+      if (typeId === "" || typeId == null) continue;
 
-    // 5. Trim excess rows (The same optimization you used in the ML Ledger)
-    const maxRows = targetSheet.getMaxRows();
-    if (maxRows > dataToWrite.length) {
-      targetSheet.deleteRows(dataToWrite.length + 1, maxRows - dataToWrite.length);
+      // Type Enforcement 1: Force Type ID to be a string integer so Sheets cannot round it
+      let safeTypeId = parseInt(typeId, 10).toString();
+
+      // Type Enforcement 2: Force prices to be pure numbers (removes " ISK" and commas if present)
+      let cleanPrice = (val) => {
+        if (typeof val === 'number') return val;
+        if (!val) return 0;
+        let parsed = parseFloat(val.toString().replace(/,/g, '').replace(/ ISK/g, '').trim());
+        return isNaN(parsed) ? 0 : parsed;
+      };
+
+      cleanedData.push([
+        safeTypeId,         // Column A: type_id
+        cleanPrice(row[1]), // Column B: min_sell
+        cleanPrice(row[2]), // Column C: max_buy
+        cleanPrice(row[3]), // Column D: median_sell
+        cleanPrice(row[4])  // Column E: median_buy
+      ]);
     }
 
-    LOG.info(`Price Sync Complete. Wrote ${dataToWrite.length} rows.`);
+    if (cleanedData.length === 0) return;
+
+    // 4. Wipe old data
+    targetSheet.clearContents(); 
+
+    // 5. Pre-format columns BEFORE pasting to stop Google Sheets from "auto-guessing"
+    targetSheet.getRange("A:A").setNumberFormat("@"); // Column A strictly Plain Text
+    targetSheet.getRange("B:E").setNumberFormat("#,##0.00"); // Columns B-E strictly Numbers
+
+    // 6. Write the clean, type-safe data
+    targetSheet.getRange(1, 1, cleanedData.length, cleanedData[0].length).setValues(cleanedData);
+
+    // 7. Trim excess rows
+    const maxRows = targetSheet.getMaxRows();
+    if (maxRows > cleanedData.length) {
+      targetSheet.deleteRows(cleanedData.length + 1, maxRows - cleanedData.length);
+    }
+
+    LOG.info(`Price Sync Complete. Wrote ${cleanedData.length} rows with enforced data types.`);
     ss.toast("✅ External Prices Synced", "Engine Room", 3);
 
   } catch (e) {
