@@ -48,8 +48,8 @@ function fetchFilteredPricesSync(ss) {
 
   // --- CONFIGURATION ---
   const SOURCE_SHEET_ID = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
-  const SOURCE_RANGE = "'filtered prices'!E7:I";
-  const TARGET_SHEET_NAME = "market price Tracker"; 
+  const SOURCE_RANGE = "'filtered prices'!E7:L750";
+  const TARGET_SHEET_NAME = "market price Tracker"; // Change to whatever you want
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
 
@@ -72,54 +72,22 @@ function fetchFilteredPricesSync(ss) {
       LOG.info(`Created new target sheet: ${TARGET_SHEET_NAME}`);
     }
 
-    // 3. Clean Data and Enforce Strict Data Types
-    const cleanedData = [];
-    for (let i = 0; i < rawValues.length; i++) {
-      let row = rawValues[i];
-      let typeId = row[0];
+    // 3. Optional: Filter out completely empty rows to save memory
+    // (Assuming Column A of the fetched data is the Item Name or ID)
+    const cleanValues = rawValues.filter(row => row[0] !== "" && row[0] != null);
+    const dataToWrite = cleanValues.length > 0 ? cleanValues : rawValues;
 
-      // Skip completely empty rows
-      if (typeId === "" || typeId == null) continue;
+    // 4. Wipe old data and write the fresh snapshot
+    targetSheet.clearContents(); // Clears everything for a fresh paste
+    targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length).setValues(dataToWrite);
 
-      // Type Enforcement 1: Force Type ID to be a string integer so Sheets cannot round it
-      let safeTypeId = parseInt(typeId, 10).toString();
-
-      // Type Enforcement 2: Force prices to be pure numbers (removes " ISK" and commas if present)
-      let cleanPrice = (val) => {
-        if (typeof val === 'number') return val;
-        if (!val) return 0;
-        let parsed = parseFloat(val.toString().replace(/,/g, '').replace(/ ISK/g, '').trim());
-        return isNaN(parsed) ? 0 : parsed;
-      };
-
-      cleanedData.push([
-        safeTypeId,         // Column A: type_id
-        cleanPrice(row[1]), // Column B: min_sell
-        cleanPrice(row[2]), // Column C: max_buy
-        cleanPrice(row[3]), // Column D: median_sell
-        cleanPrice(row[4])  // Column E: median_buy
-      ]);
-    }
-
-    if (cleanedData.length === 0) return;
-
-    // 4. Wipe old data
-    targetSheet.clearContents(); 
-
-    // 5. Pre-format columns BEFORE pasting to stop Google Sheets from "auto-guessing"
-    targetSheet.getRange("A:A").setNumberFormat("@"); // Column A strictly Plain Text
-    targetSheet.getRange("B:E").setNumberFormat("#,##0.00"); // Columns B-E strictly Numbers
-
-    // 6. Write the clean, type-safe data
-    targetSheet.getRange(1, 1, cleanedData.length, cleanedData[0].length).setValues(cleanedData);
-
-    // 7. Trim excess rows
+    // 5. Trim excess rows (The same optimization you used in the ML Ledger)
     const maxRows = targetSheet.getMaxRows();
-    if (maxRows > cleanedData.length) {
-      targetSheet.deleteRows(cleanedData.length + 1, maxRows - cleanedData.length);
+    if (maxRows > dataToWrite.length) {
+      targetSheet.deleteRows(dataToWrite.length + 1, maxRows - dataToWrite.length);
     }
 
-    LOG.info(`Price Sync Complete. Wrote ${cleanedData.length} rows with enforced data types.`);
+    LOG.info(`Price Sync Complete. Wrote ${dataToWrite.length} rows.`);
     ss.toast("✅ External Prices Synced", "Engine Room", 3);
 
   } catch (e) {
@@ -203,6 +171,43 @@ function syncESIRegionData(ss) {
   } catch (e) {
     log.error("ESI_Region Sync Error: " + e.message);
   }
+}
+
+/**
+ * Dynamically updates the Named Range for the Market Orders sheet.
+ * This prevents the "A1:H" shrinkage that causes the 0-velocity bugs.
+ */
+function updateMarketOrdersNamedRange(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetName = "Publish_ESI_Region_market_orders";
+  const rangeName = "Region_Radar_Table"; // This is what your VLOOKUP uses
+  
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    Logger.log("Error: Sheet " + sheetName + " not found.");
+    return;
+  }
+
+  // 1. Find the boundaries
+  const lastRow = sheet.getLastRow();
+  // We force it to Column 24 (X) to ensure index 18 and 23 are always inside
+  const lastCol = 24; 
+
+  // 2. Define the new range (A1 to X[LastRow])
+  const newRange = sheet.getRange(1, 1, lastRow, lastCol);
+
+// 3. Update the Named Range STABLY
+  const existingNamedRange = ss.getNamedRanges().find(nr => nr.getName() === rangeName);
+  
+  if (existingNamedRange) {
+    // This updates the "coordinates" without deleting the object,
+    // which prevents the Velocity formula from losing its mind.
+    existingNamedRange.setRange(newRange);
+  } else {
+    ss.setNamedRange(rangeName, newRange);
+  }
+  
+  Logger.log("SUCCESS: " + rangeName + " now covers A1:X" + lastRow);
 }
 
 /**
@@ -686,6 +691,7 @@ function finalizeMarketDataUpdate() {
       // This prevents the sheet from waking up and calculating until all data is fresh.
       fetchFilteredPricesSync(ss_inner);
       syncESIRegionData(ss_inner);
+      updateMarketOrdersNamedRange(ss_inner);
       
       // 3. REPRO ENGINE (The New "Tycoon" Step)
       // Recalculate Melt Values using the fresh market data just swapped in.
