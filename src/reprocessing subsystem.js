@@ -136,99 +136,106 @@ function deriveEffectiveMaterialCosts(materials, efficiency, batchCount, priceMa
 
 /**
  * REPROCESSED VALUE ENGINE
- * Logic: Uses _getBlendedCostMap for Tiered Pricing (Hangar -> Market -> API)
- * Output: Reprocessed_Material_Values with Named Range Sync
+ * typ_id: Integer | Name: String | Financials: Float
+ * Cost Source: _getBlendedCostMap
  */
-function generateProjectedCostTable(ss) {
+function generateReprocessedValueTable(ss) {
+  const start = new Date().getTime();
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ProjectedCost') : console;
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ReproValue') : console;
 
-  // 1. Setup Data & SDE Maps
-  const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
+  // 1. DATA LOAD & ARTIFACT PURGE
   const overviewSheet = ss.getSheetByName("MarketOverviewData");
-  const overviewData = overviewSheet.getDataRange().getValues();
-  const headers = overviewData[2]; 
-  const col = { 
-    id: headers.indexOf("type_id"), 
-    name: headers.indexOf("Item Name"), 
-    group: headers.indexOf("Group") 
-  };
+  if (!overviewSheet) return;
+  
+  const rawOverview = overviewSheet.getDataRange().getValues();
+  
+  // Clean headers and data of clipboard junk (Version:0.9, HTML tags, etc.)
+  const clean = (val) => String(val).replace(/Version:0\.9|StartHTML:\d+|EndHTML:\d+|StartFragment:\d+|EndFragment:\d+/g, '').trim();
+  
+  const headers = rawOverview[2].map(h => clean(h).toLowerCase());
+  const colId = headers.indexOf("type_id");
+  const colName = headers.indexOf("item name");
 
-  const validTargets = [];
-  const allRequiredMatIds = new Set();
+  const allIds = rawOverview.slice(3)
+    .map(r => parseInt(clean(r[colId]), 10))
+    .filter(id => !isNaN(id) && id > 0);
 
-  // 2. Pre-Scan: Filter Manufacturing items and collect Mat IDs
-  for (let i = 3; i < overviewData.length; i++) {
-    const row = overviewData[i];
-    if (String(row[col.group] || "").indexOf("Manufacturing") === -1) continue;
+// 2. THE TYCOON MAPS (Dynamic Material Extraction)
+  const materialMap = getSdeMaterialMap(ss);
+  const { byId: typeMap } = getSdeTypeEngine(ss);
 
-    const typeID = Number(row[col.id]);
-    const bpInfo = _getBpFromProduct(typeID, sdeProdMap); 
-    if (!bpInfo) continue;
-
-    validTargets.push({ typeID, name: row[col.name], bpID: bpInfo.bpID, yield: bpInfo.yield });
-
-    const materials = sdeMatMap.get(bpInfo.bpID);
-    if (materials) {
-      materials.forEach(m => {
-        if (m.activityID === 1) allRequiredMatIds.add(Number(m.materialTypeID));
-      });
-    }
-  }
-
-  // 3. Initialize Cost Engine (Tiered Fallback)
-  const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMatIds));
-
-  // 4. Calculation Loop (ME 10 / 5% Install Fee)
-  const ME_LEVEL = 10; 
-  const EST_INSTALL_RATE = 0.05; 
-
-  const outputRows = validTargets.map(target => {
-    const materials = sdeMatMap.get(target.bpID);
-    let totalBatchCost = 0;
-
-    materials.forEach(m => {
-      if (m.activityID !== 1) return;
-      const matID = Number(m.materialTypeID);
-      const qty = Math.max(1, Math.ceil(m.quantity * ((100 - ME_LEVEL) / 100)));
-      
-      const unitCost = costMap.get(matID) || 0;
-      totalBatchCost += (qty * unitCost);
-    });
-
-    const unitCost = (totalBatchCost * (1 + EST_INSTALL_RATE)) / target.yield;
-    
-    // Formatting for the 7-column header you defined
-    return [target.typeID, target.name, unitCost, 0, 0, 0, new Date()];
+  // Collect every unique material ID needed for the items in your list
+  const requiredMatIds = new Set();
+  allIds.forEach(id => {
+    const recipe = materialMap.get(id);
+    if (recipe) recipe.forEach(mat => requiredMatIds.add(Number(mat.matID)));
   });
 
-  // 5. WRITE & COMPACT
+  // Fetch prices for materials and the items themselves
+  const mineralPriceMap = _getBlendedCostMap(ss, Array.from(requiredMatIds)); 
+  const costMap = _getBlendedCostMap(ss, allIds); 
+  
+  const efficiency = 0.50 * 1.69;
+
+  // 3. CORE CALCULATION
+  const outputRows = rawOverview.slice(3).reduce((acc, row) => {
+    const tid = parseInt(clean(row[colId]), 10);
+    if (!tid) return acc;
+
+    const materials = materialMap.get(tid);
+    const typeInfo = typeMap.get(tid);
+    const marketCost = parseFloat(costMap.get(tid)) || 0.0;
+
+    if (materials && typeInfo) {
+      let meltValue = 0.0;
+      const batchCount = 1.0 / typeInfo.portion;
+
+      for (const mat of materials) {
+        const qty = Math.floor(mat.qty * efficiency * batchCount);
+        
+        // FIX: pObj IS the price (a number), not an object with a .buy property
+        const pObj = mineralPriceMap.get(Number(mat.matID)) || 0.0;
+        meltValue += (qty * pObj);
+      }
+
+      if (meltValue > 0) {
+        const profit = meltValue - marketCost;
+        const margin = marketCost > 0 ? (profit / marketCost) * 100 : 0.0;
+
+        acc.push([
+          tid,
+          clean(row[colName]),
+          marketCost,
+          meltValue,
+          profit,
+          margin,
+          new Date()
+        ]);
+      }
+    }
+    return acc;
+  }, []);
+
+  // 4. WRITE & COMPACT
   const SHEET_NAME = "Reprocessed_Material_Values";
   let outSheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
   if (outputRows.length === 0) return;
 
   outSheet.clearContents();
-  const finalPayload = [
-    ["Type ID", "Item Name", "Market Cost", "Melt Value", "Profit", "Margin %", "Updated"], 
-    ...outputRows
-  ];
-  
+  const finalPayload = [["Type ID", "Item Name", "Market Cost", "Melt Value", "Profit", "Margin %", "Updated"], ...outputRows];
   outSheet.getRange(1, 1, finalPayload.length, 7).setValues(finalPayload);
 
-  // THE COMPACTOR: Kill extra rows
+  // THE COMPACTOR
   const lastRow = outSheet.getLastRow();
   const maxRows = outSheet.getMaxRows();
   if (maxRows > lastRow) outSheet.deleteRows(lastRow + 1, maxRows - lastRow);
 
-  // NAMED RANGE SYNC: Keep the target range tight
+  // NAMED RANGE SYNC
   const RANGE_NAME = "NR_REPRO_VALUE_TABLE";
   const finalRange = outSheet.getRange(1, 1, lastRow, 7);
   const existing = ss.getNamedRanges().find(r => r.getName() === RANGE_NAME);
-  if (existing) {
-    existing.setRange(finalRange);
-  } else {
-    ss.setNamedRange(RANGE_NAME, finalRange);
-  }
+  if (existing) existing.setRange(finalRange); else ss.setNamedRange(RANGE_NAME, finalRange);
 
   LOG.info(`Done: ${outputRows.length} items. Cost mapped from Blended Cost.`);
 }
