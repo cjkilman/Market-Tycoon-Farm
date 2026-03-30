@@ -69,6 +69,25 @@ function _getColIndexMap(headers, requiredHeaders) {
 }
 
 /**
+ * HELPER: _getBpFromProduct(productID, sdeProdMap)
+ * Scans the SDE Product Map to find the Blueprint that produces a specific TypeID.
+ * Returns { bpID, yield } or null.
+ */
+function _getBpFromProduct(productID, sdeProdMap) {
+  if (!sdeProdMap || typeof sdeProdMap.entries !== 'function') return null;
+
+  for (const [bpID, prodObj] of sdeProdMap.entries()) {
+    if (Number(prodObj.productTypeID) === Number(productID)) {
+      return {
+        bpID: bpID,
+        yield: Number(prodObj.quantity) || 1
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * NITRO BOM ENGINE (NUCLEAR OPTION)
  * Ignores 'Units Per Run' from the sheet and forces SDE lookup.
  * Fixes the 9.8B Tritanium bug permanently.
@@ -86,13 +105,13 @@ function generateFullBOMData(ss) {
   if (!prodSheet || !sdeMatSheet || !sdeProdSheet) return;
 
   const prodRaw = prodSheet.getDataRange().getValues();
-  const pHeaders = prodRaw[4]; 
+  const pHeaders = prodRaw[4];
   const prodData = prodRaw.slice(5);
 
   const pCol = {
     prodID: pHeaders.indexOf("Type ID"),
-    bpID:   pHeaders.indexOf("Blueprint Type ID"),
-    me:     pHeaders.indexOf("Material Efficiency (ME)"),
+    bpID: pHeaders.indexOf("Blueprint Type ID"),
+    me: pHeaders.indexOf("Material Efficiency (ME)"),
     target: pHeaders.indexOf("Build Target (Qty)")
   };
 
@@ -101,7 +120,7 @@ function generateFullBOMData(ss) {
   // This bypasses the need for the sheet to have correct columns.
   const productMetaMap = new Map();
   const sdeProdData = sdeProdSheet.getDataRange().getValues();
-  
+
   // Skip header, assuming Row 1 is header
   for (let i = 1; i < sdeProdData.length; i++) {
     const r = sdeProdData[i];
@@ -110,28 +129,28 @@ function generateFullBOMData(ss) {
       const bpID = Number(r[0]);      // Col A
       const productID = Number(r[2]); // Col C
       const quantity = Number(r[3]);  // Col D (Yield)
-      
+
       productMetaMap.set(productID, { bpID: bpID, qty: quantity });
     }
   }
 
   const jobMap = new Map();
-  
+
   prodData.forEach(row => {
     const pID = Number(row[pCol.prodID]);
     const buildTarget = clean(row[pCol.target]);
-    
+
     // LOOKUP from SDE (The Fix)
     const meta = productMetaMap.get(pID);
-    
+
     if (meta && buildTarget > 0) {
       const bpID = meta.bpID;
       const unitsPerRun = meta.qty || 1; // Force SDE value (e.g., 100)
-      
+
       // Calculate TRUE cycles
       const runs = Math.ceil(buildTarget / unitsPerRun);
       const me = row[pCol.me] === "" ? 10 : clean(row[pCol.me]);
-      
+
       if (runs > 0) {
         jobMap.set(bpID, { me, runs: (jobMap.get(bpID)?.runs || 0) + runs });
       }
@@ -147,19 +166,19 @@ function generateFullBOMData(ss) {
       const job = jobMap.get(sdeBpID);
       const baseQty = Number(sdeMatData[i][3]);
       const adjQty = baseQty * ((100 - job.me) / 100);
-      
+
       // Total Req = (Mat Per Run) * (True Cycles)
       const totalReq = Math.ceil(adjQty * job.runs);
 
       outputRows.push([
-          sdeBpID, 
-          1, 
-          Number(sdeMatData[i][2]), 
-          baseQty, 
-          job.me, 
-          job.runs, 
-          adjQty, 
-          totalReq
+        sdeBpID,
+        1,
+        Number(sdeMatData[i][2]),
+        baseQty,
+        job.me,
+        job.runs,
+        adjQty,
+        totalReq
       ]);
     }
   }
@@ -172,7 +191,7 @@ function generateFullBOMData(ss) {
     outSheet.getRange(2, 1, outputRows.length, 8).setValues(outputRows);
     outSheet.getRange(2, 8, outputRows.length, 1).setNumberFormat("#,##0");
   }
-  
+
   LOG.info(`BOM NUCLEAR FIX: Processed ${outputRows.length} lines using SDE yields.`);
 }
 
@@ -198,7 +217,7 @@ function generateConsolidatedRequirements(ss) {
 
   const col = {
     id: headers.indexOf("Type ID"),
-    cost: headers.indexOf("Effective Cost"), 
+    cost: headers.indexOf("Effective Cost"),
     name: headers.indexOf("Type Name"),
     bufferPct: headers.indexOf("Buffer Status (%)"),
     deficit31d: headers.indexOf("Need to Buy (31d)"),
@@ -214,7 +233,7 @@ function generateConsolidatedRequirements(ss) {
   let results = [];
 
   const scrapCache = JSON.parse(PropertiesService.getScriptProperties().getProperty('PROJECTED_SCRAP_MINERALS') || '{}');
-  
+
   // FIX: Define acquisitionDays to match the 31-day window
   const acquisitionDays = 31;
 
@@ -333,14 +352,14 @@ function runIndustryLedgerPhase(ss) {
 function fetchAllCorpBlueprints(corporationId) {
   const authToon = getCorpAuthChar();
   const cacheKey = "corp_bps_" + corporationId;
-  
+
   // 1. Check Shard-Chucker
-  const cachedJson = _getAndDechunk(cacheKey); 
+  const cachedJson = _getAndDechunk(cacheKey);
   if (cachedJson) {
     const parsed = JSON.parse(cachedJson);
     if (parsed.length > 0) {
-       console.log(`[CACHE] Serving ${parsed.length} blueprints for ${authToon}.`);
-       return parsed;
+      console.log(`[CACHE] Serving ${parsed.length} blueprints for ${authToon}.`);
+      return parsed;
     }
   }
 
@@ -361,7 +380,7 @@ function fetchAllCorpBlueprints(corporationId) {
 
     const headers = resp1.getHeaders();
     const maxPages = Number(headers['X-Pages'] || headers['x-pages']) || 1;
-    
+
     if (maxPages > 1) {
       const requests = [];
       for (let p = 2; p <= maxPages; p++) {
@@ -621,56 +640,75 @@ function runIndustryLedgerUpdate() {
 // ----------------------------------------------------------------------
 
 function _getBlendedCostMap(ss, requiredMaterialIds) {
-  const sheet = ss.getSheetByName("Blended_Cost");
+  const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('COST_ENGINE') : console;
+  
+  // DEBUG: Check input
+  log.info(`Engine Started. IDs requested: ${requiredMaterialIds ? requiredMaterialIds.length : 0}`);
 
-  // FIX: Using standardized local _getNamedOr_
+  const sheet = ss.getSheetByName("Blended_Cost");
   const BROKER_FEE_RATE = Number(_getNamedOr_('FEE_RATE', 0.03));
   const TRANSACTION_TAX_RATE = Number(_getNamedOr_('TAX_RATE', 0.075));
   const ACQUISITION_MULTIPLIER = 1 + BROKER_FEE_RATE + TRANSACTION_TAX_RATE;
 
-  const marketMedianMap = _getMarketMedianMap(ss);
   const allItemCosts = new Map();
   const tier3FetchList = new Set();
 
-  // Tier 1: Blended Cost
+  // 2. TIER 1: BLENDED COST
   if (sheet && sheet.getLastRow() >= 2) {
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const rawData = sheet.getDataRange().getValues();
+    const headers = rawData[0];
     try {
       const col = _getColIndexMap(headers, ['type_id', 'unit_weighted_average']);
-      const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getMaxColumns()).getValues();
-      data.forEach(row => {
-        const cost = Number(row[col.unit_weighted_average]);
-        if (cost > 0) allItemCosts.set(Number(row[col.type_id]), cost);
-      });
-    } catch (e) { console.warn(e.message); }
-  }
+      rawData.slice(1).forEach(row => {
+        const tid = parseInt(row[col.type_id], 10);
+        const rawValue = String(row[col.unit_weighted_average]);
+        const cost = parseFloat(rawValue.replace(/[^0-9.]/g, '')) || 0.0;
 
-  // Tier 2: Market Median
-  if (requiredMaterialIds) {
-    requiredMaterialIds.forEach(id => {
-      if (!allItemCosts.has(id)) {
-        const mktCost = marketMedianMap.get(id) || 0;
-        if (mktCost > 0) allItemCosts.set(id, mktCost * ACQUISITION_MULTIPLIER);
-        else tier3FetchList.add(id);
-      }
-    });
-  }
-
-  // Tier 3: Fuzzwork API
-  if (tier3FetchList.size > 0 && typeof fuzAPI !== 'undefined') {
-    try {
-      const locId = _getNamedOr_('setting_sell_loc', 60003760);
-      const res = fuzAPI.requestItems(locId, 'region', Array.from(tier3FetchList));
-      LOG_INDUSTRY.info(`Attempting Tier 3 fallback for ${tier3FetchList.size} items via Fuzzwork API.`);
-      res.forEach(item => {
-        const cost = _extractMetric_(item, 'buy', 'max');
-        if (cost > 0) {
-          const finalCost = cost * ACQUISITION_MULTIPLIER;
-          allItemCosts.set(item.type_id, finalCost);
-          LOG_INDUSTRY.info(`Resolved cost for ${item.type_id} using Fuzzwork (Tier 3) + Fee: ${finalCost}`);
+        if (tid > 0 && cost > 0) {
+          allItemCosts.set(tid, cost);
         }
       });
-    } catch (e) { console.error("Fuzzwork Tier 3 failed", e); }
+      // DEBUG: Check Tier 1 results
+      log.info(`Tier 1 (Hangar) found: ${allItemCosts.size} items.`);
+    } catch (e) { log.warn("Tier 1 Load Failed: " + e.message); }
+  }
+
+  // 3. TIER 2: MARKET MEDIAN
+  const marketMedianMap = _getMarketMedianMap(ss);
+  if (requiredMaterialIds) {
+    requiredMaterialIds.forEach(id => {
+      const tid = parseInt(id, 10);
+      if (!allItemCosts.has(tid)) {
+        const mktCost = marketMedianMap.get(tid) || 0.0;
+        if (mktCost > 0) {
+          allItemCosts.set(tid, parseFloat(mktCost * ACQUISITION_MULTIPLIER));
+        } else {
+          tier3FetchList.add(tid);
+        }
+      }
+    });
+    // DEBUG: Check Tier 2 results
+    log.info(`Tier 2 (Market) added items. Map now has: ${allItemCosts.size} items.`);
+  }
+
+  // 4. TIER 3: HUB FALLBACK
+  if (tier3FetchList.size > 0) {
+    try {
+      const typeIDs = Array.from(tier3FetchList);
+      log.info(`Tier 3 fallback attempting ${typeIDs.length} items.`);
+      
+      const apiResults = hubFallBack(typeIDs, "sell", "min", ss);
+      if (apiResults && apiResults.length > 0) {
+        apiResults.forEach(item => {
+          const cost = parseFloat(item.price) || 0.0;
+          if (cost > 0) {
+            allItemCosts.set(parseInt(item.type_id, 10), cost * ACQUISITION_MULTIPLIER);
+          }
+        });
+      }
+      // DEBUG: Check Tier 3 results
+      log.info(`Tier 3 (API) finished. Final Map Size: ${allItemCosts.size}`);
+    } catch (e) { log.error("Tier 3 Hub Fallback Failed: " + e.message); }
   }
 
   return allItemCosts;
@@ -682,20 +720,20 @@ function _getBlendedCostMap(ss, requiredMaterialIds) {
 function syncCorpBlueprintsV12() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const authToon = getCorpAuthChar(ss); // Resolves "Jason Kilman"
-  
+
   // DYNAMIC RESOLUTION: Pull the Corp ID directly from Jason's character data
   const charData = GESI.getCharacterData(authToon);
   if (!charData || !charData.corporation_id) {
     console.error(`[CRITICAL] Could not find Corp ID for ${authToon}. Check GESI Auth.`);
     return;
   }
-  
+
   const corpId = charData.corporation_id;
   console.log(`Auditing Hangar for Corp: ${corpId} (${authToon})`);
 
   // Use the Ferrari to get data (It now handles dynamic IDs)
-  const allBlueprints = fetchAllCorpBlueprints(corpId); 
-  
+  const allBlueprints = fetchAllCorpBlueprints(corpId);
+
   if (allBlueprints && allBlueprints.length > 0) {
     _updateBpoConfigFromAudit(allBlueprints);
   } else {
@@ -714,7 +752,7 @@ function _updateBpoConfigFromAudit(blueprints) {
   // 1. Audit the Hangar (runs === -1 are BPOs)
   const auditMap = new Map();
   blueprints.forEach(bp => {
-    if (bp.runs === -1) { 
+    if (bp.runs === -1) {
       const id = Number(bp.type_id);
       auditMap.set(id, (auditMap.get(id) || 0) + 1);
     }
@@ -723,7 +761,7 @@ function _updateBpoConfigFromAudit(blueprints) {
   // 2. Map the Sheet using your ROBUST helper
   const rawData = sheet.getDataRange().getValues();
   const headers = rawData[0];
-  
+
   let col;
   try {
     // This helper (already in your script) handles case and spaces
@@ -868,61 +906,70 @@ function _getSdeNameMap(ss) {
 }
 
 function _getMarketMedianMap(ss) {
-  if(ss)
-    return getMarketPriceMapFor(ss,'Median Sell');
+  if (ss)
+    return getMarketPriceMapFor(ss, 'Median Sell');
   return new Map(); // Safety catch!
- 
+
 }
 
 function getMarketPriceMapFor(ss, Attribute) {
   const map = new Map();
-  const NR_Prices = "NR_MARKET_DATA";
-  if (!Attribute) Attribute = "Median Sell"; 
+  const NR_Prices = "NR_MARKET_MEDIAN_DATA";
   
+  // 1. Normalize input: "Median Sell" becomes "median_sell"
+  // This handles the space vs underscore mismatch automatically
+  let targetAttr = (Attribute || "median_sell").toLowerCase().trim().replace(/\s+/g, '_');
+
   let data;
   try {
-    // 1. Try treating it as a Named Range first
     let range = ss.getRangeByName(NR_Prices);
-    
-    // 2. If it is not a Named Range, fall back to the actual Sheet Name
     if (!range) {
       const sheet = ss.getSheetByName("market price Tracker");
-      if (!sheet) {
-        console.warn("getMarketPriceMapFor: Could not find Named Range [" + NR_Prices + "] or fallback Sheet.");
-        return map; 
-      }
+      if (!sheet) return map;
       range = sheet.getDataRange();
     }
 
     data = range.getValues();
-    if (data.length < 2) {
-      console.warn("getMarketPriceMapFor: Data source is empty.");
-      return map; 
+    if (data.length < 2) return map;
+
+    // 2. NORMALIZE HEADERS (to lowercase and trim)
+    const headers = data[0].map(h => String(h).trim().toLowerCase());
+
+    // 3. FIND COLUMNS
+    const colId = headers.indexOf("type_id");
+    let colMed = headers.indexOf(targetAttr);
+
+    // Dynamic Fallback: If "median_sell" isn't found, try others from your CSV
+    if (colMed === -1) {
+      const fallbacks = ["median_sell", "min_sell", "median_buy", "max_buy"];
+      for (const f of fallbacks) {
+        if (headers.indexOf(f) !== -1) {
+          colMed = headers.indexOf(f);
+          break;
+        }
+      }
     }
 
-    const headers = data[0];
-    
-    // Flexible ID finder (looks for "type_id_filtered" first, falls back to "type_id")
-    const colId = headers.indexOf("type_id_filtered") !== -1 ? headers.indexOf("type_id_filtered") : headers.indexOf("type_id");
-    const colMed = headers.indexOf(Attribute);
-    
     if (colId === -1 || colMed === -1) {
-      console.warn("getMarketPriceMapFor: Missing required columns. Found ID col: " + colId + ", Attribute col: " + colMed);
+      console.warn(`getMarketPriceMapFor: Missing columns. ID: ${colId}, Target: ${targetAttr}. Found: ${headers}`);
       return map;
     }
 
-    // Start at 1 to skip headers
+    // 4. PARSE DATA
     for (let i = 1; i < data.length; i++) {
-      const typeId = Number(data[i][colId]); 
-      const val = Number(String(data[i][colMed]).replace(/[^0-9.]/g, "")); 
-      
-      if (typeId > 0 && val > 0) map.set(typeId, val); 
+      const typeId = Number(data[i][colId]);
+      // Your CSV has "40,900.00 ISK" - this regex strips the commas and "ISK"
+      const rawVal = String(data[i][colMed]).replace(/[^0-9.]/g, "");
+      const val = parseFloat(rawVal) || 0;
+
+      if (typeId > 0 && val > 0) {
+        map.set(typeId, val);
+      }
     }
-  } catch (e) { 
-    // The Informational Log you requested
-    console.error("CRITICAL ERROR in getMarketPriceMapFor (Attribute: " + Attribute + "): " + e.message + " at " + e.stack);
+  } catch (e) {
+    console.error(`CRITICAL ERROR in getMarketPriceMapFor: ${e.message}`);
   }
-  
+
   return map;
 }
 

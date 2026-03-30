@@ -35,10 +35,6 @@ const STATE_FLAGS = {
 };
 const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
 
-// ... [Keep scheduleOneTimeTrigger, deleteTriggersByName, _resetMarketDataJobState unchanged] ...
-// (Assumed lines 35-100 are standard helpers)
-
-
 /**
  * Replaces IMPORTRANGE. Fetches static market prices from the external hub.
  * This completely kills the continuous recalculation loop caused by live linking.
@@ -49,14 +45,14 @@ function fetchFilteredPricesSync(ss) {
   // --- CONFIGURATION ---
   const SOURCE_SHEET_ID = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
   const SOURCE_RANGE = "'filtered prices'!E7:L750";
-  const TARGET_SHEET_NAME = "market price Tracker"; // Change to whatever you want
+  const TARGET_SHEET_NAME = "market price Tracker";
+  const RANGE_NAME = "NR_MARKET_MEDIAN_DATA"; // Define name at the top
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
 
   try {
     LOG.info("Connecting to external price database...");
 
-    // 1. Fetch the data from the external sheet
     const sourceBook = SpreadsheetApp.openById(SOURCE_SHEET_ID);
     const rawValues = sourceBook.getRange(SOURCE_RANGE).getValues();
 
@@ -65,34 +61,47 @@ function fetchFilteredPricesSync(ss) {
       return;
     }
 
-    // 2. Prepare the Target Sheet
     let targetSheet = ss.getSheetByName(TARGET_SHEET_NAME);
     if (!targetSheet) {
       targetSheet = ss.insertSheet(TARGET_SHEET_NAME);
       LOG.info(`Created new target sheet: ${TARGET_SHEET_NAME}`);
     }
 
-    // 3. Optional: Filter out completely empty rows to save memory
-    // (Assuming Column A of the fetched data is the Item Name or ID)
-    const cleanValues = rawValues.filter(row => row[0] !== "" && row[0] != null);
-    const dataToWrite = cleanValues.length > 0 ? cleanValues : rawValues;
+    // Filter data
+    const dataToWrite = rawValues.filter(row => row[0] !== "" && row[0] != null);
+    if (dataToWrite.length === 0) {
+      LOG.warn("No valid rows after cleaning.");
+      return;
+    }
 
-    // 4. Wipe old data and write the fresh snapshot
-    targetSheet.clearContents(); // Clears everything for a fresh paste
-    targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length).setValues(dataToWrite);
+    // 1. Wipe and Write
+    targetSheet.clearContents();
+    const finalRange = targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length);
+    finalRange.setValues(dataToWrite);
 
-    // 5. Trim excess rows (The same optimization you used in the ML Ledger)
+    // 2. Trim excess rows
     const maxRows = targetSheet.getMaxRows();
     if (maxRows > dataToWrite.length) {
       targetSheet.deleteRows(dataToWrite.length + 1, maxRows - dataToWrite.length);
     }
 
+    // 3. THE SAFE NAMED RANGE UPDATE
+    // We do this LAST so the range matches the final sheet dimensions exactly.
+    const existing = ss.getNamedRanges().find(nr => nr.getName() === RANGE_NAME);
+    if (existing) {
+      existing.setRange(finalRange);
+      LOG.info(`Updated existing Named Range: ${RANGE_NAME}`);
+    } else {
+      ss.setNamedRange(RANGE_NAME, finalRange);
+      LOG.info(`Created new Named Range: ${RANGE_NAME}`);
+    }
+
     LOG.info(`Price Sync Complete. Wrote ${dataToWrite.length} rows.`);
-    ss.toast("✅ External Prices Synced", "Engine Room", 3);
+    ss.toast("External Prices Synced", "Engine Room", 3);
 
   } catch (e) {
     LOG.error("Failed to sync external prices: " + e.message);
-    ss.toast("❌ Price Sync Failed", "Engine Room Error");
+    ss.toast("Price Sync Failed", "Engine Room Error");
   }
 }
 
