@@ -8,7 +8,7 @@ function trigger_generateProjectedCostTable() {
 }
 
 /**
- * REPROCESSED VALUE ENGINE
+ * REPROCESSED VALUE ENGINE - ARRAY OPTIMIZED
  * Logic: Uses _getBlendedCostMap for Tiered Pricing (Hangar -> Market -> API)
  * Output: Reprocessed_Material_Values with Named Range Sync
  */
@@ -16,11 +16,16 @@ function generateProjectedCostTable(ss) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ProjectedCost') : console;
 
-  // 1. Setup Data & SDE Maps
+  // 1. Setup Data (Replaced Sheet Object with Overview Array)
   const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
-  const overviewSheet = ss.getSheetByName("MarketOverviewData");
-  const overviewData = overviewSheet.getDataRange().getValues();
-  const headers = overviewData[2]; 
+  
+  // Use the array-returning function directly
+  const overviewData = getOverviewData(ss); 
+  if (!overviewData || overviewData.length === 0) return;
+
+  // Since getOverviewData starts at the header row, we adjust indices
+  // Original overviewData[2] (Row 3) becomes overviewData[0] (Index 0)
+  const headers = overviewData[0]; 
   const col = { 
     id: headers.indexOf("type_id"), 
     name: headers.indexOf("Item Name"), 
@@ -30,8 +35,9 @@ function generateProjectedCostTable(ss) {
   const validTargets = [];
   const allRequiredMatIds = new Set();
 
-  // 2. Pre-Scan: Filter Manufacturing items and collect Mat IDs
-  for (let i = 3; i < overviewData.length; i++) {
+  // 2. Pre-Scan: Filter Manufacturing items
+  // Starting at index 1 because index 0 is now the headers
+  for (let i = 1; i < overviewData.length; i++) {
     const row = overviewData[i];
     if (String(row[col.group] || "").indexOf("Manufacturing") === -1) continue;
 
@@ -70,8 +76,6 @@ function generateProjectedCostTable(ss) {
     });
 
     const unitCost = (totalBatchCost * (1 + EST_INSTALL_RATE)) / target.yield;
-    
-    // Formatting for the 7-column header you defined
     return [target.typeID, target.name, unitCost, 0, 0, 0, new Date()];
   });
 
@@ -88,12 +92,10 @@ function generateProjectedCostTable(ss) {
   
   outSheet.getRange(1, 1, finalPayload.length, 7).setValues(finalPayload);
 
-  // THE COMPACTOR: Kill extra rows
   const lastRow = outSheet.getLastRow();
   const maxRows = outSheet.getMaxRows();
   if (maxRows > lastRow) outSheet.deleteRows(lastRow + 1, maxRows - lastRow);
 
-  // NAMED RANGE SYNC: Keep the target range tight
   const RANGE_NAME = "NR_REPRO_VALUE_TABLE";
   const finalRange = outSheet.getRange(1, 1, lastRow, 7);
   const existing = ss.getNamedRanges().find(r => r.getName() === RANGE_NAME);
@@ -103,5 +105,5 @@ function generateProjectedCostTable(ss) {
     ss.setNamedRange(RANGE_NAME, finalRange);
   }
 
-  LOG.info(`Done: ${outputRows.length} items. Cost mapped from Blended Cost.`);
+  LOG.info(`Done: ${outputRows.length} items. Projected Costs updated via Array.`);
 }

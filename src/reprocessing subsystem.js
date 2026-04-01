@@ -135,108 +135,90 @@ function deriveEffectiveMaterialCosts(materials, efficiency, batchCount, priceMa
 }
 
 /**
- * REPROCESSED VALUE ENGINE
- * typ_id: Integer | Name: String | Financials: Float
- * Cost Source: _getBlendedCostMap
+ * REPROCESSED VALUE ENGINE - COMPLETE SDE COVERAGE
  */
 function generateReprocessedValueTable(ss) {
   const start = new Date().getTime();
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ReproValue') : console;
 
-  // 1. DATA LOAD & ARTIFACT PURGE
-  const overviewSheet = ss.getSheetByName("MarketOverviewData");
-  if (!overviewSheet) return;
-  
-  const rawOverview = overviewSheet.getDataRange().getValues();
-  
-  // Clean headers and data of clipboard junk (Version:0.9, HTML tags, etc.)
-  const clean = (val) => String(val).replace(/Version:0\.9|StartHTML:\d+|EndHTML:\d+|StartFragment:\d+|EndFragment:\d+/g, '').trim();
-  
-  const headers = rawOverview[2].map(h => clean(h).toLowerCase());
-  const colId = headers.indexOf("type_id");
-  const colName = headers.indexOf("item name");
+  // 1. MAPS & SDE DATA
+  const materialMap = getSdeMaterialMap(ss); // Map of all typeIDs to their material components
+  const { byId: typeMap } = getSdeTypeEngine(ss); // Map of typeIDs to basic info (Name, Portion)
 
-  const allIds = rawOverview.slice(3)
-    .map(r => parseInt(clean(r[colId]), 10))
-    .filter(id => !isNaN(id) && id > 0);
+  // Get all IDs that have a material recipe in the SDE
+  const allProcessableIds = Array.from(materialMap.keys());
 
-// 2. THE TYCOON MAPS (Dynamic Material Extraction)
-  const materialMap = getSdeMaterialMap(ss);
-  const { byId: typeMap } = getSdeTypeEngine(ss);
-
-  // Collect every unique material ID needed for the items in your list
+  // 2. PRICING DATA
+  // Identify all unique minerals/materials needed for ALL recipes
   const requiredMatIds = new Set();
-  allIds.forEach(id => {
+  allProcessableIds.forEach(id => {
     const recipe = materialMap.get(id);
     if (recipe) recipe.forEach(mat => requiredMatIds.add(Number(mat.matID)));
   });
 
-  // Fetch prices for materials and the items themselves
+  // Get prices for minerals (to calculate Melt Value) and items (to calculate ROI)
   const mineralPriceMap = _getBlendedCostMap(ss, Array.from(requiredMatIds)); 
-  const costMap = _getBlendedCostMap(ss, allIds); 
+  const costMap = _getBlendedCostMap(ss, allProcessableIds); 
   
-  const efficiency = 0.50 * 1.69;
+  // Set efficiency (pull from sheet if possible, otherwise hardcoded)
+  const efficiency = 0.50 * 1.69; 
 
-  // 3. CORE CALCULATION
-  const outputRows = rawOverview.slice(3).reduce((acc, row) => {
-    const tid = parseInt(clean(row[colId]), 10);
-    if (!tid) return acc;
-
+  // 3. CORE CALCULATION - Process every meltable item in the game
+  const outputRows = allProcessableIds.reduce((acc, tid) => {
     const materials = materialMap.get(tid);
     const typeInfo = typeMap.get(tid);
-    const marketCost = parseFloat(costMap.get(tid)) || 0.0;
-
+    
     if (materials && typeInfo) {
       let meltValue = 0.0;
-      const batchCount = 1.0 / typeInfo.portion;
+      const portionSize = typeInfo.portionSize || typeInfo.portion || 1;
+      const batchCount = 1.0 / portionSize;
 
       for (const mat of materials) {
+        // Floor the qty per portion as per EVE mechanics
         const qty = Math.floor(mat.qty * efficiency * batchCount);
-        
-        // FIX: pObj IS the price (a number), not an object with a .buy property
-        const pObj = mineralPriceMap.get(Number(mat.matID)) || 0.0;
-        meltValue += (qty * pObj);
+        const price = parseFloat(mineralPriceMap.get(Number(mat.matID))) || 0.0;
+        meltValue += (qty * price);
       }
 
-      if (meltValue > 0) {
-        const profit = meltValue - marketCost;
-        const margin = marketCost > 0 ? (profit / marketCost) * 100 : 0.0;
+      const marketCost = parseFloat(costMap.get(tid)) || 0.0;
+      const profit = meltValue - marketCost;
+      const margin = marketCost > 0 ? (profit / marketCost) : 0.0;
 
-        acc.push([
-          tid,
-          clean(row[colName]),
-          marketCost,
-          meltValue,
-          profit,
-          margin,
-          new Date()
-        ]);
-      }
+      acc.push([
+        tid,
+        typeInfo.typeName || "Unknown Item",
+        marketCost,
+        meltValue,
+        profit,
+        margin,
+        new Date()
+      ]);
     }
     return acc;
   }, []);
 
-  // 4. WRITE & COMPACT
+  // 4. WRITE & RANGE BINDING
   const SHEET_NAME = "Reprocessed_Material_Values";
   let outSheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
   if (outputRows.length === 0) return;
 
   outSheet.clearContents();
   const finalPayload = [["Type ID", "Item Name", "Market Cost", "Melt Value", "Profit", "Margin %", "Updated"], ...outputRows];
+  
   outSheet.getRange(1, 1, finalPayload.length, 7).setValues(finalPayload);
 
-  // THE COMPACTOR
+  // Clean up sheet length
   const lastRow = outSheet.getLastRow();
   const maxRows = outSheet.getMaxRows();
   if (maxRows > lastRow) outSheet.deleteRows(lastRow + 1, maxRows - lastRow);
 
-  // NAMED RANGE SYNC
+  // Update Named Range
   const RANGE_NAME = "NR_REPRO_VALUE_TABLE";
   const finalRange = outSheet.getRange(1, 1, lastRow, 7);
   const existing = ss.getNamedRanges().find(r => r.getName() === RANGE_NAME);
   if (existing) existing.setRange(finalRange); else ss.setNamedRange(RANGE_NAME, finalRange);
 
-  LOG.info(`Done: ${outputRows.length} items. Cost mapped from Blended Cost.`);
+  LOG.info(`Done: ${outputRows.length} items processed from SDE.`);
 }
 
