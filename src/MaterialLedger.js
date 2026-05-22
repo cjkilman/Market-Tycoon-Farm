@@ -36,7 +36,17 @@ var ML = (function () {
             if (!rows || !rows.length) return { rows: 0, status: "SUCCESS" };
             let updateCount = 0, totalWritten = 0, needsWakeUp = false;
             const ss = getSS_(), existingKeys = new Map();
-            const keyIndices = keys.map(k => HEAD.indexOf(k));
+            // Validate headers and halt if any key is missing
+            const keyIndices = keys.map(k => {
+                // Clean the HEAD array to handle accidental spaces in the spreadsheet
+                const cleanHead = HEAD.map(h => String(h).trim());
+                const idx = cleanHead.indexOf(k.trim());
+
+                if (idx === -1) {
+                    throw new Error(`CRITICAL: Key "${k}" not found in sheet "${sheetName}".`);
+                }
+                return idx;
+            });
             const normalizeK = (v, i) => (i === 1) ? String(Math.round(Number(v || 0))) : String(v || '');
 
             const last = sh.getLastRow();
@@ -73,18 +83,18 @@ var ML = (function () {
                     }
                 });
 
-                const summary = [["type_id", "total_sum", "unit_weighted_average"]];
-                Object.keys(totals).forEach(id => summary.push([id, totals[id].i, Math.round((totals[id].i / totals[id].q) * 100) / 100]));
+                const blendedPriceSummary = [["type_id", "total_sum", "unit_weighted_average"]];
+                Object.keys(totals).forEach(id => blendedPriceSummary.push([id, totals[id].i, Math.round((totals[id].i / totals[id].q) * 100) / 100]));
 
                 const tName = (sheetName === "Material_Ledger") ? "Blended_Cost" : "Blended_Sales";
                 const tSh = ss.getSheetByName(tName);
                 if (tSh) {
                     tSh.clearContents();
-                    tSh.getRange(1, 1, summary.length, 3).setValues(summary);
+                    tSh.getRange(1, 1, blendedPriceSummary.length, 3).setValues(blendedPriceSummary);
                     // 3. SNAP THE BLENDED RANGE
                     const bName = (tName === "Blended_Cost") ? "NR_BLENDED_COST" : "NR_BLENDED_SALES";
-                    ss.setNamedRange(bName, tSh.getRange(1, 1, summary.length, 3));
-                    if (tSh.getMaxRows() > summary.length) tSh.deleteRows(summary.length + 1, tSh.getMaxRows() - summary.length);
+                    ss.setNamedRange(bName, tSh.getRange(1, 1, blendedPriceSummary.length, 3));
+                    if (tSh.getMaxRows() > blendedPriceSummary.length) tSh.deleteRows(blendedPriceSummary.length + 1, tSh.getMaxRows() - blendedPriceSummary.length);
                 }
 
 

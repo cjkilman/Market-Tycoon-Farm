@@ -13,7 +13,13 @@ function trigger_generateProjectedCostTable() {
  * Output: Reprocessed_Material_Values with Named Range Sync
  */
 function generateProjectedCostTable(ss) {
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+// Use logical OR (||) and verify the object has the required method
+  ss = (ss && typeof ss.getSheetByName === 'function') ? ss : SpreadsheetApp.getActiveSpreadsheet();
+  
+  if (!ss) {
+    console.error("Could not find active spreadsheet.");
+    return;
+  }
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ProjectedCost') : console;
 
   // 1. Setup Data (Replaced Sheet Object with Overview Array)

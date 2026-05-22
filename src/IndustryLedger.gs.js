@@ -282,6 +282,7 @@ function generateConsolidatedRequirements(ss) {
     sheet.getRange(2, 3, output.length, 2).setNumberFormat("#,##0");
   }
 }
+
 function runIndustryLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -324,22 +325,13 @@ function runIndustryLedgerPhase(ss) {
     try {
       log.info('Phase 2: Manufacturing Ledger Update...');
       runIndustryLedgerUpdate(ss);
-      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '3');
-      phase = 3;
+      // Changed from '3' to '4' to skip the old Phase 3
+      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '4'); 
+      phase = 4;
     } catch (e) { log.error('Phase 2 FAILED:', e); }
   }
 
-  // NEW Phase 3: Reprocessing Forensic Audit
-  if (phase === 3) {
-    if (Date.now() - START_TIME > SOFT_TIME_LIMIT_MS) return;
-    try {
-      log.info('Phase 3: Running Reprocessing Audit (MiningHanger)...');
-      runReprocessingAudit(ss);
-      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '4');
-      phase = 4;
-    } catch (e) { log.error('Phase 3 FAILED:', e); }
-  }
-
+  // Finalization: Rolling Thunder Complete
   if (phase === 4) {
     SCRIPT_PROP.deleteProperty(INDUSTRY_JOB_PHASE);
     log.info('Phase 4: Rolling Thunder Complete.');
@@ -639,10 +631,9 @@ function runIndustryLedgerUpdate() {
 // --- DATA HELPERS ---
 // ----------------------------------------------------------------------
 
-function _getBlendedCostMap(ss, requiredMaterialIds) {
+function _getBlendedCostMap(ss, requiredMaterialIds, applyFailsafe = false) {
   const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('COST_ENGINE') : console;
   
-  // DEBUG: Check input
   log.info(`Engine Started. IDs requested: ${requiredMaterialIds ? requiredMaterialIds.length : 0}`);
 
   const sheet = ss.getSheetByName("Blended_Cost");
@@ -668,7 +659,6 @@ function _getBlendedCostMap(ss, requiredMaterialIds) {
           allItemCosts.set(tid, cost);
         }
       });
-      // DEBUG: Check Tier 1 results
       log.info(`Tier 1 (Hangar) found: ${allItemCosts.size} items.`);
     } catch (e) { log.warn("Tier 1 Load Failed: " + e.message); }
   }
@@ -687,7 +677,6 @@ function _getBlendedCostMap(ss, requiredMaterialIds) {
         }
       }
     });
-    // DEBUG: Check Tier 2 results
     log.info(`Tier 2 (Market) added items. Map now has: ${allItemCosts.size} items.`);
   }
 
@@ -698,17 +687,41 @@ function _getBlendedCostMap(ss, requiredMaterialIds) {
       log.info(`Tier 3 fallback attempting ${typeIDs.length} items.`);
       
       const apiResults = hubFallBack(typeIDs, "sell", "min", ss);
+      
+      let apiItemsAdded = 0;
       if (apiResults && apiResults.length > 0) {
-        apiResults.forEach(item => {
-          const cost = parseFloat(item.price) || 0.0;
-          if (cost > 0) {
-            allItemCosts.set(parseInt(item.type_id, 10), cost * ACQUISITION_MULTIPLIER);
+        // Loop through by index to match the price to the requested ID
+        for (let i = 0; i < typeIDs.length; i++) {
+          const tid = parseInt(typeIDs[i], 10);
+          
+          // apiResults[i] is likely an array like [990], so we pull index 0. 
+          // If it happens to be a flat number, it falls back cleanly.
+          const rawPrice = Array.isArray(apiResults[i]) ? apiResults[i][0] : apiResults[i];
+          const cost = parseFloat(rawPrice) || 0.0;
+          
+          if (tid > 0 && cost > 0) {
+            allItemCosts.set(tid, cost * ACQUISITION_MULTIPLIER);
+            apiItemsAdded++;
           }
-        });
+        }
       }
-      // DEBUG: Check Tier 3 results
-      log.info(`Tier 3 (API) finished. Final Map Size: ${allItemCosts.size}`);
+      log.info(`Tier 3 (API) finished. Added ${apiItemsAdded} prices. Final Map Size: ${allItemCosts.size}`);
     } catch (e) { log.error("Tier 3 Hub Fallback Failed: " + e.message); }
+  }
+  // 5. FINAL FAILSAFE SWEEP
+  if (requiredMaterialIds && applyFailsafe) {
+    let missingCount = 0;
+    requiredMaterialIds.forEach(id => {
+      const tid = parseInt(id, 10);
+      if (tid > 0 && (!allItemCosts.has(tid) || allItemCosts.get(tid) <= 0)) {
+        allItemCosts.set(tid, 1.0);
+        missingCount++;
+      }
+    });
+    
+    if (missingCount > 0) {
+      log.warn(`Applied 1 ISK failsafe to ${missingCount} requested items.`);
+    }
   }
 
   return allItemCosts;
@@ -795,7 +808,7 @@ function _getBpoAmortizationMap(ss) {
   const amortMap = new Map();
 
   const sdePriceMap = _getSdeBasePriceMap(ss);
-  const blendedCostMap = _getBlendedCostMap(ss);
+  const blendedCostMap = _getBlendedCostMap(ss,null,true);
   const marketMedianMap = _getMarketMedianMap(ss);
 
   const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);

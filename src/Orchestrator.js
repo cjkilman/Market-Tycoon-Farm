@@ -431,8 +431,6 @@ function runMaintenanceJobs() {
     { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'runIndustryLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL },
-    // --- NEW: Reprocessing Audit added to the 1-Hour Maintenance rotation ---
-    { name: 'runReprocessingAudit', interval: STANDARD_INTERVAL } 
   ];
 
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
