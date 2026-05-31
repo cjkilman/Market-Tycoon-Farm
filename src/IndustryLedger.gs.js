@@ -252,7 +252,10 @@ function generateConsolidatedRequirements(ss) {
     if (rawDeficit > 0 || scrapYield > 0) {
       const wagCost = clean(r[col.cost]);
       // Math now works because acquisitionDays is defined
-      const dailyTarget = Math.ceil(netDeficit / acquisitionDays);
+      // Preserve precise float thresholds for low-volume sub-components
+      const dailyTarget = netDeficit < acquisitionDays ?
+        Number((netDeficit / acquisitionDays).toFixed(2)) :
+        Math.ceil(netDeficit / acquisitionDays);
 
       let action = "STANDBY";
       if (buffer <= 0.15) action = "CRITICAL: MAX RANGE SAFE SIPHON";
@@ -326,7 +329,7 @@ function runIndustryLedgerPhase(ss) {
       log.info('Phase 2: Manufacturing Ledger Update...');
       runIndustryLedgerUpdate(ss);
       // Changed from '3' to '4' to skip the old Phase 3
-      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '4'); 
+      SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '4');
       phase = 4;
     } catch (e) { log.error('Phase 2 FAILED:', e); }
   }
@@ -345,17 +348,20 @@ function fetchAllCorpBlueprints(corporationId) {
   const authToon = getCorpAuthChar();
   const cacheKey = "corp_bps_" + corporationId;
 
-  // 1. Check Shard-Chucker
   const cachedJson = _getAndDechunk(cacheKey);
-  if (cachedJson) {
-    const parsed = JSON.parse(cachedJson);
-    if (parsed.length > 0) {
-      console.log(`[CACHE] Serving ${parsed.length} blueprints for ${authToon}.`);
-      return parsed;
-    }
-  }
+  if (cachedJson) return JSON.parse(cachedJson);
 
   console.log(`Ferrari launching... Fetching Corp ${corporationId} via ${authToon}`);
+
+  // FORCE TOKEN REFRESH CHECK VIA GESI BEFORE FETCHALL
+  try {
+    GESI.getClient().setFunction('characters_character_blueprints');
+    // A quick lightweight character check forces GESI to run its oauth refresh handshake
+    GESI.invokeRaw('characters_character_blueprints', { name: authToon, page: 1 });
+  } catch (e) {
+    console.warn(`[GESI AUTH] Pre-flight handshake failed or skipped: ${e.message}`);
+  }
+
   const client = GESI.getClient().setFunction('corporations_corporation_blueprints');
   let rawObjects = [];
 
@@ -633,7 +639,7 @@ function runIndustryLedgerUpdate() {
 
 function _getBlendedCostMap(ss, requiredMaterialIds, applyFailsafe = false) {
   const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('COST_ENGINE') : console;
-  
+
   log.info(`Engine Started. IDs requested: ${requiredMaterialIds ? requiredMaterialIds.length : 0}`);
 
   const sheet = ss.getSheetByName("Blended_Cost");
@@ -685,20 +691,20 @@ function _getBlendedCostMap(ss, requiredMaterialIds, applyFailsafe = false) {
     try {
       const typeIDs = Array.from(tier3FetchList);
       log.info(`Tier 3 fallback attempting ${typeIDs.length} items.`);
-      
+
       const apiResults = hubFallBack(typeIDs, "sell", "min", ss);
-      
+
       let apiItemsAdded = 0;
       if (apiResults && apiResults.length > 0) {
         // Loop through by index to match the price to the requested ID
         for (let i = 0; i < typeIDs.length; i++) {
           const tid = parseInt(typeIDs[i], 10);
-          
+
           // apiResults[i] is likely an array like [990], so we pull index 0. 
           // If it happens to be a flat number, it falls back cleanly.
           const rawPrice = Array.isArray(apiResults[i]) ? apiResults[i][0] : apiResults[i];
           const cost = parseFloat(rawPrice) || 0.0;
-          
+
           if (tid > 0 && cost > 0) {
             allItemCosts.set(tid, cost * ACQUISITION_MULTIPLIER);
             apiItemsAdded++;
@@ -718,7 +724,7 @@ function _getBlendedCostMap(ss, requiredMaterialIds, applyFailsafe = false) {
         missingCount++;
       }
     });
-    
+
     if (missingCount > 0) {
       log.warn(`Applied 1 ISK failsafe to ${missingCount} requested items.`);
     }
@@ -760,45 +766,103 @@ function syncCorpBlueprintsV12() {
 function _updateBpoConfigFromAudit(blueprints) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Config_BPC_Runs");
+  const nameMap = _getSdeNameMap(ss); 
   if (!sheet || !blueprints || blueprints.length === 0) return;
 
-  // 1. Audit the Hangar (runs === -1 are BPOs)
+  // 1. Accumulate stats and calculate true WEIGHTED averages
   const auditMap = new Map();
   blueprints.forEach(bp => {
-    if (bp.runs === -1) {
+    if (bp.runs === -1) { // Track only BPOs
       const id = Number(bp.type_id);
-      auditMap.set(id, (auditMap.get(id) || 0) + 1);
+      
+      if (!auditMap.has(id)) {
+        auditMap.set(id, {
+          count: 0,
+          totalMe: 0,
+          totalTe: 0
+        });
+      }
+      
+      const current = auditMap.get(id);
+      current.count += 1;
+      current.totalMe += (Number(bp.material_efficiency) || 0);
+      current.totalTe += (Number(bp.time_efficiency) || 0);
     }
   });
 
-  // 2. Map the Sheet using your ROBUST helper
+  // 2. Parse headers dynamically to prevent layout drift corruption
   const rawData = sheet.getDataRange().getValues();
   const headers = rawData[0];
 
   let col;
   try {
-    // This helper (already in your script) handles case and spaces
     col = _getColIndexMap(headers, ['bp_type_id', 'available_bpos']);
   } catch (e) {
-    console.error("Critical: Sheet headers don't match. Please ensure you have 'bp_type_id' and 'available_bpos' columns.");
+    console.error("Critical: Sheet missing required identity headers.");
     return;
   }
 
-  // Check optional columns (ME/TE) without crashing if they are missing
   const lowerHeaders = headers.map(h => String(h || '').toLowerCase().trim());
-  const meIdx = lowerHeaders.indexOf('max_me');
-  const teIdx = lowerHeaders.indexOf('max_te');
+  const meColIndex = lowerHeaders.indexOf('max_me');
+  const teColIndex = lowerHeaders.indexOf('max_te');
 
-  // 3. Update memory
-  const values = rawData.slice(1).map(row => {
-    const bpID = Number(row[col.bp_type_id]);
-    row[col.available_bpos] = auditMap.get(bpID) || 0;
-    return row;
-  });
+  const dataRows = rawData.slice(1);
+  const trackedBpIds = new Set();
 
-  // 4. One "Hammer Strike" write back to sheet
-  sheet.getRange(2, 1, values.length, headers.length).setValues(values);
-  console.log(`[SUCCESS] Hangar Audit: Synchronized ${auditMap.size} BPO types.`);
+  // 3. Loop existing rows and write rounded whole-number weighted stats
+  if (dataRows.length > 0) {
+    const updatedFullTableMatrix = dataRows.map(row => {
+      const bpID = Number(row[col.bp_type_id]);
+      trackedBpIds.add(bpID);
+      
+      if (auditMap.has(bpID)) {
+        const liveAssetData = auditMap.get(bpID);
+        row[col.available_bpos] = liveAssetData.count;
+        
+        // Compute weighted whole integers: Math.round(Total Accumulated / Total Count)
+        const weightedMeInt = Math.round(liveAssetData.totalMe / liveAssetData.count);
+        const weightedTeInt = Math.round(liveAssetData.totalTe / liveAssetData.count);
+        
+        if (meColIndex !== -1) row[meColIndex] = weightedMeInt;
+        if (teColIndex !== -1) row[teColIndex] = weightedTeInt;
+      } else {
+        row[col.available_bpos] = 0; 
+      }
+      return row;
+    });
+
+    sheet.getRange(2, 1, updatedFullTableMatrix.length, headers.length).setValues(updatedFullTableMatrix);
+  }
+
+  // 4. Delta Append Check: Handle newly discovered assets using the same integer logic
+  const newRowsToAppend = [];
+  for (const [hangarBpId, assetObj] of auditMap.entries()) {
+    if (!trackedBpIds.has(hangarBpId)) {
+      const bpName = nameMap.get(hangarBpId) || `Blueprint ${hangarBpId}`;
+      
+      const finalMeInt = Math.round(assetObj.totalMe / assetObj.count);
+      const finalTeInt = Math.round(assetObj.totalTe / assetObj.count);
+
+      const appendRow = new Array(headers.length).fill('');
+      appendRow[col.bp_type_id] = hangarBpId;
+      appendRow[headers.indexOf('preset_runs')] = 1;
+      appendRow[headers.indexOf('type_name')] = bpName;
+      appendRow[col.available_bpos] = assetObj.count;
+      if (meColIndex !== -1) appendRow[meColIndex] = finalMeInt;
+      if (teColIndex !== -1) appendRow[teColIndex] = finalTeInt;
+      appendRow[headers.indexOf('Hard Run Cap')] = 300;
+      appendRow[headers.indexOf('Daily Quota')] = 0;
+
+      newRowsToAppend.push(appendRow);
+    }
+  }
+
+  if (newRowsToAppend.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, newRowsToAppend.length, headers.length).setValues(newRowsToAppend);
+    console.log(`[DELTA INJECT] Appended ${newRowsToAppend.length} blueprint lines with whole-number weighted ME/TE.`);
+  }
+
+  console.log(`[SUCCESS] Full Sync Executed: Locked down integer stats for ${auditMap.size} unique keys.`);
 }
 
 
@@ -808,7 +872,7 @@ function _getBpoAmortizationMap(ss) {
   const amortMap = new Map();
 
   const sdePriceMap = _getSdeBasePriceMap(ss);
-  const blendedCostMap = _getBlendedCostMap(ss,null,true);
+  const blendedCostMap = _getBlendedCostMap(ss, null, true);
   const marketMedianMap = _getMarketMedianMap(ss);
 
   const sheet = getOrCreateSheet(ss, AMORT_SHEET_NAME, AMORT_HEADERS);
@@ -928,7 +992,7 @@ function _getMarketMedianMap(ss) {
 function getMarketPriceMapFor(ss, Attribute) {
   const map = new Map();
   const NR_Prices = "NR_MARKET_MEDIAN_DATA";
-  
+
   // 1. Normalize input: "Median Sell" becomes "median_sell"
   // This handles the space vs underscore mismatch automatically
   let targetAttr = (Attribute || "median_sell").toLowerCase().trim().replace(/\s+/g, '_');

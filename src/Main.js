@@ -40,13 +40,201 @@ function onOpen() {
     .addItem('🔄 Sync Restock & NeedToBuy', 'triggerRestockSync')
     .addItem('♻️ Refresh Formula Flags', 'refreshData')
     .addSeparator()
-    .addItem('🖨️ Sync Corporate BPOs', 'syncCorporateBlueprints') // <--- ADD THIS LINE (Change function name if needed)
+    .addItem('📥 Commit Reprocess to Ledger', 'reprocessItemsToLedger') // Added here for manual control
+    .addItem('🖨️ Sync Corporate BPOs', 'syncCorpBlueprintsV12')
     .addSeparator()
     .addItem('📊 Update SDE Database', 'sde_job_START')
     .addItem('🛠️ Rebuild Control Sheet', 'updateControlSheet')
     .addItem('Generate Projected Build Costs', 'generateProjectedCostTable')
     .addToUi();
 }
+
+function updateControlSheet() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
+
+  // 1. SAFETY CHECK
+  if (typeof isSdeJobRunning !== 'undefined' && isSdeJobRunning()) {
+    console.warn("updateControlSheet skipped: SDE Job is running.");
+    return;
+  }
+
+  // 2. MAINTENANCE MODE & ANESTHESIA
+  SCRIPT_PROP.setProperty(GLOBAL_STATE_KEY, 'MAINTENANCE');
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.toast("Orchestrator Paused (Maintenance Mode)", "System Status");
+  console.log("System entered MAINTENANCE mode.");
+
+  // 1. ANESTHESIA: Kill the formulas
+  pauseSheet(ss);
+  
+  try {
+    // --- CONFIGURATION ---
+    const CONFIG = {
+      ITEM_SHEET_NAME: 'MarketOverviewData',
+      LOCATION_SHEET_NAME: 'Location List',
+      CONTROL_SHEET_NAME: 'Market_Control',
+      SDE_SHEET_NAME: 'SDE_invTypes',
+      ITEM_ID_HEADERS: ['type_id', 'TypeID', 'Type ID', 'Item ID'],
+      ITEM_NAME_HEADERS: ['Item Name', 'TypeName', 'Type Name', 'Name'],
+      LOC_HEADERS: ['Station', 'System', 'Region']
+    };
+
+    const itemSheet = ss.getSheetByName(CONFIG.ITEM_SHEET_NAME);
+    const locationSheet = ss.getSheetByName(CONFIG.LOCATION_SHEET_NAME);
+    const controlSheet = ss.getSheetByName(CONFIG.CONTROL_SHEET_NAME);
+    const sdeSheet = ss.getSheetByName(CONFIG.SDE_SHEET_NAME);
+
+    if (!itemSheet || !locationSheet || !controlSheet) throw new Error("Missing required sheets.");
+
+    // =================================================================
+    // 3. READ ITEMS (Your Exact Logic)
+    // =================================================================
+    const itemDataRaw = itemSheet.getDataRange().getValues();
+    if (itemDataRaw.length < 2) throw new Error("Item sheet is empty.");
+
+    let itemHeaderRowIdx = -1, nameColIdx = -1, idColIdx = -1;
+
+    // Scan first 10 rows for headers
+    for (let r = 0; r < Math.min(10, itemDataRaw.length); r++) {
+      const row = itemDataRaw[r].map(c => String(c).trim().toLowerCase());
+      CONFIG.ITEM_ID_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { idColIdx = row.indexOf(h.toLowerCase()); itemHeaderRowIdx = r; } });
+      CONFIG.ITEM_NAME_HEADERS.forEach(h => { if (row.indexOf(h.toLowerCase()) > -1) { nameColIdx = row.indexOf(h.toLowerCase()); } });
+      if (idColIdx > -1) break;
+    }
+
+    if (itemHeaderRowIdx === -1 && nameColIdx > -1) {
+      for (let r = 0; r < Math.min(10, itemDataRaw.length); r++) {
+        const row = itemDataRaw[r].map(c => String(c).trim().toLowerCase());
+        if (row.indexOf(CONFIG.ITEM_NAME_HEADERS[0].toLowerCase()) > -1 || row.indexOf('item name') > -1) {
+          itemHeaderRowIdx = r;
+          break;
+        }
+      }
+    }
+
+    if (itemHeaderRowIdx === -1) throw new Error("Could not find headers in MarketOverviewData.");
+
+    const rawItems = [];
+    if (idColIdx > -1) {
+      for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+        const val = Number(itemDataRaw[i][idColIdx]);
+        if (val > 0) rawItems.push(val);
+      }
+    }
+
+    if (rawItems.length === 0 && nameColIdx > -1 && sdeSheet) {
+      console.log("Using SDE Name Lookup...");
+      const sdeVals = sdeSheet.getRange('A2:C' + sdeSheet.getLastRow()).getValues();
+      const typeMap = new Map(sdeVals.map(r => [String(r[2]).trim().toLowerCase(), r[0]]));
+
+      for (let i = itemHeaderRowIdx + 1; i < itemDataRaw.length; i++) {
+        let name = String(itemDataRaw[i][nameColIdx]).trim().toLowerCase().replace(/^'|'$/g, '');
+        if (name && typeMap.has(name)) rawItems.push(typeMap.get(name));
+      }
+    }
+
+    const uniqueItemIds = Array.from(new Set(rawItems));
+    console.log(`Found ${uniqueItemIds.length} unique items.`);
+
+    if (uniqueItemIds.length === 0) {
+      ss.toast("Error: No items found. Check 'MarketOverviewData' headers.", "Failed");
+      return;
+    }
+
+    // =================================================================
+    // 4. READ LOCATIONS (Your Exact Logic)
+    // =================================================================
+    const locDataRaw = locationSheet.getDataRange().getValues();
+    const locHeaderRowIdx = 4; // Row 5
+    const locSet = new Set();
+
+    if (locDataRaw.length > locHeaderRowIdx) {
+      const headerRow = locDataRaw[locHeaderRowIdx].map(c => String(c).trim().toLowerCase());
+      const colMap = {};
+      CONFIG.LOC_HEADERS.forEach(h => colMap[h] = headerRow.indexOf(h.toLowerCase()));
+
+      for (let i = locHeaderRowIdx + 1; i < locDataRaw.length; i++) {
+        const row = locDataRaw[i];
+        CONFIG.LOC_HEADERS.forEach(type => {
+          const idx = colMap[type];
+          if (idx > -1) {
+            const val = row[idx];
+            if (val && !isNaN(val) && Number(val) > 0) locSet.add(`${type}|${val}`);
+          }
+        });
+      }
+    }
+
+    const locations = Array.from(locSet).map(s => {
+      const parts = s.split('|');
+      return { type: parts[0], id: Number(parts[1]) };
+    });
+
+    console.log(`Found ${locations.length} unique locations (Markets).`);
+
+    // =================================================================
+    // 5. PREPARE DATA (Updated: added timestamp instead of '')
+    // =================================================================
+    const dedupedOutput = [];
+    const timestamp = new Date().toISOString(); // Keeps data uniform for faster write
+    for (const loc of locations) {
+      for (const itemId of uniqueItemIds) {
+        dedupedOutput.push([itemId, loc.type, loc.id, timestamp]); 
+      }
+    }
+
+    dedupedOutput.sort((a, b) => (a[2] !== b[2]) ? a[2] - b[2] : (a[1] !== b[1]) ? a[1].localeCompare(b[1]) : a[0] - b[0]);
+
+    controlSheet.clear();
+    controlSheet.getRange(1, 1, 1, 4).setValues([['type_id', 'location_type', 'location_id', 'last_updated']]);
+
+    // =================================================================
+    // 6. EXECUTE WRITE (Updated: Removed inner flush())
+    // =================================================================
+    const safeBatchWrite = (targetSheet, data, startRow, startCol) => {
+      const SOFT_LIMIT_MS = 280000;
+      const startTime = new Date().getTime();
+      const CHUNK_SIZE = 5000;
+      let rowsWritten = 0;
+
+      for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+        if ((new Date().getTime() - startTime) > SOFT_LIMIT_MS) {
+          return { success: false, rows: rowsWritten, reason: "TIME_LIMIT" };
+        }
+        const chunk = data.slice(i, i + CHUNK_SIZE);
+        if (chunk.length > 0) {
+          targetSheet.getRange(startRow + i, startCol, chunk.length, chunk[0].length).setValues(chunk);
+          rowsWritten += chunk.length;
+          // SpreadsheetApp.flush() REMOVED FOR MAXIMUM SPEED
+          Utilities.sleep(50);
+        }
+      }
+      return { success: true, rows: rowsWritten };
+    };
+
+    const writeResult = safeBatchWrite(controlSheet, dedupedOutput, 2, 1);
+
+    if (writeResult.success) {
+      ss.toast(`Success! Rebuilt ${dedupedOutput.length} rows.`, "Control Sheet");
+      console.log(`Rebuild Complete. Total Rows: ${dedupedOutput.length} | Items: ${uniqueItemIds.length} | Locations: ${locations.length}`);
+    } else {
+      ss.toast(`Partial Write: ${writeResult.rows} rows. Reason: ${writeResult.reason}`, "Warning");
+    }
+
+  } catch (e) {
+    console.error("Control Sheet Rebuild Failed: " + e.message);
+    SpreadsheetApp.getActiveSpreadsheet().toast("Rebuild Failed. See Logs.", "Error");
+  } finally {
+    // =================================================================
+    // 7. RESTORE ORCHESTRATOR & WAKE UP (Unified)
+    // =================================================================
+    wakeUpSheet(ss); 
+    SCRIPT_PROP.setProperty(GLOBAL_STATE_KEY, 'RUNNING');
+    console.log("System State restored to RUNNING.");
+  }
+}
+
 
 
 function NUKE_LOADING_ISSUES() {
@@ -117,9 +305,7 @@ function NUKE_LOADING_ISSUES() {
   } catch (e) {
     console.error("❌ Corp Jobs Injection Failed: " + e.message);
   }
-        // 3. REPRO ENGINE (The New "Tycoon" Step)
-      // Recalculate Melt Values using the fresh market data just swapped in.
-      generateReprocessedValueTable(ss);
+
 }
 
 /**
@@ -153,17 +339,17 @@ function generateDumpToBuyOrder(ss, fullData) {
   for (let i = 0; i < paramData.length; i++) {
     const label = String(paramData[i][0]).trim().toLowerCase();
     if (label.includes("minimal margin")) {
-      let rawVal = paramData[i+1][0];
-      filterMinMargin = (typeof rawVal === 'string' && rawVal.includes('%')) ? parseFloat(rawVal)/100 : (parseFloat(rawVal) > 1 ? parseFloat(rawVal)/100 : parseFloat(rawVal) || 0);
+      let rawVal = paramData[i + 1][0];
+      filterMinMargin = (typeof rawVal === 'string' && rawVal.includes('%')) ? parseFloat(rawVal) / 100 : (parseFloat(rawVal) > 1 ? parseFloat(rawVal) / 100 : parseFloat(rawVal) || 0);
     }
     else if (label.includes("group slection") || label.includes("group selection")) {
-      filterGroupName = String(paramData[i+1][0] || "").toLowerCase().trim();
+      filterGroupName = String(paramData[i + 1][0] || "").toLowerCase().trim();
     }
     else if (label.includes("full days target")) {
-      hubDaysBuyTarget = parseFloat(paramData[i+1][0]) || 7;
+      hubDaysBuyTarget = parseFloat(paramData[i + 1][0]) || 7;
     }
     else if (label.includes("liquidate stagnet") || label.includes("liquidate stagnant")) {
-      const val = paramData[i+1][0];
+      const val = paramData[i + 1][0];
       liquidateStagnant = (val === true || String(val).toUpperCase() === "TRUE");
     }
   }
@@ -180,7 +366,7 @@ function generateDumpToBuyOrder(ss, fullData) {
     const cH = corpData[1] || [];
     const tIdx = cH.indexOf("type_id");
     const bIdx = cH.indexOf("is_buy") > -1 ? cH.indexOf("is_buy") : cH.indexOf("is_buy_order");
-    
+
     if (tIdx > -1 && bIdx > -1) {
       for (let i = 2; i < corpData.length; i++) {
         const isBuy = corpData[i][bIdx];
@@ -194,14 +380,14 @@ function generateDumpToBuyOrder(ss, fullData) {
   // --- 4. DYNAMIC HEADERS (Matches B9 Target) ---
   const marginPercentLabel = (filterMinMargin * 100).toFixed(0) + "%";
   const headerLabels = [[
-    "Item Name", 
-    "Bottom Buy (" + marginPercentLabel + ")", 
-    "Manufacturing Projected", 
-    "Effective Cost", 
-    "Hub Median Buy", 
-    "Forensic Margin", 
-    "Hub Capped Qty", 
-    "Total Dump ISK", 
+    "Item Name",
+    "Bottom Buy (" + marginPercentLabel + ")",
+    "Manufacturing Projected",
+    "Effective Cost",
+    "Hub Median Buy",
+    "Forensic Margin",
+    "Hub Capped Qty",
+    "Total Dump ISK",
     "Trend"
   ]];
   sheet.getRange("C4:K4").setValues(headerLabels).setFontWeight("bold").setBackground("#f3f3f3");
@@ -238,7 +424,7 @@ function generateDumpToBuyOrder(ss, fullData) {
     const hubBuy = clean(r[col.medianBuy]);
     const effCost = clean(r[col.effCost]);
     const buildNow = clean(r[col.buildNow]);
-    const signal = String(r[col.signal] || "").toUpperCase(); 
+    const signal = String(r[col.signal] || "").toUpperCase();
     const velocity = clean(r[col.hubVelocity]);
 
     let realityFloor = buildNow > epsPrice ? Math.max(effCost, buildNow) : (effCost > epsPrice ? effCost : 0);
@@ -275,14 +461,14 @@ function generateDumpToBuyOrder(ss, fullData) {
   }
 
   // --- 6. OUTPUT ---
-  dumpResults.sort((a, b) => b[7] - a[7]); 
-  
+  dumpResults.sort((a, b) => b[7] - a[7]);
+
   const START_ROW = 5;
   const maxRows = Math.max(sheet.getMaxRows(), START_ROW);
   if (maxRows >= START_ROW) {
     sheet.getRange(START_ROW, 3, maxRows - (START_ROW - 1), 9).clearContent();
   }
-  
+
   if (dumpResults.length > 0) {
     sheet.getRange(START_ROW, 3, dumpResults.length, 9).setValues(dumpResults);
     sheet.getRange(START_ROW, 8, dumpResults.length, 1).setNumberFormat("0.00%");
@@ -312,12 +498,12 @@ function _getColIndexMap(headers, names) {
 const getOverviewData = (ss) => {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const dataSheet = ss.getSheetByName('MarketOverviewData');
-  if (!dataSheet) return []; 
+  if (!dataSheet) return [];
 
   const lastRow = dataSheet.getLastRow();
   const startRow = 3; // Shifted to 3 to capture the Header Row
   const startCol = 2; // Column B
-  
+
   const numRows = lastRow - startRow + 1;
   if (numRows <= 0) return [];
 
@@ -345,13 +531,13 @@ function triggerRestockSync() {
     generateNeedToBuyQuery(ss, fullData, dumpedItems);
     generateRestockItemsOnHand(ss, fullData);
     generatePVPTrap(ss, fullData);
-    
+
     // 3. CONSOLIDATION
     generateConsolidatedRequirements(ss);
 
     ss.toast("✅ Sync Complete.", "Engine Room", 3);
   } catch (e) {
-   console.error("CRITICAL FAILURE: " + e.toString() + "\nStack: " + e.stack);
+    console.error("CRITICAL FAILURE: " + e.toString() + "\nStack: " + e.stack);
     ss.toast("❌ Sync failed: " + e.message, "Engine Room Error");
   } finally {
     cache.remove('MANUAL_SYNC_ACTIVE');
@@ -396,10 +582,10 @@ function respondToEdit(e) {
   if (sheetName === 'Need To Buy') {
     const dumpedItems = generateDumpToBuyOrder(ss, fullData);
     generateNeedToBuyQuery(ss, fullData, dumpedItems);
-  } 
+  }
   else if (sheetName === 'Restock Items On Hand') {
     generateRestockItemsOnHand(ss, fullData);
-  } 
+  }
   else if (sheetName === 'Dump to Buy') {
     const dumpedItems = generateDumpToBuyOrder(ss, fullData);
     generateNeedToBuyQuery(ss, fullData, dumpedItems);
@@ -430,8 +616,8 @@ function generatePVPTrap(ss, fullData) {
   // Settings Pull
   const bCol = sheet.getRange("A1:B45").getValues();
   const seedDays = clean(bCol[39][0]) || 4;
-  const minROI = clean(bCol[7][1]) || 0; 
-  const priceDeviationPct = clean(sheet.getRange("A6").getValue()) || 0; 
+  const minROI = clean(bCol[7][1]) || 0;
+  const priceDeviationPct = clean(sheet.getRange("A6").getValue()) || 0;
 
   // --- NITRO LOAD ---
   // Use memory array or fall back to getter. 
@@ -439,8 +625,8 @@ function generatePVPTrap(ss, fullData) {
   const rawDataValues = fullData || getOverviewData(ss);
   if (!rawDataValues || rawDataValues.length === 0) return;
 
-  const headers = rawDataValues[0]; 
-  const rawData = rawDataValues.slice(1); 
+  const headers = rawDataValues[0];
+  const rawData = rawDataValues.slice(1);
 
   const getIdx = (name) => headers.indexOf(name);
   const auditValues = auditSheet.getDataRange().getValues();
@@ -459,7 +645,7 @@ function generatePVPTrap(ss, fullData) {
     mktQty: getIdx("Total Market Quantity"),
     effCost: getIdx("Effective Cost"),
     mfgCost: getIdx("Manufacturing Unit Cost"),
-    signal: getIdx("Signal") 
+    signal: getIdx("Signal")
   };
 
   const OUT_HEADERS = [
@@ -486,10 +672,10 @@ function generatePVPTrap(ss, fullData) {
     const currentMarket = clean(r[col.sellQty]);
     const velocity = clean(r[col.effVel]);
     const targetGoal = clean(r[col.targetGoal]);
-    const signal = String(r[col.signal] || "").toUpperCase(); 
+    const signal = String(r[col.signal] || "").toUpperCase();
 
     let targetNeeded = velocity * seedDays;
-    
+
     // --- MACD TRAP DEFENSE ---
     let finalSellAction = "TRAP: FILL BUY";
     if (signal.includes("TRAP")) {
@@ -534,8 +720,8 @@ function generatePVPTrap(ss, fullData) {
         r[getIdx("Pending Orders")], r[col.mktQty], warehouseStock,
         r[getIdx("Acquisition Velocity (u/d)")], velocity, r[getIdx("30-day traded volume")],
         r[getIdx("Listed Volume (Feed Sell)")], r[getIdx("Feed Days of Book")],
-        hubBuy, baseCost, 
-        finalSellAction, 
+        hubBuy, baseCost,
+        finalSellAction,
         r[getIdx("Buy Action")], currentMarket
       ]);
     }
@@ -567,10 +753,9 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
 
   const parseNum = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
 
-  // 1. Headers (Row 4, Col C to P)
-  const headerLabels = [["Item Name", "Snag Qty", "Entry Cost", "Order Cost", "Unit Profit", "Total Profit", "My Market Qty", "Volume (30d)", "Signal", "Warehouse Qty", "Margin (Net)", "Buy Action", "Slots", "Runs"]];
-  sheet.getRange(4, 3, 1, 14).setValues(headerLabels).setFontWeight("bold").setBackground("#d1e7dd").setHorizontalAlignment("center");
-
+  // 1. Headers (Row 4, Col C to Q) - Expanded to 15 columns
+  const headerLabels = [["Item Name", "Snag Qty", "Entry Cost", "Reprocessed Value", "Order Cost", "Unit Profit", "Total Profit", "My Market Qty", "Volume (30d)", "Signal", "Warehouse Qty", "Margin (Net)", "Buy Action", "Slots", "Runs"]];
+  sheet.getRange(4, 3, 1, 15).setValues(headerLabels).setFontWeight("bold").setBackground("#d1e7dd").setHorizontalAlignment("center");
   // 2. Setup
   const fee = ss.getRangeByName("FEE_RATE")?.getValue() || 0.01;
   const tax = ss.getRangeByName("TAX_RATE")?.getValue() || 0.036;
@@ -583,7 +768,7 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
   const headers = rawDataValues[0];
   const marketRows = rawDataValues.slice(1);
   const filters = sheet.getRange('B5:B26').getValues();
-  
+
   const cfg = {
     minDays: parseNum(filters[0][0]),
     targetDays: parseNum(filters[2][0]) || 7,
@@ -604,6 +789,7 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
     warehouse: getIdx("Warehouse Qty"),
     buildNow: getIdx("Manufacturing Projected Unit Cost"),
     effCost: getIdx("Effective Cost"),
+    reprocessVal: getIdx("Reprocessed Value"), // <--- Added mapping
     buyAction: getIdx("Buy Action"),
     signal: getIdx("Signal"),
     hubBuy: getIdx("Hub Median Buy"),
@@ -635,8 +821,26 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
     let buyAction = String(row[col.buyAction] || "BUY").toUpperCase();
     if (signal.includes("TRAP")) buyAction = "SKIP (TRAP)";
 
+    const reprocessVal = parseNum(row[col.reprocessVal]); // <--- Extract value
+
     results.push({
-      data: [name, restockNeed, entryCost, restockNeed * entryCost, unitProfit, unitProfit * restockNeed, (parseNum(row[col.buyQty]) + parseNum(row[col.sellQty]) + parseNum(row[col.pending])), parseNum(row[col.vol30]), signal || "-", parseNum(row[col.warehouse]), netMargin, buyAction, "", ""],
+      data: [
+        name,
+        restockNeed,
+        entryCost,
+        reprocessVal, // <--- Injected column
+        restockNeed * entryCost,
+        unitProfit,
+        unitProfit * restockNeed,
+        (parseNum(row[col.buyQty]) + parseNum(row[col.sellQty]) + parseNum(row[col.pending])),
+        parseNum(row[col.vol30]),
+        signal || "-",
+        parseNum(row[col.warehouse]),
+        netMargin,
+        buyAction,
+        "",
+        ""
+      ],
       profitKey: unitProfit * restockNeed
     });
   });
@@ -644,8 +848,8 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
   results.sort((a, b) => b.profitKey - a.profitKey);
   const output = results.slice(0, cfg.limit).map(r => r.data);
   const maxRows = Math.max(sheet.getLastRow(), 5);
-  sheet.getRange(5, 3, maxRows, 14).clearContent();
-  if (output.length > 0) sheet.getRange(5, 3, output.length, 14).setValues(output);
+  sheet.getRange(5, 3, maxRows, 15).clearContent();
+  if (output.length > 0) sheet.getRange(5, 3, output.length, 15).setValues(output);
 }
 
 // Set up Orders to Posting Sell Orders on the Market
@@ -658,9 +862,9 @@ function generateRestockItemsOnHand(ss, fullData) {
   const sheet = ss.getSheetByName(TARGET_SHEET);
   const auditSheet = ss.getSheetByName(AUDIT_SHEET);
   const settings = getMarketSettingsMap(ss);
-  
+
   // RUTHLESS GATE #1: Enforce strict minimum order value
-  const minOrderValue = settings.get("Min Order Value") || 500000; 
+  const minOrderValue = settings.get("Min Order Value") || 500000;
 
   if (!sheet || !auditSheet) return;
 
@@ -668,8 +872,8 @@ function generateRestockItemsOnHand(ss, fullData) {
 
   // READ METADATA 
   const bCol = sheet.getRange("A1:B45").getValues();
-  const seedDays = clean(bCol[38][0]) || 28; 
-  const minROI = clean(bCol[8][1]) || 0;    
+  const seedDays = clean(bCol[38][0]) || 28;
+  const minROI = clean(bCol[8][1]) || 0;
   const priceDeviationPct = clean(sheet.getRange("A6").getValue()) || 0;
 
   // Top-Up Restrictor from B6
@@ -681,8 +885,8 @@ function generateRestockItemsOnHand(ss, fullData) {
   const rawDataValues = fullData || getOverviewData(ss);
   if (!rawDataValues || rawDataValues.length === 0) return;
 
-  const headers = rawDataValues[0]; 
-  const rawData = rawDataValues.slice(1); 
+  const headers = rawDataValues[0];
+  const rawData = rawDataValues.slice(1);
 
   const getIdx = (name) => headers.indexOf(name);
   const auditValues = auditSheet.getDataRange().getValues();
@@ -701,7 +905,7 @@ function generateRestockItemsOnHand(ss, fullData) {
     mktQty: getIdx("Total Market Quantity"),
     effCost: getIdx("Effective Cost"),
     mfgCost: getIdx("Manufacturing Unit Cost"),
-    signal: getIdx("Signal") 
+    signal: getIdx("Signal")
   };
 
   const OUT_HEADERS = [
@@ -720,7 +924,7 @@ function generateRestockItemsOnHand(ss, fullData) {
     const sellAction = String(r[col.sellAct] || "");
     if (sellAction.includes("SATURATED") || sellAction.includes("SKIP") || sellAction.includes("HOLD") || sellAction.includes("IGNORE")) {
       continue;
-    } 
+    }
 
     if (auditMap.get(rawName) !== true) continue;
 
@@ -728,7 +932,7 @@ function generateRestockItemsOnHand(ss, fullData) {
     const currentMarket = clean(r[col.sellQty]);
     const velocity = clean(r[col.effVel]);
     const targetGoal = clean(r[col.targetGoal]);
-    const signal = String(r[col.signal] || "").toUpperCase(); 
+    const signal = String(r[col.signal] || "").toUpperCase();
     const manualPrice = clean(r[col.customPrice]);
 
     // RUTHLESS GATE #2: Velocity Check
@@ -739,7 +943,7 @@ function generateRestockItemsOnHand(ss, fullData) {
 
     // MACD TRAP DEFENSE
     if (signal.includes("TRAP")) {
-      targetNeeded = velocity * 3; 
+      targetNeeded = velocity * 3;
       finalSellAction = sellAction ? `${sellAction} (TRAP)` : "WARNING (TRAP)";
     }
 
@@ -765,7 +969,7 @@ function generateRestockItemsOnHand(ss, fullData) {
 
       // MACD LIQUIDATION PROTOCOL 
       if (signal.includes("STAGNANT")) {
-        postPrice = undercutPrice; 
+        postPrice = undercutPrice;
         finalSellAction = "LIQUIDATE (STAGNANT)";
       } else {
         postPrice = Math.max(undercutPrice, floorPrice);
@@ -784,8 +988,8 @@ function generateRestockItemsOnHand(ss, fullData) {
       r[getIdx("Pending Orders")], r[col.mktQty], warehouseStock,
       r[getIdx("Acquisition Velocity (u/d)")], velocity, r[getIdx("30-day traded volume")],
       r[getIdx("Listed Volume (Feed Sell)")], r[getIdx("Feed Days of Book")],
-      clean(r[col.hubBuy]), baseCost, 
-      finalSellAction, 
+      clean(r[col.hubBuy]), baseCost,
+      finalSellAction,
       r[getIdx("Buy Action")], currentMarket
     ]);
   }

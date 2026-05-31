@@ -209,21 +209,21 @@ function resetLootSnapshot() {
 function _invokeGesiWithRetry(endpoint, params, maxRetries = 3) {
   let attempt = 0;
   let delayMs = 2000; // Start with a 2-second delay if rate limited
-  
+
   while (attempt < maxRetries) {
     try {
       return GESI.invokeRaw(endpoint, params);
     } catch (e) {
       attempt++;
       const errorMsg = e.message || String(e);
-      
+
       // Only retry on rate limit / bandwidth errors
       if (errorMsg.includes("Bandwidth quota exceeded") || errorMsg.includes("429")) {
         if (attempt >= maxRetries) throw e; // Give up if max retries hit
-        
+
         const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('GESI_RETRY') : console;
         log.warn(`Rate limit hit for ${params.name || 'API'}. Retrying in ${delayMs}ms... (Attempt ${attempt} of ${maxRetries})`);
-        
+
         Utilities.sleep(delayMs);
         delayMs *= 2; // Exponential backoff (2s, 4s, 8s...)
       } else {
@@ -359,7 +359,7 @@ function processInternalBuffer(ss) {
 function _getEsiCacheTTL(response) {
   const headers = response.getHeaders();
   const expires = headers['Expires'] || headers['expires'];
-  
+
   if (!expires) return 3600; // Default to 1 hour if header is missing
 
   const now = new Date().getTime();
@@ -477,10 +477,10 @@ function _fetchCorpOrdersConcurrently(authName) {
 
     // 8. FINAL MAPPING AND CACHING
     const finalOutput = allOrders.concat(rawObjects.map(obj => formatRow(obj)));
-    
+
     // Store in cache to prevent hitting ESI until the next refresh
     cache.put(cacheKey, JSON.stringify(finalOutput), ttl);
-    
+
     return finalOutput;
 
   } catch (e) {
@@ -1599,7 +1599,7 @@ function syncContracts(ss, charIdMap) {
 
   const seenCids = new Set();
 
- // ---------------- PHASE 1 & 2: MULTI-STATUS FETCH ----------------
+  // ---------------- PHASE 1 & 2: MULTI-STATUS FETCH ----------------
   CONTRACT_STATUSES.forEach(status => {
 
     // --- 1 & 2: Fetch Char & Corp Data ---
@@ -1613,7 +1613,7 @@ function syncContracts(ss, charIdMap) {
           show_column_headings: false,
           version: null
         });
-        
+
         // CRITICAL FIX: Always push the result array (empty or full) to maintain alignment
         // with the index position of charName in allNames.
         allCharContractsRaw.push(contracts || []);
@@ -1622,7 +1622,7 @@ function syncContracts(ss, charIdMap) {
         }
 
         // FIX: Add a small baseline pause to prevent hammering the API too fast
-        Utilities.sleep(400); 
+        Utilities.sleep(400);
 
       } catch (e) {
         // LOG THE SPECIFIC CHARACTER THAT FAILED
@@ -1633,7 +1633,7 @@ function syncContracts(ss, charIdMap) {
       }
 
     });
-    
+
     // FIX: Wrap the Corp fetch in the retry handler and try-catch too
     let resCorp = [];
     try {
@@ -1666,10 +1666,16 @@ function syncContracts(ss, charIdMap) {
 
       if (!cid || seenCids.has(cid)) continue;
       if (cid > maxContractId) maxContractId = cid;
-     // --- Determine Buy, Sale, or Internal Transfer Status ---
+      // --- Determine Buy, Sale, or Internal Transfer Status ---
       // NEW: Check if both parties are in your character map
       const isInternalTransfer = idNameMap[String(c.issuer_id)] && idNameMap[String(c.acceptor_id)];
-      
+
+      // ZERO OUT THE ISK FOR INTERNAL TRANSFERS
+      if (isInternalTransfer) {
+        c.price = 0;
+        c.reward = 0;
+      }
+
       const isSale = (c.status === 'finished' || c.status === 'completed') &&
         (c.issuer_id === myCharId);
 
@@ -1687,14 +1693,11 @@ function syncContracts(ss, charIdMap) {
       const items = normalizeItemRows(itemsRaw);
 
       // --- PUSH TO SEGREGATED AND COMBINED ARRAYS ---
-      // NEW: Only push to ledgers if it is NOT an internal transport contract
-      if (!isInternalTransfer) {
-        if (isSale) {
-          outC_Sale.push(contractRow);
-        } else {
-          // Assume the Material Ledger handles Buys (Item Exchange where we are acceptor)
-          outC_Buy.push(contractRow);
-        }
+      // We push EVERYTHING. Internal transfers will now just have 0 ISK.
+      if (isSale) {
+        outC_Sale.push(contractRow);
+      } else {
+        outC_Buy.push(contractRow);
       }
 
       // Push raw contract/item data to combined arrays for raw sheet overwrite
@@ -1732,20 +1735,81 @@ function syncContracts(ss, charIdMap) {
 }
 
 
-// File: cjkilman/market-tycoon-farm/Market-Tycoon-Farm-dev/src/GESI Extentions.js
-
 /**
- * Refactored: processes segregated buy-side contract data into the Material_Ledger.
- *
- * @param {object} ss - Spreadsheet object.
- * @param {object} charIdMap - Character ID lookup map.
- * @param {object} buyData - { contracts: any[][], items: any[][] }
+ * ONE-TIME UTILITY: 
+ * Scans the ledger for matching contract_ids between CONTRACT and JOURNAL sources.
+ * Deletes the duplicate JOURNAL entry to fix historical double-counting.
  */
-function contractsToMaterialLedger(ss, charIdMap, buyData) {
-  // MOVED UP: Initialize log immediately so it can be used in the check below
-  const log = LoggerEx.withTag('GESI');
+function cleanInternalLedgerDoubleCounts() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
 
-  //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
+  // 1. Process Material Ledger
+  const matSheet = ss.getSheetByName("Material_Ledger");
+  let matDeleted = 0;
+
+  if (matSheet) {
+    const matData = matSheet.getDataRange().getValues();
+    const headers = matData[0];
+    const colId = headers.indexOf('contract_id');
+    const colSource = headers.indexOf('source');
+
+    if (colId > -1 && colSource > -1) {
+      const contractIds = new Set();
+      const rowsToDelete = [];
+
+      // Step A: Map all physical contract IDs
+      for (let i = 1; i < matData.length; i++) {
+        if (matData[i][colSource] === 'CONTRACT' && matData[i][colId]) {
+          contractIds.add(String(matData[i][colId]));
+        }
+      }
+
+      // Step B: Find matching JOURNAL entries
+      for (let i = 1; i < matData.length; i++) {
+        if (matData[i][colSource] === 'JOURNAL' && contractIds.has(String(matData[i][colId]))) {
+          rowsToDelete.push(i + 1); // +1 to convert array index to sheet row number
+        }
+      }
+
+      // Step C: Delete from bottom to top to prevent index shifting
+      for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+        matSheet.deleteRow(rowsToDelete[i]);
+        matDeleted++;
+      }
+    }
+  }
+
+  // 2. Process Sales Ledger (Remove fake internal revenue)
+  const salesSheet = ss.getSheetByName("Sales_Ledger");
+  let salesDeleted = 0;
+
+  if (salesSheet) {
+    const salesData = salesSheet.getDataRange().getValues();
+    const headers = salesData[0];
+    const colId = headers.indexOf('contract_id');
+
+    // Check against the same internal contract IDs we found in the Material Ledger
+    if (colId > -1 && contractIds && contractIds.size > 0) {
+      const rowsToDelete = [];
+      for (let i = 1; i < salesData.length; i++) {
+        if (contractIds.has(String(salesData[i][colId]))) {
+          rowsToDelete.push(i + 1);
+        }
+      }
+      for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+        salesSheet.deleteRow(rowsToDelete[i]);
+        salesDeleted++;
+      }
+    }
+  }
+
+  // 3. Output Results
+  ui.alert(`Cleanup Complete.\n\nDeleted ${matDeleted} duplicate costs from Material_Ledger.\nDeleted ${salesDeleted} fake revenues from Sales_Ledger.`);
+}
+
+function contractsToMaterialLedger(ss, charIdMap, buyData, holdAnesthesia) {
+  const log = LoggerEx.withTag('GESI');
 
   if (!buyData || !buyData.contracts || buyData.contracts.length === 0 || !buyData.items || buyData.items.length === 0) {
     log.log('contracts->ledger', { status: 'Skipped: In-memory data is empty.' });
@@ -1753,10 +1817,8 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) {
   }
 
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  // const log = LoggerEx.withTag('GESI'); // <--- REMOVED FROM HERE
   const MaterialLedger = ML.forSheet(LEDGER_BUY_SHEET);
 
-  // Define header indices based on the column positions written by syncContracts
   const hC_Names = ["char", "contract_id", "type", "status", "acceptor_id", "date_issued"];
   const hI_Names = ["char", "contract_id", "type_id", "quantity", "is_included"];
 
@@ -1764,24 +1826,14 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) {
   const colC = { char: ix(hC_Names, "char"), contract_id: ix(hC_Names, "contract_id"), date_issued: ix(hC_Names, "date_issued") };
   const colI = { contract_id: ix(hI_Names, "contract_id"), type_id: ix(hI_Names, "type_id"), quantity: ix(hI_Names, "quantity"), is_included: ix(hI_Names, "is_included") };
 
-  // ... rest of the function remains the same ...
-  // 1. Retrieve the list of ALL currently authenticated characters (the "Active Filter")
   const LOGGED_IN_CHARS = new Set(getCharNamesFast());
-
-  // 2. Build map of all Buy Contract IDs from the in-memory contracts
   const buyCids = new Set(buyData.contracts.map(c => c[colC.contract_id]));
 
-  // 3. Build map of Contract Items (filtering down to only BUY CIDs from the combined item list)
   const itemsByCid = {};
   for (const rowI of buyData.items) {
     const cid = rowI[colI.contract_id];
-
-    // Only include items belonging to the contracts we are processing (buyCids)
     if (!buyCids.has(cid)) continue;
-
     if (!itemsByCid[cid]) itemsByCid[cid] = [];
-
-    // Note: Items were written as 'TRUE'/'FALSE' strings by syncContracts
     itemsByCid[cid].push({
       type_id: rowI[colI.type_id],
       qty: Number(rowI[colI.quantity] || 0),
@@ -1790,41 +1842,29 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) {
   }
 
   const outRows = [];
-
-  // 4. Process Buy Contracts (C) and build ledger rows
   for (const rowC of buyData.contracts) {
     const contractChar = String(rowC[colC.char] || "");
-
-    // CRITICAL FILTER: Only process contracts belonging to a currently logged-in GESI user.
     if (!LOGGED_IN_CHARS.has(contractChar)) continue;
-
     const cid2 = rowC[colC.contract_id];
     const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
     const items = itemsByCid[cid2] || [];
 
     for (const it of items) {
       if (!it.is_included || it.qty <= 0) continue;
-      outRows.push({
-        date: issued,
-        type_id: it.type_id,
-        qty: it.qty,
-        source: "CONTRACT",
-        contract_id: cid2,
-        char: contractChar
-      });
+      outRows.push({ date: issued, type_id: it.type_id, qty: it.qty, source: "CONTRACT", contract_id: cid2, char: contractChar });
     }
   }
 
   if (outRows.length === 0) { log.log('contracts->ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
 
-  // --- Final Write Operation ---
-  // FIX: PAUSE SHEET CALCULATIONS TO PREVENT TIMEOUT
-  var needsWakeUp = pauseSheet(ss);
+  let needsWakeUp = false;
+  if (!holdAnesthesia && typeof pauseSheet === 'function') needsWakeUp = pauseSheet(ss);
 
   try {
     const keys = ['source', 'char', 'contract_id', 'type_id'];
-    const upsertResult = MaterialLedger.upsert(keys, outRows);
-    const count = upsertResult.rows; // FIX: Extract the count from the object
+    // Pass 'true' downstream so the ML namespace doesn't try to manage it either
+    const upsertResult = MaterialLedger.upsert(keys, outRows, true);
+    const count = upsertResult.rows !== undefined ? upsertResult.rows : upsertResult;
 
     log.log('contracts->ledger', { appended_or_updated: count, processed_rows: outRows.length });
     return count;
@@ -1833,10 +1873,7 @@ function contractsToMaterialLedger(ss, charIdMap, buyData) {
     log.error('contractsToMaterialLedger WRITE FAILED', e.message);
     throw e;
   } finally {
-    // FIX: RESUME SHEET CALCULATIONS, REGARDLESS OF SUCCESS OR FAILURE
-    if (needsWakeUp) {
-      wakeUpSheet(ss);
-    }
+    if (!holdAnesthesia && needsWakeUp && typeof wakeUpSheet === 'function') wakeUpSheet(ss);
   }
 }
 
@@ -1927,59 +1964,80 @@ function _nudgeCogsFinalizer() {
   return false;
 }
 
-// --- REMOVED withSheetLock wrapper ---
-/**
- * New function: contractsToSalesLedger
- * Assumes lock is held by caller.
- */
-function contractsToSalesLedger(ss, charIdMap) {
+function contractsToSalesLedger(ss, charIdMap, saleData, holdAnesthesia) {
+  const log = LoggerEx.withTag('GESI');
 
-  //TODO: make contractsToMaterialLedger capable of  replacing contractsToSalesLedger
+  if (!saleData || !saleData.contracts || saleData.contracts.length === 0 || !saleData.items || saleData.items.length === 0) {
+    log.log('contracts->sales_ledger', { status: 'Skipped: In-memory data is empty.' });
+    return 0;
+  }
 
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  const log = LoggerEx.withTag('GESI');
-  const charName = getCorpAuthChar(ss);
-  const myCharId = charIdMap[charName] || null;
   const SalesLedger = ML.forSheet(LEDGER_SALE_SHEET);
 
-  const shC = ss.getSheetByName(CONTRACTS_RAW_SHEET);
-  const shI = ss.getSheetByName(CONTRACT_ITEMS_RAW_SHEET);
-  if (!shC || !shI) throw new Error("Run syncContracts() first to populate RAW sheets.");
-  if (shC.getLastRow() <= 1 || shI.getLastRow() <= 1) { log.log('contracts->sales_ledger', { status: 'Skipped: RAW sheets empty.' }); return 0; }
-
-  const C = shC.getRange(1, 1, Math.min(shC.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shC.getLastColumn()).getValues();
-  const hC = C.shift();
-  const I = shI.getRange(1, 1, Math.min(shI.getLastRow(), MAX_RAW_ROWS_TO_PROCESS + 1), shI.getLastColumn()).getValues();
-  const hI = I.shift();
-  if (C.length === 0 || I.length === 0) { log.log('contracts->sales_ledger', { status: 'Skipped: No raw data found.' }); return 0; }
+  const hC_Names = ["char", "contract_id", "type", "status", "issuer_id", "date_issued", "price"];
+  const hI_Names = ["char", "contract_id", "type_id", "quantity", "is_included"];
 
   const ix = (arr, name) => arr.indexOf(name);
-  const colC = { char: ix(hC, "char"), contract_id: ix(hC, "contract_id"), type: ix(hC, "type"), status: ix(hC, "status"), issuer_id: ix(hC, "issuer_id"), date_issued: ix(hC, "date_issued"), price: ix(hC, "price") };
-  const colI = { contract_id: ix(hI, "contract_id"), type_id: ix(hI, "type_id"), quantity: ix(hI, "quantity"), is_included: ix(hI, "is_included") };
+  const colC = { char: ix(hC_Names, "char"), contract_id: ix(hC_Names, "contract_id"), date_issued: ix(hC_Names, "date_issued"), price: ix(hC_Names, "price") };
+  const colI = { contract_id: ix(hI_Names, "contract_id"), type_id: ix(hI_Names, "type_id"), quantity: ix(hI_Names, "quantity"), is_included: ix(hI_Names, "is_included") };
+
+  const LOGGED_IN_CHARS = new Set(getCharNamesFast());
+  const saleCids = new Set(saleData.contracts.map(c => c[colC.contract_id]));
 
   const itemsByCid = {};
-  // ... (logic to populate itemsByCid remains the same) ...
-  for (let r = 0; r < I.length; r++) { const rowI = I[r]; const cid = rowI[colI.contract_id]; if (!itemsByCid[cid]) itemsByCid[cid] = []; itemsByCid[cid].push({ type_id: rowI[colI.type_id], qty: Number(rowI[colI.quantity] || 0), is_included: !!rowI[colI.is_included] }); }
+  for (const rowI of saleData.items) {
+    const cid = rowI[colI.contract_id];
+    if (!saleCids.has(cid)) continue;
+    if (!itemsByCid[cid]) itemsByCid[cid] = [];
+    itemsByCid[cid].push({
+      type_id: rowI[colI.type_id],
+      qty: Number(rowI[colI.quantity] || 0),
+      is_included: String(rowI[colI.is_included]).toUpperCase() === 'TRUE'
+    });
+  }
 
   const outRows = [];
-  // ... (logic to populate outRows based on C and itemsByCid remains the same) ...
-  for (let q = 0; q < C.length; q++) { const rowC = C[q]; /* ... filtering logic ... */ const cid2 = rowC[colC.contract_id]; const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : ""; const items = itemsByCid[cid2] || []; const price = Number(rowC[colC.price] || 0); for (const it of items) { if (!it.is_included || it.qty <= 0) continue; let unit_price_filled = it.qty > 0 ? price / it.qty : 0; outRows.push({ date: issued, type_id: it.type_id, qty: -it.qty, unit_value: '', unit_value_filled: unit_price_filled, source: "SALE", contract_id: cid2, char: rowC[colC.char] || "" }); } }
+  for (const rowC of saleData.contracts) {
+    const contractChar = String(rowC[colC.char] || "");
+    if (!LOGGED_IN_CHARS.has(contractChar)) continue;
 
+    const cid2 = rowC[colC.contract_id];
+    const issued = rowC[colC.date_issued] ? _isoDate(rowC[colC.date_issued]) : "";
+    const items = itemsByCid[cid2] || [];
+    const price = Number(rowC[colC.price] || 0);
+
+    for (const it of items) {
+      if (!it.is_included || it.qty <= 0) continue;
+      let unit_price_filled = it.qty > 0 ? price / it.qty : 0;
+
+      outRows.push({ date: issued, type_id: it.type_id, qty: -it.qty, unit_value: '', unit_value_filled: unit_price_filled, source: "SALE", contract_id: cid2, char: contractChar });
+    }
+  }
 
   if (outRows.length === 0) { log.log('contracts->sales_ledger', { status: 'Skipped: No qualifying deltas.' }); return 0; }
 
-  // --- Code previously inside withSheetLock now runs directly ---
-  const keys = ['source', 'char', 'contract_id', 'type_id'];
-  const count = SalesLedger.upsert(keys, outRows);
-  log.log('contracts->sales_ledger', { appended_or_updated: count, processed_rows: outRows.length });
-  return count; // Return actual count
+  let needsWakeUp = false;
+  if (!holdAnesthesia && typeof pauseSheet === 'function') needsWakeUp = pauseSheet(ss);
+
+  try {
+    const keys = ['source', 'char', 'contract_id', 'type_id'];
+    // Pass 'true' downstream to ML namespace
+    const upsertResult = SalesLedger.upsert(keys, outRows, true);
+    const count = upsertResult.rows !== undefined ? upsertResult.rows : upsertResult;
+
+    log.log('contracts->sales_ledger', { appended_or_updated: count, processed_rows: outRows.length });
+    return count;
+
+  } catch (e) {
+    log.error('contractsToSalesLedger WRITE FAILED', e.message);
+    throw e;
+  } finally {
+    if (!holdAnesthesia && needsWakeUp && typeof wakeUpSheet === 'function') wakeUpSheet(ss);
+  }
 }
 
-// ==========================================================================================
-// CONTRACT UNIT COST ALLOCATION LOGIC (FINAL STEP)
-// ==========================================================================================
 
-// NOTE: This logic assumes getOrCreateSheet, _getNamedOr_, and _getData_ are defined globally.
 
 // ==========================================================================================
 // CONTRACT UNIT COST ALLOCATION HELPERS
@@ -2386,7 +2444,6 @@ function runContractLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  // --- 1. ACQUIRE LEASE ---
   const NOW_MS = new Date().getTime();
   const LEASE_UNTIL = NOW_MS + CONTRACT_LEASE_DURATION_MS;
   SCRIPT_PROP.setProperty(PROP_KEY_CONTRACT_LEASE, String(LEASE_UNTIL));
@@ -2394,44 +2451,44 @@ function runContractLedgerPhase(ss) {
 
   const charIdMap = _charIdMap(ss);
   let syncResult = {};
+  let orchestratorHoldsAnesthesia = false;
 
   try {
-    // --- STEP 1: SYNC RAW DATA AND SEGREGATE ---
+    // 1. Claim Anesthesia at the very top level
+    if (typeof pauseSheet === 'function') {
+      orchestratorHoldsAnesthesia = pauseSheet(ss);
+    }
+
     log.info('Running syncContracts (Fetch RAW data and Segregate)...');
-
     syncResult = syncContracts(ss, charIdMap);
-
     const contractsWritten = syncResult.contracts;
 
-    // --- STEP 2: TOTAL COUNT GUARD ---
     if (contractsWritten === 0) {
       log.info('Skipping contract ledger processing: No new contracts were synced.');
-
-      // Release the lease immediately if no work was found.
       SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
       return;
     }
 
-    // --- STEP 3 & 4: POST BUY-SIDE / SALES LEDGER ---
+    // Pass 'true' to sub-functions so they don't wake the sheet up prematurely
     if (syncResult.buyData.contracts.length > 0) {
       log.info('Running contractsToMaterialLedger (Contract Buys)...');
-      contractsToMaterialLedger(ss, charIdMap, syncResult.buyData);
+      contractsToMaterialLedger(ss, charIdMap, syncResult.buyData, true);
     } else {
       log.info('contractsToMaterialLedger skipped: No buy contracts found.');
     }
 
     if (syncResult.saleData.contracts.length > 0) {
       log.info('Running contractsToSalesLedger (Contract Sells)...');
-      contractsToSalesLedger(ss, charIdMap);
+      contractsToSalesLedger(ss, charIdMap, syncResult.saleData, true);
     } else {
       log.warn('contractsToSalesLedger skipped: No sales contracts found.');
     }
-    // --- STEP 6: SAVE LAST PROCESSED ID (NEW) ---
+
     if (syncResult.maxContractId && syncResult.maxContractId > 0) {
       SCRIPT_PROP.setProperty(PROP_KEY_LAST_CONTRACT_ID, String(syncResult.maxContractId));
       log.info(`Saved new last processed Contract ID: ${syncResult.maxContractId}`);
     }
-   // --- STEP 5: COST ALLOCATION (COGS) ---
+
     try {
       log.info('Decoupling COGS finalization to asynchronous trigger.');
       triggerContractUnitCostsFinalization();
@@ -2439,17 +2496,19 @@ function runContractLedgerPhase(ss) {
       log.error('rebuildContractUnitCosts FAILED', e.message);
     }
 
-    // --- RELEASE LEASE ON SUCCESS ---
     SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
-    
-    // FIX: Explicitly set the timestamp so the COGS finalizer passes its dependency check
     SCRIPT_PROP.setProperty('MAINTENANCE_LAST_RUN_TS_runContractLedgerPhase', String(new Date().getTime()));
 
   } catch (e) {
     log.error('runContractLedgerPhase FAILED', e.message);
-    // On hard failure, release the lease immediately so the orchestrator can re-try sooner.
     SCRIPT_PROP.deleteProperty(PROP_KEY_CONTRACT_LEASE);
     throw e;
+  } finally {
+    // 2. Release Anesthesia once, safely, at the very end
+    if (orchestratorHoldsAnesthesia && typeof wakeUpSheet === 'function') {
+      wakeUpSheet(ss);
+      log.info('Orchestrator released Anesthesia block.');
+    }
   }
 }
 
@@ -2515,6 +2574,16 @@ function runAllLedgerImports() {
   log.info('--- Full Ledger Import Cycle Complete ---');
   // NOTE: No lock release here, executeLocked handles it.
   return true;
+}
+
+// Add a simple deduplication logic in your Import/Processing loop
+function isDuplicateRecord(record, processedIds) {
+  const transactionKey = record.contract_id + record.char + record.type_id;
+  if (processedIds.has(transactionKey)) {
+    return true; // Already processed this pair
+  }
+  processedIds.add(transactionKey);
+  return false;
 }
 
 /**

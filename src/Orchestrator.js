@@ -44,7 +44,7 @@ function fetchFilteredPricesSync(ss) {
 
   // --- CONFIGURATION ---
   const SOURCE_SHEET_ID = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
-  const SOURCE_RANGE = "'filtered prices'!E7:L750";
+  const SOURCE_RANGE = "'filtered prices'!E7:L800";
   const TARGET_SHEET_NAME = "market price Tracker";
   const RANGE_NAME = "NR_MARKET_MEDIAN_DATA"; // Define name at the top
 
@@ -331,6 +331,17 @@ function executeWithWaitLock(funcToRun, functionName, timeoutMs = LOCK_WAIT_TIME
 
 function masterOrchestrator() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  
+  // 1. GLOBAL SAFETY CHECK: Respect the Maintenance Flag
+  const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
+  const systemState = SCRIPT_PROP.getProperty(GLOBAL_STATE_KEY);
+  
+  if (systemState === 'MAINTENANCE') {
+    console.warn("Orchestrator: System is in MAINTENANCE mode (Control Sheet Rebuild). Aborting tick.");
+    return; // Hard stop. Do not touch anything while Anesthesia is active.
+  }
+
+  // 2. PROCEED WITH NORMAL ORCHESTRATION
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
   const PROP_KEY_MARKET_LAST_RUN = 'MARKET_DATA_LAST_RUN_TS';
   const lastMarketRun = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_MARKET_LAST_RUN) || '0', 10);
@@ -347,7 +358,6 @@ function masterOrchestrator() {
     SCRIPT_PROP.deleteProperty(PROP_KEY_LEASE);
     isJobActive = false;
   }
-
 
   // NEW: Check for pending COGS Finalization and process it immediately.
   if (_nudgeCogsFinalizer()) {
@@ -425,12 +435,14 @@ function runMaintenanceJobs() {
   // 2. Job Registry with targeted intervals
   const JOB_QUEUE = [
     { name: 'generateFullBOMData', interval: 2700000, lease: 1200000 },
+     { name: 'generateReprocessedValueTable', interval: 2700000, lease: 1200000 },
     { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
     { name: 'Ledger_Import_CorpJournal', interval: 1800000 },
     { name: 'processInternalBuffer', interval: 600000 }, 
     { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'runIndustryLedgerPhase', interval: STANDARD_INTERVAL },
-    { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL },
+    { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL }
+
   ];
 
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
@@ -444,11 +456,13 @@ function runMaintenanceJobs() {
     const lastRunTs = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
     const isDue = (NOW_MS - lastRunTs) >= job.interval;
 
-    // 3. Lease Management: If the job is due, the lease is ignored/cleared.
-    if (job.name === 'generateFullBOMData') {
-      const activeLease = parseInt(SCRIPT_PROP.getProperty('BOM_MAINTENANCE_LEASE') || '0', 10);
+   // 3. Dynamic Lease Management: Now handles BOTH heavy tycoon steps dynamically
+    if (job.lease) {
+      const leaseKey = job.name + '_LEASE';
+      const activeLease = parseInt(SCRIPT_PROP.getProperty(leaseKey) || '0', 10);
+      
       if (isDue) {
-        SCRIPT_PROP.deleteProperty('BOM_MAINTENANCE_LEASE');
+        SCRIPT_PROP.deleteProperty(leaseKey);
       } else if (activeLease > NOW_MS) {
         currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
         iterations++;
@@ -461,11 +475,11 @@ function runMaintenanceJobs() {
       console.log(`[Maintenance] Dispatching: ${job.name}`);
 
       if (job.lease) {
-        SCRIPT_PROP.setProperty('BOM_MAINTENANCE_LEASE', (NOW_MS + job.lease).toString());
+        const leaseKey = job.name + '_LEASE';
+        SCRIPT_PROP.setProperty(leaseKey, (NOW_MS + job.lease).toString());
       }
 
       try {
-        // Fallback check for function scope
         const fn = this[job.name] || eval(job.name);
         if (typeof fn === 'function') {
           fn();
@@ -670,56 +684,53 @@ function finalizeMarketDataUpdate() {
   const PROP_KEY_STEP = 'marketDataJobStep';
   const finalSheetName = 'Market_Data_Raw';
   const tempSheetName = 'Market_Data_Temp';
-
+  const RESCHEDULE_DELAY_MS = RETRY_DELAY_MS;
   const funcName = 'finalizeMarketDataUpdate';
 
-  executeWithTryLock(() => {
+  // [CRITICAL FIX] Define these variables so guardedSheetTransaction can see them!
+  const ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+  const repairMap = { 'NR_MARKET_DATA': 'A:G' };
 
-    if (SCRIPT_PROP.getProperty(PROP_KEY_STEP) !== 'FINALIZING') {
-      _resetMarketDataJobState(new Error(`Wrong state.`));
-      return;
-    }
+  // Verify we are in the correct state before doing anything
+  if (SCRIPT_PROP.getProperty(PROP_KEY_STEP) !== 'FINALIZING') {
+    _resetMarketDataJobState(new Error(`Wrong state.`));
+    return;
+  }
 
-    var ss_inner = SpreadsheetApp.getActiveSpreadsheet();
+  // Execute the transaction block securely
+  const transactionResult = guardedSheetTransaction(() => {
+    // === 1. ACTIVATE ANESTHESIA LOCK ===
+    SCRIPT_PROP.setProperty('GLOBAL_SYSTEM_STATE', 'MAINTENANCE');
+    pauseSheet(ss_inner); 
 
-    // [CRITICAL FIX] REFRESH CONNECTION
-    // The previous 'ss_inner' is dead after the long flush. Get a new one.
-    ss_inner = SpreadsheetApp.getActiveSpreadsheet();
-
-    const repairMap = { ['NR_MARKET_DATA']: 'A:G' };
-
-    const transactionResult = guardedSheetTransaction(() => {
-      // --- START ANESTHESIA ---
-
-      // 1. Perform the Atomic Swap (Hot Swap)
+    try {
+      // 2. Perform the Atomic Swap (Hot Swap) while the sheet is dead
       const swapRes = atomicSwapAndFlush(ss_inner, finalSheetName, tempSheetName, repairMap);
 
-      // 2. Sync External Prices and Region Data while locked
-      // This prevents the sheet from waking up and calculating until all data is fresh.
+      // 3. Sync External Prices and Region Data while locked
       fetchFilteredPricesSync(ss_inner);
       syncESIRegionData(ss_inner);
       updateMarketOrdersNamedRange(ss_inner);
       
-      // 3. REPRO ENGINE (The New "Tycoon" Step)
-      // Recalculate Melt Values using the fresh market data just swapped in.
-      generateReprocessedValueTable(ss_inner);
 
       return swapRes;
-      // --- END ANESTHESIA ---
-    }, 60000);
 
-
-
-    let swapSuccess = (transactionResult.success && transactionResult.state.success);
-
-    if (swapSuccess) {
-
-      _resetMarketDataJobState(null);
-      console.log("SUCCESS: Finalization complete.");
-
-    } else {
-      console.warn(`[Finalizer] Swap Failed: ${transactionResult.error || transactionResult.state.errorMessage}`);
+    } finally {
+      // === 5. DEACTIVATE ANESTHESIA (WAKE UP THE SHEET) ===
+      wakeUpSheet(ss_inner); 
+      SCRIPT_PROP.setProperty('GLOBAL_SYSTEM_STATE', 'RUNNING');
+      console.log("Anesthesia: System state restored to RUNNING.");
     }
+  }, 60000); // 60-second transaction safety timeout
 
-  }, funcName);
+  // Handle the results post-transaction
+  const swapSuccess = (transactionResult && transactionResult.success && transactionResult.state && transactionResult.state.success);
+
+  if (swapSuccess) {
+    _resetMarketDataJobState(null);
+    console.log("SUCCESS: Finalization complete.");
+  } else {
+    const errorMsg = transactionResult ? (transactionResult.error || (transactionResult.state && transactionResult.state.errorMessage)) : 'Unknown Error';
+    console.warn(`[Finalizer] Swap Failed: ${errorMsg}`);
+  }
 }

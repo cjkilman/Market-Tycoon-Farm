@@ -90,21 +90,14 @@ function getSdeTypeEngine(ss) {
  * Reads the "Reprocess Items" sheet and commits the material yields to the Material_Ledger via ML.
  */
 function reprocessItemsToLedger(ss) {
-// Use logical OR (||) and verify the object has the required method
+  // Use logical OR (||) and verify the object has the required method
   ss = (ss && typeof ss.getSheetByName === 'function') ? ss : SpreadsheetApp.getActiveSpreadsheet();
-  
+
   if (!ss) {
     console.error("Could not find active spreadsheet.");
     return;
   }
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ReproLedger') : console;
-
-
-  /** 
-   * Reprocess Sheet Layout
-   * B5:f Paste Range fromClient Hangers
-   * G4 starts Folumas type_id Total Reprocess Value ROI Action
-  */
 
   // --- 1. UI CONFIRMATION POPUP ---
   try {
@@ -132,16 +125,14 @@ function reprocessItemsToLedger(ss) {
   }
 
   const allProcessableIds = Array.from(materialMap.keys());
-  // To a dynamic check (Example for NPC Station with Scrapmetal IV and 0% Tax):
-  const isNpcStation = true; // You can pull this from your Location List
-  const scrapmetalLevel = 4;
-  const stationTax = 0.00;
 
-  const efficiency = isNpcStation
-    ? (0.50 * (1 + (0.02 * scrapmetalLevel)) * (1 - stationTax))
-    : (0.50 * 1.69);
+  // A. Initialization (Do this once at the start of your function)
+  const { characterSkills, skillMap } = getGlobalContext(ss);
+  const currentStation = getActiveStationConfig(ss);
 
-  // 3. LOAD COST MAPS (Required for unit_value_filled)
+
+
+  // 3. LOAD COST MAPS
   let mineralPriceMap = new Map();
   let costMap = new Map();
   try {
@@ -152,24 +143,20 @@ function reprocessItemsToLedger(ss) {
     });
 
     mineralPriceMap = _getBlendedCostMap(ss, Array.from(requiredMatIds), true);
-    costMap = _getBlendedCostMap(ss, allProcessableIds, false); // See Point 2 below!
+    costMap = _getBlendedCostMap(ss, allProcessableIds, false);
   } catch (e) {
     LOG.warn("Pricing maps failed to load. Costs will default to 0.");
   }
 
-
   // 4. MAP THE REPROCESS SHEET
   const data = reproSheet.getDataRange().getValues();
-
-  // Change this from 2 to 3 (This points to the 4th row in the sheet)
   const headerRow = 3;
   const headers = data[headerRow];
 
-  // Ensure these match your sheet exactly
   const colIdx = {
-    action: headers.indexOf("Action"),   // Found at index 9
-    typeId: headers.indexOf("type_id"),  // Found at index 6
-    qty: headers.indexOf("Qty")         // Found at index 1
+    action: headers.indexOf("Action"),
+    typeId: headers.indexOf("type_id"),
+    qty: headers.indexOf("Qty")
   };
 
   if (colIdx.action === -1 || colIdx.typeId === -1 || colIdx.qty === -1) {
@@ -179,54 +166,58 @@ function reprocessItemsToLedger(ss) {
 
   const ledgerPayload = [];
   const rowsToUpdate = [];
-  const timestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd");
+  const timestamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd-HHmmss");
 
-  // 5. PROCESS EACH ROW
+  // NEW: The O(1) Accumulator and Single Deterministic Batch ID
+  const batchAccumulator = new Map();
+  const batchEventId = "REPRO-" + timestamp;
+
+ // 5. PROCESS EACH ROW
   for (let i = headerRow + 1; i < data.length; i++) {
     const row = data[i];
 
-
+    // --- MOVE LOGIC INTO THE LOOP ---
+    // Now 'row' is defined, so these calls will work perfectly
     const typeId = parseInt(row[colIdx.typeId], 10);
     const totalQty = parseInt(row[colIdx.qty], 10);
+    
+    // Station config and efficiency need 'typeId' from the current row
+    const efficiency = getReprocessEfficiency(currentStation, characterSkills, typeId, skillMap);
+    // --------------------------------
+
+    // SAFETY SHIELD: Drop blank rows or cross-wired string pastes immediately
+    if (isNaN(typeId) || isNaN(totalQty) || totalQty <= 0) continue;
 
     const typeInfo = typeMap.get(typeId) || {};
     const portionSize = typeInfo.portionSize || 1;
-
     const batches = Math.floor(totalQty / portionSize);
 
     if (batches > 0) {
-      const reproEventId = Utilities.getUuid();
       const materials = materialMap.get(typeId);
 
       if (materials) {
-        // Check the price. If it's 0 or missing, pass a -1 flag.
         const inputUnitCost = costMap.get(typeId) || 0;
         const totalAcquisitionCost = (inputUnitCost > 0)
           ? inputUnitCost * (batches * portionSize)
           : -1;
 
-        // Run your derivation engine to distribute the cost
         const derivedYields = deriveEffectiveMaterialCosts(materials, efficiency, batches, mineralPriceMap, totalAcquisitionCost);
 
-        // Pass the Data onto Material Ledger System for Proper Handling.
         if (derivedYields && derivedYields.length > 0) {
+          // NEW: Accumulate yields in memory instead of pushing directly to ledger
           derivedYields.forEach(yieldData => {
-            const matName = typeMap.has(yieldData.materialID) ? typeMap.get(yieldData.materialID).typeName : `Unknown Mat (${yieldData.materialID})`;
+            const matId = yieldData.materialID;
+            const matName = typeMap.has(matId) ? typeMap.get(matId).typeName : `Unknown Mat (${matId})`;
 
-            ledgerPayload.push({
-              date: timestamp,
-              type_id: yieldData.materialID,
-              item_name: matName,
-              qty: yieldData.yieldQty,
-              unit_value: '', // leave blank, reserved for Manual overides
-              source: "REPROCESS",
-              contract_id: reproEventId,
-              char: "SYSTEM",
-              unit_value_filled: yieldData.effectiveUnitPrice // Look Upstream for Possible Issues.. there should Always Be a Value here
-            });
+            if (!batchAccumulator.has(matId)) {
+              batchAccumulator.set(matId, { qty: 0, totalCost: 0, name: matName });
+            }
+
+            const current = batchAccumulator.get(matId);
+            current.qty += yieldData.yieldQty;
+            current.totalCost += (yieldData.effectiveUnitPrice * yieldData.yieldQty);
           });
         }
-
         rowsToUpdate.push(i + 1);
       } else {
         LOG.warn(`No materials found in SDE for Type ID: ${typeId}`);
@@ -234,8 +225,28 @@ function reprocessItemsToLedger(ss) {
     } else {
       LOG.warn(`Skipped ${typeInfo.typeName || typeId} - Not enough quantity to meet the portion size of ${portionSize}.`);
     }
-
   }
+
+  // 5.5 CONVERT ACCUMULATOR TO PAYLOAD
+  batchAccumulator.forEach((data, matId) => {
+    // Aggressive trim: Kill any ghost rows before they hit the ledger
+    if (data.qty <= 0) return;
+
+    // Calculate the weighted average cost for the entire melt session
+    const batchWeightedCost = data.totalCost / data.qty;
+
+    ledgerPayload.push({
+      date: timestamp,
+      type_id: matId,
+      item_name: data.name,
+      qty: data.qty,
+      unit_value: '', // leave blank, reserved for Manual overrides
+      source: "REPROCESS",
+      contract_id: batchEventId,
+      char: "SYSTEM",
+      unit_value_filled: batchWeightedCost
+    });
+  });
 
   // 6. ML ENGINE WRITE & UPDATE STATUS
   if (ledgerPayload.length > 0) {
@@ -244,14 +255,11 @@ function reprocessItemsToLedger(ss) {
       const MaterialLedger = ML.forSheet(LEDGER_SHEET_NAME);
 
       const keys = ['source', 'char', 'contract_id', 'type_id'];
-      const result = MaterialLedger.upsert(keys, ledgerPayload);
-      /** -Removed. due to Indexing alignment issues and Questional Purpse
-       * 
-            rowsToUpdate.forEach(rowNum => {
-              reproSheet.getRange(rowNum, colIdx.action + 1).setValue("DONE");
-            });*/
 
-      LOG.info(`Success: Upserted ${result.rows} rows to ${LEDGER_SHEET_NAME}. Updated ${rowsToUpdate.length} orders.`);
+      // One single, perfectly clean upsert call for the entire session
+      const result = MaterialLedger.upsert(keys, ledgerPayload);
+
+      LOG.info(`Success: Upserted ${result.rows} stacked rows to ${LEDGER_SHEET_NAME}. Processed ${rowsToUpdate.length} input stacks.`);
 
     } catch (e) {
       LOG.error('REPROCESS WRITE FAILED: ' + e.message);
@@ -266,12 +274,12 @@ function reprocessItemsToLedger(ss) {
 /**
  * CALCULATE MELT VALUE (Asset Floor Logic)
  * Logic: Calculates the total market ISK value of an item's reprocessed materials.
- * Handles EVE's "round down" yield mechanics and normalizes output to a single unit.
+ * Handles EVE's yield mechanics by calculating total mass before flooring.
  *
  * @param {Array} materials - SDE material array [{matID, qty}, ...]
  * @param {number} efficiency - Net reprocessing yield (e.g., 0.5 * 1.69)
- * @param {number} batchCount - Processing multiplier (1 / portionSize)
- * @param {Map} priceMap - Reference prices for minerals (e.g., Amarr Buy)
+ * @param {number} batchCount - Total processable batches
+ * @param {Map} priceMap - Reference prices for minerals
  * @returns {Object} - {totalValue: number, yields: Array}
  */
 function calculateMeltValue(materials, efficiency, batchCount, priceMap) {
@@ -279,9 +287,8 @@ function calculateMeltValue(materials, efficiency, batchCount, priceMap) {
   const yieldDetails = [];
 
   materials.forEach(mat => {
-    // THE FIX: EVE floors the yield PER BATCH, discarding fractional dust, 
-    // BEFORE multiplying by the number of batches being melted.
-    const yieldQty = Math.floor(mat.qty * efficiency) * batchCount;
+    // EVE multiplies total quantity by base yield and efficiency BEFORE flooring.
+    const yieldQty = Math.floor(mat.qty * batchCount * efficiency);
 
     let unitPrice = priceMap.get(Number(mat.matID));
     if (!unitPrice || unitPrice <= 0) {
@@ -297,6 +304,83 @@ function calculateMeltValue(materials, efficiency, batchCount, priceMap) {
   });
 
   return { totalValue: totalValue, yields: yieldDetails };
+}
+
+function getGlobalContext(ss) {
+  const skillSheet = ss.getSheetByName("Character_Profile");
+  const skillData = skillSheet.getDataRange().getValues();
+  const characterSkills = {};
+  
+  for (let i = 1; i < skillData.length; i++) {
+    // Stores: { "Reprocessing": { level: 5, multiplier: 1.15 } }
+    characterSkills[skillData[i][0]] = {
+      level: Number(skillData[i][1]),
+      mult: Number(skillData[i][2])
+    };
+  }
+
+  const mapSheet = ss.getSheetByName("SDE_SkillMap");
+  const mapData = mapSheet.getDataRange().getValues();
+  const skillMap = new Map();
+  for (let i = 1; i < mapData.length; i++) {
+    skillMap.set(Number(mapData[i][0]), mapData[i][1]);
+  }
+
+  return { characterSkills, skillMap };
+}
+
+function getReprocessEfficiency(station, skills, typeID, skillMap) {
+  // 1. Identify if this item is Scrapmetal
+  // If the skill required is specifically "Scrapmetal Processing", we are in "Scrap Mode"
+  const requiredSkillName = skillMap.get(typeID) || "Scrapmetal Processing";
+  const isScrap = (requiredSkillName === "Scrapmetal Processing");
+  
+  // 2. Fetch skill and base variables
+  const skill = skills[requiredSkillName] || { level: 0, mult: 1.0 };
+  const repro = skills['Reprocessing'] || { level: 0, mult: 1.0 };
+  const eff = skills['Reprocessing Efficiency'] || { level: 0, mult: 1.0 };
+
+  // 3. APPLY EVE REPROCESSING MODES
+  if (isScrap) {
+    // SCRAP MODE: Structure base yield is IGNORED. 
+    // Hard cap is 54% (0.54) with Scrapmetal V (1.08x)
+    // Formula: Base 0.50 * Scrapmetal Skill Multiplier
+    return (0.50 * skill.mult);
+  } else {
+    // ORE/ICE/MOON MODE: Uses the structure's base yield
+    const baseYield = (station.type === 'NPC') ? 0.50 : station.baseYield;
+    return (baseYield * repro.mult * eff.mult * skill.mult);
+  }
+}
+
+
+/**
+ * DYNAMIC STATION LOADER (Named Range Version)
+ * @param {string} rangeName - The Named Range pointing to the selected station name
+ */
+function getActiveStationConfig(ss) {
+  const range = ss.getRangeByName("NR_RepoStation");
+  if (!range) {
+    console.error("Named Range NR_RepoStation not found!");
+    return { type: 'NPC', baseYield: 0.50 };
+  }
+
+  const stationName = range.getValue();
+  const sheet = ss.getSheetByName("Structure_Settings");
+  const data = sheet.getDataRange().getValues();
+
+  // Find the row that matches the stationName in the first column
+  const row = data.find(r => r[0] === stationName);
+
+  if (!row) return { type: 'NPC', baseYield: 0.50 };
+
+  // Corrected return logic
+  return {
+    // Check column 1 (Structure Type) for the string
+    type: row[1] === 'NPC Station' ? 'NPC' : 'STRUCTURE',
+    // Check column 2 (Base Yield) for the number
+    baseYield: Number(row[2]) || 0.50
+  };
 }
 
 /**
@@ -335,118 +419,102 @@ function deriveEffectiveMaterialCosts(materials, efficiency, batchCount, priceMa
 }
 
 /**
- * REPROCESSED VALUE ENGINE - COMPLETE SDE COVERAGE (FIXED)
+ * ♻️ REPROCESSED VALUE ENGINE - STREAMLINED CUSTOM SCHEMA
+ * Computes asset floor melt values based on character efficiency parameters.
  */
 function generateReprocessedValueTable(ss) {
   const start = new Date().getTime();
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss = (ss && typeof ss.getSheetByName === 'function') ? ss : SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return;
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ReproValue') : console;
 
-  // 1. MAPS & SDE DATA
+  // 1. EXTRACT DATA & CONTEXT (Executed Once)
+  const { characterSkills, skillMap } = getGlobalContext(ss);
   const materialMap = getSdeMaterialMap(ss);
 
-  // FIX: Safe fallback for type engine if it fails or is missing data
   let typeMap = new Map();
   try {
     const typeEngine = getSdeTypeEngine(ss);
     if (typeEngine && typeEngine.byId) typeMap = typeEngine.byId;
   } catch (e) {
-    LOG.warn("getSdeTypeEngine missing or failed. Defaulting to empty names.");
+    LOG.warn("getSdeTypeEngine uninitialized. Defaulting to fallback labels.");
   }
 
   const allProcessableIds = Array.from(materialMap.keys());
 
-  // 2. PRICING DATA
-  const requiredMatIds = new Set();
-  allProcessableIds.forEach(id => {
-    const recipe = materialMap.get(id);
-    if (recipe) recipe.forEach(mat => requiredMatIds.add(Number(mat.matID)));
-  });
-
-  // FIX: Safe fallbacks for cost maps so the script doesn't crash if prices are missing
+  // 2. COMPILE PRICING
   let mineralPriceMap = new Map();
   let costMap = new Map();
   try {
-    mineralPriceMap = _getBlendedCostMap(ss, Array.from(requiredMatIds),true);
+    const requiredMatIds = new Set();
+    allProcessableIds.forEach(id => {
+      const recipe = materialMap.get(id);
+      if (recipe) recipe.forEach(mat => requiredMatIds.add(Number(mat.matID)));
+    });
+
+    mineralPriceMap = _getBlendedCostMap(ss, Array.from(requiredMatIds), true);
     costMap = _getBlendedCostMap(ss, allProcessableIds, false);
   } catch (e) {
-    LOG.warn("_getBlendedCostMap missing or failed. Defaulting prices to 0.");
+    LOG.warn("_getBlendedCostMap lookup failed. Initializing baseline prices to 0.");
   }
 
-  // To a dynamic check (Example for NPC Station with Scrapmetal IV and 0% Tax):
-  const isNpcStation = true; // You can pull this from your Location List
-  const scrapmetalLevel = 4;
-  const stationTax = 0.00;
+  // 3. CORE CALCULATION LOOP
+  const currentStation = getActiveStationConfig(ss);
 
-  const efficiency = isNpcStation
-    ? (0.50 * (1 + (0.02 * scrapmetalLevel)) * (1 - stationTax))
-    : (0.50 * 1.69);
-
-  // 3. CORE CALCULATION
   const outputRows = allProcessableIds.reduce((acc, tid) => {
     const materials = materialMap.get(tid);
-    // FIX: Fallback to an empty object if typeInfo is missing for this ID
     const typeInfo = typeMap.get(tid) || {};
 
-    // FIX: Removed strict dependency on typeInfo. If it has materials, calculate it!
     if (materials) {
-      let meltValue = 0.0;
-      const portionSize = typeInfo.portionSize || typeInfo.portion || 1;
+      // Get the perfect dynamic efficiency for THIS specific item ID
+     const efficiency = getReprocessEfficiency(currentStation, characterSkills, tid, skillMap);
 
+      let singleUnitMeltValue = 0.0;
       for (const mat of materials) {
-        const qtyPerUnit = (mat.qty * efficiency) / portionSize;
+        const qtyPerUnit = Number(mat.qty || 0) * efficiency;
         const price = parseFloat(mineralPriceMap.get(Number(mat.matID))) || 0.0;
-        meltValue += (qtyPerUnit * price);
+        singleUnitMeltValue += (qtyPerUnit * price);
       }
 
       const marketCost = parseFloat(costMap.get(tid)) || 0.0;
-      const profit = meltValue - marketCost;
+      const profit = singleUnitMeltValue - marketCost;
       const margin = marketCost > 0 ? (profit / marketCost) : 0.0;
 
       acc.push([
-        parseInt(tid),
-        typeInfo.typeName || `Unknown Item (${tid})`, // Show ID if name is unknown
-        parseFloat(marketCost),
-        parseFloat(meltValue),
-        parseFloat(profit),
-        parseFloat(margin),
+        parseInt(tid, 10),
+        typeInfo.typeName || `Unknown Item (${tid})`,
+        marketCost,
+        singleUnitMeltValue,
+        profit,
+        margin,
         new Date()
       ]);
     }
     return acc;
   }, []);
 
-  // 4. WRITE & RANGE BINDING
+  // 4. WRITE BACK TO SHEET (Standardized block)
   const SHEET_NAME = "Reprocessed_Material_Values";
   let outSheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+
   if (outputRows.length === 0) {
-    LOG.error("No items processed. Check if SDE_invTypeMaterials has data.");
+    LOG.error("Write aborted: Zero processed output lines generated.");
     return;
   }
 
-  outSheet.clearContents();
-  const finalPayload = [["Type ID", "Item Name", "Market Cost", "Melt Value", "Profit", "Margin %", "Updated"], ...outputRows];
+  const finalPayload = [
+    ["Type ID", "Item Name", "Market Cost", "Melt Value", "Profit", "Margin %", "Updated"],
+    ...outputRows
+  ];
 
+  outSheet.clearContents();
   outSheet.getRange(1, 1, finalPayload.length, 7).setValues(finalPayload);
 
-  // Clean up sheet length
-  const lastRow = outSheet.getLastRow();
-  const maxRows = outSheet.getMaxRows();
-  if (maxRows > lastRow) outSheet.deleteRows(lastRow + 1, maxRows - lastRow);
+  // Format & Sort
+  outSheet.getRange(2, 1, finalPayload.length - 1, 1).setNumberFormat("0");
+  outSheet.getRange(2, 3, finalPayload.length - 1, 3).setNumberFormat("#,##0.00");
+  outSheet.getRange(2, 6, finalPayload.length - 1, 1).setNumberFormat("0.00%");
+  outSheet.getRange(2, 1, finalPayload.length - 1, 7).sort({ column: 6, ascending: false });
 
-  // Update Named Range
-  const RANGE_NAME = "NR_REPRO_VALUE_TABLE";
-  const finalRange = outSheet.getRange(1, 1, lastRow, 7);
-  const existing = ss.getNamedRanges().find(r => r.getName() === RANGE_NAME);
-  if (existing) existing.setRange(finalRange); else ss.setNamedRange(RANGE_NAME, finalRange);
-
-  // BONUS: Format columns to make it look clean and sort by best Margin
-  if (lastRow > 1) {
-    outSheet.getRange(2, 3, lastRow - 1, 3).setNumberFormat("#,##0.00");
-    outSheet.getRange(2, 6, lastRow - 1, 1).setNumberFormat("0.00%");
-    finalRange.sort({ column: 6, ascending: false });
-  }
-
-  LOG.info(`Done: ${outputRows.length} items processed from SDE.`);
+  LOG.info(`Done: ${outputRows.length} items processed.`);
 }
-
