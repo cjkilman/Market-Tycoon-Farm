@@ -22,17 +22,28 @@ var LoggerEx = (function () {
     return { local: local, utc: utc };
   }
 
-  function out(levelName, levelVal, args, modTag) {
+function out(levelName, levelVal, args, modTag) {
     if (levelVal > current) return;
     var msg = fmtArgs(args);
     var ts = tsParts();
     var prefix = '[' + levelName + ']' + (modTag ? '[' + modTag + ']' : '')
                + ' ' + ts.local + ' | ' + ts.utc + ' — ';
-    Logger.log(prefix + msg);
-    // Optional V8 console mirroring:
-  //  if (levelName === 'ERROR') console.error(prefix + msg);
-  //  else if (levelName === 'WARN') console.warn(prefix + msg);
-  //  else console.log(prefix + msg);
+    
+    var fullMsg = prefix + msg;
+
+    // 1. The Legacy Logger (Useful if you still look at the classic Executions tab)
+  //  Logger.log(fullMsg);
+
+    // 2. THE UPGRADE: V8 Console Integration (Routes to GCP Logs Explorer)
+    if (levelName === 'ERROR') {
+      console.error(fullMsg);
+    } else if (levelName === 'WARN') {
+      console.warn(fullMsg);
+    } else if (levelName === 'INFO') {
+      console.info(fullMsg); // Use console.info for INFO level
+    } else {
+      console.log(fullMsg);  // DEBUG falls here
+    }
   }
 
   function makeTagged(modTag) {

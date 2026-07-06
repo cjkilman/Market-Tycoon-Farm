@@ -40,10 +40,20 @@ var NITRO_CONFIG = {
  * Helper to retrieve indices for Setting/Value columns
  */
 function _getColIndexMap(headers, names) {
+  // SAFETY CHECK: If headers or names are undefined, throw a clear error
+  if (!headers || !Array.isArray(headers)) {
+    throw new Error("_getColIndexMap: 'headers' is empty or invalid. Check the sheet structure.");
+  }
+  if (!names || !Array.isArray(names)) {
+    throw new Error("_getColIndexMap: 'names' is empty or invalid.");
+  }
+
   const map = {};
   names.forEach(name => {
     const idx = headers.indexOf(name);
-    if (idx === -1) throw new Error("Column not found: " + name);
+    // If the header isn't found, idx is -1. 
+    // Your code throws an error, which is good, but let's make it clearer.
+    if (idx === -1) throw new Error("Required column header missing in sheet: " + name);
     map[name] = idx;
   });
   return map;
@@ -240,10 +250,18 @@ function pauseSheet(ss) {
   try {
     const sheet = ss.getSheetByName('Utility');
     if (sheet) {
-      // Set flags to 0 to STOP formulas (Main.js checks this)
+      // 1. Set flags B3:D3 to 0 (Pause)
+      // 2. Set E3 to current time (Timestamp)
+      const timestamp = new Date();
+      
       sheet.getRange("B3:D3").setValues([[0, 0, 0]]);
+      sheet.getRange("E3").setValue(timestamp);
+      
+      // Optional: Set format to make it human-readable in the sheet
+      sheet.getRange("E3").setNumberFormat("yyyy-mm-dd hh:mm:ss");
+      
       SpreadsheetApp.flush();
-      console.log("[Anesthesia] Set Utility flags to 0 (Paused).");
+      console.log("[Anesthesia] Set Utility flags to 0 (Paused) and updated E3 timestamp.");
       return true;
     } else {
       console.warn("[pauseSheet] 'Utility' sheet not found.");
@@ -572,45 +590,58 @@ var previousChunkSize = 0;
 // ======================================================================
 
 /**
+ * NITRO SHARDED CACHE ENGINE: Handles memory-safe 100KB block allocations.
+ * Replaces high-overhead PropertiesService with fast, transaction-safe in-memory caching.
+ */
+
+/**
  * Splits a large string into 100KB chunks and stores them in ScriptCache.
  * @param {string} key The base cache key.
  * @param {string} content The string content to cache.
- * @param {number} ttlSeconds Expiration time in seconds.
+ * @param {number} ttlSeconds Expiration time in seconds (Max 21600 / 6 Hours).
  * @returns {boolean} True on success.
  */
 function _chunkAndPut(key, content, ttlSeconds) {
+  if (!content) return false;
+  
   const cache = CacheService.getScriptCache();
-  const MAX_SIZE = 100000; // Safe limit (100KB) per entry
+  const MAX_SIZE = 100000; // 100KB safe allocation threshold
+  const safeTtl = Math.min(Number(ttlSeconds) || 21600, 21600); // Guard against ESI max limits
 
   try {
-    // Case 1: Fits in single entry
+    // Case 1: Payload fits in a single memory slot
     if (content.length <= MAX_SIZE) {
-      cache.put(key, content, ttlSeconds);
-      // Clean up any potential old chunks from a previous larger save
-      const oldChunkCount = cache.get(key + "_chunks");
-      if (oldChunkCount) _deleteShardedData(key);
+      // Look for old meta markers BEFORE overwriting the primary key slot
+      const existingChunksMeta = cache.get(key + "_chunks");
+      
+      cache.put(key, content, safeTtl);
+      
+      // Clean up orphaned tail shards from a previous larger historical payload write
+      if (existingChunksMeta) {
+        _deleteShardedData(key, parseInt(existingChunksMeta, 10));
+      }
       return true;
     }
 
-    // Case 2: Needs Sharding
+    // Case 2: Multi-slot Sharding Needed
     const chunks = [];
     let offset = 0;
     while (offset < content.length) {
-      chunks.push(content.substr(offset, MAX_SIZE));
+      chunks.push(content.substring(offset, offset + MAX_SIZE));
       offset += MAX_SIZE;
     }
 
-    // Batch write chunks to cache
     const chunkMap = {};
-    chunks.forEach((c, i) => {
-      chunkMap[key + "_" + i] = c;
+    chunks.forEach((chunk, index) => {
+      chunkMap[`${key}_${index}`] = chunk;
     });
-    chunkMap[key + "_chunks"] = chunks.length.toString();
+    chunkMap[`${key}_chunks`] = chunks.length.toString();
 
-    cache.putAll(chunkMap, ttlSeconds);
+    // Batch commit memory states in a single atomic payload transaction
+    cache.putAll(chunkMap, safeTtl);
     return true;
   } catch (e) {
-    console.error(`_chunkAndPut failed for ${key}: ${e.message}`);
+    console.error(`[CACHE FAULT] _chunkAndPut failed for key ${key}: ${e.message}`);
     return false;
   }
 }
@@ -623,52 +654,61 @@ function _chunkAndPut(key, content, ttlSeconds) {
 function _getAndDechunk(key) {
   const cache = CacheService.getScriptCache();
 
-  // 1. Check for meta-key indicating chunks
-  const countStr = cache.get(key + "_chunks");
+  try {
+    // Check for meta-key indicating if data is sharded
+    const countStr = cache.get(key + "_chunks");
 
-  // Case A: Single Entry (No chunks)
-  if (!countStr) {
-    return cache.get(key);
-  }
-
-  // Case B: Reassemble Chunks
-  const count = parseInt(countStr, 10);
-  if (isNaN(count)) return null;
-
-  const keys = [];
-  for (let i = 0; i < count; i++) keys.push(key + "_" + i);
-
-  const chunks = cache.getAll(keys);
-  let full = "";
-
-  for (let i = 0; i < count; i++) {
-    const part = chunks[key + "_" + i];
-    if (!part) {
-      console.warn(`_getAndDechunk: Missing chunk ${i} for ${key}. Cache corrupted.`);
-      return null;
+    // Case A: Single Entry (Not sharded)
+    if (!countStr) {
+      return cache.get(key);
     }
-    full += part;
+
+    // Case B: Reassemble Chunks
+    const count = parseInt(countStr, 10);
+    if (isNaN(count) || count <= 0) return null;
+
+    const keys = [];
+    for (let i = 0; i < count; i++) {
+      keys.push(`${key}_${i}`);
+    }
+
+    // High-speed parallel block retrieval (Bypasses sequential cache loop lag)
+    const chunks = cache.getAll(keys);
+    let fullContentBuffer = "";
+
+    for (let i = 0; i < count; i++) {
+      const part = chunks[`${key}_${i}`];
+      if (!part) {
+        console.warn(`[CACHE CORRUPTION] Missing chunk index ${i} for key ${key}. Incomplete read aborted.`);
+        return null;
+      }
+      fullContentBuffer += part;
+    }
+    
+    return fullContentBuffer;
+  } catch (e) {
+    console.error(`[CACHE FAULT] _getAndDechunk failed for key ${key}: ${e.message}`);
+    return null;
   }
-  return full;
 }
 
 /**
- * Deletes all shards associated with a cache key.
- * @param {string} key The base cache key.
+ * UTILITY: Cleans old trailing fragments out of cache cells to prevent data leakage.
  */
-function _deleteShardedData(key) {
+function _deleteShardedData(baseKey, totalOldChunks) {
   const cache = CacheService.getScriptCache();
-  const countStr = cache.get(key + "_chunks");
-
-  if (countStr) {
-    const count = parseInt(countStr, 10);
-    for (let i = 0; i < count; i++) {
-      cache.remove(key + "_" + i);
-    }
-    cache.remove(key + "_chunks");
+  if (isNaN(totalOldChunks) || totalOldChunks <= 0) return;
+  
+  const keysToPurge = [`${baseKey}_chunks`];
+  for (let i = 0; i < totalOldChunks; i++) {
+    keysToPurge.push(`${baseKey}_${i}`);
   }
-  // Also remove the base key just in case
-  cache.remove(key);
+  
+  try {
+    cache.removeAll(keysToPurge);
+  } catch (e) {
+    console.warn(`[CACHE CLEANUP WARNING] Could not wipe secondary shards for ${baseKey}: ${e.message}`);
+  }
 }
 
 function manualEmergencyReset() {

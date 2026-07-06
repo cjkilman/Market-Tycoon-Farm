@@ -17,6 +17,34 @@ const MARKET_NAMED_RANGE = 'NR_MARKET_DATA';
 const RETRY_DELAY_MS = 30 * 1000;
 const PROP_KEY_FINALIZER_STEP = 'marketDataFinalizeStep';
 
+
+/**
+ * Clears all Script Properties for this specific project.
+ */
+function clearAllScriptProperties() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  scriptProperties.deleteAllProperties();
+  Logger.log("All Script Properties have been cleared.");
+}
+
+/**
+ * Clears all User Properties (stored per user per project).
+ */
+function clearAllUserProperties() {
+  const userProperties = PropertiesService.getUserProperties();
+  userProperties.deleteAllProperties();
+  Logger.log("All User Properties have been cleared.");
+}
+
+/**
+ * Clears all Document Properties (stored per spreadsheet/doc).
+ */
+function clearAllDocumentProperties() {
+  const documentProperties = PropertiesService.getDocumentProperties();
+  documentProperties.deleteAllProperties();
+  Logger.log("All Document Properties have been cleared.");
+}
+
 // --- TIME GATING CONSTANTS ---
 const HOURLY_RUN_INTERVAL_MS = 60 * 60 * 1000;
 const JOURNAL_RUN_INTERVAL_MS = 10 * 60 * 1000;
@@ -44,9 +72,9 @@ function fetchFilteredPricesSync(ss) {
 
   // --- CONFIGURATION ---
   const SOURCE_SHEET_ID = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
-  const SOURCE_RANGE = "'filtered prices'!E7:L800";
+  const SOURCE_TAB_NAME = "filtered prices";
   const TARGET_SHEET_NAME = "market price Tracker";
-  const RANGE_NAME = "NR_MARKET_MEDIAN_DATA"; // Define name at the top
+  const RANGE_NAME = "NR_MARKET_MEDIAN_DATA";
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
 
@@ -54,7 +82,17 @@ function fetchFilteredPricesSync(ss) {
     LOG.info("Connecting to external price database...");
 
     const sourceBook = SpreadsheetApp.openById(SOURCE_SHEET_ID);
-    const rawValues = sourceBook.getRange(SOURCE_RANGE).getValues();
+    const sourceSheet = sourceBook.getSheetByName(SOURCE_TAB_NAME);
+
+    if (!sourceSheet) {
+      throw new Error(`External tab '${SOURCE_TAB_NAME}' not found!`);
+    }
+
+    // Dynamically find the absolute bottom of the data
+    const lastRow = sourceSheet.getLastRow();
+
+    // Start at Row 7, Column 5 (E), drop down to lastRow, grab 8 columns across (E through L)
+    const rawValues = sourceSheet.getRange(7, 5, lastRow - 6, 8).getValues();
 
     if (!rawValues || rawValues.length === 0) {
       LOG.warn("Fetch aborted: No data found in the source range.");
@@ -74,16 +112,22 @@ function fetchFilteredPricesSync(ss) {
       return;
     }
 
-    // 1. Wipe and Write
+    // 1. Prepare the Canvas (Wipe and Resize)
     targetSheet.clearContents();
-    const finalRange = targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length);
-    finalRange.setValues(dataToWrite);
-
-    // 2. Trim excess rows
     const maxRows = targetSheet.getMaxRows();
-    if (maxRows > dataToWrite.length) {
+
+    // If the new payload is bigger than the sheet, add rows FIRST
+    if (maxRows < dataToWrite.length) {
+      targetSheet.insertRowsAfter(maxRows, dataToWrite.length - maxRows);
+    }
+    // If the sheet is too big, trim it down to save memory
+    else if (maxRows > dataToWrite.length) {
       targetSheet.deleteRows(dataToWrite.length + 1, maxRows - dataToWrite.length);
     }
+
+    // 2. Execute Write
+    const finalRange = targetSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length);
+    finalRange.setValues(dataToWrite);
 
     // 3. THE SAFE NAMED RANGE UPDATE
     // We do this LAST so the range matches the final sheet dimensions exactly.
@@ -136,11 +180,11 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
 function syncESIRegionData(ss) {
   const log = LoggerEx.withTag('REGION_SYNC');
   const sourceId = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
-  
+
   // 1. CHANGED: Pointing to the newly upgraded pipeline sheet
-  const sourceSheetName = "Publish_ESI_Region"; 
+  const sourceSheetName = "Publish_ESI_Region";
   const targetSheetName = "ESI_Region";
-  const NAMED_RANGE_NAME = "ESI_Region_Data"; 
+  const NAMED_RANGE_NAME = "ESI_Region_Data";
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const targetSheet = ss.getSheetByName(targetSheetName);
@@ -187,10 +231,10 @@ function syncESIRegionData(ss) {
  * This prevents the "A1:H" shrinkage that causes the 0-velocity bugs.
  */
 function updateMarketOrdersNamedRange(ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheetName = "Publish_ESI_Region_market_orders";
   const rangeName = "Region_Radar_Table"; // This is what your VLOOKUP uses
-  
+
   const sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     Logger.log("Error: Sheet " + sheetName + " not found.");
@@ -200,14 +244,14 @@ function updateMarketOrdersNamedRange(ss) {
   // 1. Find the boundaries
   const lastRow = sheet.getLastRow();
   // We force it to Column 24 (X) to ensure index 18 and 23 are always inside
-  const lastCol = 24; 
+  const lastCol = 24;
 
   // 2. Define the new range (A1 to X[LastRow])
   const newRange = sheet.getRange(1, 1, lastRow, lastCol);
 
-// 3. Update the Named Range STABLY
+  // 3. Update the Named Range STABLY
   const existingNamedRange = ss.getNamedRanges().find(nr => nr.getName() === rangeName);
-  
+
   if (existingNamedRange) {
     // This updates the "coordinates" without deleting the object,
     // which prevents the Velocity formula from losing its mind.
@@ -215,7 +259,7 @@ function updateMarketOrdersNamedRange(ss) {
   } else {
     ss.setNamedRange(rangeName, newRange);
   }
-  
+
   Logger.log("SUCCESS: " + rangeName + " now covers A1:X" + lastRow);
 }
 
@@ -327,15 +371,14 @@ function executeWithWaitLock(funcToRun, functionName, timeoutMs = LOCK_WAIT_TIME
   }
 }
 
-// ... [masterOrchestrator logic] ...
-
 function masterOrchestrator() {
+  const NOW_MS = new Date().getTime();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  
+
   // 1. GLOBAL SAFETY CHECK: Respect the Maintenance Flag
   const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
   const systemState = SCRIPT_PROP.getProperty(GLOBAL_STATE_KEY);
-  
+
   if (systemState === 'MAINTENANCE') {
     console.warn("Orchestrator: System is in MAINTENANCE mode (Control Sheet Rebuild). Aborting tick.");
     return; // Hard stop. Do not touch anything while Anesthesia is active.
@@ -347,7 +390,7 @@ function masterOrchestrator() {
   const lastMarketRun = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_MARKET_LAST_RUN) || '0', 10);
 
   const currentMinute = new Date().getMinutes();
-  const NOW_MS = new Date().getTime();
+
 
   const PROP_KEY_LEASE = 'marketDataJobLeaseUntil';
   const leaseUntil = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_LEASE) || '0', 10);
@@ -418,7 +461,65 @@ function forceResetMaint() {
   console.log("State cleared. BOM Engine is now next in queue.");
 }
 
-function runMaintenanceJobs() {
+/**
+ * Unified Tycoon Engine Pipeline
+ * Runs all three core calculation matrix passes sequentially in a single tick
+ * to guarantee absolute data dependency alignment with a 5-minute safety wall.
+ */
+function runUnifiedTycoonPipeline(startTime) {
+  startTime = startTime || new Date().getTime();
+  const log = LoggerEx.withTag('TYCOON_PIPELINE');
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Fallback check: if startTime wasn't provided, anchor to right now
+  const executionStart = startTime || Date.now();
+  const FIVE_MINUTES_MS = 300000;
+
+  log.info('--- Starting Unified Tycoon Calculation Pass ---');
+
+  // Pass 1: Pricing Matrices
+  try {
+    log.info('Executing Step 1/3: Projected Cost Table...');
+    generateProjectedCostTable(ss);
+  } catch (e) {
+    log.error('Step 1 (Costs) Failed. Aborting downstream pipeline to protect margins.', e);
+    return;
+  }
+
+  // SAFETY GATE 1: Check time before starting the heavy BOM expansion
+  if ((Date.now() - executionStart) >= FIVE_MINUTES_MS) {
+    log.warn('[Timeout Guard] Step 1 consumed too much time. Bailing out before Step 2 to avoid hard crash.');
+    return;
+  }
+
+  // Pass 2: Bills of Materials (Auto-Expansion)
+  try {
+    log.info('Executing Step 2/3: Full BOM Data Calculation...');
+    generateFullBOMData(ss);
+  } catch (e) {
+    log.error('Step 2 (BOM) Failed. Aborting downstream pipeline.', e);
+    return;
+  }
+
+  // SAFETY GATE 2: Check time before starting the scrap reprocessing calculations
+  if ((Date.now() - executionStart) >= FIVE_MINUTES_MS) {
+    log.warn('[Timeout Guard] Step 2 pushed past the 5-minute limit. Bailing out before Step 3.');
+    return;
+  }
+
+  // Pass 3: Scrap & Reprocessing Margins
+  try {
+    log.info('Executing Step 3/3: Reprocessed Value Table...');
+    generateReprocessedValueTable(ss);
+  } catch (e) {
+    log.error('Step 3 (Reprocessing) Failed.', e);
+  }
+
+  const totalTimeSec = ((Date.now() - executionStart) / 1000).toFixed(1);
+  log.info(`--- Tycoon Pipeline Complete. Total Execution Time: ${totalTimeSec}s ---`);
+}
+
+function runMaintenanceJobs(explicitNowMs) {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
   // 1. Priority Lock: Maintenance must yield to active Market Data syncs
@@ -429,20 +530,34 @@ function runMaintenanceJobs() {
     return;
   }
 
-  const NOW_MS = new Date().getTime();
+  const NOW_MS = explicitNowMs || new Date().getTime();
   const STANDARD_INTERVAL = 3600000; // 60m default
 
   // 2. Job Registry with targeted intervals
+  /**
+   * @typedef {Object} MaintenanceJob
+   * @property {string} name - The exact name of the global function to execute.
+   * @property {number} interval - Frequency gate (ms). Minimum time required between runs before the job is marked "due".
+   * @property {number} [lease] - Concurrency shield (ms). Active lock duration to prevent heavy tycoon tasks 
+   * from double-executing or cross-threading if an instance is still processing.
+   */
   const JOB_QUEUE = [
-    { name: 'generateFullBOMData', interval: 2700000, lease: 1200000 },
-     { name: 'generateReprocessedValueTable', interval: 2700000, lease: 1200000 },
-    { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
-    { name: 'Ledger_Import_CorpJournal', interval: 1800000 },
-    { name: 'processInternalBuffer', interval: 600000 }, 
+    // --- STEP 1: RAW INGESTION (ESI FEEDS) ---
+    { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL },
+    { name: 'syncCorpBlueprintsV12', interval: 2700000, lease: 1200000 }, // Moved up!
+    { name: 'TransactionsAndJournalSync', interval: STANDARD_INTERVAL },
+
+    // --- STEP 2: PROCESSING & MATERIAL ALIGNMENT ---
     { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'runIndustryLedgerPhase', interval: STANDARD_INTERVAL },
-    { name: 'cacheAllCorporateAssetsTrigger', interval: STANDARD_INTERVAL }
+    { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
 
+    // --- STEP 3: HEAVY TYCOON MATRIX MATH (DESTRUCTION & COGS) ---
+    { name: 'runUnifiedTycoonPipeline', interval: 2700000, lease: 1800000 },
+
+    // --- STEP 4: CLEANUP & HOUSEKEEPING ---
+    { name: 'purgeContractsWithLedgeredStatus', interval: 86400000 },
+    { name: 'runDowntimeMaintenance', interval: 86400000 }
   ];
 
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
@@ -456,11 +571,11 @@ function runMaintenanceJobs() {
     const lastRunTs = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
     const isDue = (NOW_MS - lastRunTs) >= job.interval;
 
-   // 3. Dynamic Lease Management: Now handles BOTH heavy tycoon steps dynamically
+    // 3. Dynamic Lease Management: Now handles BOTH heavy tycoon steps dynamically
     if (job.lease) {
       const leaseKey = job.name + '_LEASE';
       const activeLease = parseInt(SCRIPT_PROP.getProperty(leaseKey) || '0', 10);
-      
+
       if (isDue) {
         SCRIPT_PROP.deleteProperty(leaseKey);
       } else if (activeLease > NOW_MS) {
@@ -480,13 +595,17 @@ function runMaintenanceJobs() {
       }
 
       try {
-        const fn = this[job.name] || eval(job.name);
+        // GAS Safe: 'this' refers to the global scope. 'window' does not exist.
+        const fn = this[job.name];
+
         if (typeof fn === 'function') {
-          fn();
+          fn(); // Execute the job
           SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
           SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, ((currentIndex + 1) % JOB_QUEUE.length).toString());
           console.log(`[Maintenance] ${job.name} completed successfully.`);
           return; // One job per Orchestrator tick to save RAM
+        } else {
+          console.error(`[Maintenance] Critical: Function ${job.name} not found in global scope.`);
         }
       } catch (e) {
         console.error(`[Maintenance] Critical Failure in ${job.name}: ${e.message}`);
@@ -701,7 +820,7 @@ function finalizeMarketDataUpdate() {
   const transactionResult = guardedSheetTransaction(() => {
     // === 1. ACTIVATE ANESTHESIA LOCK ===
     SCRIPT_PROP.setProperty('GLOBAL_SYSTEM_STATE', 'MAINTENANCE');
-    pauseSheet(ss_inner); 
+    pauseSheet(ss_inner);
 
     try {
       // 2. Perform the Atomic Swap (Hot Swap) while the sheet is dead
@@ -711,13 +830,13 @@ function finalizeMarketDataUpdate() {
       fetchFilteredPricesSync(ss_inner);
       syncESIRegionData(ss_inner);
       updateMarketOrdersNamedRange(ss_inner);
-      
+
 
       return swapRes;
 
     } finally {
       // === 5. DEACTIVATE ANESTHESIA (WAKE UP THE SHEET) ===
-      wakeUpSheet(ss_inner); 
+      wakeUpSheet(ss_inner);
       SCRIPT_PROP.setProperty('GLOBAL_SYSTEM_STATE', 'RUNNING');
       console.log("Anesthesia: System state restored to RUNNING.");
     }

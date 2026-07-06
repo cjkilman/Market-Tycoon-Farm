@@ -42,15 +42,28 @@ function feedFallBack(typeIDs, orderType = "sell", orderLevel = "min", ss) {
  * @return {Object} An object containing {locationID, locationType}.
  * @throws {Error} If the sheet, named range, or source key is missing.
  */
+// 1. Rename the cache variable to avoid naming collisions
+var _marketConfigCache = {}; 
+
 function getMarketConfig(source, ss) {
+  // 2. Return cached value immediately
+  if (_marketConfigCache[source]) return _marketConfigCache[source];
+  
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   
-  const sheet = ss.getSheetByName("Location List");
-  const typeRange = ss.getRangeByName("setting_market_range");
+  // 3. Cache the sheet object so we don't fetch it every time
+  if (!_marketConfigCache._sheet) {
+    _marketConfigCache._sheet = ss.getSheetByName("Location List");
+    _marketConfigCache._typeRange = ss.getRangeByName("setting_market_range");
+  }
+
+  const sheet = _marketConfigCache._sheet;
+  const typeRange = _marketConfigCache._typeRange;
 
   if (!sheet) throw new Error("Sheet 'Location List' not found.");
   if (!typeRange) throw new Error("Named Range 'setting_market_range' not found.");
 
+  // Fetch only once
   const locationType = typeRange.getValue();
 
   const configs = {
@@ -66,7 +79,9 @@ function getMarketConfig(source, ss) {
 
   const config = configs[source.toLowerCase()];
   if (!config) throw new Error(`Source "${source}" undefined.`);
-
+  
+  // 4. Save to cache and return
+  _marketConfigCache[source] = config;
   return config;
 }
 
@@ -94,12 +109,18 @@ function getMasterBatchFromControlTable(ss = null) {
     
     for (let i = 0; i < values.length; i++) {
       const row = values[i];
-      // Validates that both TypeID and LocationID are present before pushing
-      if (row[0] && row[2]) {
+      
+      // Force conversion to numbers immediately
+      const tId = Number(row[0]);
+      const mId = Number(row[2]);
+      
+      // Strict validation: Both must resolve to positive numbers.
+      // This automatically destroys #N/A, strings, spaces, and empty cells.
+      if (tId > 0 && mId > 0) {
         marketRequests.push({
-          type_id: Number(row[0]),
-          market_type: String(row[1]),
-          market_id: Number(row[2])
+          type_id: tId,
+          market_type: String(row[1]).trim(),
+          market_id: mId
         });
       }
     }
