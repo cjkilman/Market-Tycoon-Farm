@@ -341,10 +341,7 @@ function generateConsolidatedRequirements(ss) {
     // 1. Write the payload data matrix
     sheet.getRange(2, 1, output.length, OUT_HEADERS.length).setValues(output);
 
-    // 2. Format columns accurately
-    sheet.getRange(2, 2, output.length, 1).setNumberFormat("0.00%");           // Col B: Buffer Status
-    sheet.getRange(2, 3, output.length, 4).setNumberFormat("#,##0");           // Cols C, D, E, F: Whole Numbers
-    sheet.getRange(2, 7, output.length, 1).setNumberFormat("#,##0.00 [$ISK]"); // Col G: WAG Cost Allocation
+
   } else {
     console.warn("Execution finished: No material rows met the rawDeficit > 0 conditional.");
   }
@@ -368,7 +365,7 @@ function runIndustryLedgerPhase(ss) {
     // PHASE 0: Fetcher (Write Only)
     if (phase === 0) {
       log.info('Phase 0: Fetching ESI Corp Jobs...');
-      _getCorporateJobsRaw(ss, true);
+      _getCorporateJobsRaw(ss, false); //Trust the Cache Time Expire
       phase = 1;
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '1');
     }
@@ -391,7 +388,7 @@ function runIndustryLedgerPhase(ss) {
     // PHASE 2: Processor
     if (phase === 2 && !isTimeUp()) {
       log.info('Phase 2: Manufacturing Ledger Update...');
-      runIndustryLedgerUpdate(ss, jobMap);
+      runIndustryLedgerUpdate(ss, START_TIME, jobMap);
       phase = 4;
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '4');
     }
@@ -470,12 +467,12 @@ function XRAY_MISSING_JOB() {
 }
 
 /**
- * 🌊 WATERFALL BLUEPRINT STATS ENGINE
- * Sequence: Config CSV (Base) -> Ledger (Contract/Industry Weighted Avg)
+ * 🌊 WATERFALL BLUEPRINT STATS ENGINE (FULLY UPGRADED)
+ * Sequence: Ledger (Actuals) -> Master Config Engine -> [Yields to ESI if blank]
  */
-function _buildWaterfallBlueprintStatsMap(targetBpIds, presetMap) {
-  // SAFETY: If presetMap is missing, initialize it so .get() won't crash
-  const map = presetMap || new Map();
+function _buildWaterfallBlueprintStatsMap(targetBpIds, configMap) {
+  // SAFETY: If configMap is missing, initialize it so .get() won't crash
+  const map = configMap || new Map();
   const statsMap = new Map();
 
   // 1. Query Ledger
@@ -506,35 +503,116 @@ function _buildWaterfallBlueprintStatsMap(targetBpIds, presetMap) {
     target.totalQty += qty;
   });
 
-  // 3. Resolve: Ledger (Actuals) -> Fallback to Config CSV (Baseline)
+  // 3. Resolve: Ledger (Actuals) -> Fallback to Master Config
   targetBpIds.forEach(bpId => {
-    const config = map.get(bpId) || { max_me: 0, max_te: 0, preset_runs: 0 };
+    const config = map.get(bpId);
     const data = grouped[bpId];
 
     let me, te;
+    let hasValidData = false;
 
     // 1. Try Ledger First (Priority: Contracts > Industry)
     if (data && data.contracts.totalQty > 0) {
       me = Math.round(data.contracts.weightedMe / data.contracts.totalQty);
       te = Math.round(data.contracts.weightedTe / data.contracts.totalQty);
+      hasValidData = true;
     } else if (data && data.industry.totalQty > 0) {
       me = Math.round(data.industry.weightedMe / data.industry.totalQty);
       te = Math.round(data.industry.weightedTe / data.industry.totalQty);
+      hasValidData = true;
     }
-    // 2. Fallback to Config if Ledger data is missing
-    else {
-      me = config.max_me;
-      te = config.max_te;
+    // 2. Fallback to Master Config (Using the new camelCase variables)
+    else if (config) {
+      me = config.maxMe;
+      te = config.maxTe;
+      hasValidData = true;
     }
 
-    statsMap.set(bpId, {
-      me: me,
-      te: te,
-      runs: config.preset_runs
-    });
+    // 3. ONLY set the map if we actually found real data.
+    if (hasValidData) {
+      statsMap.set(bpId, {
+        me: me,
+        te: te,
+        runs: config ? config.presetRuns : 0
+      });
+    }
   });
 
   return statsMap;
+}
+
+/**
+ * 🧮 CORE INDUSTRY MATH ENGINE (DRY)
+ * Centralizes EVE batch formulas, ME discounts, and BPC amortization.
+ * Used by both the Projected Cost engine and the Historical Ledger.
+ */
+function _calculateJobFinancials(params) {
+  const {
+    bpId,
+    activityId,
+    runs,
+    meLevel,
+    materials, // Array of SDE materials
+    costMap,
+    amortMap,
+    internalBpcMap,
+    bpcWacData,
+    presetRuns, // Needed to normalize bulk BPC contract values
+    baseYield,
+    actualInstallCost, // Passed from ESI. If undefined, it uses the estimate.
+    estInstallRate // e.g., 0.05
+  } = params;
+
+  // 1. Amortization (BPC / Setup Costs)
+  let amortization = 0;
+  if (amortMap.has(bpId)) {
+    amortization = amortMap.get(bpId) * runs;
+  } else {
+    const contractValue = internalBpcMap.get(bpId);
+    if (contractValue && contractValue > 0) {
+      // Normalizes bulk contract values down to a strict per-run cost
+      const pRuns = presetRuns || 1;
+      amortization = (contractValue / pRuns) * runs;
+    } else {
+      amortization = (Number(bpcWacData[bpId]) || 0) * runs;
+    }
+  }
+
+  // 2. Material Cost (EVE Batch Formula)
+  const meMultiplier = activityId === 1 ? (100 - meLevel) / 100 : 1;
+  let materialCost = 0;
+
+  materials.forEach(m => {
+    if (m.activityID !== activityId) return;
+    const baseQty = Number(m.quantity);
+
+    // EVE BATCH FORMULA: Math.ceil( Base * (1 - ME/100) * Runs )
+    // Math.max(runs, ...) guarantees at least 1 unit is consumed per run
+    const jobQty = Math.max(runs, Math.ceil(baseQty * meMultiplier * runs));
+    const unitPrice = (costMap.get(m.materialTypeID) || { landed: 0 }).landed;
+
+    materialCost += (jobQty * unitPrice);
+  });
+
+  // 3. Installation Cost
+  // If ESI gave us an actual live tax, use it. Otherwise, estimate it.
+  const installCost = actualInstallCost !== undefined
+    ? Number(actualInstallCost)
+    : materialCost * (estInstallRate || 0.05);
+
+  // 4. Final Yield & Unit Cost
+  const totalYield = Math.max(baseYield * runs, 1);
+  const totalCost = materialCost + installCost + amortization;
+  const unitCost = totalCost / totalYield;
+
+  return {
+    materialCost: materialCost,
+    amortization: amortization,
+    installCost: installCost,
+    totalCost: totalCost,
+    unitCost: unitCost,
+    totalYield: totalYield
+  };
 }
 
 // ----------------------------------------------------------------------
@@ -546,22 +624,16 @@ function _buildWaterfallBlueprintStatsMap(targetBpIds, presetMap) {
  * Finalized: Event Sourcing Architecture.
  * FIXED: Uses SDE Name Mapping for ledger item names.
  * FIXED: Pre-fetches Datacore/Decryptor costs to eliminate 0-cost bugs.
- */
-/**
- * STAGE 1: BPC Creation Ledger
- * Finalized: Event Sourcing Architecture.
- * FIXED: Uses SDE Name Mapping for ledger item names.
- * FIXED: Pre-fetches Datacore/Decryptor costs to eliminate 0-cost bugs.
  * FIXED: ESI Data Sanitizer added to prevent undefined type_id crashes.
  */
-function runBpcCreationLedger(ss, jobMap, holdAnesthesia = false) {
+function runBpcCreationLedger(ss, jobMap) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!jobMap) jobMap = _getJobMap(ss);
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  LOG_INDUSTRY.info("Running BPC Creation Ledger (Stage 1)...");
 
-  // --- 1. SETUP & SDE LOOKUPS ---
-  const presetRunsMap = _getConfigPresetRuns(ss);
+  // Standard Setup
+  const configMap = _getMasterBlueprintConfig(ss);
   const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
   const nameMap = _getSdeNameMap(ss);
   const encryptorMatrixMap = _loadEncryptorMatrixMap(ss);
@@ -573,144 +645,67 @@ function runBpcCreationLedger(ss, jobMap, holdAnesthesia = false) {
 
   if (newBpcJobs.length === 0) return;
 
-  // --- 1.5 ESI DATA SANITIZER ---
-  // Fixes ESI jobs missing IDs or returning whitespace/empty strings from the cache
+  // Sanitizer
   const validBpcJobs = [];
   for (const job of newBpcJobs) {
-    // 1. Force strict integer parsing. This kills spaces, empty strings, and nulls.
     let pid = parseInt(job.product_type_id, 10);
-
-    // 2. If it's invalid (NaN) or zero, attempt to derive it
     if (isNaN(pid) || pid <= 0) {
-      if (job.activity_id === INDUSTRY_ACTIVITY_COPYING) {
-        pid = parseInt(job.blueprint_type_id, 10);
-      } else if (job.activity_id === INDUSTRY_ACTIVITY_INVENTION) {
-        const productKey = `${job.activity_id}:${job.blueprint_type_id}`;
-        const productInfo = sdeProdMap.get(productKey);
-
-        if (Array.isArray(productInfo)) {
-          const target = productInfo.find(p => p.activityID === job.activity_id);
-          if (target) pid = parseInt(target.typeID || target.productTypeID, 10);
-        } else if (productInfo) {
-          pid = parseInt(productInfo.typeID || productInfo.productTypeID, 10);
-        }
+      if (job.activity_id === INDUSTRY_ACTIVITY_COPYING) pid = parseInt(job.blueprint_type_id, 10);
+      else if (job.activity_id === INDUSTRY_ACTIVITY_INVENTION) {
+        const productInfo = sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`);
+        if (productInfo) pid = parseInt(productInfo.typeID || productInfo.productTypeID, 10);
       }
     }
-
-    // 3. Final execution check: If it's STILL not a valid number, we must drop the job.
-    if (isNaN(pid) || pid <= 0) {
-      LOG_INDUSTRY.warn(`Failed to derive target product for Job ${job.job_id}. Skipping.`);
-      continue;
-    }
-
-    // 4. Overwrite the dirty data with the guaranteed clean integer
+    if (isNaN(pid) || pid <= 0) continue;
     job.product_type_id = pid;
     validBpcJobs.push(job);
   }
 
-  // Replace the raw array with our clean array
-  newBpcJobs = validBpcJobs;
-  if (newBpcJobs.length === 0) return;
-
-  // --- 2. MARKET PRE-FETCH (Fixes 0-cost bug) ---
+  // Batch Processing
   const allRequiredIds = new Set();
   encryptorMatrixMap.forEach(data => allRequiredIds.add(data.typeID));
-  newBpcJobs.forEach(job => {
+  validBpcJobs.forEach(job => {
     const materials = sdeMatMap.get(job.blueprint_type_id);
     if (materials) materials.forEach(m => allRequiredIds.add(m.materialTypeID));
   });
   const costMap = _getBlendedCostMap(ss, Array.from(allRequiredIds), true);
 
-  // --- 3. EVENT SOURCING (Rebuild History from Ledger) ---
-  const ledgerAPI = ML.forSheet('Material_Ledger');
-  const historicalLedgerData = ledgerAPI.query({
-    type_id: Array.from(new Set(newBpcJobs.map(j => j.product_type_id))),
-    source: ["INVENTION", "COPYING", "INVENTION_LOSS"]
-  });
-
-  const dynamicHistory = new Map();
-  historicalLedgerData.sort((a, b) => new Date(a.date) - new Date(b.date));
-  historicalLedgerData.forEach(row => {
-    if (row.metadata?.cumulative_cost) {
-      dynamicHistory.set(Number(row.type_id), {
-        cost: Number(row.metadata.cumulative_cost),
-        runs: Number(row.metadata.cumulative_runs)
-      });
-    }
-  });
-
-  // --- 4. CALCULATION LOOP ---
+  const ledgerAPI = ML.forSheet('Material_Ledger', ss);
   const ledgerObjects = [];
   const newlyProcessedIds = [];
 
-  for (const job of newBpcJobs) {
-    
-    // PUT THESE BACK: The sanitizer already guaranteed the ID is valid, 
-    // so itemName will perfectly grab the T1 Blueprint name for failures.
+  for (const job of validBpcJobs) {
     const itemName = nameMap.get(job.product_type_id) || "Blueprint " + job.product_type_id;
     let totalMaterialCost = 0;
 
     if (job.activity_id === INDUSTRY_ACTIVITY_INVENTION) {
-      const runMod = (job.licensed_runs / job.runs) - (presetRunsMap.get(job.product_type_id) || 1);
+      const baseRuns = configMap.has(job.product_type_id) ? configMap.get(job.product_type_id).presetRuns : 1;
+      const runMod = (job.licensed_runs / job.runs) - baseRuns;
       const decryptor = encryptorMatrixMap.get(runMod);
-
-      if (decryptor) {
-        totalMaterialCost += ((costMap.get(decryptor.typeID)?.landed || 0) * job.runs);
-      }
-
+      if (decryptor) totalMaterialCost += ((costMap.get(decryptor.typeID)?.landed || 0) * job.runs);
       (sdeMatMap.get(job.blueprint_type_id) || []).filter(m => m.activityID === INDUSTRY_ACTIVITY_INVENTION).forEach(mat => {
         totalMaterialCost += ((costMap.get(mat.materialTypeID)?.landed || 0) * mat.quantity * job.runs);
       });
-
-      const t1Cost = internalBpcMap.get(job.blueprint_type_id) || (Number(bpcWacData[job.blueprint_type_id]) || 0);
-      totalMaterialCost += (t1Cost * job.runs);
+      totalMaterialCost += ((internalBpcMap.get(job.blueprint_type_id) || Number(bpcWacData[job.blueprint_type_id] || 0)) * job.runs);
     }
 
     const totalActualCost = totalMaterialCost + (Number(job.cost) || 0);
-    const hist = dynamicHistory.get(job.product_type_id) || { cost: 0, runs: 0 };
-    hist.cost += totalActualCost;
-    hist.runs += job.licensed_runs;
-    dynamicHistory.set(job.product_type_id, hist);
-
-    // PERSIST ROW
-    // FIX: ESI uses successful_runs for failures, not licensed_runs!
-    if (job.successful_runs === 0 && job.activity_id === INDUSTRY_ACTIVITY_INVENTION) {
-      ledgerObjects.push(createLedgerRow(job, "INVENTION_LOSS", 0, totalActualCost, hist, "Failed Invention: " + itemName));
-    } else if (job.successful_runs > 0) {
-      
-      // Calculate total BPC runs actually produced
-      const totalOutputRuns = job.successful_runs * job.licensed_runs;
-      
-      ledgerObjects.push(createLedgerRow(
-        job, 
-        (job.activity_id === INDUSTRY_ACTIVITY_INVENTION ? "INVENTION" : "COPYING"), 
-        totalOutputRuns, 
-        totalActualCost / totalOutputRuns, 
-        hist, 
-        itemName
-      ));
+    if (job.successful_runs > 0) {
+      ledgerObjects.push(createLedgerRow(job, (job.activity_id === INDUSTRY_ACTIVITY_INVENTION ? "INVENTION" : "COPYING"), job.successful_runs * job.licensed_runs, totalActualCost / (job.successful_runs * job.licensed_runs), { cost: totalActualCost, runs: job.licensed_runs }, itemName));
     }
     newlyProcessedIds.push(job.job_id);
   }
 
-  // --- 5. COMMIT ---
-  // strictly enforcing update keys
-  if (ledgerObjects.length > 0) ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, holdAnesthesia);
-
-  const finalWAC = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
-  dynamicHistory.forEach((hist, bpID) => hist.runs > 0 && (finalWAC[bpID] = hist.cost / hist.runs));
-
-  SCRIPT_PROP.setProperty(BPC_WAC_KEY, JSON.stringify(finalWAC));
+  if (ledgerObjects.length > 0) ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, true);
   newlyProcessedIds.forEach(id => processedJobIds.add(id));
   SCRIPT_PROP.setProperty(BPC_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-1000)));
-  SCRIPT_PROP.deleteProperty('BpcHistoryData');
 }
 
 function createLedgerRow(job, source, qty, unitValue, hist, name) {
-if (!job.product_type_id) {
-      // This instantly kills the script and logs the custom message
-      throw new Error(`CRITICAL ESI FAILURE: Job ID ${job.job_id} returned without a product_type_id. Sync halted.`);
-    }
+  if (!job.product_type_id) {
+    // This instantly kills the script and logs the custom message
+    throw new Error(`CRITICAL ESI FAILURE: Job ID ${job.job_id} returned without a product_type_id. Sync halted.`);
+  }
   return {
     date: job.date || job.end_date,
     type_id: job.product_type_id,
@@ -805,210 +800,183 @@ function INSPECT_PROCESSED_JOB_IDS() {
 }
 
 /**
- * STAGE 2: Manufacturing Ledger (Updated for ME/TE and Object-based Costing)
- * FIXED: job.cost is safely cast to prevent NaN crashes on zero-tax ESI responses.
+ * ⚙️ MASTER BLUEPRINT CONFIG ENGINE (DRY)
+ * Loads Config_BPC_Runs exactly once and returns a comprehensive 
+ * configuration object for every tracked blueprint.
  */
-function runIndustryLedgerUpdate(ss, jobMap, holdAnesthesia) {
-  if (!holdAnesthesia) holdAnesthesia = false;
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+let _masterConfigCache = null; // Caches globally to save API/Sheet calls
 
+function _getMasterBlueprintConfig(ss) {
+  if (_masterConfigCache) return _masterConfigCache;
+
+  const CONFIG_NAME = "Config_BPC_Runs";
+  const CONFIG_HEADERS = ['bp_type_id', 'preset_runs', 'max_me', 'max_te'];
+  const configMap = new Map();
+  const sheet = getOrCreateSheet(ss, CONFIG_NAME, CONFIG_HEADERS);
+
+  if (sheet.getLastRow() >= 2) {
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col = _getColIndexMap(headers, CONFIG_HEADERS);
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+
+    data.forEach(r => {
+      const id = Number(r[col.bp_type_id]);
+      if (id > 0) {
+        configMap.set(id, {
+          presetRuns: Number(r[col.preset_runs]) || 1,
+          maxMe: Number(r[col.max_me]) || 10, // Smart fallback
+          maxTe: Number(r[col.max_te]) || 20
+        });
+      }
+    });
+  }
+
+  _masterConfigCache = configMap;
+  return configMap;
+}
+
+/**
+ * 🧠 SMART CONFIG RESOLVER
+ * Centralizes the baseline ME/TE rules. 
+ * Checks the Config CSV first. If missing, it applies the T1/T2 heuristic.
+ */
+function _resolveSmartConfig(bpId, bpName, ss) {
+  const configMap = _getMasterBlueprintConfig(ss);
+
+  // 1. Explicit Config Sheet Override (If you manually set it in the sheet, it wins)
+  if (configMap.has(bpId)) {
+    const explicit = configMap.get(bpId);
+    if (explicit.maxMe > 0) return explicit;
+  }
+
+  // 2. The Global Smart Defaults (Define your corp standards here)
+  const T1_ME = 10;
+  const T2_ME = 2; // Change to 5 if you standardize around specific decryptors
+
+  const isTech2 = String(bpName).trim().endsWith("II");
+
+  return {
+    presetRuns: configMap.has(bpId) ? configMap.get(bpId).presetRuns : 1,
+    maxMe: isTech2 ? T2_ME : T1_ME,
+    maxTe: isTech2 ? 4 : 20,
+    source: isTech2 ? "Default T2" : "Default T1" // Tags it for the logger
+  };
+}
+
+/**
+ * STAGE 2: Manufacturing Ledger (Updated for ME/TE and Object-based Costing)
+ * FIXED: job.cost is safely cast to prevent NaN crashes.
+ * FIXED: Circuit breaker added to prevent execution time timeouts.
+ */
+function runIndustryLedgerUpdate(ss, startTime, jobMap) {
+  // 1. Resolve arguments with fallback defaults
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!jobMap) jobMap = _getJobMap(ss);
+  if (!startTime) startTime = Date.now();
+
+  // 2. SAFETY CHECK: Ensure jobMap is actually a Map before proceeding
+  // If _getJobMap failed, this stops the script cleanly instead of crashing later.
   if (!jobMap || typeof jobMap.entries !== 'function') {
     const log = (typeof LOG_INDUSTRY !== 'undefined') ? LOG_INDUSTRY : console;
-    log.warn("Abort: jobMap is empty or invalid. Skipping Phase 2.");
+    log.error("CRITICAL: jobMap failed to initialize in Phase 2. Aborting.");
     return;
   }
-  
+
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
+  // 1. Initial Setup
   const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
-  if (sdeMatMap.size === 0) { LOG_INDUSTRY.warn("SDE Sheets empty."); return; }
-
+  if (sdeMatMap.size === 0) return;
   const nameMap = _getSdeNameMap(ss);
   const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
-
-  const targetActivities = [
-    INDUSTRY_ACTIVITY_MANUFACTURING,
-    INDUSTRY_ACTIVITY_INVENTION,
-    INDUSTRY_ACTIVITY_ME_RESEARCH,
-    INDUSTRY_ACTIVITY_TE_RESEARCH
-  ];
-
-  const newJobs = [];
-  for (const [jobId, job] of jobMap.entries()) {
-    const validStates = ['active', 'ready', 'delivered'];
-    const isValidState = validStates.includes(job.status);
-    const isTargetActivity = targetActivities.includes(parseInt(job.activity_id));
-    const isNew = !processedJobIds.has(jobId.toString());
-
-    if (isValidState && isTargetActivity && isNew) {
-      newJobs.push(job);
-    }
-  }
-
-  if (newJobs.length === 0) {
-    LOG_INDUSTRY.info("No new manufacturing jobs.");
-    return;
-  }
-
-  const allRequiredMaterialIds = new Set();
-  for (const job of newJobs) {
-    const materials = sdeMatMap.get(job.blueprint_type_id);
-    if (materials) {
-      for (const mat of materials) {
-        if (mat.activityID === INDUSTRY_ACTIVITY_MANUFACTURING || mat.activityID === INDUSTRY_ACTIVITY_INVENTION) {
-          allRequiredMaterialIds.add(mat.materialTypeID);
-        }
-      }
-    }
-  }
-
-  const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMaterialIds));
+  const configMap = _getMasterBlueprintConfig(ss);
+  const costMap = _getBlendedCostMap(ss);
   const amortMap = _getBpoAmortizationMap(ss);
   const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
   const bpoAttributesMap = _getBpoAttributesMapFromEsi();
   const internalBpcMap = _buildInternalBpcMap_(ss);
 
-  const getBpcCostPerRun = (bpID) => {
-    const cost = bpcWacData[bpID];
-    return (cost !== undefined && !isNaN(Number(cost))) ? Number(cost) : 0;
-  };
+  // 2. Filter New Jobs
+  const targetActivities = [1, 5, 8, 3, 4];
+  const newJobs = Array.from(jobMap.values()).filter(job =>
+    ['active', 'ready', 'delivered'].includes(job.status) &&
+    targetActivities.includes(parseInt(job.activity_id)) &&
+    !processedJobIds.has(job.job_id.toString())
+  );
+
+  if (newJobs.length === 0) {
+    LOG_INDUSTRY.info("No new jobs to process.");
+    return;
+  }
 
   const ledgerObjects = [];
   const newlyProcessedIds = [];
-  const ledgerAPI = ML.forSheet('Material_Ledger');
+  const ledgerAPI = ML.forSheet('Material_Ledger', ss);
 
+  // 3. Process
+  // No job limit; will process until all jobs are done or 4 minutes elapse
   for (const job of newJobs) {
+    // Time-based safety breaker (240,000ms = 4 minutes)
+    if ((Date.now() - (startTime || Date.now()) > 240000)) {
+      LOG_INDUSTRY.warn(`Circuit Breaker: Time limit nearing. Saving progress at ${ledgerObjects.length} jobs. Run again to continue.`);
+      break;
+    }
+
     try {
-      // --- STRICT VALIDATION & SETUP ---
       const materials = sdeMatMap.get(job.blueprint_type_id);
-      const productKey = `${job.activity_id}:${job.blueprint_type_id}`;
-      const product = sdeProdMap.get(productKey);
+      if (!materials) continue;
 
-      if (!materials || (!product && job.activity_id === INDUSTRY_ACTIVITY_MANUFACTURING)) {
-        throw new Error(`Missing SDE data for job ${job.job_id}.`);
-      }
-
-      // Enforce runs as a valid integer
       const runs = parseInt(job.runs, 10);
-      if (isNaN(runs) || runs <= 0) {
-        throw new Error(`Job ${job.job_id}: Invalid 'runs' value: ${job.runs}`);
-      }
-
       const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id);
       const meLevel = bpoItemAttributes ? bpoItemAttributes.material_efficiency : 0;
-      const teLevel = bpoItemAttributes ? bpoItemAttributes.time_efficiency : 0;
-      const jobDate = job.end_date || job.start_date;
+      const productKey = `${job.activity_id}:${job.blueprint_type_id}`;
+      const product = sdeProdMap.get(productKey);
+      let yieldPerRun = (Array.isArray(product) ? product.find(p => p.activityID === job.activity_id)?.quantity : product?.quantity) || 1;
+      const presetRuns = configMap.has(job.blueprint_type_id) ? configMap.get(job.blueprint_type_id).presetRuns : 1;
 
-      // --- RESEARCH JOBS ---
-      if (job.activity_id === INDUSTRY_ACTIVITY_ME_RESEARCH || job.activity_id === INDUSTRY_ACTIVITY_TE_RESEARCH) {
-        const jobCost = Number(job.cost);
-        if (isNaN(jobCost)) throw new Error(`Job ${job.job_id}: Invalid research cost.`);
-
-        ledgerObjects.push({
-          date: jobDate,
-          type_id: job.blueprint_type_id,
-          item_name: "Research Cost: " + (nameMap.get(job.blueprint_type_id) || `BP ${job.blueprint_type_id}`),
-          qty: 0,
-          unit_value: '',
-          source: "RESEARCH_COST",
-          contract_id: job.job_id,
-          char: job.installer_id,
-          unit_value_filled: jobCost,
-          metadata: { me: meLevel, te: teLevel }
-        });
-        newlyProcessedIds.push(job.job_id);
-        continue;
-      }
-
-      // --- MANUFACTURING & INVENTION ---
-      const materialDiscountFactor = (job.activity_id === INDUSTRY_ACTIVITY_MANUFACTURING) ? (1 - (meLevel / 100)) : 1;
-      let totalMaterialCostPerRun = 0;
-
-      for (const mat of materials) {
-        if (mat.activityID !== job.activity_id) continue;
-        const costData = costMap.get(mat.materialTypeID) || { raw: 0, landed: 0 };
-        const matCost = costData.landed;
-
-        if (typeof matCost !== 'number' || isNaN(matCost)) {
-          throw new Error(`Job ${job.job_id}: Material type ${mat.materialTypeID} has invalid cost.`);
-        }
-        totalMaterialCostPerRun += matCost * (mat.quantity * materialDiscountFactor);
-      }
-
-      const totalMaterialCostForAllRuns = totalMaterialCostPerRun * runs;
-      const totalJobInstallationCost = Number(job.cost);
-
-      if (isNaN(totalJobInstallationCost)) {
-        throw new Error(`Job ${job.job_id}: Invalid job installation cost found.`);
-      }
-
-      let amortizationSurcharge = 0;
-      if (amortMap.has(job.blueprint_type_id)) {
-        amortizationSurcharge = amortMap.get(job.blueprint_type_id) * runs;
-      } else {
-        const contractBpcValue = internalBpcMap.get(job.blueprint_type_id);
-        if (contractBpcValue && contractBpcValue > 0) {
-          const presetRunsMap = _getConfigPresetRuns(ss);
-          const presetRuns = presetRunsMap.get(job.blueprint_type_id) || 1;
-          amortizationSurcharge = (contractBpcValue / presetRuns) * runs;
-        } else {
-          amortizationSurcharge = getBpcCostPerRun(job.blueprint_type_id) * runs;
-        }
-      }
-
-      if (isNaN(amortizationSurcharge)) {
-        throw new Error(`Job ${job.job_id}: Amortization calculation resulted in NaN.`);
-      }
-
-      const totalActualCost = totalMaterialCostForAllRuns + totalJobInstallationCost + amortizationSurcharge;
-
-      let yieldPerRun = 1;
-      if (Array.isArray(product)) {
-        const targetProduct = product.find(p => p.activityID === job.activity_id);
-        yieldPerRun = targetProduct ? targetProduct.quantity : 1;
-      } else if (product) {
-        yieldPerRun = product.quantity || 1;
-      }
-
-      const totalUnitsProduced = Math.max(yieldPerRun * runs, 1);
-      if (isNaN(totalUnitsProduced) || totalUnitsProduced <= 0) {
-        throw new Error(`Job ${job.job_id}: Invalid units produced: ${totalUnitsProduced}`);
-      }
-
-      const unitManufacturingCost = totalActualCost / totalUnitsProduced;
-      if (!job.product_type_id) throw new Error(`Job ${job.job_id}: No Product ID on Blueprint ${job.blueprint_type_id}`);
+      const financials = _calculateJobFinancials({
+        bpId: job.blueprint_type_id,
+        activityId: parseInt(job.activity_id, 10),
+        runs: runs,
+        meLevel: meLevel,
+        materials: materials,
+        costMap: costMap,
+        amortMap: amortMap,
+        internalBpcMap: internalBpcMap,
+        bpcWacData: bpcWacData,
+        presetRuns: presetRuns,
+        baseYield: yieldPerRun,
+        actualInstallCost: Number(job.cost),
+        estInstallRate: 0.05
+      });
 
       ledgerObjects.push({
-        date: jobDate,
-        type_id: job.product_type_id,
+        date: job.end_date || job.start_date,
+        type_id: job.product_type_id || job.blueprint_type_id,
         item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
-        qty: totalUnitsProduced,
+        qty: financials.totalYield,
         unit_value: '',
         source: "INDUSTRY",
         contract_id: job.job_id,
         char: job.installer_id,
-        unit_value_filled: unitManufacturingCost,
-        metadata: { me: meLevel, te: teLevel }
+        unit_value_filled: financials.unitCost,
+        metadata: { me: meLevel, te: bpoItemAttributes ? bpoItemAttributes.time_efficiency : 0 }
       });
 
-      // Only tags the job as processed if it successfully made it all the way down here
       newlyProcessedIds.push(job.job_id);
-
     } catch (err) {
-      // Local catch logs the error and gracefully skips to the next job
-      LOG_INDUSTRY.error(`Skipping Job: ${err.message}`);
-      continue;
+      LOG_INDUSTRY.error(`Skipping Job ${job.job_id}: ${err.message}`);
     }
   }
 
+  // 4. Persistence
   if (ledgerObjects.length > 0) {
-    ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, holdAnesthesia);
-    LOG_INDUSTRY.info(`Processed ${ledgerObjects.length} jobs.`);
+    ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, false);
+    LOG_INDUSTRY.info(`Saved ${ledgerObjects.length} jobs to ledger.`);
   }
 
   newlyProcessedIds.forEach(id => processedJobIds.add(id));
-  // Safely constrained to 500 to avoid PropertiesService payload size limits
-  SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-500)));
+  SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-1000)));
 }
 
 // ----------------------------------------------------------------------
@@ -1762,7 +1730,7 @@ function _getBpoAttributesMapFromEsi() {
   // This instantly pulls from your chunked cache because forceRefresh is false
   const rawObjects = _getCorporateBlueprintsRaw(false);
   const attributesMap = new Map();
-  
+
   if (!rawObjects) return attributesMap;
 
   for (const bpObj of rawObjects) {
@@ -1781,7 +1749,7 @@ function _getBpoAttributesMapFromEsi() {
       attributesMap.set(typeId, { material_efficiency: me, time_efficiency: te });
     }
   }
-  
+
   return attributesMap;
 }
 
@@ -1818,11 +1786,11 @@ function _getCorporateBlueprintsRaw(forceRefresh) {
 
     // --- PASS 1: DISCOVERY RUN (Now using robustFetchAll) ---
     const reqPage1 = client.buildRequest({ corporation_id: corpId, page: 1, show_column_headings: false });
-    
+
     // Wrap the single request in an array so the robust runner can process it
     const page1Requests = [{ ...reqPage1, name: authToon, type: 'CORP_BPO', page: 1 }];
     const page1Responses = _robustFetchAll(page1Requests, 5, 3);
-    
+
     const resp1 = page1Responses[0];
 
     if (!resp1 || resp1.getResponseCode() !== 200) {
@@ -1867,7 +1835,7 @@ function _getCorporateBlueprintsRaw(forceRefresh) {
 
       listResponses.forEach((res, i) => {
         const req = listRequests[i];
-        
+
         if (res.getResponseCode() !== 200) {
           log.warn(`[ESI_WARN] Failed Page ${req.page}. Code: ${res.getResponseCode()}`);
           return;
@@ -1906,25 +1874,7 @@ function _getCorporateBlueprintsRaw(forceRefresh) {
 }
 
 
-function _getConfigPresetRuns(ss) {
-  const CONFIG_NAME = "Config_BPC_Runs";
-  // Update these to match your actual CSV headers
-  const CONFIG_HEADERS = ['bp_type_id', 'preset_runs', 'max_me', 'max_te'];
-  const presetMap = new Map();
-  const sheet = getOrCreateSheet(ss, CONFIG_NAME, CONFIG_HEADERS);
 
-  if (sheet.getLastRow() >= 2) {
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const col = _getColIndexMap(headers, CONFIG_HEADERS);
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    data.forEach(r => {
-      const id = Number(r[col.bp_type_id]);
-      const runs = Number(r[col.preset_runs]);
-      if (id > 0 && runs > 0) presetMap.set(id, runs);
-    });
-  }
-  return presetMap;
-}
 
 function _extractMetric_(row, side, level) {
   if (!row || !row[side]) return 0;

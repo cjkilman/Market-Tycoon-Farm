@@ -332,18 +332,48 @@ function cacheAllCorporateAssetsWorker() {
     }
 }
 
-/* Add this to your maintenance script to 'snap' the hangar range */
-function updateHangarNamedRange() {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sh = ss.getSheetByName("MaterialHangar");
-    if (!sh) return;
+function updateHangarNamedRanges(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  const namedRanges = ss.getNamedRanges();
+
+  // Define all hangars here to keep the engine clean and scalable
+  const hangars = [
+    { sheetName: "MarketStorage", rangeName: "NR_WAREHOUSE_HANGAR", numColumns: 4 },
+    { sheetName: "MaterialHangar", rangeName: "NR_MATERIAL_HANGAR", numColumns: 3 }
+  ];
+
+  hangars.forEach(hangar => {
+    const sh = ss.getSheetByName(hangar.sheetName);
+    
+    // FIX: Typo corrected to 'hangar' and added rangeCache wipe
+    if (typeof GLOBALS !== 'undefined') {
+      GLOBALS.dataCache.delete(hangar.rangeName);
+      GLOBALS.rangeCache.delete(hangar.rangeName);
+    }
+    
+    if (!sh) {
+      console.warn(`[WARN] ${hangar.sheetName} sheet not found. Skipping ${hangar.rangeName}.`);
+      return; 
+    }
 
     const lastRow = sh.getLastRow();
-    // Snaps from Row 1 to the end of your data (Columns A through E)
-    const newRange = sh.getRange(1, 1, lastRow, 5);
+    if (lastRow < 1) return;
 
-    ss.setNamedRange("NR_MATERIAL_HANGAR", newRange);
-    console.log(`Hangar Snapped: NR_MATERIAL_HANGAR is now ${lastRow} rows.`);
+    // Build the dynamic range based on the config array
+    const newRange = sh.getRange(1, 1, lastRow, hangar.numColumns);
+    
+    // Check if range already exists
+    const existingRange = namedRanges.find(r => r.getName() === hangar.rangeName);
+
+    if (existingRange) {
+      existingRange.setRange(newRange);
+      console.log(`[UPDATE] ${hangar.rangeName} resized to row ${lastRow}.`);
+    } else {
+      ss.setNamedRange(hangar.rangeName, newRange);
+      console.log(`[CREATE] ${hangar.rangeName} initialized at row ${lastRow}.`);
+    }
+  });
 }
 
 function finalizeAssetCacheJob() {
@@ -387,7 +417,7 @@ function finalizeAssetCacheJob() {
         log.info('[Finalizer] Performing ATOMIC SWAP.');
 
         // Add this at the very bottom of your asset caching function
-        updateHangarNamedRange();
+        updateHangarNamedRanges(ss_anchor);
 
         const repairMap = {
             [CACHE_NAMED_RANGE]: `A3:H`
