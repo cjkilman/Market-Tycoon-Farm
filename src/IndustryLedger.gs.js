@@ -35,7 +35,6 @@ const LOG_INDUSTRY = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Indust
 
 // ----------------------------------------------------------------------
 // --- LOCAL HELPER: ROBUST NAMED RANGE LOOKUP ---
-// ----------------------------------------------------------------------
 
 function _getNamedOr_(arg1, arg2, arg3) {
   let ss, name, fallback;

@@ -243,6 +243,15 @@ function _invokeGesiWithRetry(endpoint, params, maxRetries = 3) {
   }
 }
 
+// A leaner reset for your new Single-Pass architecture
+function resetCorpJournalImport() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const LAST_ID_KEY = 'CORP_JOURNAL_LAST_TRANSACTION_ID';
+  SCRIPT_PROP.deleteProperty(LAST_JOURNAL_KEY);
+  SCRIPT_PROP.deleteProperty(LAST_ID_KEY);
+  console.log("✅ Journal anchor reset.");
+}
+
 /**
  * Master Sync Controller
  * Run this function on a single trigger (e.g., every 15-30 mins)
@@ -423,13 +432,9 @@ function Feed_Journal_To_Buffer(ss) {
 
 /**
  * PROCESS INTERNAL BUFFER
- * Pairs Transactions and Journal entries and commits to ledgers.
- * Includes "Wait-Period" logic to account for ESI latency.
- */
-/**
- * PROCESS INTERNAL BUFFER
- * Pairs Transactions and Journal entries and commits to ledgers.
- * Includes "Wait-Period" logic to account for ESI latency.
+ * FIXED: Fallback detection for unlabeled Transactions.
+ * FIXED: Mapped ESI's 'market_transaction_id' for tax pairing.
+ * FIXED: Safely parses ISO Timestamps and purges 24-hour orphans.
  */
 function processInternalBuffer(ss) {
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -450,38 +455,39 @@ function processInternalBuffer(ss) {
     const entry = JSON.parse(row[1]);
     const d = entry.data;
 
-   // Strict Source-Targeted ID Isolation
+    // Bulletproof Source Detection
+    const isTx = (d.source === 'TRANSACTION' || (d.transaction_id !== undefined && !d.ref_type));
+    const isJournal = (d.source === 'JOURNAL' || d.ref_type !== undefined);
+
     let id = "";
-    if (d.source === 'TRANSACTION') {
+    if (isTx) {
       id = String(d.transaction_id || "");
-    } else if (d.source === 'JOURNAL') {
-      // EVE Corp Journal maps the actual transaction_id to context_id 
-      // ONLY when context_id_type is explicitly 'transaction_id'
-      if (String(d.context_id_type).toLowerCase() === 'transaction_id') {
+    } else if (isJournal) {
+      const cType = String(d.context_id_type || "").toLowerCase();
+      if (cType === 'transaction_id' || cType === 'market_transaction_id') {
         id = String(d.context_id || "");
       } else {
-        // Fallback to reference anchors for matching unlinked taxes/fees
         id = String(d.first_id || d.second_id || d.context_id || "");
       }
     }
-    
+
     id = id.trim();
-    if (id.indexOf('.') > -1) id = id.split('.')[0]; // Kill Google Sheets decimal casting
-    
-    if (!id || id === "undefined" || id === "null") return; // Protect the map gate
+    if (id.indexOf('.') > -1) id = id.split('.')[0];
+
+    if (!id || id === "undefined" || id === "null") return;
 
     if (!pending.has(id)) pending.set(id, { tx: null, fees: 0, ts: entry.ts, journalFound: false });
-    
+
     const record = pending.get(id);
 
-    if (d.source === 'TRANSACTION') {
+    if (isTx) {
       record.tx = d;
-    } else if (d.source === 'JOURNAL') {
-      if (['broker_fee', 'transaction_tax', 'market_escrow'].includes(d.ref_type)) {
+    } else if (isJournal) {
+      if (['broker_fee', 'transaction_tax'].includes(d.ref_type)) {
         record.fees += Math.abs(Number(d.amount || 0));
-        record.journalFound = true; // Mark as having tax info
-      } else if (d.ref_type === 'market_transaction') {
-        record.journalFound = true; // No tax/fee, but journal is confirmed synced!
+        record.journalFound = true;
+      } else if (['market_transaction', 'market_escrow'].includes(d.ref_type)) {
+        record.journalFound = true;
       }
     }
   });
@@ -492,38 +498,27 @@ function processInternalBuffer(ss) {
   const processedIds = new Set();
 
   pending.forEach((p, id) => {
-    // CONDITION: Process if Transaction exists AND (Journal data is found OR Age > 5 mins)
-    const isReady = p.tx && (p.journalFound || (now - p.ts > HOLD_DURATION_MS));
+    const pTime = new Date(p.ts).getTime() || 0;
+    const isReady = p.tx && (p.journalFound || (now - pTime > HOLD_DURATION_MS));
 
     if (isReady) {
-      // Force boolean coercion safely. It is only a buy if the API explicitly said 'true' or '1'
       const isBuy = (String(p.tx.is_buy).toLowerCase() === 'true' || p.tx.is_buy === true || p.tx.is_buy === 1);
       const perUnitFee = p.tx.quantity > 0 ? (p.fees / Number(p.tx.quantity)) : 0;
-      
-      // Calculate final unit value (Tax is added for buys, subtracted for sells)
       const finalUnitValue = isBuy ? (Number(p.tx.unit_price) + perUnitFee) : (Number(p.tx.unit_price) - perUnitFee);
 
-      if (isBuy) {
-        buys.push({
-          date: p.tx.date,
-          type_id: Number(p.tx.type_id),
-          qty: Number(p.tx.quantity), // Positive for Buys
-          source: 'TRANSACTION',
-          contract_id: id,
-          unit_value_filled: finalUnitValue,
-          char: p.tx.client_id
-        });
-      } else {
-        sells.push({
-          date: p.tx.date,
-          type_id: Number(p.tx.type_id),
-          qty: -Number(p.tx.quantity), // NEGATIVE for Sells
-          source: 'TRANSACTION',
-          contract_id: id,
-          unit_value_filled: finalUnitValue,
-          char: p.tx.client_id
-        });
-      }
+      const ledgerObj = {
+        date: p.tx.date,
+        type_id: Number(p.tx.type_id),
+        qty: isBuy ? Number(p.tx.quantity) : -Number(p.tx.quantity),
+        source: 'TRANSACTION',
+        contract_id: id,
+        unit_value_filled: finalUnitValue,
+        char: p.tx.client_id || p.tx.character_id // Failsafe for client ID
+      };
+
+      if (isBuy) buys.push(ledgerObj);
+      else sells.push(ledgerObj);
+
       processedIds.add(id);
     }
   });
@@ -534,13 +529,34 @@ function processInternalBuffer(ss) {
 
   // 4. SURGICAL CLEANUP
   const remainingRows = data.filter(row => {
+    if (!row[0]) return false;
     const entry = JSON.parse(row[1]);
     const d = entry.data;
+
+    const isTx = (d.source === 'TRANSACTION' || (d.transaction_id !== undefined && !d.ref_type));
+    const isJournal = (d.source === 'JOURNAL' || d.ref_type !== undefined);
+
     let id = "";
-    if (d.source === 'TRANSACTION') id = String(d.transaction_id);
-    else if (d.source === 'JOURNAL' && d.context_id_type === 'transaction_id') id = String(d.context_id);
-    
-    return !id || !processedIds.has(id);
+    if (isTx) {
+      id = String(d.transaction_id || "");
+    } else if (isJournal) {
+      const cType = String(d.context_id_type || "").toLowerCase();
+      if (cType === 'transaction_id' || cType === 'market_transaction_id') {
+        id = String(d.context_id || "");
+      } else {
+        id = String(d.first_id || d.second_id || d.context_id || "");
+      }
+    }
+
+    id = id.trim();
+    if (id.indexOf('.') > -1) id = id.split('.')[0];
+
+    if (processedIds.has(id)) return false;
+
+    const entryTime = new Date(entry.ts).getTime() || 0;
+    if (isJournal && (now - entryTime > 86400000)) return false;
+
+    return true;
   });
 
   bufferSheet.getRange(2, 1, Math.max(1, bufferSheet.getLastRow() - 1), 3).clearContent();
@@ -548,7 +564,6 @@ function processInternalBuffer(ss) {
     bufferSheet.getRange(2, 1, remainingRows.length, 3).setValues(remainingRows);
   }
 
-  // Debugging output to prove sales are moving
   console.log(`Buffer Processed. Paired: ${processedIds.size}. Held: ${remainingRows.length}. Buys: ${buys.length} | Sells: ${sells.length}`);
 }
 
@@ -638,7 +653,7 @@ function _getEsiCacheTTL(response) {
  * Complete Version: Dynamic Paging, ESI-Synced Cache, and Strict Data Typing.
  */
 function _fetchCorpOrdersConcurrently(authName) {
- 
+
   const SCRIPT_NAME = '_fetchCorpOrdersConcurrently';
   const client = GESI.getClient().setFunction('corporations_corporation_orders');
   const cache = CacheService.getUserCache();
@@ -1542,9 +1557,9 @@ function _robustFetchAll(requests, chunkSize = 5, maxRetries = 3) {
           // Properly extract the ESI wait time
           const retryAfter = res.getHeaders()['Retry-After'] || res.getHeaders()['retry-after'];
           const waitTime = retryAfter ? Number(retryAfter) * 1000 : 30000;
-          
+
           log.warn(`ESI 429: Rate limited. Sleeping ${waitTime / 1000}s.`);
-          Utilities.sleep(waitTime); 
+          Utilities.sleep(waitTime);
           nextChunk.push(currentChunk[index]); // Retry this specific request
         } else if (code >= 500) {
           log.warn(`ESI ${code}: Transient error. Backing off.`);
@@ -1684,12 +1699,12 @@ function purgeContractsWithLedgeredStatus(ss) {
   const contData = contractsSheet.getDataRange().getValues();
   const hCont = contData[0].map(h => String(h).trim().toLowerCase());
   const cCidIdx = hCont.indexOf('contract_id');
-  
+
   if (cCidIdx === -1) {
     log.error("Critical Failure: 'contract_id' not found in Contracts (RAW) sheet.");
     return;
   }
-  
+
   const contractsToKeep = contData.filter((row, index) => {
     if (index === 0) return true;
     return !processedCids.has(String(row[cCidIdx]).trim());
@@ -1723,7 +1738,7 @@ function debugPurgeMismatch() {
   const hItems = itemsData[0];
   const cidIdxItems = hItems.indexOf('contract_id');
   const statIdx = hItems.indexOf('Status');
-  
+
   const processedCids = new Set();
   for (let i = 1; i < itemsData.length; i++) {
     if (String(itemsData[i][statIdx]).toUpperCase() === 'LEDGERED') {
@@ -1736,11 +1751,11 @@ function debugPurgeMismatch() {
   const contData = contractsSheet.getDataRange().getValues();
   const hCont = contData[0];
   const cCidIdx = hCont.indexOf('contract_id');
-  
+
   Logger.log("--- ID COMPARISON ---");
   Logger.log("Total LEDGERED IDs found in Items: " + processedCids.size);
-  
-  for(let i = 1; i < Math.min(6, contData.length); i++) {
+
+  for (let i = 1; i < Math.min(6, contData.length); i++) {
     const rawId = String(contData[i][cCidIdx]).trim();
     const isMatch = processedCids.has(rawId);
     Logger.log(`Row ${i} ID: '${rawId}' | Match Found in Set: ${isMatch}`);
@@ -1750,30 +1765,30 @@ function debugMismatch() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const itemsSh = ss.getSheetByName('Contract Items (RAW)');
   const contSh = ss.getSheetByName('Contracts (RAW)');
-  
+
   const itemsData = itemsSh.getDataRange().getValues();
   const contData = contSh.getDataRange().getValues();
-  
+
   const cidIdxItems = itemsData[0].indexOf('contract_id');
   const statIdx = itemsData[0].indexOf('Status');
   const cidIdxCont = contData[0].indexOf('contract_id');
-  
+
   // Collect 3 sample ledgered IDs
   const sampleIds = [];
-  for(let i = 1; i < itemsData.length; i++) {
-    if(String(itemsData[i][statIdx]).toUpperCase() === 'LEDGERED') {
+  for (let i = 1; i < itemsData.length; i++) {
+    if (String(itemsData[i][statIdx]).toUpperCase() === 'LEDGERED') {
       sampleIds.push(String(itemsData[i][cidIdxItems]).trim());
-      if(sampleIds.length >= 3) break;
+      if (sampleIds.length >= 3) break;
     }
   }
-  
+
   // Check if they exist in Contracts (RAW)
   const contIds = contData.map(r => String(r[cidIdxCont]).trim());
-  
+
   Logger.log("--- MATCHING DIAGNOSTIC ---");
   Logger.log("Sample Ledgered IDs from Items: " + JSON.stringify(sampleIds));
   Logger.log("First 10 IDs in Contracts (RAW): " + JSON.stringify(contIds.slice(1, 11)));
-  
+
   sampleIds.forEach(id => {
     Logger.log(`Is ID ${id} in Contracts sheet? ${contIds.includes(id) ? "YES" : "NO"}`);
   });
@@ -1800,14 +1815,14 @@ function syncContracts(ss, charIdMap) {
   for (const status of CONTRACT_STATUSES) {
     allNames.forEach(charName => {
       const req = GESI.getClient(charName)
-                      .setFunction(EP_LIST_CHAR)
-                      .buildRequest({ status: status, show_column_headings: false, page: 1 });
+        .setFunction(EP_LIST_CHAR)
+        .buildRequest({ status: status, show_column_headings: false, page: 1 });
       page1Requests.push({ ...req, name: charName, type: 'CHAR', status: status, page: 1 });
     });
-    
+
     const corpReq = GESI.getClient(authToon)
-                        .setFunction(EP_LIST_CORP)
-                        .buildRequest({ status: status, show_column_headings: false, page: 1 });
+      .setFunction(EP_LIST_CORP)
+      .buildRequest({ status: status, show_column_headings: false, page: 1 });
     page1Requests.push({ ...corpReq, name: authToon, type: 'CORP', status: status, page: 1 });
   }
 
@@ -1826,8 +1841,8 @@ function syncContracts(ss, charIdMap) {
 
     if (Array.isArray(data) && data.length > 0) {
       allTuples = allTuples.concat(
-        req.type === 'CHAR' 
-          ? _normalizeCharContracts([data], [req.name], idNameMap) 
+        req.type === 'CHAR'
+          ? _normalizeCharContracts([data], [req.name], idNameMap)
           : _normalizeCorpContracts(data, req.name)
       );
     }
@@ -1838,7 +1853,7 @@ function syncContracts(ss, charIdMap) {
 
     if (maxPages > 1) {
       log.info(`Pagination overflow found: ${req.type} '${req.name}' [Status: ${req.status}] has ${maxPages} pages. Queuing remainder.`);
-      
+
       const client = GESI.getClient(req.name).setFunction(req.type === 'CHAR' ? EP_LIST_CHAR : EP_LIST_CORP);
       for (let p = 2; p <= maxPages; p++) {
         const overflowReq = client.buildRequest({ status: req.status, show_column_headings: false, page: p });
@@ -1860,8 +1875,8 @@ function syncContracts(ss, charIdMap) {
 
       if (Array.isArray(data) && data.length > 0) {
         allTuples = allTuples.concat(
-          req.type === 'CHAR' 
-            ? _normalizeCharContracts([data], [req.name], idNameMap) 
+          req.type === 'CHAR'
+            ? _normalizeCharContracts([data], [req.name], idNameMap)
             : _normalizeCorpContracts(data, req.name)
         );
       }
@@ -1904,7 +1919,7 @@ function syncContracts(ss, charIdMap) {
 
   log.info(`Compiled contract pool. Requesting items for ${itemRequests.length} new contracts...`);
   const itemResponses = _robustFetchAll(itemRequests, 10, 3);
-  
+
   var outC_Combined = [];
   var outI_Combined = [];
 
@@ -2068,7 +2083,7 @@ function _runRebuildContractUnitCostsWorker() {
     const lastLoot = getTs('runLootDeltaPhase');
     const lastJournal = getTs('TransactionsAndJournalSync');
     const lastContracts = getTs('runContractLedgerPhase');
-    
+
     const now = Date.now();
     const MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
 
@@ -2613,8 +2628,8 @@ function _markContractsLedgered_(ss, processedIds) {
     const h = data[0].map(h => String(h).trim());
     const cidIdx = h.indexOf('contract_id');
     // FORCE: Look for Capitalized 'Status', skip lowercase 'status'
-    const statIdx = h.lastIndexOf('Status'); 
-    
+    const statIdx = h.lastIndexOf('Status');
+
     if (cidIdx !== -1 && statIdx !== -1) {
       for (let i = 1; i < data.length; i++) {
         if (idSet.has(String(data[i][cidIdx]))) {
@@ -2629,14 +2644,7 @@ function _markContractsLedgered_(ss, processedIds) {
   }
 }
 
-// A leaner reset for your new Single-Pass architecture
-function resetCorpJournalImport() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const LAST_ID_KEY = 'CORP_JOURNAL_LAST_TRANSACTION_ID';
 
-  SCRIPT_PROP.deleteProperty(LAST_ID_KEY);
-  console.log("✅ Journal anchor reset.");
-}
 
 function runContractLedgerPhase(ss) {
   const log = LoggerEx.withTag('MASTER_SYNC');
