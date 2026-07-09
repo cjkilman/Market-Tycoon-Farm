@@ -235,7 +235,10 @@ var ML = (function () {
 
         // Nuke and pave: wipe old data, dump the clean merged array
         if (last > 1) sh.getRange(2, 1, last - 1, HEAD_CURRENT.length).clearContent();
-        sh.getRange(2, 1, allValues.length, HEAD_CURRENT.length).setValues(allValues);
+
+        if (allValues.length > 0) {
+          sh.getRange(2, 1, allValues.length, HEAD_CURRENT.length).setValues(allValues);
+        }
 
         // Re-anchor the database range dynamically
         const rangeName = (sheetName === "Material_Ledger") ? "NR_MATERIAL_LEDGER" : "NR_SALES_LEDGER";
@@ -295,7 +298,7 @@ var ML = (function () {
         const rawDate = row[idxDate];
         // Safely extract just the YYYY-MM-DD part so JS can do the 7-day math
         const dateStr = String(rawDate || "").substring(0, 10);
-        const rowDate = (dateStr !== "") ? new Date(dateStr) : new Date(0);
+        const rowDate = (rawDate instanceof Date) ? rawDate : new Date(rawDate || 0);
 
         if (rowDate < cutoffDate) {
           const k = keys.map(key => {
@@ -344,7 +347,8 @@ var ML = (function () {
         if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, HEAD.length).clearContent();
 
         if (finalRows.length > 0) {
-          sh.getRange(2, 1, finalRows.length, HEAD.length).setValues(finalRows);
+          // In condenseHistory, replace the setValues line with this:
+          sh.getRange(2, 1, finalRows.length, HEAD_CURRENT.length).setValues(finalRows);
           GLOBALS.dataCache.delete(rangeName);
 
           // --- THE FIX: Force the Summary to update and clear its own cache ---
@@ -421,6 +425,14 @@ var ML = (function () {
         if (typeof GLOBALS !== 'undefined' && GLOBALS.dataCache) {
           GLOBALS.dataCache.delete(rangeName);
         }
+
+        // In dedupeExisting, right at the bottom:
+        if (typeof GLOBALS !== 'undefined' && GLOBALS.dataCache) {
+          GLOBALS.dataCache.delete(rangeName);
+        }
+
+        // Add this line right before the return statement:
+        updateBlendedSummary();
 
         return { removed: removedCount, status: "SUCCESS" };
       } finally {
