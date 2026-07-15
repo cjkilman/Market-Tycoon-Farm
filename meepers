@@ -1,10 +1,36 @@
-={"type_id", "Weighted Avg Price";
-LET(
-  src, NR_REPRO_VALUE_TABLE,
-  hdr, INDEX(src, 1,),
-  item B4:B v//match to Item Name
-  retrieve Reprocess Value,ROI
-  
-  c_tid, MATCH("type_id", hdr, 0),
+{"data":
+  {
+    "client_id":2121888450,
+    "date":"2026-06-12T01:31:37Z",
+  "is_buy":true,
+  "journal_ref_id":25682855110,
+  "location_id":1044437894297,
+  "quantity":663,
+  "transaction_id":6814181655,
+  "type_id":209,"
+  unit_price":78
+},
+  "status":"RECOVERED",
+  "ts":1783808119107
+
  
-)}
+}
+
+{
+  "data": {
+    "amount": -51714.00,
+    "balance": 989762245.79,
+    "context_id": 6814181655, 
+    "context_id_type": "transaction_id",
+    "date": "2026-06-12T01:31:37Z",
+    "description": "Market transaction",
+    "first_party_id": 12345678, 
+    "id": 25682855110, 
+    "reason": "",
+    "ref_type": "market_transaction",
+    "second_party_id": 2121888450, 
+    "source": "JOURNAL"
+  },
+  "status": "WAITING",
+  "ts": 1783808119107
+}

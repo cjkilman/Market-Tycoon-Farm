@@ -379,7 +379,7 @@ function runIndustryLedgerPhase(ss) {
     // PHASE 1: Processor
     if (phase === 1 && !isTimeUp()) {
       log.info('Phase 1: Running BPC Creation Ledger...');
-      runBpcCreationLedger(ss, jobMap);
+      runBpcCreationLedger(ss, jobMap, true);
       phase = 2;
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '2');
     }
@@ -625,11 +625,11 @@ function _calculateJobFinancials(params) {
  * FIXED: Pre-fetches Datacore/Decryptor costs to eliminate 0-cost bugs.
  * FIXED: ESI Data Sanitizer added to prevent undefined type_id crashes.
  */
-function runBpcCreationLedger(ss, jobMap) {
+function runBpcCreationLedger(ss, jobMap, skipSummary) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!jobMap) jobMap = _getJobMap(ss);
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-
+  if (!skipSummary) skipSummary = false;
 
   // Standard Setup
   const configMap = _getMasterBlueprintConfig(ss);
@@ -695,7 +695,7 @@ function runBpcCreationLedger(ss, jobMap) {
     newlyProcessedIds.push(job.job_id);
   }
 
-  if (ledgerObjects.length > 0) ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, true);
+  if (ledgerObjects.length > 0) ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, true, skipSummary);
   newlyProcessedIds.forEach(id => processedJobIds.add(id));
   SCRIPT_PROP.setProperty(BPC_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-1000)));
 }
@@ -707,7 +707,7 @@ function createLedgerRow(job, source, qty, unitValue, hist, name) {
   }
   return {
     date: job.date || job.end_date,
-    type_id: job.product_type_id,
+    date: job.completed_date || job.end_date,
     item_name: name,
     qty: qty,
     unit_value: '',
@@ -863,9 +863,9 @@ function _resolveSmartConfig(bpId, bpName, ss) {
 }
 
 /**
- * STAGE 2: Manufacturing Ledger (Updated for ME/TE and Object-based Costing)
- * FIXED: job.cost is safely cast to prevent NaN crashes.
- * FIXED: Circuit breaker added to prevent execution time timeouts.
+ * STAGE 2: Manufacturing Ledger (CACHE-FREE MASTER ARCHITECTURE)
+ * UPGRADE: 1k cache limit completely removed. The Sheet is now the absolute database.
+ * UPGRADE: Defensive array initialization prevents 'undefined' crash errors.
  */
 function runIndustryLedgerUpdate(ss, startTime, jobMap) {
   // 1. Resolve arguments with fallback defaults
@@ -873,35 +873,48 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
   if (!jobMap) jobMap = _getJobMap(ss);
   if (!startTime) startTime = Date.now();
 
-  // 2. SAFETY CHECK: Ensure jobMap is actually a Map before proceeding
-  // If _getJobMap failed, this stops the script cleanly instead of crashing later.
+  // SAFETY CHECK: Ensure jobMap is actually a Map before proceeding
   if (!jobMap || typeof jobMap.entries !== 'function') {
     const log = (typeof LOG_INDUSTRY !== 'undefined') ? LOG_INDUSTRY : console;
     log.error("CRITICAL: jobMap failed to initialize in Phase 2. Aborting.");
     return;
   }
 
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-
-  // 1. Initial Setup
+  // 2. Initial Setup (Note: processedJobIds memory block has been eradicated)
   const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
   if (sdeMatMap.size === 0) return;
+  
   const nameMap = _getSdeNameMap(ss);
-  const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(INDUSTRY_JOB_KEY) || '[]'));
   const configMap = _getMasterBlueprintConfig(ss);
   const costMap = _getBlendedCostMap(ss);
   const amortMap = _getBpoAmortizationMap(ss);
+  
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
+  
   const bpoAttributesMap = _getBpoAttributesMapFromEsi();
   const internalBpcMap = _buildInternalBpcMap_(ss);
+  const ledgerAPI_Local = ML.forSheet('Material_Ledger', ss);
 
-  // 2. Filter New Jobs
+  // --- 3. THE MASTER MEMORY FILTER (SHEET AS DATABASE) ---
+  // Defensively load the ledger. If it's empty/null, it defaults to a safe, empty array.
+  const existingLedger = ledgerAPI_Local.query({ source: "INDUSTRY" }) || [];
+  const safeLedgerArray = Array.isArray(existingLedger) ? existingLedger : [];
+  const ledgerIds = new Set(safeLedgerArray.map(j => String(j.contract_id)));
+
   const targetActivities = [1, 5, 8, 3, 4];
-  const newJobs = Array.from(jobMap.values()).filter(job =>
-    ['active', 'ready', 'delivered'].includes(job.status) &&
-    targetActivities.includes(parseInt(job.activity_id)) &&
-    !processedJobIds.has(job.job_id.toString())
-  );
+  
+  const newJobs = Array.from(jobMap.values()).filter(job => {
+    const jid = String(job.job_id);
+    
+    // THE ULTIMATE GHOST KILLER: 
+    // If it's delivered AND already saved in the ledger, ignore it completely.
+    if (job.status === 'delivered' && ledgerIds.has(jid)) return false;
+
+    // Otherwise, process it! (Active jobs will recalculate and upsert to show live WIP costs)
+    return ['active', 'ready', 'delivered'].includes(job.status) &&
+           targetActivities.includes(parseInt(job.activity_id, 10));
+  });
 
   if (newJobs.length === 0) {
     LOG_INDUSTRY.info("No new jobs to process.");
@@ -909,15 +922,12 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
   }
 
   const ledgerObjects = [];
-  const newlyProcessedIds = [];
-  const ledgerAPI = ML.forSheet('Material_Ledger', ss);
 
-  // 3. Process
-  // No job limit; will process until all jobs are done or 4 minutes elapse
+  // --- 4. PROCESS THE FILTERED JOBS ---
   for (const job of newJobs) {
     // Time-based safety breaker (240,000ms = 4 minutes)
     if ((Date.now() - (startTime || Date.now()) > 240000)) {
-      LOG_INDUSTRY.warn(`Circuit Breaker: Time limit nearing. Saving progress at ${ledgerObjects.length} jobs. Run again to continue.`);
+      LOG_INDUSTRY.warn(`Circuit Breaker: Time limit nearing. Saving progress...`);
       break;
     }
 
@@ -925,32 +935,26 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
       const materials = sdeMatMap.get(job.blueprint_type_id);
       if (!materials) continue;
 
-      const runs = parseInt(job.runs, 10);
-      const bpoItemAttributes = bpoAttributesMap.get(job.blueprint_type_id);
-      const meLevel = bpoItemAttributes ? bpoItemAttributes.material_efficiency : 0;
-      const productKey = `${job.activity_id}:${job.blueprint_type_id}`;
-      const product = sdeProdMap.get(productKey);
-      let yieldPerRun = (Array.isArray(product) ? product.find(p => p.activityID === job.activity_id)?.quantity : product?.quantity) || 1;
-      const presetRuns = configMap.has(job.blueprint_type_id) ? configMap.get(job.blueprint_type_id).presetRuns : 1;
-
       const financials = _calculateJobFinancials({
         bpId: job.blueprint_type_id,
         activityId: parseInt(job.activity_id, 10),
-        runs: runs,
-        meLevel: meLevel,
+        runs: parseInt(job.runs, 10),
+        meLevel: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).material_efficiency : 0,
         materials: materials,
         costMap: costMap,
         amortMap: amortMap,
         internalBpcMap: internalBpcMap,
         bpcWacData: bpcWacData,
-        presetRuns: presetRuns,
-        baseYield: yieldPerRun,
+        presetRuns: configMap.has(job.blueprint_type_id) ? configMap.get(job.blueprint_type_id).presetRuns : 1,
+        baseYield: (Array.isArray(sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`)) 
+            ? sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`).find(p => p.activityID === parseInt(job.activity_id, 10))?.quantity 
+            : sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`)?.quantity) || 1,
         actualInstallCost: Number(job.cost),
         estInstallRate: 0.05
       });
 
       ledgerObjects.push({
-        date: job.end_date || job.start_date,
+        date: job.completed_date || job.end_date,
         type_id: job.product_type_id || job.blueprint_type_id,
         item_name: nameMap.get(job.product_type_id) || `Product ${job.product_type_id}`,
         qty: financials.totalYield,
@@ -959,23 +963,22 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
         contract_id: job.job_id,
         char: job.installer_id,
         unit_value_filled: financials.unitCost,
-        metadata: { me: meLevel, te: bpoItemAttributes ? bpoItemAttributes.time_efficiency : 0 }
+        metadata: { 
+          me: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).material_efficiency : 0, 
+          te: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).time_efficiency : 0 
+        }
       });
 
-      newlyProcessedIds.push(job.job_id);
     } catch (err) {
       LOG_INDUSTRY.error(`Skipping Job ${job.job_id}: ${err.message}`);
     }
   }
 
-  // 4. Persistence
+  // --- 5. PERSISTENCE ---
   if (ledgerObjects.length > 0) {
-    ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, false);
+    ledgerAPI_Local.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, false);
     LOG_INDUSTRY.info(`Saved ${ledgerObjects.length} jobs to ledger.`);
   }
-
-  newlyProcessedIds.forEach(id => processedJobIds.add(id));
-  SCRIPT_PROP.setProperty(INDUSTRY_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-1000)));
 }
 
 // ----------------------------------------------------------------------
@@ -1013,7 +1016,7 @@ function _getBlendedCostMap(ss, requiredMaterialIds, applyFailsafe = false) {
           const tid = parseInt(row[col.type_id], 10);
           const rawValue = String(row[col.unit_weighted_average]);
           const cost = parseFloat(rawValue.replace(/[^0-9.]/g, '')) || 0.0;
-          if (tid > 0 && cost > 0) blendedCache.set(tid, createCostObj(cost, false));
+          if (tid > 0 && cost > 0) blendedCache.set(tid, createCostObj(cost, true));
         });
       } catch (e) { log.warn("Tier 1 Load Failed: " + e.message); }
     }
@@ -1610,84 +1613,6 @@ function forceOverhaulReset() {
 }
 
 
-
-
-/**
- * SOURCE OF TRUTH: Handles API Fetch, Persistence, and Cache-Control.
- */
-function _getCorporateJobsRaw(ss, forceRefresh = false) {
-  // If ss is not passed or is a boolean (like 'true' for forceRefresh), 
-  // correctly identify the active spreadsheet.
-  if (!ss || typeof ss.getSheetByName !== 'function') {
-    // If the first argument was actually the 'forceRefresh' boolean, shift arguments
-    if (typeof ss === 'boolean') forceRefresh = ss;
-    ss = SpreadsheetApp.getActiveSpreadsheet();
-  }
-
-  const props = PropertiesService.getScriptProperties();
-  const lastSync = parseInt(props.getProperty('LAST_ESI_SYNC') || '0', 10);
-  const now = Date.now();
-
-  // 1. Perform Live Sync if needed
-  if (forceRefresh || (now - lastSync) >= 3600000) {
-    const log = LoggerEx.withTag('CORP_JOBS');
-    const authToon = getCorpAuthChar();
-    if (!authToon) return [];
-
-    const charData = GESI.getCharacterData(authToon);
-    if (!charData || !charData.corporation_id) return [];
-
-    const corpId = charData.corporation_id;
-    const client = GESI.getClient(authToon);
-    client.setFunction('corporations_corporation_industry_jobs');
-
-    const req1 = client.buildRequest({ corporation_id: corpId, include_completed: true, page: 1 });
-    const res1 = _robustFetchAll([req1], 1, 3);
-    if (!res1 || res1.length === 0) return [];
-
-    let allJobs = JSON.parse(res1[0].getContentText());
-    const totalPages = parseInt(res1[0].getHeaders()['x-pages'] || res1[0].getHeaders()['X-Pages'] || 1, 10);
-
-    if (totalPages > 1) {
-      const pageRequests = [];
-      for (let p = 2; p <= totalPages; p++) {
-        pageRequests.push(client.buildRequest({ corporation_id: corpId, include_completed: true, page: p }));
-      }
-      const responses = _robustFetchAll(pageRequests, 3, 3);
-      responses.forEach(res => {
-        try { allJobs = allJobs.concat(JSON.parse(res.getContentText())); } catch (e) { }
-      });
-    }
-
-    const jobsSheet = ss.getSheetByName("ESI Corp Jobs");
-    const STANDARD_HEADERS = ["activity_id", "blueprint_id", "blueprint_location_id", "blueprint_type_id", "completed_character_id", "completed_date", "cost", "duration", "end_date", "facility_id", "installer_id", "job_id", "licensed_runs", "location_id", "output_location_id", "pause_date", "probability", "product_type_id", "runs", "start_date", "status", "successful_runs"];
-
-    const rows = allJobs.map(job => STANDARD_HEADERS.map(h => job[h] ?? null));
-    const fullData = [STANDARD_HEADERS, ...rows];
-
-    jobsSheet.getRange(1, 3, Math.max(jobsSheet.getLastRow(), 1), STANDARD_HEADERS.length).clearContent();
-    const targetRange = jobsSheet.getRange(1, 3, fullData.length, STANDARD_HEADERS.length);
-    targetRange.setValues(fullData);
-    ss.setNamedRange("NR_ESI_CORP_JOBS", targetRange);
-
-    props.setProperty('LAST_ESI_SYNC', now.toString());
-    log.info(`[SUCCESS] Synced ${allJobs.length} jobs.`);
-    return allJobs;
-  }
-
-  // 2. FALLBACK: Read directly from the sheet
-  const range = ss.getRangeByName("NR_ESI_CORP_JOBS");
-  if (!range) return [];
-  const values = range.getValues();
-  const headers = values[0];
-  return values.slice(1).map(row => {
-    const obj = {};
-    headers.forEach((h, i) => obj[h] = row[i]);
-    return obj;
-  });
-}
-
-
 function _getJobMap(ss) {
   const range = ss.getRangeByName("NR_ESI_CORP_JOBS");
   if (!range) throw new Error("Named Range 'NR_ESI_CORP_JOBS' not found!");
@@ -1752,128 +1677,96 @@ function _getBpoAttributesMapFromEsi() {
   return attributesMap;
 }
 
+/**
+ * UPGRADED: Corporate Jobs Fetcher
+ * Now uses ESI.forEndpoint for centralized error handling and quota management.
+ */
+function _getCorporateJobsRaw(ss, forceRefresh = false) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  const authToon = getCorpAuthChar();
+  
+  // 1. Quota Gate
+  if (ESI.isLocked()) {
+    LOG_INDUSTRY.error("ABORT: ESI global quota is locked. Skipping Jobs fetch.");
+    return [];
+  }
 
+  const log = LoggerEx.withTag('CORP_JOBS');
+  const charData = GESI.getCharacterData(authToon);
+  if (!charData || !charData.corporation_id) {
+    log.error(`Aborted: Could not resolve dynamic Corp ID.`);
+    return [];
+  }
 
+  // 2. ESI Module Integration
+  const authClient = GESI.getClient(authToon);
+  const service = ESI.forEndpoint(authClient, 'corporations_corporation_industry_jobs', {
+    onLock: () => stopWorker_('Quota Lock Active')
+  });
+
+  const result = service.get({ corporation_id: charData.corporation_id });
+
+  if (result.error) {
+    log.error(`[ESI_MODULE] Fetch failed: ${result.error}`);
+    return [];
+  }
+
+  const allJobs = result.data;
+  if (!allJobs || allJobs.length === 0) return [];
+
+  // 3. Sheet Writing
+  const jobsSheet = ss.getSheetByName("ESI Corp Jobs");
+  const STANDARD_HEADERS = ["activity_id", "blueprint_id", "blueprint_location_id", "blueprint_type_id", "completed_character_id", "completed_date", "cost", "duration", "end_date", "facility_id", "installer_id", "job_id", "licensed_runs", "location_id", "output_location_id", "pause_date", "probability", "product_type_id", "runs", "start_date", "status", "successful_runs"];
+
+  const rows = allJobs.map(job => STANDARD_HEADERS.map(h => job[h] ?? null));
+  const fullData = [STANDARD_HEADERS, ...rows];
+
+  jobsSheet.getRange(1, 3, Math.max(jobsSheet.getLastRow(), 1), STANDARD_HEADERS.length).clearContent();
+  const targetRange = jobsSheet.getRange(1, 3, fullData.length, STANDARD_HEADERS.length);
+  targetRange.setValues(fullData);
+  ss.setNamedRange("NR_ESI_CORP_JOBS", targetRange);
+
+  return allJobs;
+}
+
+/**
+ * UPGRADED: Blueprint Ingestion Engine
+ */
 function _getCorporateBlueprintsRaw(forceRefresh) {
   const log = LoggerEx.withTag('CORP_BPOS');
   const authToon = getCorpAuthChar();
   if (!authToon) return null;
 
-  // 1. Resolve dynamic context to protect against property drift
   const charData = GESI.getCharacterData(authToon);
-  if (!charData || !charData.corporation_id) {
-    log.error(`Aborted: Could not resolve dynamic Corp ID for character '${authToon}'.`);
-    return null;
-  }
+  if (!charData || !charData.corporation_id) return null;
+
   const corpId = charData.corporation_id;
   const cacheKey = BPO_RAW_CACHE_KEY + ':' + corpId;
 
-  // 2. Cache Interception Layer
   if (!forceRefresh) {
     const cachedJson = _getAndDechunk(cacheKey);
     if (cachedJson) return JSON.parse(cachedJson);
   }
 
-  log.info(`Fetching live blueprints matrix... (Reason: ${forceRefresh ? "Force Refresh" : "Cache Miss"})`);
+  // ESI Module Integration
+  const authClient = GESI.getClient(authToon);
+  const service = ESI.forEndpoint(authClient, 'corporations_corporation_blueprints', {
+    onLock: () => log.error("Blueprint fetch locked by Quota")
+  });
 
-  const ENDPOINT = 'corporations_corporation_blueprints';
-  const client = GESI.getClient(authToon);
-  client.setFunction(ENDPOINT);
+  const result = service.get({ corporation_id: corpId });
 
-  try {
-    let allBlueprints = [];
-
-    // --- PASS 1: DISCOVERY RUN (Now using robustFetchAll) ---
-    const reqPage1 = client.buildRequest({ corporation_id: corpId, page: 1, show_column_headings: false });
-
-    // Wrap the single request in an array so the robust runner can process it
-    const page1Requests = [{ ...reqPage1, name: authToon, type: 'CORP_BPO', page: 1 }];
-    const page1Responses = _robustFetchAll(page1Requests, 5, 3);
-
-    const resp1 = page1Responses[0];
-
-    if (!resp1 || resp1.getResponseCode() !== 200) {
-      const code = resp1 ? resp1.getResponseCode() : 'NO_RESPONSE';
-      log.error(`ESI Page 1 Fetch Failed [${code}]. Aborting pipeline.`);
-      return null;
-    }
-
-    let page1Data;
-    try {
-      page1Data = JSON.parse(resp1.getContentText());
-    } catch (e) {
-      log.error(`[PARSE_ERROR] Corrupted JSON on Page 1. Aborting pipeline.`);
-      return null; // If Page 1 fails, we can't read X-Pages, so we must abort
-    }
-
-    if (Array.isArray(page1Data)) {
-      allBlueprints = allBlueprints.concat(page1Data);
-    }
-
-    // Read the true structural depth from ESI headers
-    const headers = resp1.getHeaders();
-    const maxPages = Number(headers['X-Pages'] || headers['x-pages']) || 1;
-
-    // --- PASS 2: FETCH OVERFLOW PAGES ---
-    if (maxPages > 1) {
-      log.info(`Pagination detected. Spawning look-ahead batch for remaining ${maxPages - 1} pages.`);
-      const listRequests = [];
-
-      for (let p = 2; p <= maxPages; p++) {
-        const req = client.buildRequest({ corporation_id: corpId, page: p, show_column_headings: false });
-        listRequests.push({
-          ...req,
-          name: authToon,
-          type: 'CORP_BPO',
-          page: p
-        });
-      }
-
-      // Execute via your centralized chunking runner (5 concurrent allocations)
-      const listResponses = _robustFetchAll(listRequests, 5, 3);
-
-      listResponses.forEach((res, i) => {
-        const req = listRequests[i];
-
-        if (res.getResponseCode() !== 200) {
-          log.warn(`[ESI_WARN] Failed Page ${req.page}. Code: ${res.getResponseCode()}`);
-          return;
-        }
-
-        let data;
-        try {
-          data = JSON.parse(res.getContentText());
-        } catch (e) {
-          log.error(`[PARSE_ERROR] Corrupted JSON on Page ${req.page}. Skipping.`);
-          return;
-        }
-
-        if (Array.isArray(data)) {
-          allBlueprints = allBlueprints.concat(data);
-        }
-      });
-    }
-
-    if (allBlueprints.length === 0) {
-      log.warn("Compiled zero total blueprint elements from execution run.");
-      return null;
-    }
-
-    log.info(`Pipeline successful. Compiled ${allBlueprints.length} corporate assets across ${maxPages} pages.`);
-
-    // 5. Update Application Cache Storage
-    _chunkAndPut(cacheKey, JSON.stringify(allBlueprints), BPO_RAW_CACHE_TTL);
-
-    return allBlueprints;
-
-  } catch (e) {
-    log.error(`Critical Failure in Blueprint ingestion sequence: ${e.message}`);
+  if (result.error) {
+    log.error(`ESI Module Failure: ${result.error}`);
     return null;
   }
+
+  const allBlueprints = result.data;
+  _chunkAndPut(cacheKey, JSON.stringify(allBlueprints), BPO_RAW_CACHE_TTL);
+
+  return allBlueprints;
 }
-
-
-
 
 function _extractMetric_(row, side, level) {
   if (!row || !row[side]) return 0;

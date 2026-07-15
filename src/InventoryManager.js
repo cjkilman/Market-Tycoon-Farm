@@ -55,16 +55,20 @@ const PROP_KEY_WRITE_INDEX = ASSET_CACHE_ROW_INDEX_KEY;
 const PROP_KEY_CHUNK_SIZE = ASSET_CHUNK_SIZE_KEY;
 
 /**
- * TRUE CONCURRENT FETCHER (The Ferrari Engine)
+ * UPGRADED: Corporate Asset Ingestion Engine
+ * Now integrates directly with the standard ESI module wrapper.
+ * Dynamically handles pagination by parsing sequential pages until empty.
  */
 function _fetchAssetsConcurrently(authName) {
-    const SCRIPT_NAME = '_fetchAssetsConcurrently';
-    const client = GESI.getClient().setFunction('corporations_corporation_assets');
+    const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CORP_ASSETS') : console);
 
-    let maxPages = 1;
-    const headerRow = ASSET_CACHE_HEADERS;
-    const allAssets = [headerRow];
+    // 1. HARD GATE: Quota protection via the new ESI module circuit status
+    if (typeof ESI !== 'undefined' && ESI.isLocked()) {
+        log.warn("Aborted: Daily Quota already exhausted or circuit breaker tripped.");
+        return [ASSET_CACHE_HEADERS];
+    }
 
+    // 2. Corp ID Resolution
     let corpId = 0;
     try {
         const charObj = GESI.getCharacterData ? GESI.getCharacterData(authName) : null;
@@ -77,99 +81,77 @@ function _fetchAssetsConcurrently(authName) {
     }
 
     if (!corpId) {
-        try {
-            const search = GESI.search(['character'], authName);
-            if (search && search.character && search.character.length > 0) {
-                const charId = search.character[0];
-                const pubChar = GESI.characters_character(charId);
-                corpId = pubChar.corporation_id;
-            }
-        } catch (e) { }
+        log.error(`[CORP_ASSETS] Could not resolve Corp ID for character matching '${authName}'.`);
+        return [ASSET_CACHE_HEADERS];
     }
 
-    if (!corpId) {
-        log.error(`[${SCRIPT_NAME}] Could not resolve Corp ID for '${authName}'.`);
-        return [headerRow];
+    // 3. THE UPGRADE & FIX: Generate the specific Auth Client for the Director
+    if (typeof ESI === 'undefined') {
+        log.error("CRITICAL: ESI Master Module is not defined in the scope.");
+        return [ASSET_CACHE_HEADERS];
     }
+    
+    // --- THE FIX IS HERE ---
+    // Generate the specific client token for the authName (Your Director)
+    const authClient = GESI.getClient(authName);
+    
+    // Pass that specific client into the Endpoint wrapper
+    const assetEndpoint = ESI.forEndpoint(authClient, 'corporations_corporation_assets');
+    // -----------------------
+    
+    const allAssets = [ASSET_CACHE_HEADERS];
+    
+    let page = 1;
+    let keepPaginationActive = true;
 
-    try {
-        // 1. Fetch Page 1
-        const req1 = client.buildRequest({ corporation_id: corpId, page: 1, name: authName });
-        const options1 = {
-            method: req1.method || 'get',
-            headers: req1.headers,
-            muteHttpExceptions: true
+    log.info(`[START] Beginning sequential asset fetch for Corp: ${corpId} using token: ${authName}`);
+
+    // 4. Sequential Pagination Processing (Robust End-of-Collection Catching)
+    while (keepPaginationActive) {
+        const requestParams = {
+            corporation_id: corpId,
+            page: page
         };
-        const resp1 = UrlFetchApp.fetch(req1.url, options1);
 
-        if (resp1.getResponseCode() !== 200) {
-            throw new Error(`Page 1 failed: ${resp1.getResponseCode()}`);
+        // Execute network call through Good Citizen retry/caching layer
+        const result = assetEndpoint.get(requestParams);
+
+        if (result.error) {
+            log.error(`[ESI_ERROR] Fetch failed on page ${page}: ${result.error}`);
+            // Terminate processing immediately on structural or block errors to save execution time
+            break;
         }
 
-        const headers = resp1.getHeaders();
-        maxPages = Number(headers['X-Pages'] || headers['x-pages']) || 1;
-        log.info(`[${SCRIPT_NAME}] Found ${maxPages} pages of assets. Fetching concurrently...`);
+        const pageData = result.data;
 
-        const dataPage1 = JSON.parse(resp1.getContentText());
-        dataPage1.forEach(obj => {
-            allAssets.push([
-                obj.is_blueprint_copy,
-                obj.is_singleton,
-                obj.item_id,
-                obj.location_flag,
-                obj.location_id,
-                obj.location_type,
-                obj.quantity,
-                obj.type_id
-            ]);
-        });
-
-    } catch (e) {
-        log.error(`[${SCRIPT_NAME}] Critical fetch error: ${e.message}`);
-        return [headerRow];
+        if (Array.isArray(pageData) && pageData.length > 0) {
+            log.info(`Processed page ${page} containing ${pageData.length} records.`);
+            
+            // Map raw response attributes into our strictly-ordered matrix rows
+            pageData.forEach(obj => {
+                allAssets.push([
+                    obj.is_blueprint_copy,
+                    obj.is_singleton,
+                    obj.item_id,
+                    obj.location_flag,
+                    obj.location_id,
+                    obj.location_type,
+                    obj.quantity,
+                    obj.type_id
+                ]);
+            });
+            
+            page++;
+        } else {
+            // An empty array or blank response indicates the absolute end of data
+            log.info(`Reached end of data stream at page ${page}. Closing loop.`);
+            keepPaginationActive = false;
+        }
     }
 
-    // 2. Fetch Remaining Pages
-    if (maxPages > 1) {
-        const allRequests = [];
-        for (let i = 2; i <= maxPages; i++) {
-            const req = client.buildRequest({ corporation_id: corpId, page: i, name: authName });
-            allRequests.push({
-                url: req.url,
-                method: req.method || 'get',
-                headers: req.headers,
-                muteHttpExceptions: true
-            });
-        }
-
-        if (allRequests.length > 0) {
-            const responses = UrlFetchApp.fetchAll(allRequests);
-            responses.forEach((response, index) => {
-                if (response.getResponseCode() === 200) {
-                    try {
-                        const rawData = JSON.parse(response.getContentText());
-                        rawData.forEach(obj => {
-                            allAssets.push([
-                                obj.is_blueprint_copy,
-                                obj.is_singleton,
-                                obj.item_id,
-                                obj.location_flag,
-                                obj.location_id,
-                                obj.location_type,
-                                obj.quantity,
-                                obj.type_id
-                            ]);
-                        });
-                    } catch (e) { }
-                }
-            });
-        }
-    }
+    log.info(`[SUCCESS] Corporate asset sync complete. Processed ${allAssets.length - 1} total items across ${page - 1} pages.`);
     return allAssets;
 }
-
-
-
 
 /**
  * Corporate Asset Cache Worker (Nitro Edition - HYBRID)

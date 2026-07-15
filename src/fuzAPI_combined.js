@@ -376,29 +376,36 @@ function withRetries(fn, tries = 3, base = 300) {
   function getDataForRequests(marketRequests) {
     if (!marketRequests || marketRequests.length === 0) return [];
 
-    // --- QUOTA MAGIC GATE ---
-    if (_isQuotaExhausted()) {
-      console.warn("fuzAPI: Circuit is OPEN (Quota hit). Fetching blocked for cooldown.");
-      return []; // Return empty array; calling code handles the data void
+    // --- TIER 2: GLOBAL QUOTA GATE (NEW) ---
+    if (_props.getProperty('DAILY_QUOTA_EXHAUSTED') === 'true') {
+      console.warn("fuzAPI ABORT: Global UrlFetchApp Quota Exhausted. Standing down.");
+      return []; 
     }
 
-    if (_isCircuitOpen()) return [];
+    // --- TIER 1: LOCAL FUZZWORK CIRCUIT ---
+    if (_isQuotaExhausted() || _isCircuitOpen()) {
+      console.warn("fuzAPI ABORT: Fuzzwork Server Circuit is OPEN. Blocked for cooldown.");
+      return []; 
+    }
 
     const { cachedData, missingRequests } = _checkCacheForRequests(marketRequests);
+    let newlyFetchedData = [];
 
-let newlyFetchedData = [];
     if (missingRequests.length > 0) {
       try {
         const fetchResult = _executeFetchAll(missingRequests);
         newlyFetchedData = fetchResult.newlyFetchedData;
         _cacheNewData(fetchResult.dataToCache);
-        _resetCircuit(); // Success resets failure counts
+        _resetCircuit(); // Success resets Fuzzwork failure counts
       } catch (e) {
         const msg = e.message.toLowerCase();
-        // Detect Google Account-Wide Quota Limits
-        if (msg.includes("too many times") || msg.includes("limit exceeded")) {
-           _tripCircuit("Google Account Quota Exhausted.");
+        
+        // --- TRIP THE GLOBAL LOCK IF GOOGLE DIES ---
+        if (msg.includes("too many times") || msg.includes("quota") || msg.includes("limit exceeded")) {
+           console.error("FATAL: Google UrlFetchApp Daily Quota Exhausted via fuzAPI. Tripping Global Lock.");
+           _props.setProperty('DAILY_QUOTA_EXHAUSTED', 'true');
         } else {
+           // Otherwise, it's just a Fuzzwork error. Trip the local circuit.
            _tripCircuit(e.message);
         }
         throw e; 
@@ -453,7 +460,7 @@ let newlyFetchedData = [];
 // --- Public Custom Functions (Wrappers for Google Sheets) ---
 
 /**
- * MANUAL RESET: Run this function to clear the fuzAPI quota locks immediately.
+ * MANUAL RESET: Run this function to clear the fuzAPI and Global quota locks immediately.
  * Use this when you know your 20k/100k UrlFetch quota has reset.
  */
 function manual_FuzAPI_Reset() {
@@ -461,14 +468,15 @@ function manual_FuzAPI_Reset() {
   const keysToReset = [
     'FuzCircuitState', 
     'FuzCircuitFailCount', 
-    'FuzCircuitOpenUntilMs'
+    'FuzCircuitOpenUntilMs',
+    'DAILY_QUOTA_EXHAUSTED' // <-- Hooked into the Global Lock
   ];
   
   keysToReset.forEach(key => props.deleteProperty(key));
   
-  console.log("fuzAPI: Quota Crowbar manually reset. Circuit is now CLOSED.");
+  console.log("fuzAPI & ESI: Master Quota Crowbar manually reset. All Circuits CLOSED.");
   if (typeof SpreadsheetApp !== 'undefined') {
-    SpreadsheetApp.getActiveSpreadsheet().toast("fuzAPI Circuit Reset Successful", "Quota Magic");
+    SpreadsheetApp.getActiveSpreadsheet().toast("Master Circuit Reset Successful", "Quota Magic");
   }
 }
 
@@ -511,12 +519,19 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
     return Number.isFinite(n) ? n : null;
   });
 
-  // --- IMPROVED ERROR LOGGING ---
-  const lt = String(location_type || "").toLowerCase();
-  if (!["region","system","station"].includes(lt)) {
-    throw new Error(`Location Undefined: Received "${location_type}". Valid types are 'region', 'system', or 'station'. Check your spreadsheet parameters.`);
+// --- IMPROVED ERROR LOGGING & AUTO-CORRECTION ---
+  let lt = String(location_type || "").toLowerCase();
+  
+  // If the sheet sends #REF! or an empty cell, default to 'station' 
+  // so the script doesn't explode and kill your whole price table.
+  if (lt === "#ref!" || lt === "" || lt === "undefined") {
+    console.warn("FuzAPI: Received #REF! or empty location. Defaulting to 'station'.");
+    lt = "station"; 
   }
-  // ------------------------------
+
+  if (!["region","system","station"].includes(lt)) {
+    throw new Error(`Location Undefined: Received "${location_type}". Valid types are 'region', 'system', or 'station'.`);
+  }
 
   const { type: side, level: lvl } = _normalizeOrder(order_type, order_level);
   const validIds = flatIds.filter(n => n != null);

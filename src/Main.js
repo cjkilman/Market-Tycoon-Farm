@@ -418,18 +418,19 @@ function generateDumpToBuyOrder(ss, fullData) {
     const buildNow = clean(r[col.buildNow]);
     const signal = String(r[col.signal] || "").toUpperCase();
     const velocity = clean(r[col.hubVelocity]);
-    
+
     // Extract ESI-fed velocity data
     const sales30d = col.sales30d > -1 ? clean(r[col.sales30d]) : 1;
     const sales5d = col.sales5d > -1 ? clean(r[col.sales5d]) : 1;
     const momentum = (sales30d > 0) ? (sales5d / sales30d) : 1;
+    // NEW LOGIC: Use Projected Cost as the floor if available, otherwise use Effective Cost
+    let realityFloor = (buildNow > 0) ? buildNow : (effCost > epsPrice ? effCost : 0);
 
-    let realityFloor = effCost > epsPrice ? effCost : 0;
     if (realityFloor === 0 || hubBuy < epsPrice) continue;
 
     // Bottom Buy calculates the price needed to hit your Minimal Margin (B9)
     const bottomBuyPrice = realityFloor * (1 + filterMinMargin) * rateMultiplier;
-    
+
     // Base Forensic Margin
     let rawMargin = ((hubBuy / rateMultiplier) - realityFloor) / realityFloor;
 
@@ -458,14 +459,14 @@ function generateDumpToBuyOrder(ss, fullData) {
 
       if (dumpQty > 0) {
         dumpResults.push([
-          name, 
-          bottomBuyPrice, 
-          buildNow || "", 
-          effCost, 
-          hubBuy, 
-          margin, 
-          dumpQty, 
-          (hubBuy * dumpQty), 
+          name,
+          bottomBuyPrice,
+          buildNow || "",
+          effCost,
+          hubBuy,
+          margin,
+          dumpQty,
+          (hubBuy * dumpQty),
           trendOutput
         ]);
       }
@@ -767,9 +768,10 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
 
   const parseNum = (v) => (typeof v === 'number') ? v : parseFloat(String(v || 0).replace(/[^0-9.-]/g, '')) || 0;
 
-  // 1. Headers (Row 4, Col C to Q) - Expanded to 15 columns
+  // 1. Headers
   const headerLabels = [["Item Name", "Snag Qty", "Entry Cost", "Reprocessed Value", "Order Cost", "Unit Profit", "Total Profit", "My Market Qty", "Volume (30d)", "Signal", "Warehouse Qty", "Margin (Net)", "Buy Action", "Slots", "Runs"]];
   sheet.getRange(4, 3, 1, 15).setValues(headerLabels).setFontWeight("bold").setBackground("#d1e7dd").setHorizontalAlignment("center");
+
   // 2. Setup
   const fee = ss.getRangeByName("FEE_RATE")?.getValue() || 0.01;
   const tax = ss.getRangeByName("TAX_RATE")?.getValue() || 0.036;
@@ -793,6 +795,7 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
 
   const getIdx = (n) => headers.indexOf(n);
   const col = {
+    typeId: getIdx("type_id"), // Fixed: Added missing mapping
     name: getIdx("Item Name"),
     group: getIdx("Group"),
     buyQty: getIdx("Quantity Left"),
@@ -803,42 +806,38 @@ function generateNeedToBuyQuery(ss, fullData, dumpedItems = new Set()) {
     warehouse: getIdx("Warehouse Qty"),
     buildNow: getIdx("Manufacturing Projected Unit Cost"),
     effCost: getIdx("Effective Cost"),
-    reprocessVal: getIdx("Reprocessed Value"), // <--- Added mapping
+    reprocessVal: getIdx("Reprocessed Value"),
     buyAction: getIdx("Buy Action"),
     signal: getIdx("Signal"),
     hubBuy: getIdx("Hub Median Buy"),
     sellPrice: getIdx("Hub Sell Price"),
-    sales30d: getIdx("30d Sales"), // Or whatever your 30-day ESI column is named
+    sales30d: getIdx("30d Sales"),
     sales5d: getIdx("5d Sales")
   };
 
-const materialMap = new Map();
-const materialData = typeof getCachedData === 'function' ? getCachedData(ss, "NR_MATERIAL_HANGAR") : null;
+  const materialMap = new Map();
+  const materialData = typeof getCachedData === 'function' ? getCachedData(ss, "NR_MATERIAL_HANGAR") : null;
 
-if (materialData && materialData.length > 1) {
-  for (let i = 1; i < materialData.length; i++) {
-    // Assuming CSV/Sheet layout from your uploaded file: Type ID (Col 0), Loc ID (Col 1), Quantity (Col 2)
-    const typeId = String(materialData[i][0]).trim();
-    const qty = +(materialData[i][2]);
-    if (typeId && !isNaN(qty)) {
-      materialMap.set(typeId, (materialMap.get(typeId) || 0) + qty);
+  if (materialData && materialData.length > 1) {
+    for (let i = 1; i < materialData.length; i++) {
+      const typeId = String(materialData[i][0]).trim();
+      const qty = +(materialData[i][2]);
+      if (typeId && !isNaN(qty)) {
+        materialMap.set(typeId, (materialMap.get(typeId) || 0) + qty);
+      }
     }
   }
-}
 
   let results = [];
 
   marketRows.forEach(row => {
-    const typeId = String(row[col.typeId] || "").trim(); // Ensure this column is mapped in 'col'
+    const typeId = String(row[col.typeId] || "").trim();
     const name = String(row[col.name] || "").trim();
     const itemGroup = String(row[col.group] || "").toLowerCase().trim();
 
     if (!name || dumpedItems.has(name)) return;
-const materialWhQty = materialMap.get(typeId) || 0;
-    // Check if the group name contains ANY of the substrings listed in cfg.ignoreGroups
+    const materialWhQty = materialMap.get(typeId) || 0;
     const isIgnoredGroup = cfg.ignoreGroups.some(ignoredWord => itemGroup.includes(ignoredWord));
-
-    // Maintain your single-word filter for names
     const isSingleWord = !name.includes(' ');
 
     if (isSingleWord || isIgnoredGroup) return;
@@ -851,52 +850,35 @@ const materialWhQty = materialMap.get(typeId) || 0;
     const restockNeed = Math.round(Math.ceil(velocity * cfg.targetDays) - currentStock);
     if (restockNeed <= 0) return;
 
-// Calculate Momentum
+    // Momentum
     const sales30 = (col.sales30d > -1) ? parseNum(row[col.sales30d]) : 1;
     const sales5 = (col.sales5d > -1) ? parseNum(row[col.sales5d]) : 1;
     const momentum = (sales30 > 0) ? (sales5 / sales30) : 1;
 
-    // Calculate Real Margin
-    const entryCost = Math.min(Math.max(epsPrice, parseNum(row[col.hubBuy])), parseNum(row[col.buildNow]) || Infinity, parseNum(row[col.effCost]) || Infinity);
+    // REALITY LOGIC: Prefer Projected (buildNow), fallback to Effective Cost (Historical)
+    const buildNow = parseNum(row[col.buildNow]);
+    const effCost = parseNum(row[col.effCost]);
+    const entryCost = (buildNow > 0) ? buildNow : effCost;
+
     const unitProfit = (parseNum(row[col.sellPrice]) / rateMultiplier) - entryCost;
-    
-    // Base forensic margin
     const rawMargin = entryCost > 0 ? (unitProfit / entryCost) : 0;
-    
-    // Scale by momentum and penalize stagnant traps
     let netMargin = rawMargin * momentum;
-    
-    // Extract signal exactly once
+
     const signal = String(row[col.signal] || "").toUpperCase();
-    
-    if (signal.includes("STAGNANT") || signal.includes("TRAP")) {
-      netMargin = netMargin * 0.5; // Stagnation penalty
-    }
+    if (signal.includes("STAGNANT") || signal.includes("TRAP")) netMargin *= 0.5;
 
     if (netMargin < cfg.minMargin) return;
 
     let buyAction = String(row[col.buyAction] || "BUY").toUpperCase();
     if (signal.includes("TRAP")) buyAction = "SKIP (TRAP)";
 
-    const reprocessVal = parseNum(row[col.reprocessVal]);
-
     results.push({
       data: [
-        name,
-        restockNeed,
-        entryCost,
-        reprocessVal, // <--- Injected column
-        restockNeed * entryCost,
-        unitProfit,
-        unitProfit * restockNeed,
+        name, restockNeed, entryCost, parseNum(row[col.reprocessVal]),
+        restockNeed * entryCost, unitProfit, unitProfit * restockNeed,
         (parseNum(row[col.buyQty]) + parseNum(row[col.sellQty]) + parseNum(row[col.pending])),
-        parseNum(row[col.vol30]),
-        signal || "-",
-        parseNum(row[col.warehouse]),
-        netMargin,
-        buyAction,
-        "",
-        ""
+        parseNum(row[col.vol30]), signal || "-", parseNum(row[col.warehouse]),
+        netMargin, buyAction, "", ""
       ],
       profitKey: unitProfit * restockNeed
     });
@@ -905,10 +887,9 @@ const materialWhQty = materialMap.get(typeId) || 0;
   results.sort((a, b) => b.profitKey - a.profitKey);
   const output = results.slice(0, cfg.limit).map(r => r.data);
   const maxRows = Math.max(sheet.getLastRow(), 5);
-  sheet.getRange(5, 3, maxRows, 15).clearContent();
+  sheet.getRange(5, 3, maxRows - 4, 15).clearContent();
   if (output.length > 0) sheet.getRange(5, 3, output.length, 15).setValues(output);
 }
-
 
 // Set up Orders to Posting Sell Orders on the Market
 function generateRestockItemsOnHand(ss, fullData) {
@@ -952,7 +933,7 @@ function generateRestockItemsOnHand(ss, fullData) {
 
   const col = {
     item: getIdx("Item Name"),
-    typeId: getIdx("type_id"), 
+    typeId: getIdx("type_id"),
     targetGoal: getIdx("Target"),
     sellQty: getIdx("Posted Sell Quantity"),
     whQty: getIdx("Warehouse Qty"),
@@ -1003,7 +984,7 @@ function generateRestockItemsOnHand(ss, fullData) {
     const sales30 = (col.sales30d > -1) ? clean(r[col.sales30d]) : 1;
     const sales5 = (col.sales5d > -1) ? clean(r[col.sales5d]) : 1;
     let momentum = (sales30 > 0) ? (sales5 / sales30) : 1;
-    
+
     // Safety clamps: Never throttle below 25% exposure, never over-list past 150% on a spike
     momentum = Math.min(Math.max(momentum, 0.25), 1.5);
 
@@ -1029,7 +1010,13 @@ function generateRestockItemsOnHand(ss, fullData) {
 
     let postPrice = 0;
     const hubSell = clean(r[col.hubSell]);
-    const baseCost = clean(r[col.effCost]) || clean(r[col.mfgCost]);
+    // REALITY CHECK: Prioritize Projected Manufacturing Cost (Rolling Thunder)
+    // If Projected Cost is 0, fall back to Effective/Accounting cost
+    const buildNow = clean(r[col.buildNow]);
+    const effCost = clean(r[col.effCost]);
+    const mfgCost = clean(r[col.mfgCost]);
+
+    const baseCost = (buildNow > 0) ? buildNow : (effCost > 0 ? effCost : mfgCost);
 
     if (manualPrice > 0) {
       postPrice = manualPrice;
