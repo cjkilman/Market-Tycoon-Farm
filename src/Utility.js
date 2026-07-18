@@ -36,6 +36,37 @@ var NITRO_CONFIG = {
   MAX_CHUNK_SIZE: 4000
 };
 
+function reportSheetBloat() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  let report = "--- Sheet Bloat Report ---\n";
+  let totalExcess = 0;
+
+  sheets.forEach(sheet => {
+    const name = sheet.getName();
+    const maxRows = sheet.getMaxRows();
+    const lastRow = sheet.getLastRow();
+
+    // Always leave a small buffer of empty rows so scripts can append normally
+    const blankRows = maxRows - (lastRow < 1 ? 1 : lastRow);
+
+    // Only report sheets that have more than 100 wasted rows at the bottom
+    if (blankRows > 100) {
+      report += `[${name}] -> ${blankRows} wasted blank rows (Data ends at ${lastRow}, Sheet ends at ${maxRows})\n`;
+      totalExcess += blankRows;
+    }
+  });
+
+  if (totalExcess === 0) {
+    report += "All clear. No significant blank row bloat found.";
+  } else {
+    report += `\nTOTAL EXCESS BLANK ROWS: ${totalExcess}\n`;
+    report += "Note: Array formulas evaluate ALL of these. Trimming them will drastically reduce calculation lag.";
+  }
+
+  console.log(report);
+}
+
 /**
  * Helper to retrieve indices for Setting/Value columns
  */
@@ -59,16 +90,53 @@ function _getColIndexMap(headers, names) {
   return map;
 }
 
+function executeBloatTrim() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  let trimmedCount = 0;
+
+  // Safe buffer - always leave a few rows so appends are fast
+  const SAFE_BUFFER = 20;
+
+  sheets.forEach(sheet => {
+    const name = sheet.getName();
+    const maxRows = sheet.getMaxRows();
+    let lastRow = sheet.getLastRow();
+
+    // If a sheet is completely empty, treat row 1 as the last row
+    if (lastRow < 1) lastRow = 1;
+
+    // Calculate how many rows are completely unused beyond the buffer
+    const rowsToDelete = maxRows - lastRow - SAFE_BUFFER;
+
+    if (rowsToDelete > 0) {
+      try {
+        // Syntax: deleteRows(rowPosition, howMany)
+        // Start deleting right after the last data row + buffer
+        sheet.deleteRows(lastRow + SAFE_BUFFER + 1, rowsToDelete);
+        console.log(`[TRIMMED] ${name}: Removed ${rowsToDelete} rows.`);
+        trimmedCount += rowsToDelete;
+      } catch (e) {
+        console.error(`[ERROR] Failed to trim ${name}: ${e.message}`);
+      }
+    }
+  });
+
+  console.log(`--- BLOAT TRIM COMPLETE ---`);
+  console.log(`Total empty rows removed: ${trimmedCount}`);
+  console.log(`Your workbook should calculate significantly faster now.`);
+}
+
 /**
  * Maps Market Settings from the Location List sheet using a Named Range.
  * Bulletproof against row/column insertions.
  */
 function getMarketSettingsMap(ss) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  
+
   const range = ss.getRangeByName("g_market_settings");
   const map = new Map();
-  
+
   if (!range) {
     console.error("Named Range 'g_market_settings' not found!");
     return map;
@@ -81,14 +149,14 @@ function getMarketSettingsMap(ss) {
     // values[0] is the first row of your Named Range (the headers)
     const headers = values[0];
     const col = _getColIndexMap(headers, ['Setting', 'Value']);
-    
+
     // Process everything after the header row
     const data = values.slice(1);
 
     for (const r of data) {
       const key = r[col.Setting];
       if (key && String(key).trim() !== "") {
-        
+
         let rawVal = r[col.Value];
         let val;
 
@@ -99,14 +167,14 @@ function getMarketSettingsMap(ss) {
           const cleaned = String(rawVal || "0").replace(/[^0-9.-]/g, '');
           val = parseFloat(cleaned) || 0;
         }
-        
+
         map.set(key, val);
       }
     }
   } catch (e) {
     console.error("Error in getMarketSettingsMap: " + e.message);
   }
-  
+
   return map;
 }
 
@@ -184,13 +252,13 @@ function prepareTempSheet(ss, sheetName, headers) {
 function getOrCreateSheet(ss, name, headers, fixHeaders = false) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(name);
-  
+
   // 1. Create if missing
   if (!sheet) {
     console.log(`Creating new sheet: '${name}'`);
     sheet = ss.insertSheet(name);
   }
-  
+
   // 2. Handle Headers
   if (headers && headers.length > 0) {
     const lastRow = sheet.getLastRow();
@@ -205,34 +273,30 @@ function getOrCreateSheet(ss, name, headers, fixHeaders = false) {
     if (lastRow === 0) {
       sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
       console.log(`Headers written to new/empty sheet '${name}'`);
-    } 
+    }
     // Case B: Sheet has data, check for Repair (Only if fixHeaders is TRUE)
     else if (fixHeaders === true) {
-       // Read current row 1 to see if it matches
-       const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-       
-       // Compare contents
-       const isMismatch = JSON.stringify(currentHeaders) !== JSON.stringify(headers);
+      // Read current row 1 to see if it matches
+      const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
 
-       if (isMismatch) {
-         console.warn(`[getOrCreateSheet] Header mismatch detected in '${name}'. Repairing...`);
-         
-         // CRITICAL: Shift existing data down to Row 2 to prevent overwriting
-         sheet.insertRowBefore(1);
-         
-         // Write correct headers into the NEW empty Row 1
-         sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-       }
+      // Compare contents
+      const isMismatch = JSON.stringify(currentHeaders) !== JSON.stringify(headers);
+
+      if (isMismatch) {
+        console.warn(`[getOrCreateSheet] Header mismatch detected in '${name}'. Repairing...`);
+
+        // CRITICAL: Shift existing data down to Row 2 to prevent overwriting
+        sheet.insertRowBefore(1);
+
+        // Write correct headers into the NEW empty Row 1
+        sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+      }
     }
   }
-  
+
   return sheet;
 }
 
-/**
- * [NEW] Separate trigger to turn calculation back on.
- * If this times out, it's fine. The data is already safe.
- */
 /**
  * [ANESTHESIA] - Pauses heavy formulas via Helper Cells.
  * Toggles Utility!B3:D3 to 0.
@@ -253,13 +317,13 @@ function pauseSheet(ss) {
       // 1. Set flags B3:D3 to 0 (Pause)
       // 2. Set E3 to current time (Timestamp)
       const timestamp = new Date();
-      
+
       sheet.getRange("B3:D3").setValues([[0, 0, 0]]);
       sheet.getRange("E3").setValue(timestamp);
-      
+
       // Optional: Set format to make it human-readable in the sheet
       sheet.getRange("E3").setNumberFormat("yyyy-mm-dd hh:mm:ss");
-      
+
       SpreadsheetApp.flush();
       console.log("[Anesthesia] Set Utility flags to 0 (Paused) and updated E3 timestamp.");
       return true;
@@ -340,6 +404,23 @@ function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
       finalSheet.getRange(1, 1, sourceValues.length, sourceValues[0].length).setValues(sourceValues);
     }
 
+    // AUTO-TRIM EXCESS ROWS/COLS
+    const totalRows = finalSheet.getMaxRows();
+    const totalCols = finalSheet.getMaxColumns();
+    if (sourceValues.length > 0 && sourceValues[0].length > 0) {
+      const dataRows = sourceValues.length;
+      const dataCols = sourceValues[0].length;
+
+      // Delete excess rows if any
+      if (totalRows > dataRows) {
+        finalSheet.deleteRows(dataRows + 1, totalRows - dataRows);
+      }
+      // Delete excess columns if any
+      if (totalCols > dataCols) {
+        finalSheet.deleteColumns(dataCols + 1, totalCols - dataCols);
+      }
+    }
+
     // 4. REWIRE NAMED RANGES (If map provided)
     // Since we overwrote the target sheet (kept ID), most ranges persist.
     // However, if the data size changed drastically, we might need to resize them.
@@ -387,7 +468,7 @@ function isEngineRunning_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const util = ss.getSheetByName("Utility");
   if (!util) return false;
-  
+
   // Checks cell D3 (TICK.ESI)
   return util.getRange("D3").getValue() === 1;
 }
@@ -468,7 +549,7 @@ function writeDataToSheet(sheetName, dataArray, startRow, startCol, stateObject)
   var i = Number(state.nextBatchIndex) || 0;
 
   currentChunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(MIN_CHUNK_SIZE, currentChunkSize));
-var previousChunkSize = 0;
+  var previousChunkSize = 0;
   var dataLength = dataArray.length;
   var numCols = (dataLength > 0) ? dataArray[0].length : 0;
 
@@ -517,7 +598,7 @@ var previousChunkSize = 0;
           Utilities.sleep(THROTTLE_PAUSE_MS);
           previousDuration = 0;
         }
-        
+
         currentChunkSize = Math.min(currentChunkSize, MAX_ROWS_BY_COLUMNS);
         currentChunkSize = Math.max(currentChunkSize, MIN_CHUNK_SIZE);
 
@@ -560,7 +641,7 @@ var previousChunkSize = 0;
         i += numRows;
 
         state.nextBatchIndex = i;
-        
+
         state.config.currentChunkSize = currentChunkSize;
         state.metrics.previousDuration = previousDuration;
       }
@@ -603,7 +684,7 @@ var previousChunkSize = 0;
  */
 function _chunkAndPut(key, content, ttlSeconds) {
   if (!content) return false;
-  
+
   const cache = CacheService.getScriptCache();
   const MAX_SIZE = 100000; // 100KB safe allocation threshold
   const safeTtl = Math.min(Number(ttlSeconds) || 21600, 21600); // Guard against ESI max limits
@@ -613,9 +694,9 @@ function _chunkAndPut(key, content, ttlSeconds) {
     if (content.length <= MAX_SIZE) {
       // Look for old meta markers BEFORE overwriting the primary key slot
       const existingChunksMeta = cache.get(key + "_chunks");
-      
+
       cache.put(key, content, safeTtl);
-      
+
       // Clean up orphaned tail shards from a previous larger historical payload write
       if (existingChunksMeta) {
         _deleteShardedData(key, parseInt(existingChunksMeta, 10));
@@ -684,7 +765,7 @@ function _getAndDechunk(key) {
       }
       fullContentBuffer += part;
     }
-    
+
     return fullContentBuffer;
   } catch (e) {
     console.error(`[CACHE FAULT] _getAndDechunk failed for key ${key}: ${e.message}`);
@@ -698,12 +779,12 @@ function _getAndDechunk(key) {
 function _deleteShardedData(baseKey, totalOldChunks) {
   const cache = CacheService.getScriptCache();
   if (isNaN(totalOldChunks) || totalOldChunks <= 0) return;
-  
+
   const keysToPurge = [`${baseKey}_chunks`];
   for (let i = 0; i < totalOldChunks; i++) {
     keysToPurge.push(`${baseKey}_${i}`);
   }
-  
+
   try {
     cache.removeAll(keysToPurge);
   } catch (e) {

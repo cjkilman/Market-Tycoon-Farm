@@ -254,47 +254,153 @@ function updateControlSheet() {
     console.log("System State restored to RUNNING.");
   }
 }
-
-
-
-function NUKE_LOADING_ISSUES() {
+function NUKE_AND_REFETCH() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const authToon = getCorpAuthChar(ss);
+  const sheet = ss.getSheetByName("CorpOrdersCalc");
 
+  if (sheet) {
+    // 1. Completely wipe the sheet to eliminate any ghost data/mismatches
+    sheet.clearContents();
+
+    // 2. Force the cache property to 0 so the next fetch ignores the ESI window
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('CORP_ORDERS_EXPIRES', '0');
+
+    // 3. Re-run your loader with the forceRefresh flag enabled
+    NUKE_LOADING_ISSUES(true);
+
+    console.log("Nuke and Refetch Complete. Sheet is clear and fresh data is incoming.");
+  } else {
+    console.error("Sheet 'CorpOrdersCalc' not found. Check your sheet name.");
+  }
+}
+
+function NUKE_AND_CACHE() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("CorpOrdersCalc");
+
+  if (sheet) {
+    // 1. Completely wipe the sheet to eliminate any ghost data/mismatches
+    sheet.clearContents();
+
+    // 2. Force the cache property to 0 so the next fetch ignores the ESI window
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('CORP_ORDERS_EXPIRES', '0');
+
+    // 3. Re-run your loader with the forceRefresh flag enabled
+    NUKE_LOADING_ISSUES(true);
+
+    console.log("Nuke and Refetch Complete. Sheet is clear and fresh data is incoming.");
+  } else {
+    console.error("Sheet 'CorpOrdersCalc' not found. Check your sheet name.");
+  }
+}
+
+
+
+function NUKE_LOADING_ISSUES(forceRefresh = false) {
+  // Fix the Event Object hijack: strict type check for boolean true
+  const force = forceRefresh === true;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+
+  if (ESI.isLocked()) {
+    LoggerEx.warn("Quota dead. Orchestrator idling.");
+    return;
+  }
+
+  // --- 1. THE EXPIRE PROPERTY GATE ---
+
+  const storedExpires = Number(props.getProperty('CORP_ORDERS_EXPIRES') || 0);
+  console.log(`Current Time: ${Date.now()}`);
+  console.log(`Stored Expires: ${storedExpires}`);
+  console.log(`Is within window: ${Date.now() < storedExpires}`);
+  if (!force && Date.now() < storedExpires) {
+    console.log("Corp Orders: Within ESI cache window. Skipping fetch.");
+    return;
+  }
+
+
+
+  const authToon = getCorpAuthChar(ss);
   if (!authToon) {
     console.error("[ERROR] Could not find authorized character.");
     return;
   }
+
   console.log(`Starting Precision Data Injection for ${authToon}...`);
 
-  // --- 1. OVERWRITE CORP ORDERS (Target: B2 data zone) ---
+  // --- 2. THE FETCH & VALIDATION ---
   try {
     const orderSheet = ss.getSheetByName("CorpOrdersCalc");
     if (orderSheet) {
       console.log("Igniting true concurrent fetch for Corp Orders...");
-      const fullData = _fetchCorpOrdersConcurrently(authToon);
 
+      // Receive the new Object format
+      const fetchResponse = _fetchCorpOrdersConcurrently(authToon);
+      console.log(`Fetch Status: ${fetchResponse.status} - ${fetchResponse.message}`);
+
+      // Abort safely if fetch failed
+      if (fetchResponse.status !== "SUCCESS") {
+        console.warn("[WARN] Fetch did not succeed. Aborting injection to protect sheet data.");
+        return;
+      }
+
+      // Extract the fully pre-typed, header-included 2D array
+      const fullData = fetchResponse.data;
+
+      // Ensure we have at least the header row PLUS one row of data
       if (fullData && fullData.length > 1) {
+
         const numRows = fullData.length;
         const numCols = fullData[0].length;
-        const currentLastRow = orderSheet.getLastRow();
-        const numRowsToClear = Math.max(currentLastRow - 1, 1);
 
-        orderSheet.getRange(2, 1, numRowsToClear, numCols).clearContent();
+        // --- 3. ENSURE SHEET CAPACITY ---
+        const maxRows = orderSheet.getMaxRows();
+        if (maxRows < numRows) {
+          orderSheet.insertRowsAfter(maxRows, numRows - maxRows);
+        }
+
+        // --- 4. ATOMIC CLEAR & INJECT ---
+        // Clear everything from Row 2 down to the bottom
+        orderSheet.getRange(2, 2, maxRows - 1, numCols).clearContent();
+
+        // Inject headers into Row 2, and data into Row 3+
         const injectionTargetRange = orderSheet.getRange(2, 2, numRows, numCols);
         injectionTargetRange.setValues(fullData);
 
-        const ORDERS_RANGE_NAME = "corp_unsorted_orders";
-        ss.setNamedRange(ORDERS_RANGE_NAME, injectionTargetRange);
+        // --- NEW: 4.5. TRIM EMPTY ROWS ---
+        // Calculate the exact last row where our new data ends (starts at Row 2, so 1 + numRows)
+        const lastDataRow = 1 + numRows;
+        const currentTotalRows = orderSheet.getMaxRows();
 
-        console.log(`[SUCCESS] Wrote ${numRows} rows and updated Named Range '${ORDERS_RANGE_NAME}' flawlessly.`);
+        // If the sheet has more rows than we need, chop off the bottom
+        if (currentTotalRows > lastDataRow) {
+          orderSheet.deleteRows(lastDataRow + 1, currentTotalRows - lastDataRow);
+        }
+
+        // --- 5. UPDATE STABLE NAMED RANGE ---
+        const ORDERS_RANGE_NAME = "corp_unsorted_orders";
+        const existingNr = ss.getNamedRanges().find(nr => nr.getName() === ORDERS_RANGE_NAME);
+
+        // Set the Named Range to exactly match the injected block (Row 1 through End)
+        if (existingNr) {
+          existingNr.setRange(injectionTargetRange);
+        } else {
+          ss.setNamedRange(ORDERS_RANGE_NAME, injectionTargetRange);
+        }
+
+        console.log(`[SUCCESS] Wrote ${numRows - 1} data rows (plus headers). Updated Named Range '${ORDERS_RANGE_NAME}'.`);
+      } else {
+        console.warn("[WARN] Fetch returned zero data rows. Nuke aborted to prevent blanking sheet.");
       }
+    } else {
+      console.error("[ERROR] 'CorpOrdersCalc' sheet not found.");
     }
   } catch (e) {
     console.error("[ERROR] Corp Orders Injection Failed: " + e.message);
   }
-
-
 }
 
 /**

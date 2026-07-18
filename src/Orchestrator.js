@@ -63,6 +63,26 @@ const STATE_FLAGS = {
 };
 const PROP_KEY_SETUP_STAGE = 'marketDataSetupStage';
 
+function FORCE_RESTORE_RUNNING_STATE() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // 1. Force the system state back to RUNNING
+  SCRIPT_PROP.setProperty('GLOBAL_SYSTEM_STATE', 'RUNNING');
+  
+  // 2. Force the sheet to wake up (in case it was paused)
+  try {
+    wakeUpSheet(ss);
+  } catch(e) {
+    console.error("Wakeup failed, but state is reset. Proceeding.");
+  }
+  
+  // 3. Clear the market engine lock to allow fresh start
+  _resetMarketDataJobState(null);
+  
+  console.log("CRITICAL: System forced back to RUNNING state.");
+}
+
 /**
  * Replaces IMPORTRANGE. Fetches static market prices from the external hub.
  * This completely kills the continuous recalculation loop caused by live linking.
@@ -172,6 +192,23 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
     console.error(`Failed to create trigger: ${e.message}`);
   }
 }
+
+function DEBUG_REMOTE_FILE_STRUCTURE() {
+  const sourceId = "1L37sYZPznkNu3EJy554nmaclXQl6DpvERc_N6ans76M";
+  const sourceFile = SpreadsheetApp.openById(sourceId);
+  const sheets = sourceFile.getSheets();
+  
+  console.log("Remote File Sheets:");
+  sheets.forEach(s => console.log("- " + s.getName()));
+  
+  const target = sourceFile.getSheetByName("Publish_ESI_Region_market_orders");
+  if(target) {
+    console.log("Target Sheet Found. Data Range: " + target.getDataRange().getA1Notation());
+  } else {
+    console.error("Target sheet not found!");
+  }
+}
+
 
 /**
  * Grabs Regional Pricing from Market Price Tracker.
@@ -312,6 +349,19 @@ function _resetMarketDataJobState(error) {
 
   try {
     keysToDelete.forEach(k => SCRIPT_PROP.deleteProperty(k));
+
+    // --- NEW: ARM THE PENALTY BOX ---
+    if (error) {
+      // If triggered by an error, enforce a 30-minute cooldown
+      const cooldownDuration = 30 * 60 * 1000; 
+      const cooldownUntil = new Date().getTime() + cooldownDuration;
+      SCRIPT_PROP.setProperty('MARKET_COOLDOWN', cooldownUntil.toString());
+      console.warn(`[COOLDOWN] Market Data engine quarantined until ${new Date(cooldownUntil).toLocaleTimeString()}.`);
+    } else {
+      // If it's a manual/clean reset, clear any active cooldowns so we can run immediately
+      SCRIPT_PROP.deleteProperty('MARKET_COOLDOWN');
+    }
+
   } catch (propError) {
     console.error(`Error deleting properties: ${propError.message}`);
   }
@@ -386,38 +436,7 @@ function executeWithWaitLock(funcToRun, functionName, timeoutMs = LOCK_WAIT_TIME
  * Call this when the daily quota resets or you want to clear a failed-job cooldown.
  */
 function resetSystemQuota() {
-  const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ENGINE_ROOM') : console;
-  const props = PropertiesService.getScriptProperties();
-  const lock = LockService.getScriptLock();
-
-  // Ensure we don't clear properties while the engine is writing
-  if (!lock.tryLock(5000)) {
-    log.warn("Reset aborted: Engine is currently busy with an active lock.");
-    if (typeof SpreadsheetApp !== 'undefined') {
-      SpreadsheetApp.getActiveSpreadsheet().toast("Reset failed: Engine Busy.", "Engine Room");
-    }
-    return;
-  }
-
-  try {
-    // 1. Remove the Hard Kill-Switch
-    props.deleteProperty('DAILY_QUOTA_EXHAUSTED');
-    
-    // 2. Remove the Engine Cooldown (in case it tripped on a failure)
-    props.deleteProperty('MARKET_COOLDOWN');
-
-    log.info("System-wide Quota and Cooldown flags successfully cleared.");
-
-    // 3. User feedback
-    if (typeof SpreadsheetApp !== 'undefined') {
-      SpreadsheetApp.getActiveSpreadsheet().toast("Quota & Cooldown Reset!", "Engine Room", 3);
-    }
-    
-  } catch (e) {
-    log.error("Failed to reset quota/cooldown: " + e.message);
-  } finally {
-    lock.releaseLock();
-  }
+ ESI.reset();
 }
 
 /**
@@ -428,33 +447,23 @@ function resetSystemQuota() {
 function masterOrchestrator() {
   const NOW_MS = new Date().getTime();
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const LOG = LoggerEx ? LoggerEx.withTag('ORCHESTRATOR') : console;
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ORCHESTRATOR') : console;
 
-  // --- NEW: PROACTIVE QUOTA COMPLIANCE ---
-  if (SCRIPT_PROP.getProperty('DAILY_QUOTA_EXHAUSTED') === 'true') {
-    LOG.error("Orchestrator: System Quota Exhausted. Entering standby mode.");
-    return; // Stop the Orchestrator entirely
+  // --- 1. PROACTIVE QUOTA COMPLIANCE ---
+  if (typeof ESI !== 'undefined' && ESI.isLocked()) {
+    LOG.warn("QUOTA DEAD: masterOrchestrator suspended to save execution time.");
+    return;
   }
 
-  // 1. GLOBAL SAFETY CHECK: Respect the Maintenance Flag (Anesthesia)
-  const systemState = SCRIPT_PROP.getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
-  if (systemState === 'MAINTENANCE') {
-    LOG.warn("System is in MAINTENANCE mode (Anesthesia Active). Aborting tick.");
-    return; // Hard stop: Do not attempt to process market data or jobs
-  }
-
-  // 2. COOL DOWN CHECK: If the engine crashed previously, respect the cooldown
+  // --- 3. COOL DOWN CHECK ---
   const cooldownUntil = parseInt(SCRIPT_PROP.getProperty('MARKET_COOLDOWN') || '0', 10);
   if (cooldownUntil > NOW_MS) {
-    LOG.warn(`Market Data engine is on cooldown until ${new Date(cooldownUntil).toLocaleTimeString()}.`);
-    // We don't return here because maintenance jobs can still run during market cooldown!
+    LOG.warn(`Market Data engine is on cooldown.`);
   }
 
-  // 3. PENDING FINALIZATIONS
-  // Check for pending COGS Finalization and nudge it if found
+  // --- 4. PENDING FINALIZATIONS ---
   if (_nudgeCogsFinalizer()) return;
 
-  // Finalizer check for Market Data
   const marketDataStep = SCRIPT_PROP.getProperty('marketDataJobStep');
   if (marketDataStep === STATE_FLAGS.FINALIZING) {
     const lock = LockService.getScriptLock();
@@ -466,39 +475,45 @@ function masterOrchestrator() {
     return;
   }
 
-  // 4. MARKET DATA ENGINE DISPATCH
+  // --- 5. MARKET DATA ENGINE DISPATCH ---
   const lastMarketRun = parseInt(SCRIPT_PROP.getProperty('MARKET_DATA_LAST_RUN_TS') || '0', 10);
   const isMarketOnCooldown = (cooldownUntil > NOW_MS);
-  
-  // Logic: Dispatch NEW run if interval passed, or Nudge if in PROCESSING
   const timeSinceLastRun = NOW_MS - lastMarketRun;
   const RUN_INTERVAL_MS = 28 * 60 * 1000; // 28 minute cycle
 
   if (!isMarketOnCooldown && timeSinceLastRun > RUN_INTERVAL_MS) {
-    // Check if job is currently "Active" (lease present)
     const leaseUntil = parseInt(SCRIPT_PROP.getProperty('marketDataJobLeaseUntil') || '0', 10);
     const isJobActive = leaseUntil > NOW_MS;
 
     if (!isJobActive) {
       LOG.info(`DISPATCHING MARKET DATA JOB (30m Cycle).`);
-      const launchResult = updateMarketDataSheet(); // This triggers the NEW_RUN phase
-
-      if (launchResult !== null) {
-        SCRIPT_PROP.setProperty('marketDataJobLeaseUntil', (NOW_MS + 300000).toString());
-      }
-      return; // Dispatch successful
+      
+      // Set the lease target BEFORE invoking so concurrent ticks cannot duplicate the run
+      SCRIPT_PROP.setProperty('marketDataJobLeaseUntil', (NOW_MS + 300000).toString());
+      
+      updateMarketDataSheet(NOW_MS); 
+      return;
     }
   }
 
-  // If in a processing state, simply "nudge" the worker to continue work
+  // --- 6. SMART NUDGE GATE ---
+  // Only nudge the worker if the processing step is active AND the script lock is clear.
+  // If the lock cannot be acquired immediately, the worker is actively processing chunks.
   if (marketDataStep === STATE_FLAGS.PROCESSING || marketDataStep === STATE_FLAGS.NEW_RUN) {
-    LOG.info(`Market Data Active (${marketDataStep}). Nudging.`);
-    updateMarketDataSheet();
+    const probeLock = LockService.getScriptLock();
+    if (probeLock.tryLock(0)) {
+      // The lock was free, meaning the chained trigger died! Revive it.
+      probeLock.releaseLock();
+      LOG.info(`Market Data engine stalled in state (${marketDataStep}). Nudging worker.`);
+      updateMarketDataSheet(NOW_MS);
+    } else {
+      // Lock is busy: The worker is healthy and running its chunk loops right now. Keep quiet.
+      LOG.info(`Market Data Active (${marketDataStep}). Worker loop verified running.`);
+    }
     return;
   }
 
-  // 5. MAINTENANCE & IDLE TASKS
-  // If we reach here, the system is Idle. Run maintenance jobs.
+  // --- 7. MAINTENANCE & IDLE TASKS ---
   LOG.info(`Market Data Idle. Attempting Maintenance cycle.`);
   executeWithTryLock(runMaintenanceJobs, 'runMaintenanceJobs');
 }
@@ -591,7 +606,7 @@ function runMaintenanceJobs(explicitNowMs) {
     { name: 'TransactionsAndJournalSync', interval: STANDARD_INTERVAL },
 
     // --- STEP 2: PROCESSING & MATERIAL ALIGNMENT ---
-    { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
+    // Disabled { name: 'runContractLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'runIndustryLedgerPhase', interval: STANDARD_INTERVAL },
     { name: 'runLootDeltaPhase', interval: STANDARD_INTERVAL },
 
@@ -599,7 +614,6 @@ function runMaintenanceJobs(explicitNowMs) {
     { name: 'runUnifiedTycoonPipeline', interval: 2700000, lease: 1800000 },
 
     // --- STEP 4: CLEANUP & HOUSEKEEPING ---
-    { name: 'purgeContractsWithLedgeredStatus', interval: 86400000 },
     { name: 'runDowntimeMaintenance', interval: 86400000 }
   ];
 
@@ -666,7 +680,11 @@ function runMaintenanceJobs(explicitNowMs) {
  * Phase 1: Surgical Pause (Prevent creation crash)
  * Phase 2: Live Write (No pause, allows dashboard use)
  */
-function updateMarketDataSheet() {
+function updateMarketDataSheet(statTime) {
+ // Explicitly declare START_TIME as a constant within this function's scope
+ const trueStart = new Date().getTime();
+ const START_TIME = (typeof statTime === 'number') ? statTime : trueStart;
+
   if (isSdeJobRunning()) {
     console.warn("ABORT: SDE Update in progress. Parking Market Tycoon.");
     return;
@@ -678,17 +696,15 @@ function updateMarketDataSheet() {
   }
 
   // --- THE BOUNCER: STRICT SCRIPT LOCK ---
-  // Prevents the Orchestrator "Nudge" and Time-Driven triggers from overlapping.
   const scriptLock = LockService.getScriptLock();
-  if (!scriptLock.tryLock(1000)) { // Fail fast (1 second)
+  if (!scriptLock.tryLock(1000)) { 
     console.warn("ABORT: updateMarketDataSheet is already running. Bouncing overlapping trigger.");
     return;
   }
 
   try {
-    const START_TIME = new Date().getTime();
+    // 2. STAMP THE LOGICAL START TIME IMMEDIATELY
     const SCRIPT_PROP = PropertiesService.getScriptProperties();
-
     const PROP_KEY_STEP = 'marketDataJobStep';
     const PROP_KEY_WRITE_INDEX = 'marketDataNextWriteRow';
     const PROP_KEY_CHUNK_SIZE = 'marketDataChunkSize';
@@ -702,14 +718,15 @@ function updateMarketDataSheet() {
     const DATA_SHEET_HEADERS = ["cacheKey", "type_id", "location_type", "location_id", "sell_min", "buy_max", "sell_volume", "buy_volume", "last_updated"];
 
     var ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
-    const masterRequests = getMasterBatchFromControlTable(ss_anchor);
-
+    
+    // 3. CHECK STEP FIRST BEFORE LOADING 20k ROWS
     let currentStep = SCRIPT_PROP.getProperty(PROP_KEY_STEP) || STATE_FLAGS.NEW_RUN;
 
     // --- Phase 1: NEW_RUN (SURGICAL PAUSE) ---
-    if (currentStep === STATE_FLAGS.NEW_RUN || !masterRequests || masterRequests.length === 0) {
+    if (currentStep === STATE_FLAGS.NEW_RUN) {
       console.log(`State: ${STATE_FLAGS.NEW_RUN}.`);
-
+      
+      const masterRequests = getMasterBatchFromControlTable(ss_anchor);
       if (!masterRequests || masterRequests.length === 0) {
         _resetMarketDataJobState(new Error("Control Table empty"));
         return;
@@ -744,7 +761,13 @@ function updateMarketDataSheet() {
     // --- Phase 2: WRITE (Nitro Mode - LIVE/UNPAUSED) ---
     if (currentStep === 'PROCESSING' || currentStep === 'WRITE') {
 
+      // FETCH EXACTLY ONCE HERE
       const masterRequests_stable = getMasterBatchFromControlTable(ss_anchor);
+      if (!masterRequests_stable || masterRequests_stable.length === 0) {
+        _resetMarketDataJobState(new Error("Control Table empty during processing"));
+        return;
+      }
+
       let allRowsToWrite = [];
 
       try {
@@ -775,8 +798,6 @@ function updateMarketDataSheet() {
         scheduleOneTimeTrigger('updateMarketDataSheet', RESCHEDULE_DELAY_MS * 2);
         return;
       }
-
-      ss_anchor = SpreadsheetApp.getActiveSpreadsheet();
 
       let writeState = {
         logInfo: console.log, logError: console.error, logWarn: console.warn,
@@ -818,25 +839,17 @@ function updateMarketDataSheet() {
         scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
       }
       else {
-        // --- CRITICAL FIX START ---
         if (writeResult.error && (writeResult.error.includes("Lock Failed") || writeResult.error.includes("Lock timeout"))) {
           console.warn("Lock Conflict detected. Pausing for Sheet to breathe. DO NOT RESET.");
-
-          // Preserve the current index so it picks up where it left off
           const nextIndex = (writeResult.state.nextBatchIndex || 0).toString();
           SCRIPT_PROP.setProperty(PROP_KEY_WRITE_INDEX, nextIndex);
-
-          // Force a 30-second delay to allow Google Sheets to finish calculations
           scheduleOneTimeTrigger('updateMarketDataSheet', 30000);
         } else {
-          // Only reset on actual data corruption or API failures
           _resetMarketDataJobState(new Error(`Write Failure: ${writeResult.error}`));
         }
-        // --- CRITICAL FIX END ---
       }
     }
   } finally {
-    // ALWAYS release the script lock so the next trigger can run
     scriptLock.releaseLock();
   }
 }

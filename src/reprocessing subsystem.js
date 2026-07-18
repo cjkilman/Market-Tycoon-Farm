@@ -177,7 +177,7 @@ function reprocessItemsToLedger(ss) {
       });
     });
 
-    const result = ML.forSheet("Material_Ledger").upsert(['source', 'char', 'contract_id', 'type_id'], ledgerPayload);
+    const result = ML.forSheet("Material_Ledger").upsert(['date','source', 'char', 'contract_id', 'type_id'], ledgerPayload);
     LOG.info(`Aggregated reprocessing complete. Upserted ${result.rows} rows.`);
   } else {
     LOG.info("No valid items to reprocess.");

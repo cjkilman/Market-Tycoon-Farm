@@ -59,98 +59,39 @@ const PROP_KEY_CHUNK_SIZE = ASSET_CHUNK_SIZE_KEY;
  * Now integrates directly with the standard ESI module wrapper.
  * Dynamically handles pagination by parsing sequential pages until empty.
  */
+/**
+ * UPGRADED: Corporate Asset Ingestion Engine
+ * Now integrates directly with the standard ESI module wrapper.
+ * Dynamically handles pagination by parsing sequential pages until empty.
+ */
 function _fetchAssetsConcurrently(authName) {
     const log = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CORP_ASSETS') : console);
-
-    // 1. HARD GATE: Quota protection via the new ESI module circuit status
-    if (typeof ESI !== 'undefined' && ESI.isLocked()) {
-        log.warn("Aborted: Daily Quota already exhausted or circuit breaker tripped.");
+    const charData = GESI.getCharacterData ? GESI.getCharacterData(authName) : null;
+    
+    if (!charData?.corporation_id) {
+        log.error(`Could not resolve Corp ID for: ${authName}`);
         return [ASSET_CACHE_HEADERS];
     }
 
-    // 2. Corp ID Resolution
-    let corpId = 0;
-    try {
-        const charObj = GESI.getCharacterData ? GESI.getCharacterData(authName) : null;
-        if (charObj) corpId = charObj.corporation_id;
-    } catch (e) { }
+    log.info(`[START] Syncing Assets: Corp ${charData.corporation_id}`);
 
-    if (!corpId && GESI.name === authName) {
-        const charData = GESI.getCharacterData ? GESI.getCharacterData() : null;
-        if (charData) corpId = charData.corporation_id;
-    }
+    const result = ESI.forEndpoint(GESI.getClient(authName), 'corporations_corporation_assets')
+                      .get({ corporation_id: charData.corporation_id });
 
-    if (!corpId) {
-        log.error(`[CORP_ASSETS] Could not resolve Corp ID for character matching '${authName}'.`);
+    if (result.error) {
+        log.error(`Fetch failed: ${result.error}`);
         return [ASSET_CACHE_HEADERS];
     }
 
-    // 3. THE UPGRADE & FIX: Generate the specific Auth Client for the Director
-    if (typeof ESI === 'undefined') {
-        log.error("CRITICAL: ESI Master Module is not defined in the scope.");
-        return [ASSET_CACHE_HEADERS];
-    }
-    
-    // --- THE FIX IS HERE ---
-    // Generate the specific client token for the authName (Your Director)
-    const authClient = GESI.getClient(authName);
-    
-    // Pass that specific client into the Endpoint wrapper
-    const assetEndpoint = ESI.forEndpoint(authClient, 'corporations_corporation_assets');
-    // -----------------------
-    
-    const allAssets = [ASSET_CACHE_HEADERS];
-    
-    let page = 1;
-    let keepPaginationActive = true;
+    // Mapping the data
+    const mappedAssets = result.data.map(obj => [
+        obj.is_blueprint_copy, obj.is_singleton, obj.item_id,
+        obj.location_flag, obj.location_id, obj.location_type,
+        obj.quantity, obj.type_id
+    ]);
 
-    log.info(`[START] Beginning sequential asset fetch for Corp: ${corpId} using token: ${authName}`);
-
-    // 4. Sequential Pagination Processing (Robust End-of-Collection Catching)
-    while (keepPaginationActive) {
-        const requestParams = {
-            corporation_id: corpId,
-            page: page
-        };
-
-        // Execute network call through Good Citizen retry/caching layer
-        const result = assetEndpoint.get(requestParams);
-
-        if (result.error) {
-            log.error(`[ESI_ERROR] Fetch failed on page ${page}: ${result.error}`);
-            // Terminate processing immediately on structural or block errors to save execution time
-            break;
-        }
-
-        const pageData = result.data;
-
-        if (Array.isArray(pageData) && pageData.length > 0) {
-            log.info(`Processed page ${page} containing ${pageData.length} records.`);
-            
-            // Map raw response attributes into our strictly-ordered matrix rows
-            pageData.forEach(obj => {
-                allAssets.push([
-                    obj.is_blueprint_copy,
-                    obj.is_singleton,
-                    obj.item_id,
-                    obj.location_flag,
-                    obj.location_id,
-                    obj.location_type,
-                    obj.quantity,
-                    obj.type_id
-                ]);
-            });
-            
-            page++;
-        } else {
-            // An empty array or blank response indicates the absolute end of data
-            log.info(`Reached end of data stream at page ${page}. Closing loop.`);
-            keepPaginationActive = false;
-        }
-    }
-
-    log.info(`[SUCCESS] Corporate asset sync complete. Processed ${allAssets.length - 1} total items across ${page - 1} pages.`);
-    return allAssets;
+    log.info(`[SUCCESS] Assets synced: ${mappedAssets.length} items.`);
+    return [ASSET_CACHE_HEADERS, ...mappedAssets];
 }
 
 /**

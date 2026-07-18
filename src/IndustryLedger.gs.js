@@ -363,14 +363,20 @@ function runIndustryLedgerPhase(ss) {
   try {
     // PHASE 0: Fetcher (Write Only)
     if (phase === 0) {
-      log.info('Phase 0: Fetching ESI Corp Jobs...');
-      _getCorporateJobsRaw(ss, false); //Trust the Cache Time Expire
+      log.info('Phase 0: Synchronizing ESI Corp Jobs...');
+      const result = _getCorporateJobsRaw(ss, false);
+
+      if (result && result.length > 0) {
+        log.info(`Phase 0: Fetched ${result.length} new jobs.`);
+      } else {
+        log.info('Phase 0: Using cached ESI data.');
+      }
+
       phase = 1;
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '1');
     }
 
-    // Initialize jobMap only once we are sure data exists
-    // This runs only if we are in Phase 1 or 2
+    // Initialize jobMap only if we are in Phase 1 or 2
     let jobMap;
     if (phase >= 1) {
       jobMap = _getJobMap(ss);
@@ -695,7 +701,14 @@ function runBpcCreationLedger(ss, jobMap, skipSummary) {
     newlyProcessedIds.push(job.job_id);
   }
 
-  if (ledgerObjects.length > 0) ledgerAPI.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, true, skipSummary);
+  if (ledgerObjects.length > 0) {
+    // Capture the return object from the ML Gatekeeper
+    const result = ledgerAPI.upsert(['source', 'type_id', 'contract_id'], ledgerObjects, true, skipSummary);
+
+    // Print the exact telemetry
+    const log = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('BPC_LEDGER') : console;
+    log.info(`BPC Ledger -> Appended: ${result.appended} | Updated: ${result.upserted} | Processed: ${ledgerObjects.length}`);
+  }
   newlyProcessedIds.forEach(id => processedJobIds.add(id));
   SCRIPT_PROP.setProperty(BPC_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-1000)));
 }
@@ -883,15 +896,15 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
   // 2. Initial Setup (Note: processedJobIds memory block has been eradicated)
   const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
   if (sdeMatMap.size === 0) return;
-  
+
   const nameMap = _getSdeNameMap(ss);
   const configMap = _getMasterBlueprintConfig(ss);
   const costMap = _getBlendedCostMap(ss);
   const amortMap = _getBpoAmortizationMap(ss);
-  
+
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
-  
+
   const bpoAttributesMap = _getBpoAttributesMapFromEsi();
   const internalBpcMap = _buildInternalBpcMap_(ss);
   const ledgerAPI_Local = ML.forSheet('Material_Ledger', ss);
@@ -903,17 +916,17 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
   const ledgerIds = new Set(safeLedgerArray.map(j => String(j.contract_id)));
 
   const targetActivities = [1, 5, 8, 3, 4];
-  
+
   const newJobs = Array.from(jobMap.values()).filter(job => {
     const jid = String(job.job_id);
-    
+
     // THE ULTIMATE GHOST KILLER: 
     // If it's delivered AND already saved in the ledger, ignore it completely.
     if (job.status === 'delivered' && ledgerIds.has(jid)) return false;
 
     // Otherwise, process it! (Active jobs will recalculate and upsert to show live WIP costs)
     return ['active', 'ready', 'delivered'].includes(job.status) &&
-           targetActivities.includes(parseInt(job.activity_id, 10));
+      targetActivities.includes(parseInt(job.activity_id, 10));
   });
 
   if (newJobs.length === 0) {
@@ -946,9 +959,9 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
         internalBpcMap: internalBpcMap,
         bpcWacData: bpcWacData,
         presetRuns: configMap.has(job.blueprint_type_id) ? configMap.get(job.blueprint_type_id).presetRuns : 1,
-        baseYield: (Array.isArray(sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`)) 
-            ? sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`).find(p => p.activityID === parseInt(job.activity_id, 10))?.quantity 
-            : sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`)?.quantity) || 1,
+        baseYield: (Array.isArray(sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`))
+          ? sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`).find(p => p.activityID === parseInt(job.activity_id, 10))?.quantity
+          : sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`)?.quantity) || 1,
         actualInstallCost: Number(job.cost),
         estInstallRate: 0.05
       });
@@ -963,9 +976,9 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
         contract_id: job.job_id,
         char: job.installer_id,
         unit_value_filled: financials.unitCost,
-        metadata: { 
-          me: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).material_efficiency : 0, 
-          te: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).time_efficiency : 0 
+        metadata: {
+          me: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).material_efficiency : 0,
+          te: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).time_efficiency : 0
         }
       });
 
@@ -976,8 +989,11 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
 
   // --- 5. PERSISTENCE ---
   if (ledgerObjects.length > 0) {
-    ledgerAPI_Local.upsert(['date', 'source', 'type_id', 'contract_id'], ledgerObjects, false);
-    LOG_INDUSTRY.info(`Saved ${ledgerObjects.length} jobs to ledger.`);
+    // Capture the return object from the ML Gatekeeper
+    const result = ledgerAPI_Local.upsert(['source', 'type_id', 'contract_id'], ledgerObjects, false);
+
+    // Print the exact telemetry
+    LOG_INDUSTRY.info(`MFG Ledger -> Appended: ${result.appended} | Updated: ${result.upserted} (Total WIP Tracked: ${ledgerObjects.length})`);
   }
 }
 
@@ -1097,6 +1113,7 @@ function _getBlendedCostMap(ss, requiredMaterialIds, applyFailsafe = false) {
   return blendedCache;
 }
 
+
 /**
  * Phase 4: Hangar Audit (Dynamic ID Version)
  */
@@ -1134,11 +1151,18 @@ function _updateBpoConfigFromAudit(blueprints) {
   const nameMap = _getSdeNameMap(ss);
   if (!sheet || !blueprints || blueprints.length === 0) return;
 
-  // 1. Group raw hangar items by Type ID and aggregate research percentages
+  // 1. Group raw hangar items by Type ID and calculate true weighted totals
   const auditMap = new Map();
   blueprints.forEach(bp => {
-    if (bp.runs === -1) { // Process BPOs only (Ignore BPCs)
+  if (bp.runs === -1 || bp.runs > 0) { 
       const id = Number(bp.type_id);
+      
+      // FIX: ESI uses negative numbers (-1 or -2) for unpackaged singletons.
+      const rawQty = Number(bp.quantity) || 1;
+      const qty = rawQty > 0 ? rawQty : 1;
+      
+      const me = Number(bp.material_efficiency) || 0;
+      const te = Number(bp.time_efficiency) || 0;
 
       if (!auditMap.has(id)) {
         auditMap.set(id, {
@@ -1149,9 +1173,13 @@ function _updateBpoConfigFromAudit(blueprints) {
       }
 
       const current = auditMap.get(id);
-      current.count += 1;
-      current.totalMe += (Number(bp.material_efficiency) || 0);
-      current.totalTe += (Number(bp.time_efficiency) || 0);
+      
+      // Add the actual physical number of blueprints
+      current.count += qty;
+      
+      // Weight the ME/TE by how many blueprints are in this stack
+      current.totalMe += (me * qty);
+      current.totalTe += (te * qty);
     }
   });
 
@@ -1174,7 +1202,7 @@ function _updateBpoConfigFromAudit(blueprints) {
   const dataRows = rawData.slice(1);
   const trackedBpIds = new Set();
 
-  // 3. Loop existing registry records and overwrite with fresh averages
+  // 3. Loop existing registry records and overwrite with fresh weighted averages
   if (dataRows.length > 0) {
     const updatedFullTableMatrix = dataRows.map(row => {
       const bpID = Number(row[col.bp_type_id]);
@@ -1184,10 +1212,11 @@ function _updateBpoConfigFromAudit(blueprints) {
         const liveAssetData = auditMap.get(bpID);
         row[col.available_bpos] = liveAssetData.count;
 
-        // Compute whole numbers, then clamp to EVE engine limits (ME: 10, TE: 20)
+        // Compute the true weighted average
         const avgMe = Math.round(liveAssetData.totalMe / liveAssetData.count);
         const avgTe = Math.round(liveAssetData.totalTe / liveAssetData.count);
 
+        // Clamp the stats to engine limits (ME: 10, TE: 20)
         const weightedMeInt = Math.min(avgMe, 10);
         const weightedTeInt = Math.min(avgTe, 20);
 
@@ -1195,6 +1224,10 @@ function _updateBpoConfigFromAudit(blueprints) {
         if (teColIndex !== -1) row[teColIndex] = weightedTeInt;
       } else {
         row[col.available_bpos] = 0; // Asset is no longer in corporation hangars
+        
+        // FIX: Clear out any ghost data like #NUM! if the asset doesn't exist
+        if (meColIndex !== -1) row[meColIndex] = 0;
+        if (teColIndex !== -1) row[teColIndex] = 0;
       }
       return row;
     });
@@ -1208,12 +1241,13 @@ function _updateBpoConfigFromAudit(blueprints) {
     if (!trackedBpIds.has(hangarBpId)) {
       const bpName = nameMap.get(hangarBpId) || `Blueprint ${hangarBpId}`;
 
-      // Compute whole numbers, then clamp to EVE engine limits
-      const rawMe = Math.round(assetObj.totalMe / assetObj.count);
-      const rawTe = Math.round(assetObj.totalTe / assetObj.count);
+      // Compute the true weighted average
+      const avgMe = Math.round(assetObj.totalMe / assetObj.count);
+      const avgTe = Math.round(assetObj.totalTe / assetObj.count);
 
-      const finalMeInt = Math.min(rawMe, 10);
-      const finalTeInt = Math.min(rawTe, 20);
+      // Clamp the stats to engine limits
+      const finalMeInt = Math.min(avgMe, 10);
+      const finalTeInt = Math.min(avgTe, 20);
 
       const appendRow = new Array(headers.length).fill('');
       appendRow[col.bp_type_id] = hangarBpId;
@@ -1684,50 +1718,65 @@ function _getBpoAttributesMapFromEsi() {
 function _getCorporateJobsRaw(ss, forceRefresh = false) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const props = PropertiesService.getScriptProperties();
-  const authToon = getCorpAuthChar();
-  
-  // 1. Quota Gate
-  if (ESI.isLocked()) {
-    LOG_INDUSTRY.error("ABORT: ESI global quota is locked. Skipping Jobs fetch.");
+  const log = LoggerEx.withTag('CORP_JOBS');
+
+  // 1. Check ESI Expiry Property
+  const storedExpires = Number(props.getProperty('CORP_JOBS_EXPIRES') || 0);
+  if (!forceRefresh && Date.now() < storedExpires) {
+    log.info("ESI Corp Jobs: Within ESI cache window. Skipping fetch.");
     return [];
   }
 
-  const log = LoggerEx.withTag('CORP_JOBS');
+  const authToon = getCorpAuthChar();
+  if (!authToon) return [];
+
+  // Fix: Initialize charData to resolve the corporation_id
   const charData = GESI.getCharacterData(authToon);
   if (!charData || !charData.corporation_id) {
-    log.error(`Aborted: Could not resolve dynamic Corp ID.`);
+    log.error("Could not resolve Corp ID.");
     return [];
   }
 
-  // 2. ESI Module Integration
   const authClient = GESI.getClient(authToon);
-  const service = ESI.forEndpoint(authClient, 'corporations_corporation_industry_jobs', {
-    onLock: () => stopWorker_('Quota Lock Active')
-  });
+  const service = ESI.forEndpoint(authClient, 'corporations_corporation_industry_jobs');
 
-  const result = service.get({ corporation_id: charData.corporation_id });
+  // 2. Perform Fetch using charData.corporation_id
+  const result = service.get({
+    corporation_id: charData.corporation_id,
+    include_completed: true
+  });
 
   if (result.error) {
     log.error(`[ESI_MODULE] Fetch failed: ${result.error}`);
     return [];
   }
 
-  const allJobs = result.data;
-  if (!allJobs || allJobs.length === 0) return [];
+  // 3. Parse and Store Expiry Header
+  const headers = result.headers;
+  const expiresHeader = headers['Expires'] || headers['expires'];
+  if (expiresHeader) {
+    props.setProperty('CORP_JOBS_EXPIRES', new Date(expiresHeader).getTime().toString());
+  }
 
-  // 3. Sheet Writing
-  const jobsSheet = ss.getSheetByName("ESI Corp Jobs");
+  // 4. Normalize Data (In Memory)
   const STANDARD_HEADERS = ["activity_id", "blueprint_id", "blueprint_location_id", "blueprint_type_id", "completed_character_id", "completed_date", "cost", "duration", "end_date", "facility_id", "installer_id", "job_id", "licensed_runs", "location_id", "output_location_id", "pause_date", "probability", "product_type_id", "runs", "start_date", "status", "successful_runs"];
 
-  const rows = allJobs.map(job => STANDARD_HEADERS.map(h => job[h] ?? null));
-  const fullData = [STANDARD_HEADERS, ...rows];
+  const rows = result.data.map(job => STANDARD_HEADERS.map(h => {
+    const val = job[h] ?? null;
+    if (val === null) return null;
+    if (["completed_date", "end_date", "start_date", "pause_date"].includes(h)) return new Date(val);
+    if (["blueprint_id", "cost", "duration", "product_type_id", "runs"].includes(h)) return Number(val);
+    return String(val);
+  }));
 
+  // 5. Update Sheet
+  const jobsSheet = ss.getSheetByName("ESI Corp Jobs");
   jobsSheet.getRange(1, 3, Math.max(jobsSheet.getLastRow(), 1), STANDARD_HEADERS.length).clearContent();
-  const targetRange = jobsSheet.getRange(1, 3, fullData.length, STANDARD_HEADERS.length);
-  targetRange.setValues(fullData);
+  const targetRange = jobsSheet.getRange(1, 3, rows.length + 1, STANDARD_HEADERS.length);
+  targetRange.setValues([STANDARD_HEADERS, ...rows]);
   ss.setNamedRange("NR_ESI_CORP_JOBS", targetRange);
 
-  return allJobs;
+  return result.data;
 }
 
 /**
@@ -1744,12 +1793,13 @@ function _getCorporateBlueprintsRaw(forceRefresh) {
   const corpId = charData.corporation_id;
   const cacheKey = BPO_RAW_CACHE_KEY + ':' + corpId;
 
+  // 1. Try cache first
   if (!forceRefresh) {
     const cachedJson = _getAndDechunk(cacheKey);
     if (cachedJson) return JSON.parse(cachedJson);
   }
 
-  // ESI Module Integration
+  // 2. Fetch fresh
   const authClient = GESI.getClient(authToon);
   const service = ESI.forEndpoint(authClient, 'corporations_corporation_blueprints', {
     onLock: () => log.error("Blueprint fetch locked by Quota")
@@ -1762,10 +1812,23 @@ function _getCorporateBlueprintsRaw(forceRefresh) {
     return null;
   }
 
-  const allBlueprints = result.data;
-  _chunkAndPut(cacheKey, JSON.stringify(allBlueprints), BPO_RAW_CACHE_TTL);
+  // 3. Calculate TTL from Expires Header
+  const headers = result.headers;
+  const expiresHeader = headers['Expires'] || headers['expires'];
 
-  return allBlueprints;
+  // Default to 5 minutes if header is missing
+  let ttl = 300;
+  if (expiresHeader) {
+    const expireDate = new Date(expiresHeader).getTime();
+    const seconds = Math.floor((expireDate - Date.now()) / 1000);
+    // Ensure at least 60 seconds of cache, or fall back to 300
+    ttl = seconds > 60 ? seconds : 300;
+  }
+
+  // 4. Chunk and Store
+  _chunkAndPut(cacheKey, JSON.stringify(result.data), ttl);
+
+  return result.data;
 }
 
 function _extractMetric_(row, side, level) {
@@ -1791,62 +1854,3 @@ function resetIndustryLedgerProperties() {
 }
 
 
-
-/**
- * Custom function to fetch Corporation Industry Jobs with caching.
- * Prevents continuous API calls during sheet recalculations.
- * * @param {string} name Character name with ESI Corp Jobs scope.
- * @param {boolean} [include_completed=false] Whether to include completed jobs.
- * @returns {any[][]} Raw data from GESI call.
- * @customfunction
- */
-function GESI_CORP_JOBS_CACHED(name, include_completed) {
-  // NOTE: GLOBAL_STATE_KEY must be accessible. Assuming it's defined elsewhere.
-  const GLOBAL_STATE_KEY = 'GLOBAL_SYSTEM_STATE';
-
-  // START LOGGING & PARAM CHECK
-  Logger.log(`[CIJ_SHEET] START: Name='${name}', Completed=${include_completed}`);
-
-  if (!name) {
-    Logger.log('[CIJ_SHEET] FAIL: Name is missing.');
-    return [['Error: Auth name required']];
-  }
-
-  // ROBUST MAINTENANCE CHECK
-  const systemState = PropertiesService.getScriptProperties().getProperty(GLOBAL_STATE_KEY) || 'RUNNING';
-
-  if (systemState === 'MAINTENANCE') {
-    Logger.log(`[CIJ_SHEET] ABORT: System is in MAINTENANCE mode.`);
-    return [['MAINTENANCE_ACTIVE']];
-  }
-
-  // 1. Fetch data from the *shared* cache handled by _getCorporateJobsRaw.
-  // NOTE: We pass 'false' to force the helper to read from the cache only (no live API call).
-  const rawData = _getCorporateJobsRaw(ss, false);
-
-  if (!rawData || rawData.length === 0) {
-    Logger.log('[CIJ_SHEET] WARN: No data found in shared cache. Returning cache instruction.');
-    return [['DATA_NOT_CACHED'], ['Run Industry Ledger script to refresh cache.']];
-  }
-
-  // 2. Format output for Google Sheets (array of objects -> array of arrays).
-  try {
-    const headerRow = Object.keys(rawData[0] || {});
-
-    if (headerRow.length === 0) {
-      Logger.log('[CIJ_SHEET] ERROR: Raw data object structure is invalid (no headers).');
-      return [['ERROR: Invalid Data Structure']];
-    }
-
-    // Map the array of objects to an array of arrays for sheet compatibility
-    const values = rawData.map(obj => headerRow.map(key => obj[key]));
-
-    Logger.log(`[CIJ_SHEET] SUCCESS: Returning ${values.length} jobs.`);
-
-    // Return the headers and the values
-    return [headerRow, ...values];
-  } catch (e) {
-    Logger.log(`[CIJ_SHEET] ERROR: Formatting failed: ${e.message}`);
-    return [['ERROR', `Formatting failed: ${e.message}`]];
-  }
-}

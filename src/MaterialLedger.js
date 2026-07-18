@@ -29,46 +29,46 @@ function RUN_MATERIAL_AUDIT() { AUDIT_LEDGER_INTEGRITY("Material_Ledger"); }
 function AUDIT_LEDGER_INTEGRITY(sheetName) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(sheetName);
-  
+
   if (!sh) {
     console.error(`ERROR: Could not find a sheet named '${sheetName}'. Please check that the name matches your tab exactly.`);
     return;
   }
-  
+
   const data = sh.getDataRange().getValues();
   const headers = data[0];
   const dateIdx = headers.indexOf('date');
   const typeIdx = headers.indexOf('type_id');
-  
+
   if (dateIdx === -1 || typeIdx === -1) {
     console.error("ERROR: Sheet missing required headers 'date' or 'type_id'.");
     return;
   }
-  
+
   const registry = new Map();
   const nearDuplicates = [];
 
-  for(let i = 1; i < data.length; i++) {
+  for (let i = 1; i < data.length; i++) {
     const row = data[i];
     const dateVal = row[dateIdx];
-    
+
     // Safety check for empty or invalid dates
-    if(!dateVal) continue;
-    
+    if (!dateVal) continue;
+
     const date = new Date(dateVal);
     const tid = row[typeIdx];
-    
+
     // Create a key that is just YYYY-MM-DD + TID
     const key = `${date.toISOString().split('T')[0]}|${tid}`;
-    
-    if(registry.has(key)) {
+
+    if (registry.has(key)) {
       nearDuplicates.push({ key, rowId: i + 1 });
     } else {
       registry.set(key, i + 1);
     }
   }
 
-  if(nearDuplicates.length > 0) {
+  if (nearDuplicates.length > 0) {
     console.warn(`FOUND ${nearDuplicates.length} POTENTIAL DEDUPE CONFLICTS in ${sheetName}:`);
     // Log first 10 for clarity
     nearDuplicates.slice(0, 10).forEach(d => console.log(`Conflict at Row ${d.rowId} for key: ${d.key}`));
@@ -149,11 +149,9 @@ var ML = (function () {
       // --- STRICT DATE PARSING (ESI ISO Strings & Native Dates) ---
       if (d instanceof Date) {
         dt = d;
-      }
-      else if (typeof d === 'string' || typeof d === 'number') {
+      } else if (d) {
         dt = new Date(d);
-      }
-      else {
+      } else {
         throw new Error(`CRITICAL: Expected a Date or ESI string, but received type '${typeof d}' (Value: ${JSON.stringify(d)}).`);
       }
 
@@ -162,77 +160,80 @@ var ML = (function () {
         throw new Error(`CRITICAL: Could not parse ESI timestamp into a valid Date object (Value: ${d}).`);
       }
 
-      // Pass the clean, native JS Date object to the grid.
       out.date = dt;
 
       // --- STRICT NUMBER PARSING (IDs & Financials) ---
-      // THE FIX: Stripping commas out of Type IDs so they don't get incinerated
       out.type_id = Number(String(r.type_id || 0).replace(/,/g, '')) || 0;
-
       out.item_name = r.item_name || '';
-
-      // Strip commas and force pure Numbers
       out.qty = Number(String(r.qty || 0).replace(/,/g, '')) || 0;
 
       var u0 = Number(String(r.unit_value || 0).replace(/,/g, ''));
       var u1 = Number(String(r.unit_value_filled || 0).replace(/,/g, ''));
-
-      // Pass the native Number. If zero, pass a true empty string so Sheets leaves the cell blank.
       out.unit_value = u0 > 0 ? u0 : '';
-      out.source = r.source || '';
-      out.contract_id = r.contract_id || '';
-      out.char = r.char || '';
+
+      // --- STRICT STRING PARSING ---
+      out.source = String(r.source || '').trim();
+      out.contract_id = String(r.contract_id || '').trim(); // Absolute String Lock
+      out.char = String(r.char || '').trim();
 
       var finalVal = u0 > 0 ? u0 : (u1 > 0 ? u1 : 0);
       out.unit_value_filled = finalVal > 0 ? finalVal : '';
-      out.metadata = r.metadata || '';
+      out.metadata = (typeof r.metadata === 'object') ? JSON.stringify(r.metadata) : (r.metadata || '');
 
-      // Map back to your column headers
-      return HEAD_CURRENT.map(k => (out[k] === undefined ? '' : out[k]));
+      // Map back using LOWERCASE headers to guarantee immunity from capitalized sheet columns
+      return HEAD_LOWER.map(k => (out[k] === undefined ? '' : out[k]));
     }
 
-   // --- STANDALONE KEY NORMALIZER (DRY & KEY-STABLE) ---
+    // --- STANDALONE KEY NORMALIZER (DRY & KEY-STABLE) ---
     function _normalizeKeySegment(v, colName) {
       if (colName === 'date') {
         let dt = (v instanceof Date) ? v : new Date(v);
         if (!isNaN(dt.getTime())) {
-          // FIX: Strip the time from the KEY, but preserve the date.
-          // This keeps your deduplication consistent with previous ledger rows.
           return dt.toISOString().split('T')[0];
         }
         return String(v).trim();
       }
 
-      // THE ARMOR: Strip commas before attempting math on type_id
       if (colName === 'type_id') {
         const cleanV = String(v || 0).replace(/,/g, '');
         return String(Math.round(Number(cleanV) || 0));
       }
 
+      // THE SHIELD: Never let JS run math or lowercase on the Contract ID
+      if (colName === 'contract_id') {
+        return String(v).trim();
+      }
+
       // For everything else: strings, names, or generic numbers
-      let str = String(v || '').trim().toLowerCase();
+      let str = String(v || '').trim();
       const cleanStr = str.replace(/,/g, '');
+
+      // Generic numbers
       if (cleanStr !== '' && !isNaN(Number(cleanStr))) {
         return String(Number(cleanStr));
       }
 
-      return str;
+      // Generic strings (lowercased for safe matching on things like 'source' or 'char')
+      return str.toLowerCase();
     }
 
     function upsertBy(keys, rows, holdAnesthesia, skipSummary) {
       if (!rows || !rows.length) return { appended: 0, upserted: 0, totalRows: 0, status: "SUCCESS" };
 
+      // 1. SCOPE LOCK: Define everything immediately so nothing goes missing
+      const last = sh.getLastRow();
       const keyIndices = keys.map(k => {
-        const idx = HEAD_CURRENT.indexOf(k.trim());
+        const idx = HEAD_LOWER.indexOf(k.toLowerCase().trim());
         if (idx === -1) throw new Error(`CRITICAL: Key "${k}" not found.`);
         return idx;
       });
 
       const incomingRows = [];
-      const validQtyIdx = HEAD_CURRENT.indexOf('qty');
-      const validTypeIdIdx = HEAD_CURRENT.indexOf('type_id');
-      const validDateIdx = HEAD_CURRENT.indexOf('date');
+      const validQtyIdx = HEAD_LOWER.indexOf('qty');
+      const validTypeIdIdx = HEAD_LOWER.indexOf('type_id');
+      const validDateIdx = HEAD_LOWER.indexOf('date');
 
+      // 2. NORMALIZE
       rows.forEach(obj => {
         const out = normalizeRow_(obj);
         const checkQty = Number(out[validQtyIdx]) || 0;
@@ -249,47 +250,48 @@ var ML = (function () {
 
       if (incomingRows.length === 0) return { appended: 0, upserted: 0, totalRows: 0, status: "SUCCESS" };
 
-      const last = sh.getLastRow();
       const existingKeys = new Set();
       let fullExistingData = [];
 
-      // Load existing keys into memory
+      // 3. LOAD EXISTING
       if (last >= 2) {
         fullExistingData = sh.getRange(2, 1, last - 1, HEAD_CURRENT.length).getValues();
         fullExistingData.forEach(row => {
-          // FIX 1: Use the DRY helper for existing data too
           const k = keyIndices.map(idx => _normalizeKeySegment(row[idx], HEAD_LOWER[idx])).join('|');
           existingKeys.add(k);
         });
       }
 
-      // Separate incoming data into pure appends vs updates
+      // 4. SQUASH INCOMING AND SEPARATE UPDATES VS APPENDS (The Twin Trap Fix)
+      const squashedIncoming = new Map();
+      incomingRows.forEach(item => squashedIncoming.set(item.key, item.data));
+
       const pureAppends = [];
       const updates = new Map();
 
-      incomingRows.forEach(item => {
-        if (existingKeys.has(item.key)) {
-          updates.set(item.key, item.data);
+      squashedIncoming.forEach((data, key) => {
+        if (existingKeys.has(key)) {
+          updates.set(key, data);
         } else {
-          existingKeys.add(item.key); 
-          pureAppends.push(item.data);
+          pureAppends.push(data);
         }
       });
 
       let needsWakeUp = false;
       let finalRowsCount = last - 1;
+      const initialUpdatesCount = updates.size; 
 
+      // 5. WRITE
       try {
         if (!holdAnesthesia && typeof pauseSheet === 'function') needsWakeUp = pauseSheet(ss);
 
-        if (updates.size === 0 && pureAppends.length > 0) {
+        if (initialUpdatesCount === 0 && pureAppends.length > 0) {
           sh.getRange(last + 1, 1, pureAppends.length, HEAD_CURRENT.length).setValues(pureAppends);
           finalRowsCount = (last - 1) + pureAppends.length;
         }
-        else if (updates.size > 0) {
+        else if (initialUpdatesCount > 0) {
           const finalData = [];
           fullExistingData.forEach(row => {
-            // FIX 2: Use the DRY helper for the update check
             const k = keyIndices.map(idx => _normalizeKeySegment(row[idx], HEAD_LOWER[idx])).join('|');
             if (updates.has(k)) {
               finalData.push(updates.get(k));
@@ -309,13 +311,11 @@ var ML = (function () {
 
         if (typeof GLOBALS !== 'undefined' && GLOBALS.dataCache) GLOBALS.dataCache.delete(rangeName);
 
-        if (pureAppends.length > 0 || updates.size > 0) {
-          if (!skipSummary) {
-            updateBlendedSummary();
-          }
+        if (pureAppends.length > 0 || initialUpdatesCount > 0) {
+          if (!skipSummary) updateBlendedSummary();
         }
 
-        return { appended: pureAppends.length, upserted: updates.size, totalRows: finalRowsCount, status: "SUCCESS" };
+        return { appended: pureAppends.length, upserted: initialUpdatesCount, totalRows: finalRowsCount, status: "SUCCESS" };
 
       } finally {
         if (!holdAnesthesia && needsWakeUp && typeof wakeUpSheet === 'function') wakeUpSheet(ss);
@@ -339,7 +339,7 @@ var ML = (function () {
       }).filter(item => item !== null);
     }
 
-   function condenseHistory(cutoffDays, keys, holdAnesthesia) {
+    function condenseHistory(cutoffDays, keys, holdAnesthesia) {
       const lastRow = sh.getLastRow();
       if (lastRow <= 2) return { rows: 0, status: "SUCCESS" };
 
@@ -360,8 +360,6 @@ var ML = (function () {
         const rowDate = (rawDate instanceof Date) ? rawDate : new Date(rawDate || 0);
 
         if (rowDate < cutoffDate) {
-          
-          // FIX 3: Reverted this logic to properly scope to condenseHistory
           const k = keys.map(key => {
             const idx = HEAD_LOWER.indexOf(String(key).toLowerCase());
             return _normalizeKeySegment(row[idx], HEAD_LOWER[idx]);
@@ -372,11 +370,8 @@ var ML = (function () {
 
           if (!condensedGroups.has(k)) {
             let newRow = [...row];
-            
-            // FIX 4: Timezone immune date formatting
             cutoffDate.setHours(0, 0, 0, 0);
             newRow[idxDate] = new Date(cutoffDate.getTime());
-
             newRow.total_cost = Number(row[idxQty]) * actualPrice;
 
             if (idxUnitValue !== -1) newRow[idxUnitValue] = '';
@@ -409,10 +404,17 @@ var ML = (function () {
       try {
         if (!holdAnesthesia && typeof pauseSheet === 'function') needsWakeUp = pauseSheet(ss);
 
-        if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, HEAD.length).clearContent();
+        if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, HEAD_CURRENT.length).clearContent();
 
         if (finalRows.length > 0) {
           sh.getRange(2, 1, finalRows.length, HEAD_CURRENT.length).setValues(finalRows);
+          
+          // --- THE BLOAT GENERATOR FIX ---
+          const rowsDiff = (lastRow - 1) - finalRows.length;
+          if (rowsDiff > 0) {
+            sh.deleteRows(finalRows.length + 2, rowsDiff);
+          }
+          
           GLOBALS.dataCache.delete(rangeName);
           updateBlendedSummary();
         }
@@ -423,8 +425,7 @@ var ML = (function () {
       }
     }
 
-   function dedupeExisting(keys) {
-      // FIX 5: Restored the keyIndices array generator
+    function dedupeExisting(keys) {
       const keyIndices = keys.map(k => {
         const idx = HEAD_CURRENT.indexOf(k.trim());
         if (idx === -1) throw new Error(`CRITICAL: Key "${k}" not found.`);
@@ -440,7 +441,6 @@ var ML = (function () {
       const originalCount = data.length;
 
       data.forEach((row) => {
-        // FIX 6: Replaced normalizeK safely inside the data loop
         const k = keyIndices.map(idx => _normalizeKeySegment(row[idx], HEAD_LOWER[idx])).join('|');
         existingMap.set(k, row);
       });
@@ -459,6 +459,12 @@ var ML = (function () {
 
         if (last > 1) sh.getRange(2, 1, last - 1, HEAD_CURRENT.length).clearContent();
         sh.getRange(2, 1, allValues.length, HEAD_CURRENT.length).setValues(allValues);
+        
+        // --- THE BLOAT GENERATOR FIX ---
+        const rowsDiff = (last - 1) - allValues.length;
+        if (rowsDiff > 0) {
+          sh.deleteRows(allValues.length + 2, rowsDiff);
+        }
 
         const rangeName = (sheetName === "Material_Ledger") ? "NR_MATERIAL_LEDGER" : "NR_SALES_LEDGER";
         ss.setNamedRange(rangeName, sh.getRange(1, 1, allValues.length + 1, HEAD_CURRENT.length));
@@ -492,7 +498,6 @@ var ML = (function () {
       const summaryMap = new Map();
 
       ledgerData.forEach(row => {
-        // FIX 1: Force Type ID into a pure Number so XLOOKUP doesn't crash on the dashboard
         const id = Number(row.type_id);
         const qty = Number(row.qty) || 0;
         const price = Number(row.unit_value) || Number(row.unit_value_filled) || 0;
@@ -511,9 +516,7 @@ var ML = (function () {
       const columnsToSave = ['type_id', 'total_sum', 'unit_weighted_average'];
       const outputData = [];
 
-      // FIX 2: Enforcing your object-selection rule. No string headers pushed to the array.
       summaryMap.forEach(obj => {
-        // Safely handle an empty stockpile without crashing the math
         obj.unit_weighted_average = obj.total_qty !== 0 ? Number((obj.total_sum / obj.total_qty).toFixed(6)) : 0;
         const rowArray = columnsToSave.map(col => obj[col] !== undefined ? obj[col] : '');
         outputData.push(rowArray);
@@ -529,6 +532,12 @@ var ML = (function () {
 
       // 4. Write pure data starting at Row 2
       summarySheet.getRange(2, 1, outputData.length, columnsToSave.length).setValues(outputData);
+
+      // --- THE BLOAT GENERATOR FIX ---
+      const rowsDiff = (sumLast - 1) - outputData.length;
+      if (rowsDiff > 0) {
+        summarySheet.deleteRows(outputData.length + 2, rowsDiff);
+      }
 
       // 5. Update the named range to span the entire block INCLUDING the static headers on Row 1
       ss.setNamedRange(targetRangeName, summarySheet.getRange(1, 1, outputData.length + 1, columnsToSave.length));
