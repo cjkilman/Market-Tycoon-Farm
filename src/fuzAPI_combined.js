@@ -8,42 +8,42 @@
 
 /** Helper class to structure raw Fuzzworks API data for caching. */
 class FuzDataObject {
-    _normalizeNumber(value, defaultValue = 0) {
-        const num = parseInt(value);
-        return isNaN(num) ? defaultValue : num;
-    }
-    _normalizeFloat(value, defaultValue = "") {
-        const num = parseFloat(value);
-        return isNaN(num) ? defaultValue : num;
-    }
+  _normalizeNumber(value, defaultValue = 0) {
+    const num = parseInt(value);
+    return isNaN(num) ? defaultValue : num;
+  }
+  _normalizeFloat(value, defaultValue = "") {
+    const num = parseFloat(value);
+    return isNaN(num) ? defaultValue : num;
+  }
 
-    constructor(typeId, rawFuzData) {
-        const buyData = rawFuzData?.buy || {};
-        const sellData = rawFuzData?.sell || {};
+  constructor(typeId, rawFuzData) {
+    const buyData = rawFuzData?.buy || {};
+    const sellData = rawFuzData?.sell || {};
 
-        this.type_id = parseInt(typeId, 10);
-        this.last_updated = new Date();
+    this.type_id = parseInt(typeId, 10);
+    this.last_updated = new Date();
 
-        this.buy = {
-            avg: this._normalizeFloat(buyData.weightedAverage, ""),
-            max: this._normalizeFloat(buyData.max, ""),
-            min: this._normalizeFloat(buyData.min, ""),
-            stddev: this._normalizeFloat(buyData.stddev, ""),
-            median: this._normalizeFloat(buyData.median, ""),
-            volume: this._normalizeNumber(buyData.volume, 0),
-            orderCount: this._normalizeNumber(buyData.orderCount, 0)
-        };
+    this.buy = {
+      avg: this._normalizeFloat(buyData.weightedAverage, ""),
+      max: this._normalizeFloat(buyData.max, ""),
+      min: this._normalizeFloat(buyData.min, ""),
+      stddev: this._normalizeFloat(buyData.stddev, ""),
+      median: this._normalizeFloat(buyData.median, ""),
+      volume: this._normalizeNumber(buyData.volume, 0),
+      orderCount: this._normalizeNumber(buyData.orderCount, 0)
+    };
 
-        this.sell = {
-            avg: this._normalizeFloat(sellData.weightedAverage, ""),
-            max: this._normalizeFloat(sellData.max, ""),
-            min: this._normalizeFloat(sellData.min, ""),
-            stddev: this._normalizeFloat(sellData.stddev, ""),
-            median: this._normalizeFloat(sellData.median, ""),
-            volume: this._normalizeNumber(sellData.volume, 0),
-            orderCount: this._normalizeNumber(sellData.orderCount, 0)
-        };
-    }
+    this.sell = {
+      avg: this._normalizeFloat(sellData.weightedAverage, ""),
+      max: this._normalizeFloat(sellData.max, ""),
+      min: this._normalizeFloat(sellData.min, ""),
+      stddev: this._normalizeFloat(sellData.stddev, ""),
+      median: this._normalizeFloat(sellData.median, ""),
+      volume: this._normalizeNumber(sellData.volume, 0),
+      orderCount: this._normalizeNumber(sellData.orderCount, 0)
+    };
+  }
 }
 
 
@@ -72,7 +72,7 @@ function _reshape(flat, rows, cols) {
 
 /** Normalize order_type/order_level. Defaults: sell/min. */
 function _normalizeOrder(order_type, order_level) {
-  let type  = order_type ? String(order_type).toLowerCase() : null;
+  let type = order_type ? String(order_type).toLowerCase() : null;
   let level = order_level ? String(order_level).toLowerCase() : null;
 
   if (type === "bid") type = "buy";
@@ -80,15 +80,15 @@ function _normalizeOrder(order_type, order_level) {
   const levelAliases = { mean: "avg", average: "avg", med: "median", vol: "volume", qty: "volume", quantity: "volume" };
   if (level && levelAliases[level]) level = levelAliases[level];
 
-  if (!type && !level)        { type = "sell"; level = "min"; }
-  else if (!type && level)    { type = (level === "max") ? "buy" : "sell"; }
-  else if (type && !level)    { level = (type === "buy") ? "max" : "min"; }
+  if (!type && !level) { type = "sell"; level = "min"; }
+  else if (!type && level) { type = (level === "max") ? "buy" : "sell"; }
+  else if (type && !level) { level = (type === "buy") ? "max" : "min"; }
 
-  const validTypes  = ["buy","sell"];
-  const validLevels = ["min","max","avg","median","volume","ordercount"];
+  const validTypes = ["buy", "sell"];
+  const validLevels = ["min", "max", "avg", "median", "volume", "ordercount"];
   if (level === 'orders' || level === 'ordercount' || level === 'numorders') level = 'orderCount';
-  
-  if (!validTypes.includes(type))  throw new Error("order_type must be 'buy' or 'sell'");
+
+  if (!validTypes.includes(type)) throw new Error("order_type must be 'buy' or 'sell'");
   if (!validLevels.includes(level)) throw new Error("order_level must be one of 'min','max','avg','median','volume','ordercount'");
   return { type, level };
 }
@@ -111,7 +111,7 @@ function _extractMetric_(fuzObject, side, field) {
   const node = fuzObject[side];
   if (!node || typeof node !== 'object') return "";
   const raw = node[field];
-  
+
   if ((field === 'volume' || field === 'orderCount') &&
     (raw === null || raw === undefined || raw === "")) return 0;
 
@@ -137,27 +137,27 @@ const fuzAPI = (() => {
   const CIRCUIT_COOLDOWN_MS = 60 * 60 * 1000;
   const _props = PropertiesService.getScriptProperties();
 
-function withRetries(fn, tries = 3, base = 300) {
-      var retryPattern = /(?:\b(429|420|5\d\d)\b|dns|socket|ssl|handsh|timeout|temporar|rate|quota|Service invoked|empty-200|bad[-\s]?json)/i;
-      var lastErr;
-      for (var i = 0; i < tries; i++) {
-          try {
-              var res = fn();
-              if (res && typeof res.getResponseCode === 'function') {
-                  var code = res.getResponseCode();
-                  if (code === 429 || code === 420 || (code >= 500 && code < 600)) {
-                      throw new Error('HTTP ' + code);
-                  }
-              }
-              return res;
-          } catch (e) {
-              lastErr = e;
-              var s = String((e && e.message) || e);
-              if (!retryPattern.test(s) || i === tries - 1) throw e;
-              Utilities.sleep(base * Math.pow(2, i) + Math.floor(Math.random() * 200));
+  function withRetries(fn, tries = 3, base = 300) {
+    var retryPattern = /(?:\b(429|420|5\d\d)\b|dns|socket|ssl|handsh|timeout|temporar|rate|quota|Service invoked|empty-200|bad[-\s]?json)/i;
+    var lastErr;
+    for (var i = 0; i < tries; i++) {
+      try {
+        var res = fn();
+        if (res && typeof res.getResponseCode === 'function') {
+          var code = res.getResponseCode();
+          if (code === 429 || code === 420 || (code >= 500 && code < 600)) {
+            throw new Error('HTTP ' + code);
           }
+        }
+        return res;
+      } catch (e) {
+        lastErr = e;
+        var s = String((e && e.message) || e);
+        if (!retryPattern.test(s) || i === tries - 1) throw e;
+        Utilities.sleep(base * Math.pow(2, i) + Math.floor(Math.random() * 200));
       }
-      throw lastErr;
+    }
+    throw lastErr;
   }
 
   function _isCircuitOpen() {
@@ -216,13 +216,13 @@ function withRetries(fn, tries = 3, base = 300) {
       if (!call.items || call.items.length === 0) continue;
 
       const url = "https://market.fuzzwork.co.uk/aggregates/";
-      
+
       // --- THE FIX ---
       // Force the parameter key to be 'region' even if we are looking up a system.
       // This forces Fuzzworks to filter by the ID we provide (3000xxxx), 
       // instead of ignoring the 'system' tag and returning the whole region.
-      let paramKey = 'region'; 
-      
+      let paramKey = 'region';
+
       // Note: We still send the System ID (3000...) or Station ID (6000...)
       // We just call it a "region" in the JSON payload so the API respects it.
       const payload = { [paramKey]: call.locationId, types: call.items.join(",") };
@@ -339,8 +339,8 @@ function withRetries(fn, tries = 3, base = 300) {
       if (cacheValue === "null") {
         const emptyMarketData = { avg: '', max: '', min: '', stddev: '', median: '', volume: 0, orderCount: 0 };
         tempGroupedCache[locationKey].fuzObjects.push(new FuzDataObject(req.type_id, {
-            buy: emptyMarketData,
-            sell: emptyMarketData
+          buy: emptyMarketData,
+          sell: emptyMarketData
         }));
       } else if (cacheValue) {
         try {
@@ -366,7 +366,7 @@ function withRetries(fn, tries = 3, base = 300) {
     if (state === 'OPEN') {
       const openUntil = parseInt(_props.getProperty(CIRCUIT_PROPS.OPEN_UNTIL) || '0', 10);
       if (Date.now() < openUntil) return true;
-      
+
       // Cooldown expired, move to HALF_OPEN to test a single fetch
       _props.setProperty(CIRCUIT_PROPS.STATE, 'HALF_OPEN');
     }
@@ -376,51 +376,66 @@ function withRetries(fn, tries = 3, base = 300) {
   function getDataForRequests(marketRequests) {
     if (!marketRequests || marketRequests.length === 0) return [];
 
-    // --- TIER 2: GLOBAL QUOTA GATE (NEW) ---
-    if (_props.getProperty('DAILY_QUOTA_EXHAUSTED') === 'true') {
-      console.warn("fuzAPI ABORT: Global UrlFetchApp Quota Exhausted. Standing down.");
-      return []; 
-    }
-
-    // --- TIER 1: LOCAL FUZZWORK CIRCUIT ---
-    if (_isQuotaExhausted() || _isCircuitOpen()) {
-      console.warn("fuzAPI ABORT: Fuzzwork Server Circuit is OPEN. Blocked for cooldown.");
-      return []; 
-    }
-
+    // 1. ALWAYS check the cache first. We want to salvage whatever we can.
     const { cachedData, missingRequests } = _checkCacheForRequests(marketRequests);
-    let newlyFetchedData = [];
 
-    if (missingRequests.length > 0) {
-      try {
-        const fetchResult = _executeFetchAll(missingRequests);
-        newlyFetchedData = fetchResult.newlyFetchedData;
-        _cacheNewData(fetchResult.dataToCache);
-        _resetCircuit(); // Success resets Fuzzwork failure counts
-      } catch (e) {
-        const msg = e.message.toLowerCase();
-        
-        // --- TRIP THE GLOBAL LOCK IF GOOGLE DIES ---
-        if (msg.includes("too many times") || msg.includes("quota") || msg.includes("limit exceeded")) {
-           console.error("FATAL: Google UrlFetchApp Daily Quota Exhausted via fuzAPI. Tripping Global Lock.");
-           _props.setProperty('DAILY_QUOTA_EXHAUSTED', 'true');
-        } else {
-           // Otherwise, it's just a Fuzzwork error. Trip the local circuit.
-           _tripCircuit(e.message);
-        }
-        throw e; 
-      }
+    // If everything we need is already cached, return it immediately. No need to hit breakers.
+    if (missingRequests.length === 0) {
+      return cachedData;
     }
 
+    // 2. --- TIER 2: GLOBAL QUOTA GATE (NEW) ---
+    if (_props.getProperty('DAILY_QUOTA_EXHAUSTED') === 'true') {
+      if (missingRequests.length > 0) {
+         // CACHE IS DEAD AND QUOTA IS DEAD. DO NOT RETURN [].
+         throw new Error("Global Quota Exhausted and Cache Expired. Aborting to prevent Zero-Out.");
+      }
+      return cachedData; 
+    }
+
+    // 3. --- TIER 1: LOCAL FUZZWORK CIRCUIT ---
+    if (_isQuotaExhausted() || _isCircuitOpen()) {
+      if (missingRequests.length > 0) {
+         // CACHE IS DEAD AND FUZZWORKS IS DOWN. DO NOT RETURN [].
+         throw new Error("Fuzzwork Circuit is OPEN and Cache Expired. Aborting to prevent Zero-Out.");
+      }
+      return cachedData; 
+    }
+
+    // 4. Fetch the missing requests
+    let newlyFetchedData = [];
+    try {
+      const fetchResult = _executeFetchAll(missingRequests);
+      newlyFetchedData = fetchResult.newlyFetchedData;
+      _cacheNewData(fetchResult.dataToCache);
+      _resetCircuit();
+    } catch (e) {
+      const msg = e.message.toLowerCase();
+
+      if (msg.includes("too many times") || msg.includes("quota") || msg.includes("limit exceeded")) {
+        console.error("FATAL: Google UrlFetchApp Daily Quota Exhausted via fuzAPI. Tripping Global Lock.");
+        _props.setProperty('DAILY_QUOTA_EXHAUSTED', 'true');
+      } else {
+        _tripCircuit(e.message);
+      }
+      // CRITICAL: We throw the error here so the calling function fails and doesn't write zeros.
+      throw e; 
+    }
+
+    // 5. Merge and Return
     const finalDataMap = {};
     cachedData.forEach(crate => {
       const key = `${crate.market_type}_${crate.market_id}`;
       finalDataMap[key] = crate;
     });
+
     newlyFetchedData.forEach(newCrate => {
       const key = `${newCrate.market_type}_${newCrate.market_id}`;
-      if (finalDataMap[key]) finalDataMap[key].fuzObjects.push(...newCrate.fuzObjects);
-      else finalDataMap[key] = newCrate;
+      if (finalDataMap[key]) {
+        finalDataMap[key].fuzObjects = finalDataMap[key].fuzObjects.concat(newCrate.fuzObjects);
+      } else {
+        finalDataMap[key] = newCrate;
+      }
     });
 
     return Object.values(finalDataMap);
@@ -466,14 +481,14 @@ function withRetries(fn, tries = 3, base = 300) {
 function manual_FuzAPI_Reset() {
   const props = PropertiesService.getScriptProperties();
   const keysToReset = [
-    'FuzCircuitState', 
-    'FuzCircuitFailCount', 
+    'FuzCircuitState',
+    'FuzCircuitFailCount',
     'FuzCircuitOpenUntilMs',
     'DAILY_QUOTA_EXHAUSTED' // <-- Hooked into the Global Lock
   ];
-  
+
   keysToReset.forEach(key => props.deleteProperty(key));
-  
+
   console.log("fuzAPI & ESI: Master Quota Crowbar manually reset. All Circuits CLOSED.");
   if (typeof SpreadsheetApp !== 'undefined') {
     SpreadsheetApp.getActiveSpreadsheet().toast("Master Circuit Reset Successful", "Quota Magic");
@@ -497,7 +512,7 @@ function setupDailyFuzReset() {
   ScriptApp.newTrigger('manual_FuzAPI_Reset')
     .timeBased()
     .everyDays(1)
-    .atHour(5) 
+    .atHour(5)
     .create();
 
   console.log("fuzAPI: 24-hour reset trigger installed.");
@@ -505,7 +520,7 @@ function setupDailyFuzReset() {
 
 /**
  * Generic API to get prices for an array/range of type_ids at a location.
- * Preserves the input shape (rows x cols).
+ * Supports single metrics or multi-metric arrays for single-execution batching.
  * @customfunction
  */
 function marketStatData(type_ids, location_type, location_id, order_type, order_level) {
@@ -519,32 +534,55 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
     return Number.isFinite(n) ? n : null;
   });
 
-// --- IMPROVED ERROR LOGGING & AUTO-CORRECTION ---
+  // Flatten order types and levels to handle sheet 2D array formatting safely
+  const types2D = _as2D(order_type);
+  const flatTypes = _flatten2D(types2D);
+
+  const levels2D = _as2D(order_level);
+  const flatLevels = _flatten2D(levels2D);
+
+  // --- IMPROVED ERROR LOGGING & AUTO-CORRECTION ---
   let lt = String(location_type || "").toLowerCase();
-  
-  // If the sheet sends #REF! or an empty cell, default to 'station' 
-  // so the script doesn't explode and kill your whole price table.
+
   if (lt === "#ref!" || lt === "" || lt === "undefined") {
     console.warn("FuzAPI: Received #REF! or empty location. Defaulting to 'station'.");
-    lt = "station"; 
+    lt = "station";
   }
 
-  if (!["region","system","station"].includes(lt)) {
+  if (!["region", "system", "station"].includes(lt)) {
     throw new Error(`Location Undefined: Received "${location_type}". Valid types are 'region', 'system', or 'station'.`);
   }
 
-  const { type: side, level: lvl } = _normalizeOrder(order_type, order_level);
   const validIds = flatIds.filter(n => n != null);
-
   const results = fuzAPI.requestItems(Number(location_id), lt, validIds);
   const resultsMap = new Map(results.map(o => [o.type_id, o]));
-  
-  const outFlat = flatIds.map(id => {
-    const fuzObject = resultsMap.get(id);
-    return (id == null || !fuzObject) ? "" : _extractMetric_(fuzObject, side, lvl);
-  });
-  
-  return _reshape(outFlat, rows, cols);
+
+  const isMulti = flatTypes.length > 1;
+
+  if (isMulti) {
+    const numMetrics = flatTypes.length;
+    const outFlat = [];
+
+    flatIds.forEach(id => {
+      const fuzObject = resultsMap.get(id);
+      for (let i = 0; i < numMetrics; i++) {
+        const { type: side, level: lvl } = _normalizeOrder(flatTypes[i], flatLevels[i]);
+        const val = (id == null || !fuzObject) ? "" : _extractMetric_(fuzObject, side, lvl);
+        outFlat.push(val);
+      }
+    });
+
+    return _reshape(outFlat, rows, cols * numMetrics);
+
+  } else {
+    const { type: side, level: lvl } = _normalizeOrder(flatTypes[0], flatLevels[0]);
+    const outFlat = flatIds.map(id => {
+      const fuzObject = resultsMap.get(id);
+      return (id == null || !fuzObject) ? "" : _extractMetric_(fuzObject, side, lvl);
+    });
+
+    return _reshape(outFlat, rows, cols);
+  }
 }
 
 
@@ -557,7 +595,7 @@ function fuzzPriceDataByHub(type_ids, market_hub = "Jita", order_type = "sell", 
   if (!type_ids) throw new Error('type_ids is required');
 
   const hubId = _hubToStationId_(market_hub);
-  
+
   return marketStatData(type_ids, "station", hubId, order_type, order_level);
 }
 
@@ -568,14 +606,14 @@ function fuzzPriceDataByHub(type_ids, market_hub = "Jita", order_type = "sell", 
  * @customfunction
  */
 function fuzzApiPriceDataJitaSell(type_ids, market_hub = 60003760, order_type = null, order_level = null) {
-  const hubId = _hubToStationId_(market_hub); 
+  const hubId = _hubToStationId_(market_hub);
   return marketStatData(type_ids, "station", hubId, order_type, order_level);
 }
 
 
 // --- Stubbed Functions (Compatibility with MarketFetcherEsi.js and Sheets) ---
 
-function marketStatDataCache(type_ids, location_type, location_id, order_type, order_level) { 
+function marketStatDataCache(type_ids, location_type, location_id, order_type, order_level) {
   console.warn("marketStatDataCache is deprecated. Falling back to marketStatData.");
   return marketStatData(type_ids, location_type, location_id, order_type, order_level);
 }

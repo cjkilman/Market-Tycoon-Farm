@@ -86,8 +86,104 @@ function getSdeTypeEngine(ss) {
 }
 
 /**
- * REPROCESS TO LEDGER ENGINE (Aggregated)
- * Reads "Reprocess Items", aggregates yields, and commits weighted-average values.
+ * REPROCESS CORE ENGINE (Raw Feed Execution - No Pre-stacking)
+ */
+function processReprocessingCore(ss, rawData, headerRow, options = {}) {
+  const { 
+    onlyProcessValidBatches = true, 
+    onItemProcessed = null 
+  } = options;
+
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('ReproCore') : console;
+  const headers = rawData[headerRow].map(h => String(h).trim().toLowerCase());
+
+  const colIdx = {
+    typeId: headers.indexOf("type id") > -1 ? headers.indexOf("type id") : headers.indexOf("type_id"),
+    qty: headers.indexOf("quantity") > -1 ? headers.indexOf("quantity") : headers.indexOf("qty")
+  };
+
+  if (colIdx.typeId === -1 || colIdx.qty === -1) {
+    LOG.error("Reprocessing Core: Could not find required 'Type ID' and 'Quantity' columns.");
+    return { masterAggregation: new Map(), detailedResults: [] };
+  }
+
+  const materialMap = getSdeMaterialMap(ss);
+  const typeMap = getSdeTypeEngine(ss).byId;
+
+  const materialIdsToPrice = new Set();
+  materialMap.forEach(matList => {
+    matList.forEach(m => materialIdsToPrice.add(Number(m.matID)));
+  });
+
+  const mineralPriceMap = _getBlendedCostMap(ss, Array.from(materialIdsToPrice), true);
+  const costMap = _getBlendedCostMap(ss, Array.from(materialMap.keys()), false);
+
+  const efficiency = 0.50 * (1 + (0.02 * 4)) * (1 - 0.00);
+
+  const masterAggregation = new Map();
+  const detailedResults = [];
+  let skippedIncomplete = 0;
+
+  for (let i = headerRow + 1; i < rawData.length; i++) {
+    const row = rawData[i];
+    const typeId = parseInt(row[colIdx.typeId], 10);
+    const totalQty = parseInt(row[colIdx.qty], 10) || 0;
+
+    if (!typeId || isNaN(typeId)) continue;
+
+    const typeInfo = typeMap.get(typeId) || {};
+    const portionSize = typeInfo.portionSize || 1;
+
+    // Evaluate each row's quantity directly against its portion size
+    let batches = 0;
+    if (portionSize === 1) {
+      batches = totalQty; // Unstackable modules/crystals processed per unit
+    } else {
+      batches = Math.floor(totalQty / portionSize);
+    }
+
+    if (batches <= 0) {
+      skippedIncomplete++;
+      continue;
+    }
+
+    const materials = materialMap.get(typeId);
+    if (!materials) continue;
+
+    const costObj = costMap.get(typeId);
+    const inputUnitCost = (costObj && typeof costObj.landed === 'number') ? costObj.landed : 0;
+    const totalAcqCost = inputUnitCost > 0 ? inputUnitCost * (batches * portionSize) : -1;
+
+    const derivedYields = deriveEffectiveMaterialCosts(materials, efficiency, batches, mineralPriceMap, totalAcqCost / batches);
+
+    const itemResult = {
+      typeId: typeId,
+      typeName: typeInfo.typeName || `Unknown Item (${typeId})`,
+      totalQty: totalQty,
+      batches: batches,
+      yields: derivedYields,
+      totalMeltValue: derivedYields.reduce((sum, y) => sum + (y.yieldQty * (y.marketUnitPrice || 0)), 0),
+      marketCost: inputUnitCost * totalQty
+    };
+
+    if (onItemProcessed) onItemProcessed(itemResult);
+    detailedResults.push(itemResult);
+
+    derivedYields.forEach(y => {
+      if (!masterAggregation.has(y.materialID)) masterAggregation.set(y.materialID, { qty: 0, val: 0 });
+      const agg = masterAggregation.get(y.materialID);
+      agg.qty += y.yieldQty;
+      agg.val += (y.yieldQty * (y.effectiveUnitPrice || 0));
+    });
+  }
+
+  LOG.info(`Processed raw rows. Skipped ${skippedIncomplete} items due to quantity being below portion size.`);
+
+  return { masterAggregation, detailedResults };
+}
+
+/**
+ * REPROCESS TO LEDGER ENGINE (Aggregated) - Using Core D.R.Y.
  */
 function reprocessItemsToLedger(ss) {
   ss = (ss && typeof ss.getSheetByName === 'function') ? ss : SpreadsheetApp.getActiveSpreadsheet();
@@ -104,58 +200,10 @@ function reprocessItemsToLedger(ss) {
   const lastRow = reproSheet.getLastRow();
   const rawData = reproSheet.getRange(1, 1, lastRow, 15).getValues();
   const headerRow = 3;
-  const headers = rawData[headerRow];
 
-  const colIdx = {
-    typeId: headers.indexOf("type_id"),
-    qty: headers.indexOf("Qty")
-  };
-
-  const materialMap = getSdeMaterialMap(ss);
   const typeMap = getSdeTypeEngine(ss).byId;
-  const mineralPriceMap = _getBlendedCostMap(ss, Array.from(materialMap.keys()), true);
-  const costMap = _getBlendedCostMap(ss, Array.from(materialMap.keys()), false);
-  const efficiency = 0.50 * (1 + (0.02 * 4)) * (1 - 0.00);
-
-  const masterAggregation = new Map();
-
-  // 4. Processing Loop
-  for (let i = headerRow + 1; i < rawData.length; i++) {
-    const row = rawData[i];
-    const typeId = parseInt(row[colIdx.typeId], 10);
-    const totalQty = parseInt(row[colIdx.qty], 10) || 0;
-
-    if (!typeId || isNaN(typeId)) continue;
-
-    const typeInfo = typeMap.get(typeId) || {};
-    const portionSize = typeInfo.portionSize || 1;
-    if (totalQty < portionSize) continue;
-
-    const batches = Math.floor(totalQty / portionSize);
-    const materials = materialMap.get(typeId);
-
-    if (batches > 0 && materials) {
-      // FIX: Access .landed (from createCostObj) instead of .marketPrice
-      const costObj = costMap.get(typeId);
-      const inputUnitCost = (costObj && typeof costObj.landed === 'number') ? costObj.landed : 0;
-
-
-      // SHOULD BE:
-      // Attribute only the cost of the items actually consumed in these batches
-      const totalAcqCost = inputUnitCost > 0 ? inputUnitCost * (batches * portionSize) : -1;
-
-      // AND PASS IT DIVIDED BY THE BATCH COUNT:
-      const derivedYields = deriveEffectiveMaterialCosts(materials, efficiency, batches, mineralPriceMap, totalAcqCost / batches);
-
-      derivedYields.forEach(y => {
-        if (!masterAggregation.has(y.materialID)) masterAggregation.set(y.materialID, { qty: 0, val: 0 });
-        const agg = masterAggregation.get(y.materialID);
-        agg.qty += y.yieldQty;
-        // Use effectiveUnitPrice from your yield engine
-        agg.val += (y.yieldQty * (y.effectiveUnitPrice || 0));
-      });
-    }
-  }
+  const coreResult = processReprocessingCore(ss, rawData, headerRow);
+  const masterAggregation = coreResult.masterAggregation;
 
   if (masterAggregation.size > 0) {
     const ledgerPayload = [];
@@ -172,15 +220,82 @@ function reprocessItemsToLedger(ss) {
         source: "REPROCESS",
         contract_id: reproEventId,
         char: "SYSTEM",
-        // Force numeric value to ensure ledger acceptance
         unit_value_filled: data.qty > 0 ? Number(data.val / data.qty) : 0
       });
     });
 
-    const result = ML.forSheet("Material_Ledger").upsert(['date','source', 'char', 'contract_id', 'type_id'], ledgerPayload);
+    const result = ML.forSheet("Material_Ledger").upsert(['date', 'source', 'char', 'contract_id', 'type_id'], ledgerPayload);
     LOG.info(`Aggregated reprocessing complete. Upserted ${result.rows} rows.`);
   } else {
     LOG.info("No valid items to reprocess.");
+  }
+}
+
+/**
+ * Generates the Pending Reprocessing Yield summary table 
+ * matching your target schema: type_id, item_name, quantity, price, total value
+ */
+function generatePendingReprocessingYield(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('PendingYield') : console;
+
+  const reproSheet = ss.getSheetByName("Reprocessing Bin");
+  if (!reproSheet) {
+    LOG.error("Missing sheet 'Reprocessing Bin'.");
+    return;
+  }
+
+  const rawData = reproSheet.getDataRange().getValues();
+  if (rawData.length <= 1) {
+    LOG.info("Reprocessing Bin is empty.");
+    return;
+  }
+
+  // Run through our flexible core engine with header at row 0 (or adjust if you have header rows)
+  const headerRow = 0;
+  const coreResult = processReprocessingCore(ss, rawData, headerRow, { onlyProcessValidBatches: false });
+  const masterAggregation = coreResult.masterAggregation;
+
+  const typeMap = getSdeTypeEngine(ss).byId;
+  const outputRows = [];
+
+  masterAggregation.forEach((data, matID) => {
+    const typeInfo = typeMap.get(matID) || {};
+    const itemName = typeInfo.typeName || `Unknown Item (${matID})`;
+    const qty = data.qty;
+    const unitPrice = qty > 0 ? (data.val / qty) : 0;
+    const totalValue = qty * unitPrice;
+
+    if (qty > 0) {
+      outputRows.push([
+        Number(matID),
+        itemName,
+        qty,
+        Number(unitPrice.toFixed(2)),
+        Number(totalValue.toFixed(2))
+      ]);
+    }
+  });
+
+  // Sort by total value descending so top high-value minerals appear first
+  outputRows.sort((a, b) => b[4] - a[4]);
+
+  const SHEET_NAME = "Pending Reprocessing Yield";
+  let outSheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+  outSheet.clearContents();
+
+  const finalPayload = [
+    ["type_id", "item_name", "quantity", "price", "total value"],
+    ...outputRows
+  ];
+
+  if (finalPayload.length > 1) {
+    outSheet.getRange(1, 1, finalPayload.length, 5).setValues(finalPayload);
+    outSheet.getRange(2, 3, outputRows.length, 1).setNumberFormat("#,##0");
+    outSheet.getRange(2, 4, outputRows.length, 2).setNumberFormat("#,##0.00");
+    LOG.info(`Pending Reprocessing Yield updated with ${outputRows.length} materials.`);
+  } else {
+    LOG.info("No materials generated from reprocessing bin.");
   }
 }
 

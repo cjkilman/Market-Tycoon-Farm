@@ -1,9 +1,6 @@
 /**
  * IndustryLedger.gs.js
  *
- * This module is the Industry Ledger Add-on, built for robust COGS accounting.
- * It includes sharding utilities to bypass the Google Apps Script Cache limit.
- *
  * FIX APPLIED:
  * 1. generateFullBOMData: Now calculates Blueprint Cycles strictly from 'Build Target' / 'Units Per Run'.
  * - Ignores 'Total Runs' column to prevent 100x multiplier errors.
@@ -93,23 +90,23 @@ function _getBpFromProduct(productID, sdeProdMap) {
 }
 
 /**
- * NITRO BOM ENGINE V3 (HYBRID AUTO-EXPANSION)
- * Keeps the 8-column output but automatically calculates and injects 
- * sub-components for T2 manufacturing. Stops at market composites.
+ * NITRO BOM ENGINE V3.4 (CLEAN HYBRID: MFG + INVENTION ONLY)
+ * Reads Manufacturing (Act 1) and Invention Datacores (Act 8). Activity 5 removed.
  */
 function generateFullBOMData(ss) {
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('BOM_Engine') : console;
-  const clean = (v) => (typeof v === 'number') ? v : parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0;
+  const clean = (v) => (typeof v === 'number' ? v : parseFloat(String(v).replace(/[^0-9.-]/g, '')) || 0);
 
-  // --- 1. Load Data ---
-  const prodSheet = ss.getSheetByName("ProductionList ");
-  const sdeMatSheet = ss.getSheetByName("SDE_industryActivityMaterials");
-  const sdeProdSheet = ss.getSheetByName("SDE_industryActivityProducts");
-
-  if (!prodSheet || !sdeMatSheet || !sdeProdSheet) return;
+  // --- 1. Load Production Manifest (Activity 1) ---
+  const prodSheet = ss.getSheetByName("ProductionList") || ss.getSheetByName("ProductionList ");
+  if (!prodSheet) return;
 
   const prodRaw = prodSheet.getDataRange().getValues();
+  if (prodRaw.length <= 5) return;
   const pHeaders = prodRaw[4];
   const prodData = prodRaw.slice(5);
 
@@ -119,43 +116,65 @@ function generateFullBOMData(ss) {
     target: pHeaders.indexOf("Build Target (Qty)")
   };
 
-  // --- 2. BUILD SDE MAPS (Strictly Activity 1 - Manufacturing) ---
+  // --- 2. Load Copy/Invention Manifest (Activity 8 Triggers) ---
+  const invSheet = ss.getSheetByName("Copy_Invention") || ss.getSheetByName("Copy/Invention");
+  const invJobsMap = new Map();  // Blueprint ID -> Invention Slots Needed
+
+  if (invSheet) {
+    const invRaw = invSheet.getDataRange().getValues();
+    if (invRaw.length > 5) {
+      const iHeaders = invRaw[4];
+      const iData = invRaw.slice(5);
+      const iCol = {
+        bpID: iHeaders.indexOf("Blueprint Type ID"),
+        slots: iHeaders.indexOf("Invention Slots Needed")
+      };
+
+      if (iCol.bpID !== -1 && iCol.slots !== -1) {
+        iData.forEach(row => {
+          const bpid = Number(row[iCol.bpID]);
+          const slots = clean(row[iCol.slots]);
+          if (bpid > 0 && slots > 0) {
+            const currentSlots = invJobsMap.get(bpid) || 0;
+            invJobsMap.set(bpid, currentSlots + slots);
+          }
+        });
+      }
+    }
+  }
+
+  // --- 3. BUILD SDE MAPS VIA DRY CACHE ---
+  const sdeMaps = _getSdeMaps(ss);
   const productMetaMap = new Map();
-  const sdeProdData = sdeProdSheet.getDataRange().getValues();
-
-  for (let i = 1; i < sdeProdData.length; i++) {
-    // Activity 1 ONLY. This creates the firewall against Reaction Formulas.
-    if (Number(sdeProdData[i][1]) === 1) {
-      productMetaMap.set(Number(sdeProdData[i][2]), {
-        bpID: Number(sdeProdData[i][0]),
-        qty: Number(sdeProdData[i][3])
-      });
-    }
-  }
-
   const bpMaterialsMap = new Map();
-  const sdeMatData = sdeMatSheet.getDataRange().getValues();
 
-  for (let i = 1; i < sdeMatData.length; i++) {
-    if (Number(sdeMatData[i][1]) === 1) {
-      const bpID = Number(sdeMatData[i][0]);
-      if (!bpMaterialsMap.has(bpID)) bpMaterialsMap.set(bpID, []);
-      bpMaterialsMap.get(bpID).push({
-        matID: Number(sdeMatData[i][2]),
-        qty: Number(sdeMatData[i][3])
+  for (const [key, prodObj] of sdeMaps.sdeProdMap.entries()) {
+    if (key.startsWith("1:")) {
+      const bpID = Number(key.split(':')[1]);
+      productMetaMap.set(Number(prodObj.productTypeID), {
+        bpID: bpID,
+        qty: Number(prodObj.quantity)
       });
     }
   }
 
-  // --- 3. AUTO-EXPANSION QUEUE (The Ghost Jobs) ---
-  const jobMap = new Map(); // Tracks bpID -> {me, runs}
+  // FIXED: Strictly pulling Activity 1 (Mfg) and Activity 8 (Invention Datacores)
+  for (const [bpID, mats] of sdeMaps.sdeMatMap.entries()) {
+    const validMats = mats.filter(m => m.activityID === 1 || m.activityID === 8);
+    if (validMats.length > 0) {
+      bpMaterialsMap.set(bpID, validMats.map(m => ({
+        matID: m.materialTypeID,
+        qty: m.quantity,
+        actID: m.activityID
+      })));
+    }
+  }
 
-  // Recursive function to drill down through components
+  // --- 4. AUTO-EXPANSION QUEUE (Manufacturing Ghost Jobs) ---
+  const jobMap = new Map();
+
   function injectJob(productID, requiredQty, currentME) {
     const meta = productMetaMap.get(productID);
-
-    // FIREWALL: If it's a Composite (Activity 11) or raw mineral, it won't be 
-    // in productMetaMap. The script stops here and leaves it as a market purchase.
     if (!meta) return;
 
     const unitsPerRun = meta.qty || 1;
@@ -163,25 +182,20 @@ function generateFullBOMData(ss) {
 
     if (runs > 0) {
       const bpID = meta.bpID;
-
-      // Add to the master job queue
       const existingRuns = jobMap.get(bpID)?.runs || 0;
       jobMap.set(bpID, { me: currentME, runs: existingRuns + runs });
 
-      // Look at the blueprint's ingredients and drill down
       const materials = bpMaterialsMap.get(bpID) || [];
       materials.forEach(mat => {
-        const adjQty = mat.qty * ((100 - currentME) / 100);
-        const totalMatReq = Math.ceil(adjQty * runs);
-
-        // Recursively inject. We force ME 10 here for sub-components
-        // assuming your component blueprints are fully researched.
-        injectJob(mat.matID, totalMatReq, 10);
+        if (mat.actID === 1) {
+          const adjQty = mat.qty * ((100 - currentME) / 100);
+          const totalMatReq = Math.ceil(adjQty * runs);
+          injectJob(mat.matID, totalMatReq, 10);
+        }
       });
     }
   }
 
-  // Read ProductionList and trigger the expansion
   prodData.forEach(row => {
     const pID = Number(row[pCol.prodID]);
     const buildTarget = clean(row[pCol.target]);
@@ -192,32 +206,38 @@ function generateFullBOMData(ss) {
     }
   });
 
-  // --- 4. Generate the 8-Column Output ---
+  // --- 5. Generate the 8-Column Output ---
   const outputRows = [];
-  for (let i = 1; i < sdeMatData.length; i++) {
-    const sdeBpID = Number(sdeMatData[i][0]);
 
-    // Match blueprints in our jobMap (both explicit and ghost jobs)
-    if (sdeMatData[i][1] === 1 && jobMap.has(sdeBpID)) {
-      const job = jobMap.get(sdeBpID);
-      const baseQty = Number(sdeMatData[i][3]);
-      const adjQty = baseQty * ((100 - job.me) / 100);
-      const totalReq = Math.ceil(adjQty * job.runs);
+  // A. Manufacturing Requirements (Activity 1)
+  for (const [bpID, mats] of bpMaterialsMap.entries()) {
+    if (jobMap.has(bpID)) {
+      const job = jobMap.get(bpID);
+      mats.forEach(mat => {
+        if (mat.actID === 1) {
+          const baseQty = mat.qty;
+          const adjQty = baseQty * ((100 - job.me) / 100);
+          const totalReq = Math.ceil(adjQty * job.runs);
 
-      outputRows.push([
-        sdeBpID,
-        1,
-        Number(sdeMatData[i][2]),
-        baseQty,
-        job.me,
-        job.runs,
-        adjQty,
-        totalReq
-      ]);
+          outputRows.push([bpID, 1, mat.matID, baseQty, job.me, job.runs, adjQty, totalReq]);
+        }
+      });
     }
   }
 
-  // --- 5. Paste to Sheet ---
+  // B. Invention Requirements (Activity 8) - Datacores & Decryptors Only
+  for (const [bpID, inventionSlots] of invJobsMap.entries()) {
+    const mats = bpMaterialsMap.get(bpID) || [];
+    mats.forEach(mat => {
+      if (mat.actID === 8) {
+        const baseQty = mat.qty;
+        const totalReq = baseQty * inventionSlots;
+        outputRows.push([bpID, 8, mat.matID, baseQty, 0, inventionSlots, baseQty, totalReq]);
+      }
+    });
+  }
+
+  // --- 6. Paste to Sheet ---
   const outSheet = ss.getSheetByName("Full_BOM_Data");
   outSheet.clearContents();
   outSheet.getRange(1, 1, 1, 8).setValues([["BP ID", "Act ID", "Mat ID", "Base Qty", "ME", "Runs", "Adj Qty", "Total Req"]]);
@@ -226,7 +246,7 @@ function generateFullBOMData(ss) {
     outSheet.getRange(2, 8, outputRows.length, 1).setNumberFormat("#,##0");
   }
 
-  LOG.info(`BOM V3 HYBRID: Expanded T2 chains. Processed ${outputRows.length} job lines.`);
+  LOG.info("BOM V3.4 (CLEAN): Processed " + outputRows.length + " valid BOM lines.");
 }
 
 /**
@@ -237,7 +257,10 @@ function generateConsolidatedRequirements(ss) {
   const TARGET_SHEET_NAME = 'Consolidated_Requirements';
   const SOURCE_SHEET_NAME = 'Manufaturing Inputs Effective Cost';
 
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+
   const sheet = ss.getSheetByName(TARGET_SHEET_NAME);
   const sourceSheet = ss.getSheetByName(SOURCE_SHEET_NAME);
 
@@ -347,24 +370,30 @@ function generateConsolidatedRequirements(ss) {
 }
 
 function runIndustryLedgerPhase(ss) {
-  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
   const log = LoggerEx.withTag('MASTER_SYNC');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-
-  if (SCRIPT_PROP.getProperty('cogsJobStep') === 'FINALIZING') {
-    log.warn('Skipping: Contract COGS calculation pending.');
-    return;
-  }
 
   const START_TIME = Date.now();
   let phase = parseInt(SCRIPT_PROP.getProperty(INDUSTRY_JOB_PHASE) || '0', 10);
   const isTimeUp = () => (Date.now() - START_TIME > SOFT_TIME_LIMIT_MS);
 
+  // Declare SDE state holder at orchestrator scope
+  const sdeMaps = _getSdeMaps(ss);
+
+  // --- START ANESTHESIA LOOP ---
+  let needsWakeUp = false;
+
   try {
+    // Put the sheet to sleep for whichever Phase(s) run in this execution block
+    needsWakeUp = (typeof pauseSheet === 'function') ? pauseSheet(ss) : false;
+
     // PHASE 0: Fetcher (Write Only)
-    if (phase === 0) {
+    if (phase === 0 && !isTimeUp()) {
       log.info('Phase 0: Synchronizing ESI Corp Jobs...');
-      const result = _getCorporateJobsRaw(ss, false);
+      const result = _getCorporateJobsRaw(ss, false, sdeMaps);
 
       if (result && result.length > 0) {
         log.info(`Phase 0: Fetched ${result.length} new jobs.`);
@@ -376,7 +405,7 @@ function runIndustryLedgerPhase(ss) {
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '1');
     }
 
-    // Initialize jobMap only if we are in Phase 1 or 2
+    // Initialize jobMap when moving into Phase 1 or Phase 2
     let jobMap;
     if (phase >= 1) {
       jobMap = _getJobMap(ss);
@@ -385,7 +414,7 @@ function runIndustryLedgerPhase(ss) {
     // PHASE 1: Processor
     if (phase === 1 && !isTimeUp()) {
       log.info('Phase 1: Running BPC Creation Ledger...');
-      runBpcCreationLedger(ss, jobMap, true);
+      runBpcCreationLedger(ss, jobMap, true, sdeMaps, true);
       phase = 2;
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '2');
     }
@@ -393,7 +422,7 @@ function runIndustryLedgerPhase(ss) {
     // PHASE 2: Processor
     if (phase === 2 && !isTimeUp()) {
       log.info('Phase 2: Manufacturing Ledger Update...');
-      runIndustryLedgerUpdate(ss, START_TIME, jobMap);
+      runIndustryLedgerUpdate(ss, START_TIME, jobMap, sdeMaps, true);
       phase = 4;
       SCRIPT_PROP.setProperty(INDUSTRY_JOB_PHASE, '4');
     }
@@ -405,6 +434,10 @@ function runIndustryLedgerPhase(ss) {
     }
   } catch (e) {
     log.error('Phase ' + phase + ' FAILED.', e);
+  } finally {
+    // --- WAKE UP BEFORE SCRIPT EXIT ---
+    // Guaranteed to wake the sheet up whether it finished Phase 4, bailed for time, or threw an error.
+    if (needsWakeUp && typeof wakeUpSheet === 'function') wakeUpSheet(ss);
   }
 }
 
@@ -471,74 +504,118 @@ function XRAY_MISSING_JOB() {
   log.log(`🔥 CONCLUSION: The job perfectly clears all gates. If it is vanishing, it is being overwritten during the ML.forSheet upsert operation.`);
 }
 
-/**
- * 🌊 WATERFALL BLUEPRINT STATS ENGINE (FULLY UPGRADED)
- * Sequence: Ledger (Actuals) -> Master Config Engine -> [Yields to ESI if blank]
- */
+function NUKE_LEDGER_CACHE() {
+  const c1 = CacheService.getScriptCache();
+  const c2 = CacheService.getDocumentCache();
+  if (c1) { c1.remove("NR_MATERIAL_LEDGER"); c1.remove("NR_SALES_LEDGER"); }
+  if (c2) { c2.remove("NR_MATERIAL_LEDGER"); c2.remove("NR_SALES_LEDGER"); }
+
+  // Also clear our new global variable cache just in case
+  if (typeof _globalWaterfallGroupedCache !== 'undefined') {
+    _globalWaterfallGroupedCache = null;
+  }
+
+  console.log("CACHE DESTROYED. The script will now see live data.");
+}
+
+// Global cache ensures the 8,600 row ledger is only parsed once per script execution
+var _globalWaterfallGroupedCache = null;
+
 function _buildWaterfallBlueprintStatsMap(targetBpIds, configMap) {
-  // SAFETY: If configMap is missing, initialize it so .get() won't crash
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const map = configMap || new Map();
   const statsMap = new Map();
 
-  // 1. Query Ledger
-  const ledgerData = ML.forSheet("Material_Ledger").query({
-    type_id: targetBpIds,
-    source: ["CONTRACT", "INVENTION", "COPYING"]
-  });
+  // 1. One-Time Global Ledger Load & Grouping
+  if (!_globalWaterfallGroupedCache) {
+    const ledgerData = ML.forSheet("Material_Ledger").query({}) || [];
 
-  // 2. Pre-aggregate Ledger data (Single-pass)
-  const grouped = {};
-  ledgerData.forEach(r => {
-    const bpId = Number(r.type_id);
-    if (!grouped[bpId]) {
-      grouped[bpId] = {
-        contracts: { weightedMe: 0, weightedTe: 0, totalQty: 0 },
-        industry: { weightedMe: 0, weightedTe: 0, totalQty: 0 }
-      };
+    // THE FIX: "INDUSTRY" included to catch legacy invention runs
+    const validSources = new Set(["CONTRACT", "INVENTION", "COPYING", "INDUSTRY"]);
+
+    _globalWaterfallGroupedCache = {};
+
+    ledgerData.forEach(r => {
+      if (!validSources.has(String(r.source).toUpperCase())) return;
+      const rawId = Number(r.type_id);
+      if (!rawId) return;
+
+      if (!_globalWaterfallGroupedCache[rawId]) {
+        _globalWaterfallGroupedCache[rawId] = {
+          contracts: { weightedMe: 0, weightedTe: 0, totalQty: 0, totalCost: 0 },
+          industry: { weightedMe: 0, weightedTe: 0, totalQty: 0, totalCost: 0 }
+        };
+      }
+
+      // THE FIX: Regex Armor added to Quantity to prevent NaN breaks
+      const cleanQty = parseFloat(String(r.qty || 1).replace(/[^0-9.-]/g, '')) || 1;
+      const qty = Math.abs(cleanQty);
+
+      const meta = (typeof r.metadata === 'object' && r.metadata !== null) ? r.metadata : {};
+      const me = (Number(meta.me) || 0);
+      const te = (Number(meta.te) || 0);
+
+      // THE FIX: Regex Armor and Manual Override Priority
+      const cleanOverride = parseFloat(String(r.unit_value).replace(/[^0-9.-]/g, ''));
+      const cleanFilled = parseFloat(String(r.unit_value_filled).replace(/[^0-9.-]/g, ''));
+      const unitVal = (!isNaN(cleanOverride) && cleanOverride > 0) ? cleanOverride : (cleanFilled || 0);
+
+      const totalVal = Number(meta.cumulative_cost) || (unitVal * qty) || 0;
+
+      const target = (r.source === "CONTRACT") ? _globalWaterfallGroupedCache[rawId].contracts : _globalWaterfallGroupedCache[rawId].industry;
+      target.weightedMe += (me * qty);
+      target.weightedTe += (te * qty);
+      target.totalQty += qty;
+      target.totalCost += totalVal;
+    });
+  }
+
+  // 2. Map Product IDs locally for cross-referencing
+  const sdeMaps = _getSdeMaps(ss);
+  const bpToProductMap = new Map();
+  if (sdeMaps && sdeMaps.sdeProdMap) {
+    for (const [key, prodObj] of sdeMaps.sdeProdMap.entries()) {
+      if (key.startsWith("1:")) {
+        const bpID = Number(key.split(':')[1]);
+        if (bpID > 0 && prodObj.productTypeID > 0) {
+          bpToProductMap.set(bpID, Number(prodObj.productTypeID));
+        }
+      }
     }
+  }
 
-    const qty = Math.abs(Number(r.qty)) || 1;
-    const meta = (typeof r.metadata === 'object' && r.metadata !== null) ? r.metadata : {};
-    const me = (Number(meta.me) || 0);
-    const te = (Number(meta.te) || 0);
-
-    const target = (r.source === "CONTRACT") ? grouped[bpId].contracts : grouped[bpId].industry;
-    target.weightedMe += (me * qty);
-    target.weightedTe += (te * qty);
-    target.totalQty += qty;
-  });
-
-  // 3. Resolve: Ledger (Actuals) -> Fallback to Master Config
+  // 3. Resolve O(1) Instantly without logging delays
   targetBpIds.forEach(bpId => {
-    const config = map.get(bpId);
-    const data = grouped[bpId];
+    const numBpId = Number(bpId);
+    const config = map.get(numBpId);
+    const prodId = bpToProductMap.get(numBpId);
 
-    let me, te;
-    let hasValidData = false;
+    // Pull from the global cache
+    let data = _globalWaterfallGroupedCache[numBpId] || (prodId ? _globalWaterfallGroupedCache[prodId] : null);
 
-    // 1. Try Ledger First (Priority: Contracts > Industry)
+    let me = config ? config.maxMe : 0;
+    let te = config ? config.maxTe : 0;
+    let avgCost = 0;
+    let hasValidData = !!config;
+
     if (data && data.contracts.totalQty > 0) {
       me = Math.round(data.contracts.weightedMe / data.contracts.totalQty);
       te = Math.round(data.contracts.weightedTe / data.contracts.totalQty);
+      avgCost = data.contracts.totalCost / data.contracts.totalQty;
       hasValidData = true;
     } else if (data && data.industry.totalQty > 0) {
       me = Math.round(data.industry.weightedMe / data.industry.totalQty);
       te = Math.round(data.industry.weightedTe / data.industry.totalQty);
-      hasValidData = true;
-    }
-    // 2. Fallback to Master Config (Using the new camelCase variables)
-    else if (config) {
-      me = config.maxMe;
-      te = config.maxTe;
+      avgCost = data.industry.totalCost / data.industry.totalQty;
       hasValidData = true;
     }
 
-    // 3. ONLY set the map if we actually found real data.
     if (hasValidData) {
-      statsMap.set(bpId, {
+      statsMap.set(numBpId, {
         me: me,
         te: te,
-        runs: config ? config.presetRuns : 0
+        runs: config ? config.presetRuns : 0,
+        avgCost: avgCost
       });
     }
   });
@@ -547,9 +624,9 @@ function _buildWaterfallBlueprintStatsMap(targetBpIds, configMap) {
 }
 
 /**
- * 🧮 CORE INDUSTRY MATH ENGINE (DRY)
+ * CORE INDUSTRY MATH ENGINE (DRY)
  * Centralizes EVE batch formulas, ME discounts, and BPC amortization.
- * Used by both the Projected Cost engine and the Historical Ledger.
+ * UPGRADED: Now integrates True Installation Tax Projections.
  */
 function _calculateJobFinancials(params) {
   const {
@@ -557,15 +634,21 @@ function _calculateJobFinancials(params) {
     activityId,
     runs,
     meLevel,
-    materials, // Array of SDE materials
+    materials,
     costMap,
     amortMap,
     internalBpcMap,
     bpcWacData,
-    presetRuns, // Needed to normalize bulk BPC contract values
+    presetRuns,
     baseYield,
-    actualInstallCost, // Passed from ESI. If undefined, it uses the estimate.
-    estInstallRate // e.g., 0.05
+    actualInstallCost,
+    estInstallRate,
+    systemId,
+    sdeBasePriceMap,
+    systemIndexMap,
+    facilityTaxRate,
+    structureRigBonus,
+    waterfallAvgCost // <--- Accept waterfall cost override
   } = params;
 
   // 1. Amortization (BPC / Setup Costs)
@@ -575,11 +658,12 @@ function _calculateJobFinancials(params) {
   } else {
     const contractValue = internalBpcMap.get(bpId);
     if (contractValue && contractValue > 0) {
-      // Normalizes bulk contract values down to a strict per-run cost
       const pRuns = presetRuns || 1;
       amortization = (contractValue / pRuns) * runs;
     } else {
-      amortization = (Number(bpcWacData[bpId]) || 0) * runs;
+      // Fallback hierarchy: Script Prop WAC -> Waterfall Ledger Avg Cost -> 0
+      const unitBpcCost = Number(bpcWacData[bpId]) || Number(waterfallAvgCost) || 0;
+      amortization = unitBpcCost * runs;
     }
   }
 
@@ -590,20 +674,32 @@ function _calculateJobFinancials(params) {
   materials.forEach(m => {
     if (m.activityID !== activityId) return;
     const baseQty = Number(m.quantity);
-
-    // EVE BATCH FORMULA: Math.ceil( Base * (1 - ME/100) * Runs )
-    // Math.max(runs, ...) guarantees at least 1 unit is consumed per run
-    const jobQty = Math.max(runs, Math.ceil(baseQty * meMultiplier * runs));
+    const jobQty = Math.ceil(baseQty * meMultiplier * runs);
     const unitPrice = (costMap.get(m.materialTypeID) || { landed: 0 }).landed;
-
     materialCost += (jobQty * unitPrice);
   });
 
-  // 3. Installation Cost
-  // If ESI gave us an actual live tax, use it. Otherwise, estimate it.
-  const installCost = actualInstallCost !== undefined
-    ? Number(actualInstallCost)
-    : materialCost * (estInstallRate || 0.05);
+  // 3. Installation Cost (The Upgraded Logic)
+  let installCost = 0;
+  if (actualInstallCost !== undefined && !isNaN(actualInstallCost)) {
+    // A. Use ESI Actuals (Historical Ledger)
+    installCost = Number(actualInstallCost);
+  } else if (systemId && sdeBasePriceMap && systemIndexMap) {
+    // B. Use True Math Projection (BOM Engine / Future Jobs)
+    installCost = _calculateProjectedTax({
+      systemId: systemId,
+      activityId: activityId,
+      runs: runs,
+      materials: materials,
+      sdeBasePriceMap: sdeBasePriceMap,
+      systemIndexMap: systemIndexMap,
+      facilityTaxRate: facilityTaxRate,
+      structureRigBonus: structureRigBonus
+    });
+  } else {
+    // C. Safety Fallback (Legacy)
+    installCost = materialCost * (estInstallRate || 0.05);
+  }
 
   // 4. Final Yield & Unit Cost
   const totalYield = Math.max(baseYield * runs, 1);
@@ -620,6 +716,59 @@ function _calculateJobFinancials(params) {
   };
 }
 
+// Global memory cache for System Indexes
+var _systemIndexCache = null;
+
+/**
+ * Loads the ESI Cost Indexes into a high-speed Map formatted by Activity ID.
+ */
+function _getSystemCostIndexMap(ss) {
+  if (_systemIndexCache) return _systemIndexCache;
+  const map = new Map();
+
+  try {
+    const range = ss.getRangeByName("NR_ESI_COST_INDEXES");
+    if (!range) return map;
+
+    const data = range.getValues();
+    if (data.length < 2) return map;
+
+    const headers = data[0].map(h => String(h).trim().toLowerCase());
+    const colId = headers.indexOf("solar_system_id");
+
+    // Map to global activity IDs (1=Mfg, 3=TE, 4=ME, 5=Copy, 8=Invent, 11=React)
+    const cols = {
+      1: headers.indexOf("manufacturing"),
+      3: headers.indexOf("time_research"),
+      4: headers.indexOf("material_research"),
+      5: headers.indexOf("copying"),
+      8: headers.indexOf("invention"),
+      11: headers.indexOf("reaction")
+    };
+
+    if (colId === -1 || cols[1] === -1) return map;
+
+    for (let i = 1; i < data.length; i++) {
+      const id = Number(data[i][colId]);
+      if (id > 0) {
+        map.set(id, {
+          1: Number(data[i][cols[1]]) || 0.0014,
+          3: Number(data[i][cols[3]]) || 0.0014,
+          4: Number(data[i][cols[4]]) || 0.0014,
+          5: Number(data[i][cols[5]]) || 0.0014,
+          8: Number(data[i][cols[8]]) || 0.0014,
+          11: Number(data[i][cols[11]]) || 0.0014
+        });
+      }
+    }
+  } catch (e) {
+    if (typeof LOG_INDUSTRY !== 'undefined') LOG_INDUSTRY.warn("Cost Index load failed: " + e.message);
+  }
+
+  _systemIndexCache = map;
+  return map;
+}
+
 // ----------------------------------------------------------------------
 // --- STAGE 1: BPC Cost Calculation (DYNAMIC EXTENSION ENG) ---
 // ----------------------------------------------------------------------
@@ -630,20 +779,34 @@ function _calculateJobFinancials(params) {
  * FIXED: Uses SDE Name Mapping for ledger item names.
  * FIXED: Pre-fetches Datacore/Decryptor costs to eliminate 0-cost bugs.
  * FIXED: ESI Data Sanitizer added to prevent undefined type_id crashes.
+ * UPGRADED: Now integrates Structure Settings, Facility Tax, and Rig Bonuses for Copy/Invention.
  */
-function runBpcCreationLedger(ss, jobMap, skipSummary) {
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+function runBpcCreationLedger(ss, jobMap, skipSummary, sdeMaps, holdAnesthesia) {
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+  if (!holdAnesthesia) holdAnesthesia = false;
+
   if (!jobMap) jobMap = _getJobMap(ss);
+  if (!sdeMaps) sdeMaps = _getSdeMaps(ss); // Fallback if called directly
+
+  const { sdeMatMap, sdeProdMap } = sdeMaps;
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   if (!skipSummary) skipSummary = false;
 
   // Standard Setup
   const configMap = _getMasterBlueprintConfig(ss);
-  const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
   const nameMap = _getSdeNameMap(ss);
   const encryptorMatrixMap = _loadEncryptorMatrixMap(ss);
   const internalBpcMap = _buildInternalBpcMap_(ss);
   const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
+
+  // --- TRUE TAX & STRUCTURE SETTINGS MAPPINGS FOR COPY / INVENTION ---
+  const sdeBasePriceMap = _getSdeBasePriceMap(ss);
+  const systemIndexMap = _getSystemCostIndexMap(ss);
+  const activeLocation = _getNamedOr_(ss, 'setting_production_structure', 'Amarr VIII (NPC)');
+  const structureMap = _getStructureSettingsMap(ss);
+  const activeSetting = structureMap.get(activeLocation) || { taxRate: 0.0, rigBonus: 1.0, structureType: 'NPC Station' };
 
   const processedJobIds = new Set(JSON.parse(SCRIPT_PROP.getProperty(BPC_JOB_KEY) || '[]'));
   let newBpcJobs = _getNewCompletedJobs(jobMap, processedJobIds, [INDUSTRY_ACTIVITY_COPYING, INDUSTRY_ACTIVITY_INVENTION]);
@@ -688,27 +851,51 @@ function runBpcCreationLedger(ss, jobMap, skipSummary) {
       const runMod = (job.licensed_runs / job.runs) - baseRuns;
       const decryptor = encryptorMatrixMap.get(runMod);
       if (decryptor) totalMaterialCost += ((costMap.get(decryptor.typeID)?.landed || 0) * job.runs);
-      (sdeMatMap.get(job.blueprint_type_id) || []).filter(m => m.activityID === INDUSTRY_ACTIVITY_INVENTION).forEach(mat => {
+
+      const inventionMaterials = (sdeMatMap.get(job.blueprint_type_id) || []).filter(m => m.activityID === INDUSTRY_ACTIVITY_INVENTION);
+      inventionMaterials.forEach(mat => {
         totalMaterialCost += ((costMap.get(mat.materialTypeID)?.landed || 0) * mat.quantity * job.runs);
       });
+
       totalMaterialCost += ((internalBpcMap.get(job.blueprint_type_id) || Number(bpcWacData[job.blueprint_type_id] || 0)) * job.runs);
     }
 
-    const totalActualCost = totalMaterialCost + (Number(job.cost) || 0);
+    // Determine Installation Cost: Use ESI Actuals (`job.cost`), or fallback to Structure Tax Projection if missing/zero
+    let installCost = Number(job.cost) || 0;
+    if (installCost === 0 && sdeBasePriceMap && systemIndexMap) {
+      const matsForTax = sdeMatMap.get(job.blueprint_type_id) || [];
+      installCost = _calculateProjectedTax({
+        systemId: Number(job.solar_system_id) || _getNamedOr_(ss, 'setting_production_system', 30002187),
+        activityId: Number(job.activity_id),
+        runs: Number(job.runs),
+        materials: matsForTax,
+        sdeBasePriceMap: sdeBasePriceMap,
+        systemIndexMap: systemIndexMap,
+        facilityTaxRate: activeSetting.taxRate,
+        structureRigBonus: activeSetting.rigBonus
+      });
+    }
+
+    const totalActualCost = totalMaterialCost + installCost;
     if (job.successful_runs > 0) {
-      ledgerObjects.push(createLedgerRow(job, (job.activity_id === INDUSTRY_ACTIVITY_INVENTION ? "INVENTION" : "COPYING"), job.successful_runs * job.licensed_runs, totalActualCost / (job.successful_runs * job.licensed_runs), { cost: totalActualCost, runs: job.licensed_runs }, itemName));
+      ledgerObjects.push(createLedgerRow(
+        job,
+        (job.activity_id === INDUSTRY_ACTIVITY_INVENTION ? "INVENTION" : "COPYING"),
+        job.successful_runs * job.licensed_runs,
+        totalActualCost / (job.successful_runs * job.licensed_runs),
+        { cost: totalActualCost, runs: job.licensed_runs },
+        itemName
+      ));
     }
     newlyProcessedIds.push(job.job_id);
   }
 
   if (ledgerObjects.length > 0) {
-    // Capture the return object from the ML Gatekeeper
-    const result = ledgerAPI.upsert(['source', 'type_id', 'contract_id'], ledgerObjects, true, skipSummary);
-
-    // Print the exact telemetry
+    const result = ledgerAPI.upsert(['source', 'type_id', 'contract_id'], ledgerObjects, holdAnesthesia, skipSummary);
     const log = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('BPC_LEDGER') : console;
     log.info(`BPC Ledger -> Appended: ${result.appended} | Updated: ${result.upserted} | Processed: ${ledgerObjects.length}`);
   }
+
   newlyProcessedIds.forEach(id => processedJobIds.add(id));
   SCRIPT_PROP.setProperty(BPC_JOB_KEY, JSON.stringify(Array.from(processedJobIds).slice(-1000)));
 }
@@ -719,8 +906,7 @@ function createLedgerRow(job, source, qty, unitValue, hist, name) {
     throw new Error(`CRITICAL ESI FAILURE: Job ID ${job.job_id} returned without a product_type_id. Sync halted.`);
   }
   return {
-    date: job.date || job.end_date,
-    date: job.completed_date || job.end_date,
+    date: job.completed_date || job.date || job.end_date,
     item_name: name,
     qty: qty,
     unit_value: '',
@@ -740,23 +926,7 @@ function createLedgerRow(job, source, qty, unitValue, hist, name) {
   };
 }
 
-function purgeCorruptWacEntries() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const rawData = SCRIPT_PROP.getProperty(BPC_WAC_KEY);
-  if (!rawData) return;
 
-  const wacData = JSON.parse(rawData);
-  const corruptIds = ["31795", "2334", "31723", "12085", "31725", "4400", "1071", "1878", "3832", "3042", "31221", "31379", "19807", "32046", "24428", "2938", "2874"];
-
-  corruptIds.forEach(id => {
-    if (wacData.hasOwnProperty(id)) {
-      delete wacData[id];
-      Logger.log("Purged corrupt WAC for ID: " + id);
-    }
-  });
-
-  SCRIPT_PROP.setProperty(BPC_WAC_KEY, JSON.stringify(wacData));
-}
 
 // ----------------------------------------------------------------------
 // --- MATRIX INGESTION LOADER ---
@@ -880,10 +1050,17 @@ function _resolveSmartConfig(bpId, bpName, ss) {
  * UPGRADE: 1k cache limit completely removed. The Sheet is now the absolute database.
  * UPGRADE: Defensive array initialization prevents 'undefined' crash errors.
  */
-function runIndustryLedgerUpdate(ss, startTime, jobMap) {
-  // 1. Resolve arguments with fallback defaults
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+function runIndustryLedgerUpdate(ss, startTime, jobMap, sdeMaps, holdAnestia) {
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+  if (!holdAnestia) holdAnestia = false;
   if (!jobMap) jobMap = _getJobMap(ss);
+  if (!startTime) startTime = Date.now();
+  if (!sdeMaps) sdeMaps = _getSdeMaps(ss); // Fallback if called directly
+
+  const { sdeMatMap, sdeProdMap } = sdeMaps;
+
   if (!startTime) startTime = Date.now();
 
   // SAFETY CHECK: Ensure jobMap is actually a Map before proceeding
@@ -893,8 +1070,6 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
     return;
   }
 
-  // 2. Initial Setup (Note: processedJobIds memory block has been eradicated)
-  const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
   if (sdeMatMap.size === 0) return;
 
   const nameMap = _getSdeNameMap(ss);
@@ -909,8 +1084,14 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
   const internalBpcMap = _buildInternalBpcMap_(ss);
   const ledgerAPI_Local = ML.forSheet('Material_Ledger', ss);
 
+  // --- TRUE TAX & STRUCTURE SETTINGS MAPPINGS ---
+  const sdeBasePriceMap = _getSdeBasePriceMap(ss);
+  const systemIndexMap = _getSystemCostIndexMap(ss);
+  const activeLocation = _getNamedOr_(ss, 'setting_production_structure', 'Amarr VIII (NPC)');
+  const structureMap = _getStructureSettingsMap(ss);
+  const activeSetting = structureMap.get(activeLocation) || { taxRate: 0.0, rigBonus: 1.0, structureType: 'NPC Station' };
+
   // --- 3. THE MASTER MEMORY FILTER (SHEET AS DATABASE) ---
-  // Defensively load the ledger. If it's empty/null, it defaults to a safe, empty array.
   const existingLedger = ledgerAPI_Local.query({ source: "INDUSTRY" }) || [];
   const safeLedgerArray = Array.isArray(existingLedger) ? existingLedger : [];
   const ledgerIds = new Set(safeLedgerArray.map(j => String(j.contract_id)));
@@ -920,19 +1101,34 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
   const newJobs = Array.from(jobMap.values()).filter(job => {
     const jid = String(job.job_id);
 
-    // THE ULTIMATE GHOST KILLER: 
-    // If it's delivered AND already saved in the ledger, ignore it completely.
-    if (job.status === 'delivered' && ledgerIds.has(jid)) return false;
+    // 1. Check valid activity and status whitelists first
+    if (!['active', 'ready', 'delivered'].includes(job.status)) return false;
+    if (!targetActivities.includes(parseInt(job.activity_id, 10))) return false;
 
-    // Otherwise, process it! (Active jobs will recalculate and upsert to show live WIP costs)
-    return ['active', 'ready', 'delivered'].includes(job.status) &&
-      targetActivities.includes(parseInt(job.activity_id, 10));
+    // 2. Check ledger history & previous status state
+    const existingRecord = safeLedgerArray.find(j => String(j.contract_id) === jid);
+    const previousStatus = existingRecord && existingRecord.metadata ? existingRecord.metadata.last_status : null;
+    
+    const statusChanged = previousStatus !== job.status;
+    const isInLedger = ledgerIds.has(jid);
+
+    // 3. THE GATING RULE: Skip if already logged and status hasn't changed.
+    // Process if it's completely new OR if its status mutated since last tick.
+    if (isInLedger && !statusChanged) {
+      return false;
+    }
+
+    return true;
   });
 
   if (newJobs.length === 0) {
     LOG_INDUSTRY.info("No new jobs to process.");
     return;
   }
+
+  // --- 3.5. Build Waterfall Map for Ledger Fallbacks ---
+  const allJobBpIds = Array.from(new Set(newJobs.map(j => Number(j.blueprint_type_id))));
+  const waterfallStatsMap = _buildWaterfallBlueprintStatsMap(allJobBpIds, configMap);
 
   const ledgerObjects = [];
 
@@ -948,6 +1144,8 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
       const materials = sdeMatMap.get(job.blueprint_type_id);
       if (!materials) continue;
 
+      const waterfallStats = waterfallStatsMap.get(Number(job.blueprint_type_id));
+
       const financials = _calculateJobFinancials({
         bpId: job.blueprint_type_id,
         activityId: parseInt(job.activity_id, 10),
@@ -962,8 +1160,18 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
         baseYield: (Array.isArray(sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`))
           ? sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`).find(p => p.activityID === parseInt(job.activity_id, 10))?.quantity
           : sdeProdMap.get(`${job.activity_id}:${job.blueprint_type_id}`)?.quantity) || 1,
+
+        waterfallAvgCost: waterfallStats ? waterfallStats.avgCost : 0,
+
         actualInstallCost: Number(job.cost),
-        estInstallRate: 0.05
+        estInstallRate: 0.05,
+
+        // DYNAMIC STRUCTURE SETTINGS INJECTION:
+        systemId: Number(job.solar_system_id) || _getNamedOr_(ss, 'setting_production_system', 30002187),
+        sdeBasePriceMap: sdeBasePriceMap,
+        systemIndexMap: systemIndexMap,
+        facilityTaxRate: activeSetting.taxRate,
+        structureRigBonus: activeSetting.rigBonus
       });
 
       ledgerObjects.push({
@@ -977,8 +1185,11 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
         char: job.installer_id,
         unit_value_filled: financials.unitCost,
         metadata: {
-          me: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).material_efficiency : 0,
-          te: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).time_efficiency : 0
+          me: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).material_efficiency : (job.me || 0),
+          te: bpoAttributesMap.has(job.blueprint_type_id) ? bpoAttributesMap.get(job.blueprint_type_id).time_efficiency : (job.te || 0),
+          last_status: job.status,
+          system_id: Number(job.solar_system_id) || 0,
+          updated_at: new Date().getTime()
         }
       });
 
@@ -989,10 +1200,7 @@ function runIndustryLedgerUpdate(ss, startTime, jobMap) {
 
   // --- 5. PERSISTENCE ---
   if (ledgerObjects.length > 0) {
-    // Capture the return object from the ML Gatekeeper
-    const result = ledgerAPI_Local.upsert(['source', 'type_id', 'contract_id'], ledgerObjects, false);
-
-    // Print the exact telemetry
+    const result = ledgerAPI_Local.upsert(['source', 'type_id', 'contract_id'], ledgerObjects, holdAnestia);
     LOG_INDUSTRY.info(`MFG Ledger -> Appended: ${result.appended} | Updated: ${result.upserted} (Total WIP Tracked: ${ledgerObjects.length})`);
   }
 }
@@ -1144,40 +1352,56 @@ function syncCorpBlueprintsV12() {
 /**
  * THE REGISTRY BRIDGE: Aggregates ESI hangar assets and commits whole-number 
  * weighted ME/TE stats strictly to the Config_BPC_Runs backend master tab.
+ * NOW INCLUDES: Total Runs, Avg Runs, and splits BPOs vs BPCs.
+ * FULLY OPTIMIZED: Column indexes are hoisted outside the loops.
  */
 function _updateBpoConfigFromAudit(blueprints) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Config_BPC_Runs");
-  const nameMap = _getSdeNameMap(ss);
+  const nameMap = typeof getIndyTypeMap === 'function' ? getIndyTypeMap(ss) : new Map();
   if (!sheet || !blueprints || blueprints.length === 0) return;
 
-  // 1. Group raw hangar items by Type ID and calculate true weighted totals
+  // 1. Group raw hangar items by Type ID and calculate true weighted totals & runs
   const auditMap = new Map();
   blueprints.forEach(bp => {
-  if (bp.runs === -1 || bp.runs > 0) { 
+    if (bp.runs === -1 || bp.runs > 0) {
       const id = Number(bp.type_id);
-      
+
       // FIX: ESI uses negative numbers (-1 or -2) for unpackaged singletons.
       const rawQty = Number(bp.quantity) || 1;
       const qty = rawQty > 0 ? rawQty : 1;
-      
+
       const me = Number(bp.material_efficiency) || 0;
       const te = Number(bp.time_efficiency) || 0;
 
+      const isBpo = (bp.runs === -1);
+      const runsOnBp = isBpo ? 0 : Number(bp.runs); // BPOs are infinite, so we don't count their "runs"
+
       if (!auditMap.has(id)) {
         auditMap.set(id, {
-          count: 0,
+          totalPhysicalItems: 0,
+          bpoCount: 0,
+          bpcCount: 0,
+          totalRuns: 0,
           totalMe: 0,
           totalTe: 0
         });
       }
 
       const current = auditMap.get(id);
-      
-      // Add the actual physical number of blueprints
-      current.count += qty;
-      
-      // Weight the ME/TE by how many blueprints are in this stack
+
+      // Add the physical pieces of paper
+      current.totalPhysicalItems += qty;
+
+      // Separate BPOs and BPCs, and sum the total manufacturing capacity
+      if (isBpo) {
+        current.bpoCount += qty;
+      } else {
+        current.bpcCount += qty;
+        current.totalRuns += (runsOnBp * qty);
+      }
+
+      // Weight the ME/TE by how many physical blueprints are in this stack
       current.totalMe += (me * qty);
       current.totalTe += (te * qty);
     }
@@ -1189,6 +1413,7 @@ function _updateBpoConfigFromAudit(blueprints) {
 
   let col;
   try {
+    // We will keep 'available_bpos' as the Total BPCs / Physical Item counter
     col = _getColIndexMap(headers, ['bp_type_id', 'available_bpos']);
   } catch (e) {
     console.error("Critical: Config_BPC_Runs sheet missing required identity headers.");
@@ -1196,13 +1421,24 @@ function _updateBpoConfigFromAudit(blueprints) {
   }
 
   const lowerHeaders = headers.map(h => String(h || '').toLowerCase().trim());
+
+  // --- CACHE COLUMN INDEXES OUTSIDE THE LOOPS (Optimized) ---
   const meColIndex = lowerHeaders.indexOf('max_me');
   const teColIndex = lowerHeaders.indexOf('max_te');
+  const totalRunsIdx = lowerHeaders.findIndex(h => h === 'total_runs' || h === 'total runs');
+  const avgRunsIdx = lowerHeaders.findIndex(h => h === 'avg_runs' || h === 'avg runs');
+  const totalBpoIdx = lowerHeaders.findIndex(h => h === 'total_bpos' || h === 'total bpos');
+
+  // Cache the append-only columns too!
+  const presetRunsIdx = lowerHeaders.findIndex(h => h === 'preset_runs' || h === 'preset runs');
+  const typeNameIdx = lowerHeaders.findIndex(h => h === 'type_name' || h === 'type name');
+  const hardCapIdx = lowerHeaders.findIndex(h => h === 'hard run cap' || h === 'hard_run_cap');
+  const dailyQuotaIdx = lowerHeaders.findIndex(h => h === 'daily quota' || h === 'daily_quota');
 
   const dataRows = rawData.slice(1);
   const trackedBpIds = new Set();
 
-  // 3. Loop existing registry records and overwrite with fresh weighted averages
+  // 3. Loop existing registry records and overwrite with fresh data
   if (dataRows.length > 0) {
     const updatedFullTableMatrix = dataRows.map(row => {
       const bpID = Number(row[col.bp_type_id]);
@@ -1210,11 +1446,14 @@ function _updateBpoConfigFromAudit(blueprints) {
 
       if (auditMap.has(bpID)) {
         const liveAssetData = auditMap.get(bpID);
-        row[col.available_bpos] = liveAssetData.count;
 
-        // Compute the true weighted average
-        const avgMe = Math.round(liveAssetData.totalMe / liveAssetData.count);
-        const avgTe = Math.round(liveAssetData.totalTe / liveAssetData.count);
+        // Physical Count of BPCs goes here (what you previously called available_bpos)
+        row[col.available_bpos] = liveAssetData.bpcCount > 0 ? liveAssetData.bpcCount : liveAssetData.totalPhysicalItems;
+
+        // Compute the true weighted averages
+        const avgMe = Math.round(liveAssetData.totalMe / liveAssetData.totalPhysicalItems);
+        const avgTe = Math.round(liveAssetData.totalTe / liveAssetData.totalPhysicalItems);
+        const avgRuns = liveAssetData.bpcCount > 0 ? Math.round(liveAssetData.totalRuns / liveAssetData.bpcCount) : 0;
 
         // Clamp the stats to engine limits (ME: 10, TE: 20)
         const weightedMeInt = Math.min(avgMe, 10);
@@ -1222,12 +1461,21 @@ function _updateBpoConfigFromAudit(blueprints) {
 
         if (meColIndex !== -1) row[meColIndex] = weightedMeInt;
         if (teColIndex !== -1) row[teColIndex] = weightedTeInt;
+
+        // Inject the new Run Capacity metrics
+        if (totalRunsIdx !== -1) row[totalRunsIdx] = liveAssetData.totalRuns;
+        if (avgRunsIdx !== -1) row[avgRunsIdx] = avgRuns;
+        if (totalBpoIdx !== -1) row[totalBpoIdx] = liveAssetData.bpoCount;
+
       } else {
-        row[col.available_bpos] = 0; // Asset is no longer in corporation hangars
-        
-        // FIX: Clear out any ghost data like #NUM! if the asset doesn't exist
+        row[col.available_bpos] = 0; // Asset is no longer in hangars
+
+        // Clear out ghost data
         if (meColIndex !== -1) row[meColIndex] = 0;
         if (teColIndex !== -1) row[teColIndex] = 0;
+        if (totalRunsIdx !== -1) row[totalRunsIdx] = 0;
+        if (avgRunsIdx !== -1) row[avgRunsIdx] = 0;
+        if (totalBpoIdx !== -1) row[totalBpoIdx] = 0;
       }
       return row;
     });
@@ -1237,35 +1485,34 @@ function _updateBpoConfigFromAudit(blueprints) {
 
   // 4. Append Delta Check: Inject newly acquired blueprint patterns
   const newRowsToAppend = [];
-  for (const [hangarBpId, assetObj] of auditMap.entries()) {
+  for (const [hangarBpId, liveAssetData] of auditMap.entries()) {
     if (!trackedBpIds.has(hangarBpId)) {
-      const bpName = nameMap.get(hangarBpId) || `Blueprint ${hangarBpId}`;
+      const bpName = typeof nameMap.get === 'function' ? nameMap.get(hangarBpId) : `Blueprint ${hangarBpId}`;
 
-      // Compute the true weighted average
-      const avgMe = Math.round(assetObj.totalMe / assetObj.count);
-      const avgTe = Math.round(assetObj.totalTe / assetObj.count);
+      // Compute the true weighted averages for new items
+      const avgMe = Math.round(liveAssetData.totalMe / liveAssetData.totalPhysicalItems);
+      const avgTe = Math.round(liveAssetData.totalTe / liveAssetData.totalPhysicalItems);
+      const avgRuns = liveAssetData.bpcCount > 0 ? Math.round(liveAssetData.totalRuns / liveAssetData.bpcCount) : 0;
 
-      // Clamp the stats to engine limits
       const finalMeInt = Math.min(avgMe, 10);
       const finalTeInt = Math.min(avgTe, 20);
 
       const appendRow = new Array(headers.length).fill('');
       appendRow[col.bp_type_id] = hangarBpId;
 
-      const presetRunsIdx = headers.indexOf('preset_runs');
       if (presetRunsIdx !== -1) appendRow[presetRunsIdx] = 1;
-
-      const typeNameIdx = headers.indexOf('type_name');
       if (typeNameIdx !== -1) appendRow[typeNameIdx] = bpName;
 
-      appendRow[col.available_bpos] = assetObj.count;
+      appendRow[col.available_bpos] = liveAssetData.bpcCount > 0 ? liveAssetData.bpcCount : liveAssetData.totalPhysicalItems;
+
       if (meColIndex !== -1) appendRow[meColIndex] = finalMeInt;
       if (teColIndex !== -1) appendRow[teColIndex] = finalTeInt;
+      if (totalRunsIdx !== -1) appendRow[totalRunsIdx] = liveAssetData.totalRuns;
+      if (avgRunsIdx !== -1) appendRow[avgRunsIdx] = avgRuns;
+      if (totalBpoIdx !== -1) appendRow[totalBpoIdx] = liveAssetData.bpoCount;
 
-      const hardCapIdx = headers.indexOf('Hard Run Cap');
+      // Safe initialization of new rows
       if (hardCapIdx !== -1) appendRow[hardCapIdx] = 300;
-
-      const dailyQuotaIdx = headers.indexOf('Daily Quota');
       if (dailyQuotaIdx !== -1) appendRow[dailyQuotaIdx] = 0;
 
       newRowsToAppend.push(appendRow);
@@ -1274,10 +1521,23 @@ function _updateBpoConfigFromAudit(blueprints) {
 
   if (newRowsToAppend.length > 0) {
     sheet.getRange(sheet.getLastRow() + 1, 1, newRowsToAppend.length, headers.length).setValues(newRowsToAppend);
-    console.log(`[REGISTRY ADD] Appended ${newRowsToAppend.length} newly discovered blueprint types to backend reference.`);
+    console.log(`[REGISTRY ADD] Appended ${newRowsToAppend.length} newly discovered blueprint types.`);
   }
 
   console.log(`[SUCCESS] Master Registry Sync Complete. Updated stats for ${auditMap.size} unique keys.`);
+}
+
+
+function DEBUG_NAME_LOOKUP() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const nameMap = getIndyTypeMap(ss); // Uses your existing logic
+  const targetId = 116411;
+
+  if (nameMap.has(targetId)) {
+    console.log(`DEBUG: ID ${targetId} resolves to: "${nameMap.get(targetId)}"`);
+  } else {
+    console.log(`DEBUG: ID ${targetId} is missing from the map entirely.`);
+  }
 }
 
 
@@ -1405,6 +1665,59 @@ function _getSdeMaps(ss) {
   return res;
 }
 
+var SdeMaterialsMapCache = null;
+
+/**
+ * Centralized SDE Materials Map (DRY Protocol)
+ * UPGRADED: Accepts pre-loaded sdeMaps object for Dependency Injection.
+ */
+function _getSdeMaterialsMap(ss, sdeMaps) {
+  if (SdeMaterialsMapCache && SdeMaterialsMapCache.size > 0) {
+    return SdeMaterialsMapCache;
+  }
+
+  // Use injected state if available, otherwise fetch it
+  const maps = sdeMaps || _getSdeMaps(ss);
+
+  if (maps && maps.sdeMatMap) {
+    SdeMaterialsMapCache = maps.sdeMatMap;
+  }
+
+  return SdeMaterialsMapCache || new Map();
+}
+
+var SdeProductQtyMapCache = null;
+
+/**
+ * Centralized SDE Product Quantity Map (DRY Protocol)
+ * UPGRADED: Accepts pre-loaded sdeMaps object for Dependency Injection.
+ */
+function _getSdeProductQtyMap(ss, sdeMaps) {
+  if (SdeProductQtyMapCache && SdeProductQtyMapCache.size > 0) {
+    return SdeProductQtyMapCache;
+  }
+
+  const productQtyMap = new Map();
+  // Use injected state if available, otherwise fetch it
+  const maps = sdeMaps || _getSdeMaps(ss);
+
+  if (maps && maps.sdeProdMap) {
+    for (const [key, prodObj] of maps.sdeProdMap.entries()) {
+      // Activity 1 = Manufacturing composite keys ("1:bpId")
+      if (key.startsWith("1:")) {
+        const productId = Number(prodObj.productTypeID);
+        const quantity = Number(prodObj.quantity);
+        if (productId > 0 && quantity > 0) {
+          productQtyMap.set(productId, quantity);
+        }
+      }
+    }
+  }
+
+  SdeProductQtyMapCache = productQtyMap;
+  return productQtyMap;
+}
+
 function _buildInternalBpcMap_(ss) {
   const log = LoggerEx.withTag('BPC_ALLOC');
   // Point to your actual item list sheet
@@ -1446,9 +1759,76 @@ function _buildInternalBpcMap_(ss) {
   return bpcMap;
 }
 
+
+
+/**
+ * UNIVERSAL BLUEPRINT BRIDGE (DRY REFACTOR)
+ * Identifies any Blueprint missing from the standard database and derives 
+ * its name directly from the exact product it manufactures, utilizing the centralized SDE cache.
+ */
+function getIndyTypeMap(ss) {
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+
+  const marketMap = _getSdeNameMap(ss);
+  const indyMap = new Map(marketMap);
+
+  const sdeMaps = _getSdeMaps(ss);
+  if (sdeMaps && sdeMaps.sdeProdMap) {
+    for (const [key, prodObj] of sdeMaps.sdeProdMap.entries()) {
+      // Check for Activity 1 (Manufacturing) keys formatted as "1:bpId"
+      if (key.startsWith("1:")) {
+        const bpId = Number(key.split(':')[1]);
+        const productId = Number(prodObj.productTypeID);
+
+        if (bpId > 0 && productId > 0 && !indyMap.has(bpId)) {
+          const rawProductName = indyMap.get(productId);
+          if (rawProductName) {
+            const productName = String(rawProductName).trim();
+            indyMap.set(bpId, productName + " Blueprint");
+          }
+        }
+      }
+    }
+  }
+
+  return indyMap;
+}
+
+function testIndyTypeMap() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const log = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('DEBUG_MAP') : Logger;
+
+  log.log("Starting map generation...");
+  const nameMap = getIndyTypeMap(ss);
+
+  log.log(`Map generated! Total items in dictionary: ${nameMap.size}`);
+
+  // 1. Check the specific ID that failed earlier
+  const targetId = 31679;
+  if (nameMap.has(targetId)) {
+    log.log(`✅ SUCCESS: ID ${targetId} resolved to --> "${nameMap.get(targetId)}"`);
+  } else {
+    log.log(`❌ FAIL: ID ${targetId} is STILL missing from the map.`);
+  }
+
+  // 2. Let's prove the " II" synthesis is working by finding 5 examples
+  log.log("--- 5 Random T2 Synthesized Names ---");
+  let count = 0;
+  for (const [id, name] of nameMap.entries()) {
+    if (String(name).endsWith(" II") && count < 5) {
+      log.log(`ID: ${id} | Name: ${name}`);
+      count++;
+    }
+  }
+
+  if (count === 0) {
+    log.log("⚠️ WARNING: No items ending in ' II' were found. Your column indices (row[0], row[1], row[2]) might be pointing at the wrong columns.");
+  }
+}
 // Add a global variable at the top of IndustryLedger.gs
 var _cachedSdeNameMap = null;
-
 function _getSdeNameMap(ss) {
   if (_cachedSdeNameMap) return _cachedSdeNameMap;
 
@@ -1491,21 +1871,6 @@ function _getMarketMedianMap(ss) {
 
 
 
-function debugEsiJobs() {
-  const authToon = getCorpAuthChar(); // This is your auth character
-  const client = GESI.getClient();
-  const charData = GESI.getCharacterData(authToon);
-  const corpId = charData.corporation_id;
-
-  client.setFunction('corporations_corporation_industry_jobs');
-  const req = client.buildRequest({ corporation_id: corpId, include_completed: true, name: authToon });
-  const response = UrlFetchApp.fetch(req.url, { method: 'get', headers: req.headers });
-  const jobs = JSON.parse(response.getContentText());
-
-  // Find your missing item by ID (or name) in this massive list
-  const t2Jobs = jobs.filter(j => j.product_type_id === 31794); // Replace 31789 with the actual TypeID of your Extender II
-  Logger.log(JSON.stringify(t2Jobs, null, 2));
-}
 var _cacheMarketPriceMapFor = null;
 function getMarketPriceMapFor(ss, Attribute) {
 
@@ -1569,6 +1934,83 @@ function getMarketPriceMapFor(ss, Attribute) {
   _cacheMarketPriceMapFor = map;
   return map;
 }
+
+/**
+ * Loads the Structure_Settings sheet into a high-speed Map.
+ * OPTIMIZED: Uses dimension clamping and memoized global caching.
+ */
+var _structureSettingsCache = null;
+
+function _getStructureSettingsMap(ss, forceRefresh = false) {
+  if (_structureSettingsCache && !forceRefresh) return _structureSettingsCache;
+
+  const SHEET_NAME = "Structure_Settings";
+  const map = new Map();
+
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) return map;
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return map;
+
+  const data = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = data[0].map(h => String(h || '').trim().toLowerCase());
+
+  const colNickname = headers.indexOf('location nickname');
+  const colType = headers.indexOf('structure type');
+  const colYield = headers.indexOf('base yield');
+  const colRig = headers.indexOf('rig type');
+  const colSec = headers.indexOf('sec status');
+  const colTax = headers.indexOf('tax');
+
+  if (colNickname === -1) return map;
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const nickname = String(row[colNickname] || '').trim();
+    if (!nickname) continue;
+
+    // Optimized Tax Parsing
+    let rawTax = row[colTax];
+    let taxRate = 0;
+    if (rawTax !== null && rawTax !== undefined && rawTax !== '') {
+      if (typeof rawTax === 'number') {
+        taxRate = rawTax;
+      } else {
+        const cleaned = String(rawTax).replace(/[^0-9.-]/g, '');
+        taxRate = cleaned !== '' ? parseFloat(cleaned) / 100 : 0;
+      }
+    }
+
+    // Rig Type Multiplier
+    const rigType = colRig !== -1 ? String(row[colRig]).trim() : '';
+    let rigBonus = 1.0;
+    const rigLower = rigType.toLowerCase();
+    if (rigLower.includes('t2')) {
+      rigBonus = 0.92;
+    } else if (rigLower.includes('t1')) {
+      rigBonus = 0.96;
+    }
+
+    map.set(nickname, {
+      structureType: colType !== -1 ? String(row[colType]).trim() : '',
+      baseYield: colYield !== -1 ? Number(row[colYield]) || 0.5 : 0.5,
+      rigType: rigType,
+      secStatus: colSec !== -1 ? String(row[colSec]).trim() : '',
+      taxRate: taxRate,
+      rigBonus: rigBonus
+    });
+  }
+
+  _structureSettingsCache = map;
+  return map;
+}
+
 
 // Global memory cache for the SDE Base Prices
 var sdeBasePriceCache = null;
@@ -1711,31 +2153,38 @@ function _getBpoAttributesMapFromEsi() {
   return attributesMap;
 }
 
+
+
 /**
- * UPGRADED: Corporate Jobs Fetcher
- * Now uses ESI.forEndpoint for centralized error handling and quota management.
+ * UPGRADED: Corporate Jobs Fetcher (In-Place Overwrite)
  */
-function _getCorporateJobsRaw(ss, forceRefresh = false) {
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+function _getCorporateJobsRaw(ss, forceRefresh = false, sdeMaps = null) {
+  const startTime = Date.now();
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+
   const props = PropertiesService.getScriptProperties();
-  const log = LoggerEx.withTag('CORP_JOBS');
 
   // 1. Check ESI Expiry Property
   const storedExpires = Number(props.getProperty('CORP_JOBS_EXPIRES') || 0);
   if (!forceRefresh && Date.now() < storedExpires) {
-    log.info("ESI Corp Jobs: Within ESI cache window. Skipping fetch.");
+    Logger.log(`[CORP_JOBS] Within ESI cache window (Expires in ${Math.round((storedExpires - Date.now()) / 1000)}s). Skipping fetch.`);
     return [];
   }
 
   const authToon = getCorpAuthChar();
-  if (!authToon) return [];
-
-  // Fix: Initialize charData to resolve the corporation_id
-  const charData = GESI.getCharacterData(authToon);
-  if (!charData || !charData.corporation_id) {
-    log.error("Could not resolve Corp ID.");
+  if (!authToon) {
+    Logger.log("[CORP_JOBS ERROR] Failed to resolve auth character (getCorpAuthChar returned null/empty).");
     return [];
   }
+
+  const charData = GESI.getCharacterData(authToon);
+  if (!charData || !charData.corporation_id) {
+    Logger.log(`[CORP_JOBS ERROR] Could not resolve corporation_id for character: ${authToon}`);
+    return [];
+  }
+  Logger.log(`[CORP_JOBS] Fetching corp jobs for Corporation ID: ${charData.corporation_id} using character: ${authToon}`);
 
   const authClient = GESI.getClient(authToon);
   const service = ESI.forEndpoint(authClient, 'corporations_corporation_industry_jobs');
@@ -1747,37 +2196,96 @@ function _getCorporateJobsRaw(ss, forceRefresh = false) {
   });
 
   if (result.error) {
-    log.error(`[ESI_MODULE] Fetch failed: ${result.error}`);
+    Logger.log(`[CORP_JOBS ERROR] ESI Fetch failed: ${result.error}`);
     return [];
   }
 
+  const rawCount = result.data ? result.data.length : 0;
+  Logger.log(`[CORP_JOBS] Successfully fetched ${rawCount} raw jobs from ESI.`);
+
   // 3. Parse and Store Expiry Header
-  const headers = result.headers;
-  const expiresHeader = headers['Expires'] || headers['expires'];
+  const expiresHeader = result.headers['Expires'] || result.headers['expires'];
   if (expiresHeader) {
-    props.setProperty('CORP_JOBS_EXPIRES', new Date(expiresHeader).getTime().toString());
+    const expiryTime = new Date(expiresHeader).getTime();
+    props.setProperty('CORP_JOBS_EXPIRES', expiryTime.toString());
+    Logger.log(`[CORP_JOBS] ESI Cache updated. Next valid fetch after: ${new Date(expiryTime).toLocaleString()}`);
   }
 
-  // 4. Normalize Data (In Memory)
-  const STANDARD_HEADERS = ["activity_id", "blueprint_id", "blueprint_location_id", "blueprint_type_id", "completed_character_id", "completed_date", "cost", "duration", "end_date", "facility_id", "installer_id", "job_id", "licensed_runs", "location_id", "output_location_id", "pause_date", "probability", "product_type_id", "runs", "start_date", "status", "successful_runs"];
+  // 4. Retrieve SDE Product Quantity Map (MOVED HERE)
+  const productQtyMap = _getSdeProductQtyMap(ss, sdeMaps);
 
-  const rows = result.data.map(job => STANDARD_HEADERS.map(h => {
-    const val = job[h] ?? null;
-    if (val === null) return null;
-    if (["completed_date", "end_date", "start_date", "pause_date"].includes(h)) return new Date(val);
-    if (["blueprint_id", "cost", "duration", "product_type_id", "runs"].includes(h)) return Number(val);
-    return String(val);
-  }));
+  // 5. Normalize Data & Compute Units Per Run and Total Quantity
+  const STANDARD_HEADERS = [
+    "activity_id", "blueprint_id", "blueprint_location_id", "blueprint_type_id",
+    "completed_character_id", "completed_date", "cost", "duration", "end_date",
+    "facility_id", "installer_id", "job_id", "licensed_runs", "location_id",
+    "output_location_id", "pause_date", "probability", "product_type_id",
+    "runs", "start_date", "status", "successful_runs", "units_per_run", "total_quantity"
+  ];
 
-  // 5. Update Sheet
+  let matchedSdeCount = 0;
+  const rows = result.data.map(job => {
+    const productId = Number(job.product_type_id || 0);
+    const runs = Number(job.runs || 0);
+
+    let unitsPerRun = productQtyMap.get(productId);
+    if (unitsPerRun) {
+      matchedSdeCount++;
+    } else {
+      unitsPerRun = 1; // Fallback
+    }
+    const totalQuantity = runs * unitsPerRun;
+
+    return STANDARD_HEADERS.map(h => {
+      if (h === "units_per_run") return unitsPerRun;
+      if (h === "total_quantity") return totalQuantity;
+
+      const val = job[h] ?? null;
+      if (val === null) return null;
+      if (["completed_date", "end_date", "start_date", "pause_date"].includes(h)) return new Date(val);
+      if (["blueprint_id", "cost", "duration", "product_type_id", "runs", "licensed_runs", "successful_runs"].includes(h)) return Number(val);
+      return String(val);
+    });
+  });
+
+  Logger.log(`[CORP_JOBS] Processed ${rows.length} rows. SDE product quantity matched for ${matchedSdeCount}/${rows.length} jobs.`);
+
+  // 6. Update Sheet & Named Range via In-Place Direct Overwrite
   const jobsSheet = ss.getSheetByName("ESI Corp Jobs");
-  jobsSheet.getRange(1, 3, Math.max(jobsSheet.getLastRow(), 1), STANDARD_HEADERS.length).clearContent();
-  const targetRange = jobsSheet.getRange(1, 3, rows.length + 1, STANDARD_HEADERS.length);
+  if (!jobsSheet) {
+    Logger.log("[CORP_JOBS ERROR] Sheet 'ESI Corp Jobs' not found!");
+    return result.data;
+  }
+
+  const numCols = STANDARD_HEADERS.length;
+  const newRowCount = rows.length + 1; // Headers + data rows
+  const oldMaxRow = jobsSheet.getLastRow();
+
+  // Overwrite existing range directly without clearContent()
+  const targetRange = jobsSheet.getRange(1, 3, newRowCount, numCols);
   targetRange.setValues([STANDARD_HEADERS, ...rows]);
-  ss.setNamedRange("NR_ESI_CORP_JOBS", targetRange);
+
+  // Only clear leftover orphan rows if the previous payload was larger
+  if (oldMaxRow > newRowCount) {
+    const orphanRows = oldMaxRow - newRowCount;
+    jobsSheet.getRange(newRowCount + 1, 3, orphanRows, numCols).clearContent();
+  }
+
+  // Update Named Range efficiently
+  const existingNamedRange = ss.getNamedRanges().find(nr => nr.getName() === "NR_ESI_CORP_JOBS");
+  if (existingNamedRange) {
+    existingNamedRange.setRange(targetRange);
+  } else {
+    ss.setNamedRange("NR_ESI_CORP_JOBS", targetRange);
+  }
+
+  const durationMs = Date.now() - startTime;
+  Logger.log(`[CORP_JOBS SUCCESS] Completed full sync in ${durationMs}ms. Named range 'NR_ESI_CORP_JOBS' updated.`);
 
   return result.data;
 }
+
+
 
 /**
  * UPGRADED: Blueprint Ingestion Engine
@@ -1851,6 +2359,166 @@ function resetIndustryLedgerProperties() {
   props.deleteProperty('processedConsumptionJobIds');
 
   console.log("Industry Ledger Properties Reset.");
+}
+
+const CACHE_CONFIG = {
+  SHEET_NAME: 'Cost Indexes',
+  EXPIRES_PROP: 'ESI_COST_INDEX_EXPIRES'
+};
+
+/**
+ * Calculates the projected installation tax for a job.
+ * EVE Formula: Base Job Cost * System Cost Index * Facility Tax * Structure Rig Modifier
+ */
+function _calculateProjectedTax(params) {
+  const {
+    systemId,
+    activityId,
+    runs,
+    baseMaterialQuantities,
+    materials, // Accepts both names to prevent undefined crashes
+    sdeBasePriceMap,
+    systemIndexMap,
+    facilityTaxRate,
+    structureRigBonus
+  } = params;
+
+  const materialList = baseMaterialQuantities || materials || [];
+
+  // 1. Calculate Base Job Cost (SDE Base Price * SDE Base Quantity * Runs)
+  let baseJobCost = 0;
+  materialList.forEach(mat => {
+    const sdeBasePrice = sdeBasePriceMap.get(mat.materialTypeID) || 0;
+    // Base cost ignores ME research; it always uses the raw SDE quantity
+    baseJobCost += (sdeBasePrice * mat.quantity * runs);
+  });
+
+  // 2. Retrieve System Index
+  const systemData = systemIndexMap.get(systemId);
+  const costIndex = systemData ? (systemData[activityId] || 0.0014) : 0.0014;
+
+  // 3. Apply Facility & Rig Modifiers
+  const facTax = facilityTaxRate || 0;
+  const rigBonus = structureRigBonus || 1.0;
+
+  // 4. Final Calculation
+  const finalTax = baseJobCost * costIndex * (1 + facTax) * rigBonus;
+
+  return finalTax;
+}
+
+function _getSystemIndexesRaw(ss, forceRefresh = false) {
+  const startTime = Date.now();
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+
+  const props = PropertiesService.getScriptProperties();
+
+  // 1. Check ESI Expiry Property
+  const storedExpires = Number(props.getProperty('SYSTEM_INDEXES_EXPIRES') || 0);
+  if (!forceRefresh && Date.now() < storedExpires) {
+    Logger.log(`[SYS_INDEXES] Within ESI cache window (Expires in ${Math.round((storedExpires - Date.now()) / 1000)}s). Skipping fetch.`);
+    return [];
+  }
+
+  // 2. Resolve Client Setup (Matching the Corp Jobs Pattern)
+  const authToon = getCorpAuthChar();
+  if (!authToon) {
+    Logger.log("[SYS_INDEXES ERROR] Failed to resolve auth character (getCorpAuthChar returned null/empty).");
+    return [];
+  }
+
+  const authClient = GESI.getClient(authToon);
+  Logger.log(`[SYS_INDEXES] Fetching System Indexes from ESI...`);
+
+  // 3. Perform Fetch
+  const service = ESI.forEndpoint(authClient, 'industry_systems');
+  const result = service.get({});
+
+  if (result.error || !result.data) {
+    Logger.log(`[SYS_INDEXES ERROR] ESI Fetch failed: ${result.error}`);
+    return [];
+  }
+
+  const rawCount = result.data.length;
+  Logger.log(`[SYS_INDEXES] Successfully fetched ${rawCount} system indexes from ESI.`);
+
+  // 4. Parse and Store Expiry Header
+  const expiresHeader = result.headers['Expires'] || result.headers['expires'];
+  if (expiresHeader) {
+    const expiryTime = new Date(expiresHeader).getTime();
+    props.setProperty('SYSTEM_INDEXES_EXPIRES', expiryTime.toString());
+    Logger.log(`[SYS_INDEXES] ESI Cache updated. Next valid fetch after: ${new Date(expiryTime).toLocaleString()}`);
+  } else {
+    // Standard 1-hour fallback if header is missing
+    const fallbackTime = Date.now() + (60 * 60 * 1000);
+    props.setProperty('SYSTEM_INDEXES_EXPIRES', fallbackTime.toString());
+  }
+
+  // 5. Normalize Data (Enforcing Numeric Types)
+  const STANDARD_HEADERS = [
+    "solar_system_id", "manufacturing", "time_research", "material_research",
+    "copying", "invention", "reaction"
+  ];
+
+  const BASELINE_COST = 0.0014;
+
+  const rows = result.data.map(system => {
+    const record = [
+      Number(system.solar_system_id),
+      BASELINE_COST, BASELINE_COST, BASELINE_COST,
+      BASELINE_COST, BASELINE_COST, BASELINE_COST
+    ];
+
+    if (system.cost_indices && Array.isArray(system.cost_indices)) {
+      system.cost_indices.forEach(ci => {
+        const cost = Number(ci.cost_index);
+        switch (ci.activity) {
+          case 'manufacturing': record[1] = cost; break;
+          case 'researching_time_efficiency': record[2] = cost; break;
+          case 'researching_material_efficiency': record[3] = cost; break;
+          case 'copying': record[4] = cost; break;
+          case 'invention': record[5] = cost; break;
+          case 'reaction': record[6] = cost; break;
+        }
+      });
+    }
+    return record;
+  });
+
+  // 6. Update Sheet & Named Range via In-Place Direct Overwrite
+  const indexSheet = ss.getSheetByName("Cost Indexes");
+  if (!indexSheet) {
+    Logger.log("[SYS_INDEXES ERROR] Sheet 'Cost Indexes' not found!");
+    return result.data;
+  }
+
+  const numCols = STANDARD_HEADERS.length;
+  const newRowCount = rows.length + 1; // Headers + data rows
+  const oldMaxRow = indexSheet.getLastRow();
+
+  const targetRange = indexSheet.getRange(1, 1, newRowCount, numCols);
+  targetRange.setValues([STANDARD_HEADERS, ...rows]);
+
+  // Delete leftover orphan rows to keep the sheet and Named Range tightly trimmed
+  if (oldMaxRow > newRowCount) {
+    const orphanRows = oldMaxRow - newRowCount;
+    indexSheet.deleteRows(newRowCount + 1, orphanRows);
+  }
+
+  // Update Named Range efficiently
+  const existingNamedRange = ss.getNamedRanges().find(nr => nr.getName() === "NR_ESI_COST_INDEXES");
+  if (existingNamedRange) {
+    existingNamedRange.setRange(targetRange);
+  } else {
+    ss.setNamedRange("NR_ESI_COST_INDEXES", targetRange);
+  }
+
+  const durationMs = Date.now() - startTime;
+  Logger.log(`[SYS_INDEXES SUCCESS] Completed full sync in ${durationMs}ms. Named range 'NR_ESI_COST_INDEXES' updated.`);
+
+  return result.data;
 }
 
 

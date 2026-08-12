@@ -9,7 +9,7 @@ function runDowntimeMaintenance() {
   LOG.info("Starting Daily Ledger Maintenance...");
   if (typeof pauseSheet === 'function') pauseSheet(ss);
 
-  try {
+ try {
     ML.forSheet("Material_Ledger").condenseHistory(30, ['type_id', 'source', 'char'], true);
     LOG.info("Material Ledger Condensed.");
 
@@ -17,9 +17,6 @@ function runDowntimeMaintenance() {
     LOG.info("Sales Ledger Condensed.");
   } catch (e) {
     LOG.error("Maintenance Error: " + e.message);
-  } finally {
-    if (typeof wakeUpSheet === 'function') wakeUpSheet(ss);
-    LOG.info("Maintenance Complete. Sheet Awake.");
   }
 }
 
@@ -84,7 +81,7 @@ function purgeLedger(sheetName) {
   var LOG = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('DEDUPE') : console;
   LOG.info(`Starting ${sheetName} Purge...`);
   try {
-    var res = ML.forSheet(sheetName).dedupeExisting(['date', 'type_id', 'source', 'char']);
+    var res = ML.forSheet(sheetName).dedupeExisting(['date', 'type_id', 'source', 'char','contract_id']);
     LOG.info(`${sheetName}: Purged ${res.removed} duplicates.`);
   } catch (e) {
     LOG.error("Purge Failed: " + e.message);
@@ -432,6 +429,7 @@ var ML = (function () {
         return idx;
       });
 
+      const contractIdx = HEAD_LOWER.indexOf('contract_id');
       const existingMap = new Map();
       const last = sh.getLastRow();
 
@@ -441,7 +439,14 @@ var ML = (function () {
       const originalCount = data.length;
 
       data.forEach((row) => {
-        const k = keyIndices.map(idx => _normalizeKeySegment(row[idx], HEAD_LOWER[idx])).join('|');
+        let k;
+        // THE FIX: If a contract_id exists and is valid, use it as the absolute unique key
+        if (contractIdx !== -1 && row[contractIdx] && String(row[contractIdx]).trim() !== '') {
+          k = `CID|${String(row[contractIdx]).trim()}`;
+        } else {
+          // Fallback to standard compound key for non-contract entries
+          k = keyIndices.map(idx => _normalizeKeySegment(row[idx], HEAD_LOWER[idx])).join('|');
+        }
         existingMap.set(k, row);
       });
 
@@ -460,7 +465,6 @@ var ML = (function () {
         if (last > 1) sh.getRange(2, 1, last - 1, HEAD_CURRENT.length).clearContent();
         sh.getRange(2, 1, allValues.length, HEAD_CURRENT.length).setValues(allValues);
         
-        // --- THE BLOAT GENERATOR FIX ---
         const rowsDiff = (last - 1) - allValues.length;
         if (rowsDiff > 0) {
           sh.deleteRows(allValues.length + 2, rowsDiff);

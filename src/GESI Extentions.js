@@ -238,56 +238,63 @@ function resetLootSnapshot() {
  */
 function TransactionsAndJournalSync(ss) {
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Grab the buffer sheet exactly once
+  const bufferSheet = ss.getSheetByName("_Internal_Ledger_Buffer");
+  if (!bufferSheet) {
+    console.error("Critical: _Internal_Ledger_Buffer sheet is missing. Aborting sync.");
+    return;
+  }
 
   try {
-    // 1. Capture the boolean return values from the feeders
-    const txAdded = executeWithWaitLock(() => Feed_Transactions_To_Buffer(ss), 'Feed_Transactions_To_Buffer', 300000);
-    const journalAdded = executeWithWaitLock(() => Feed_Journal_To_Buffer(ss), 'Feed_Journal_To_Buffer', 300000);
+    // Pass bufferSheet down to the feeders
+    const txAdded = executeWithWaitLock(() => Feed_Transactions_To_Buffer(ss, bufferSheet), 'Feed_Transactions_To_Buffer', 300000);
+    const journalAdded = executeWithWaitLock(() => Feed_Journal_To_Buffer(ss, bufferSheet), 'Feed_Journal_To_Buffer', 300000);
 
-    // 2. Gatekeeper: Only process if at least one feeder brought in new data
+    // Pass bufferSheet down to the processor
     if (txAdded || journalAdded) {
-      processInternalBuffer(ss);
+      processInternalBuffer(ss, bufferSheet);
     } else {
       console.log("No new transactions or journal entries. Skipping buffer processing to save quota.");
     }
 
   } catch (e) {
-    // If the 5-minute lock fails, quietly abort and let the next trigger handle it
     console.warn("Sync deferred due to heavy traffic: " + e.message);
   }
 }
+
 function Reset_Sync_Anchors() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  // Nuke the bookmarks completely. 
-  // Setting to 0 forces the API to pull maximum available history (usually 30 days for ESI).
-  // Your deduplicator will safely ignore the overlap.
+  // Nuke the bookmarks completely to force maximum rewind.
   SCRIPT_PROP.setProperty('CORP_LAST_TRANSACTION_ID', '0');
   SCRIPT_PROP.setProperty('CORP_LAST_JOURNAL_ID', '0');
 
-  // FIXED: Removed the floating variable.
-  // FIXED: Removed quotes around GLOBAL_STATE_KEY so it uses your global constant.
-  // Set to 'RUNNING' to ensure the maintenance lock is fully lifted.
+  // --- NEW: Wipe the ESI cache gatekeepers ---
+  SCRIPT_PROP.deleteProperty('EXP_CORP_JOURNAL');
+  SCRIPT_PROP.deleteProperty('EXP_CORP_TRANSACTIONS');
+
+  // Lift the maintenance lock.
   SCRIPT_PROP.setProperty(GLOBAL_STATE_KEY, 'RUNNING');
 
-  console.log("Anchors set to 0 (Maximum Rewind). Maintenance Lock lifted. Run Master Sync now.");
+  console.log("Anchors set to 0. ESI Cache cleared. Maintenance Lock lifted. Run Master Sync now.");
 }
 
-function Feed_Journal_To_Buffer(ss) {
+function Feed_Journal_To_Buffer(ss, bufferSheet) {
   const log = LoggerEx.withTag('JOURNAL_FEEDER');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const LAST_JOURNAL_KEY = 'CORP_LAST_JOURNAL_ID';
-  const CACHE_KEY = 'EXP_CORP_JOURNAL'; // New Cache Property
+  const CACHE_KEY = 'EXP_CORP_JOURNAL';
 
-  // --- NEW: ESI GATE ---
   const storedExpires = Number(SCRIPT_PROP.getProperty(CACHE_KEY) || 0);
   if (Date.now() < storedExpires) {
     log.info("Within ESI cache window. Skipping fetch.");
     return false;
   }
 
+  // Accept passed sheet, or fall back to finding it if run manually
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  const bufferSheet = ss.getSheetByName("_Internal_Ledger_Buffer");
+  bufferSheet = bufferSheet || ss.getSheetByName("_Internal_Ledger_Buffer");
   if (!bufferSheet) {
     log.error("Missing _Internal_Ledger_Buffer sheet.");
     return false;
@@ -352,20 +359,21 @@ function Feed_Journal_To_Buffer(ss) {
   return true;
 }
 
-function Feed_Transactions_To_Buffer(ss) {
+function Feed_Transactions_To_Buffer(ss, bufferSheet) {
   const log = LoggerEx.withTag('TXN_FEEDER');
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const LAST_TXN_KEY = 'CORP_LAST_TRANSACTION_ID';
-  const CACHE_KEY = 'EXP_CORP_TRANSACTIONS'; // New Cache Property
+  const CACHE_KEY = 'EXP_CORP_TRANSACTIONS'; 
 
-  // --- NEW: ESI GATE ---
   const storedExpires = Number(SCRIPT_PROP.getProperty(CACHE_KEY) || 0);
   if (Date.now() < storedExpires) {
     log.info("Within ESI cache window. Skipping fetch.");
     return false;
   }
+  
+  // Accept passed sheet, or fall back
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
-  const bufferSheet = ss.getSheetByName("_Internal_Ledger_Buffer");
+  bufferSheet = bufferSheet || ss.getSheetByName("_Internal_Ledger_Buffer");
   if (!bufferSheet) {
     log.error("Missing _Internal_Ledger_Buffer sheet.");
     return false;
@@ -434,10 +442,7 @@ function processInternalBuffer(ss) {
 
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   const bufferSheet = ss.getSheetByName("_Internal_Ledger_Buffer");
-  if (!bufferSheet) {
-    log.warn("Could not find _Internal_Ledger_Buffer sheet.");
-    return;
-  }
+  if (!bufferSheet) return;
 
   const lastRow = bufferSheet.getLastRow();
   if (lastRow <= 1) {
@@ -445,22 +450,24 @@ function processInternalBuffer(ss) {
     return;
   }
 
-  // Only pull the 3 columns we care about to save memory on massive buffers
-  const data = bufferSheet.getRange(1, 1, lastRow, 3).getValues();
-  const headers = data.shift();
+  // Single bulk read
+  const rawRange = bufferSheet.getRange(2, 1, lastRow - 1, 3);
+  const data = rawRange.getValues();
   log.info(`Loaded ${data.length} raw rows from buffer.`);
 
   const pending = new Map();
+  const parsedRows = []; // OPTIMIZATION: Cache parsed JSON to prevent double-parsing
 
-  // --- 1. GROUPING PHASE ---
-  data.forEach((row, rowIndex) => {
-    if (!row[0]) return;
+  // --- 1. SINGLE-PARSE & GROUPING PHASE ---
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    if (!row[0]) continue;
 
     let entry;
     try {
       entry = JSON.parse(row[1]);
     } catch (e) {
-      return; // Skip gracefully if the cell has malformed data
+      continue; // Skip malformed cells
     }
     const d = entry.data;
 
@@ -469,21 +476,20 @@ function processInternalBuffer(ss) {
 
     let id = 0;
     if (isTx) {
-      id = Number(d.transaction_id || 0);
+      id = Math.floor(Number(d.transaction_id || 0));
     } else if (isJournal) {
       const cType = String(d.context_id_type || "").toLowerCase();
       if (cType === 'transaction_id' || cType === 'market_transaction_id') {
-        id = Number(d.context_id || 0);
-      } else {
-        return;
+        id = Math.floor(Number(d.context_id || 0));
       }
     }
 
-    id = Math.floor(Number(id));
-    if (!id || isNaN(id) || id === 0) return;
+    if (!id) continue;
+
+    // Save to memory so the Garbage Collector doesn't have to parse it again
+    parsedRows.push({ originalRow: row, id: id, d: d });
 
     if (!pending.has(id)) pending.set(id, { tx: null, fees: 0, ts: entry.ts, journalFound: false, journalAmount: 0 });
-
     const record = pending.get(id);
 
     if (isTx) {
@@ -496,89 +502,90 @@ function processInternalBuffer(ss) {
         record.journalAmount = Number(d.amount || 0);
       }
     }
-  });
+  }
 
   // --- 2. PROCESSING PHASE ---
   const sells = [];
   const buys = [];
   const processedIds = new Set();
-
-  // Define strict keys to ensure identical items bought on the same day stay distinct in the ledger
   const LEDGER_KEYS = ['date', 'type_id', 'source', 'contract_id', 'char'];
+  const ONE_HOUR = 60 * 60 * 1000;
 
   pending.forEach((p, id) => {
-    if (p.tx && p.journalFound) {
-      const isCorpPurchase = (p.journalAmount < 0);
-      const perUnitFee = p.tx.quantity > 0 ? (p.fees / Number(p.tx.quantity)) : 0;
-      const finalUnitValue = isCorpPurchase ? (Number(p.tx.unit_price) + perUnitFee) : (Number(p.tx.unit_price) - perUnitFee);
+    if (!p.tx) return;
 
+    let isCorpPurchase = false;
+    let isValidToProcess = false;
+    let finalUnitValue = Number(p.tx.unit_price);
+
+    // 1. If we have a verified journal entry, use it (The gold standard)
+    if (p.journalFound) {
+      isCorpPurchase = (p.journalAmount <= 0);
+      const perUnitFee = p.tx.quantity > 0 ? (p.fees / Number(p.tx.quantity)) : 0;
+      finalUnitValue = isCorpPurchase ? (Number(p.tx.unit_price) + perUnitFee) : (Number(p.tx.unit_price) - perUnitFee);
+      isValidToProcess = (finalUnitValue > 0); // GUARD: Never process 0 ISK rows
+
+    } else {
+      // 2. Fallback ONLY if journal is missing, but strictly respect ESI is_buy definition:
+      // p.tx.is_buy === true means BUY order (Acquisition / Material)
+      // p.tx.is_buy === false means SELL order (Sale / Revenue)
+      const txTime = new Date(p.tx.date).getTime();
+      
+      if ((Date.now() - txTime) > ONE_HOUR && Number(p.tx.unit_price) > 0) {
+        isCorpPurchase = (p.tx.is_buy === true); // FIXED: True = Buy, False = Sell
+        finalUnitValue = Number(p.tx.unit_price);
+        isValidToProcess = true;
+      }
+    }
+
+    if (isValidToProcess) {
+      const cleanDate = String(p.tx.date).substring(0, 16).replace('T', ' ');
       const ledgerObj = {
-        date: p.tx.date,              // Janitor parses/formats this
-        type_id: p.tx.type_id,        // Janitor rounds/strips commas
+        date: cleanDate,
+        type_id: p.tx.type_id,
         qty: isCorpPurchase ? p.tx.quantity : -p.tx.quantity,
         unit_value_filled: finalUnitValue,
         source: 'TRANSACTION',
-        contract_id: String(id),      // Lock the Transaction ID to string
+        contract_id: String(id),
         char: "Corp Wallet"
       };
 
       if (isCorpPurchase) buys.push(ledgerObj);
       else sells.push(ledgerObj);
-
       processedIds.add(String(id));
     }
   });
 
-  log.info(`Processing complete. Cleanly routed ${processedIds.size} verified transactions.`);
-
-  // --- 3. UPSERT & BUFFER CLEANUP ---
+  // --- 3. UPSERT & HIGH-SPEED CLEANUP ---
   let needsWakeUp = false;
   try {
     if (typeof pauseSheet === 'function') needsWakeUp = pauseSheet(ss);
 
-    if (sells.length > 0) {
-      ML.forSheet("Sales_Ledger").upsert(LEDGER_KEYS, sells, true, true); // true, true = hold anesthesia, skip summary
-    }
+    if (sells.length > 0) ML.forSheet("Sales_Ledger").upsert(LEDGER_KEYS, sells, true, false);
+    if (buys.length > 0) ML.forSheet("Material_Ledger").upsert(LEDGER_KEYS, buys, true, false);
 
-    if (buys.length > 0) {
-      ML.forSheet("Material_Ledger").upsert(LEDGER_KEYS, buys, true, false); // Update summary on the final run
-    }
-
-    // Keep rows that haven't been processed AND aren't expired
     const MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000; // 3 Days
     const NOW = Date.now();
+    const remainingRows = [];
 
-    const remainingRows = data.filter(row => {
-      if (!row[0]) return false;
-      const entry = JSON.parse(row[1]);
-      const d = entry.data;
-
-      // THE REAL GARBAGE COLLECTOR: Look at the EVE Server Date
-      if (d.date) {
-        const eveTime = new Date(d.date).getTime();
-        if (!isNaN(eveTime) && (NOW - eveTime > MAX_AGE_MS)) {
-          return false; // Vaporize it. The EVE transaction is older than 3 days.
-        }
+    // OPTIMIZATION: Loop over pre-parsed memory instead of re-parsing JSON
+    for (let i = 0; i < parsedRows.length; i++) {
+      const item = parsedRows[i];
+      
+      if (item.d.date) {
+        const eveTime = new Date(item.d.date).getTime();
+        if (!isNaN(eveTime) && (NOW - eveTime > MAX_AGE_MS)) continue; // Vaporize old orphans
       }
-
-      let id = 0;
-      if (d.source === 'TRANSACTION') id = Math.floor(Number(d.transaction_id || 0));
-      else if (d.source === 'JOURNAL' && (String(d.context_id_type || "").toLowerCase() === 'transaction_id' || String(d.context_id_type || "").toLowerCase() === 'market_transaction_id')) id = Math.floor(Number(d.context_id || 0));
-
-      return !processedIds.has(String(id));
-    });
-
-    const rowsDiff = (lastRow - 1) - remainingRows.length;
-
-    // Clear and Write
-    bufferSheet.getRange(2, 1, Math.max(1, lastRow - 1), 3).clearContent();
-    if (remainingRows.length > 0) {
-      bufferSheet.getRange(2, 1, remainingRows.length, 3).setValues(remainingRows);
+      
+      if (!processedIds.has(String(item.id))) {
+        remainingRows.push(item.originalRow);
+      }
     }
 
-    // --- THE BLOAT GENERATOR FIX ---
-    if (rowsDiff > 0) {
-      bufferSheet.deleteRows(remainingRows.length + 2, rowsDiff);
+    // OPTIMIZATION: Clear the whole block and paste the remaining array (no deleteRows!)
+    rawRange.clearContent();
+    if (remainingRows.length > 0) {
+      bufferSheet.getRange(2, 1, remainingRows.length, 3).setValues(remainingRows);
     }
 
     log.info(`Execution Summary - Held: ${remainingRows.length} | Buys: ${buys.length} | Sells: ${sells.length}`);
@@ -586,6 +593,64 @@ function processInternalBuffer(ss) {
   } finally {
     if (needsWakeUp && typeof wakeUpSheet === 'function') wakeUpSheet(ss);
   }
+}
+
+function Surgical_Ledger_Fix() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const salesSheet = ss.getSheetByName("Sales_Ledger");
+  const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('SURGEON') : console;
+  
+  log.info("Spinning up the hunter-killer script...");
+
+  // 1. Fetch recent JOURNAL entries to find the 0-ISK Escrow anomalies
+  const authToon = getCorpAuthChar(ss);
+  const authClient = GESI.getClient(authToon);
+  const service = ESI.forEndpoint(authClient, 'corporations_corporation_wallets_division_journal');
+  
+  const result = service.get({ division: 3 });
+  if (result.error) {
+    log.error("ESI connection failed. Aborting surgery: " + result.error);
+    return;
+  }
+  
+  // Find all market_transactions where amount is exactly 0 (Escrowed Buy Orders)
+  const zeroIskPurchaseIds = new Set(
+    result.data
+      .filter(j => j.ref_type === 'market_transaction' && Number(j.amount || 0) === 0)
+      .map(j => String(j.context_id))
+  );
+  
+  if (zeroIskPurchaseIds.size === 0) {
+    log.info("Could not find any 0-ISK transactions in recent journal history. They might be too old to fetch.");
+    return;
+  }
+
+  // 2. Scan the Sales Ledger and nuke the impostors
+  const data = salesSheet.getDataRange().getValues();
+  const headers = data[0];
+  const contractIdCol = headers.findIndex(h => String(h).trim() === "contract_id");
+  
+  if (contractIdCol === -1) {
+     log.error("Could not find 'contract_id' column in Sales_Ledger.");
+     return;
+  }
+  
+  let deletedCount = 0;
+  for (let i = data.length - 1; i > 0; i--) {
+    const rowId = String(data[i][contractIdCol]);
+    
+    // If the Sales Ledger row ID matches a 0-ISK Purchase
+    if (zeroIskPurchaseIds.has(rowId)) {
+      salesSheet.deleteRow(i + 1);
+      deletedCount++;
+    }
+  }
+  
+  log.info(`Surgery complete. Vaporized ${deletedCount} misclassified Buy Orders from the Sales_Ledger.`);
+  
+  // 3. Reset anchors so Master Sync processes them properly
+  Reset_Sync_Anchors();
+  log.info("Anchors reset. Run Master Sync to properly route them to the Material Ledger.");
 }
 
 
@@ -748,10 +813,10 @@ function _fetchCorpOrdersConcurrently(authName) {
   const finalData = [STANDARD_ORDER_HEADERS, ...result.data.map(formatRow)];
 
   // 7. Successful Return
-  return { 
-    status: "SUCCESS", 
-    message: `Fetched ${result.data.length} orders. Next expiry: ${cacheExpiryStr}`, 
-    data: finalData 
+  return {
+    status: "SUCCESS",
+    message: `Fetched ${result.data.length} orders. Next expiry: ${cacheExpiryStr}`,
+    data: finalData
   };
 }
 
@@ -1962,30 +2027,7 @@ function _runRebuildContractUnitCostsWorker() {
   executeWithTryLock(workerFunc, funcName);
 }
 
-/**
- * Checks for and restarts the COGS unit cost worker if the flag is still set.
- * Assumes scheduleOneTimeTrigger is defined.
- */
-function _nudgeCogsFinalizer() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  // NOTE: Assuming PROP_KEY_COGS_STEP and STATE_FLAGS_COGS are defined or globally available.
 
-  if (SCRIPT_PROP.getProperty('cogsJobStep') === 'FINALIZING') {
-    const lock = LockService.getScriptLock();
-
-    // Check if the worker's lock is currently available (meaning the worker is not running).
-    if (lock.tryLock(0)) {
-      lock.releaseLock();
-      console.log(`Orchestrator: COGS Finalizer flag found. Re-queuing worker.`);
-      // Assumes _runRebuildContractUnitCostsWorker and scheduleOneTimeTrigger are global.
-      scheduleOneTimeTrigger("_runRebuildContractUnitCostsWorker", 5000);
-      return true;
-    } else {
-      console.log(`Orchestrator: COGS Finalizer flag set but worker lock is busy. Skipping nudge.`);
-    }
-  }
-  return false;
-}
 
 // ==========================================================================================
 // UNIVERSAL CONTRACT ROUTER (DRY)
@@ -2629,18 +2671,7 @@ function runContractLedgerPhase(ss, startTime) {
     log.warn("Skipping purge: Execution time limit approaching.");
   }
 }
-function triggerContractUnitCostsFinalization() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const LOG = LoggerEx.withTag('COGS_TRIGGER');
-  const FINALIZER_FUNC = '_runRebuildContractUnitCostsWorker';
 
-  // 1. Set the finalize flag before scheduling
-  SCRIPT_PROP.setProperty(PROP_KEY_COGS_STEP, STATE_FLAGS_COGS.FINALIZING);
-
-  // 2. Schedule the worker to run soon after the main ledger phase exits.
-  scheduleOneTimeTrigger(FINALIZER_FUNC, 5000); // 5 seconds delay
-  LOG.info(`Scheduled heavy COGS finalization: ${FINALIZER_FUNC}. Flag set.`);
-}
 
 
 

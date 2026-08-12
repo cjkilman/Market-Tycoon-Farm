@@ -7,9 +7,89 @@ function trigger_generateProjectedCostTable() {
   generateProjectedCostTable(ss);
 }
 
+function repairBpcWacCache() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+
+  // Query the Material Ledger for all Invention and Copying entries
+  const ledgerData = ML.forSheet("Material_Ledger", ss).query({
+    source: ["INVENTION", "COPYING"]
+  });
+
+  const wacMap = {};
+
+  // Aggregate weighted average costs per blueprint type ID
+  ledgerData.forEach(r => {
+    const typeId = Number(r.type_id);
+    const qty = Number(r.qty) || 1;
+    const totalVal = Number(r.total_value) || (Number(r.unit_value_filled) * qty) || 0;
+
+    if (typeId > 0 && totalVal > 0) {
+      if (!wacMap[typeId]) {
+        wacMap[typeId] = { totalCost: 0, totalQty: 0 };
+      }
+      wacMap[typeId].totalCost += totalVal;
+      wacMap[typeId].totalQty += qty;
+    }
+  });
+
+  const finalWacData = {};
+  for (const [typeId, data] of Object.entries(wacMap)) {
+    finalWacData[typeId] = data.totalCost / data.totalQty;
+  }
+
+  // Save directly to the exact script property key the projection engine looks for
+  SCRIPT_PROP.setProperty(BPC_WAC_KEY, JSON.stringify(finalWacData));
+  console.log(`[REPAIR SUCCESS] Loaded WAC data for ${Object.keys(finalWacData).length} blueprints into ${BPC_WAC_KEY}.`);
+}
+
+function SNIPER_TRACE_EM_RIG() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const log = typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('SNIPER') : Logger;
+  
+  const TARGET_BP_ID = 2206; // Hobgoblin II
+  const TARGET_PRODUCT_ID = 2205; 
+
+  const { sdeMatMap } = _getSdeMaps(ss);
+  const costMap = _getBlendedCostMap(ss);
+  const nameMap = _getSdeNameMap(ss);
+  const bpcWacData = JSON.parse(PropertiesService.getScriptProperties().getProperty(BPC_WAC_KEY) || '{}');
+  
+  const configMap = _getMasterBlueprintConfig(ss);
+  const waterfallStatsMap = _buildWaterfallBlueprintStatsMap([TARGET_BP_ID], configMap);
+  const waterfallStats = waterfallStatsMap.get(TARGET_BP_ID);
+  
+  const materials = sdeMatMap.get(TARGET_BP_ID) || [];
+  
+  log.log(`\n\n========== SNIPER TRACE: SMALL EM SHIELD REINFORCER II ==========`);
+  log.log(`1. AMORTIZATION (BPC COST)`);
+  log.log(`   - WAC Cache Memory  : ${bpcWacData[TARGET_BP_ID] || 0} ISK`);
+  log.log(`   - Waterfall History : ${waterfallStats ? waterfallStats.avgCost : 0} ISK`);
+  
+  log.log(`\n2. MATERIAL BREAKDOWN (ME: ${waterfallStats ? waterfallStats.me : 0})`);
+  let totalMatCost = 0;
+  
+  materials.forEach(m => {
+    if (m.activityID !== 1) return;
+    const matName = nameMap.get(m.materialTypeID) || m.materialTypeID;
+    const baseQty = Number(m.quantity);
+    const unitPrice = (costMap.get(m.materialTypeID) || { landed: 0 }).landed;
+    const lineCost = baseQty * unitPrice;
+    totalMatCost += lineCost;
+    
+    log.log(`   - [${matName}] Qty: ${baseQty} | Unit Price: ${unitPrice.toLocaleString(undefined, {minimumFractionDigits: 2})} ISK | Line Cost: ${lineCost.toLocaleString(undefined, {minimumFractionDigits: 2})} ISK`);
+  });
+  
+  log.log(`\n3. TOTALS`);
+  log.log(`   - Raw Material Sum : ${totalMatCost.toLocaleString(undefined, {minimumFractionDigits: 2})} ISK`);
+  log.log(`=================================================================\n\n`);
+}
+
 /**
  * PROJECTED MANUFACTURING COSTS ENGINE
  * Computes assembly unit costs by feeding data directly from getOverviewData()
+ * UPGRADE: Now uses True EVE Online Projected Taxes via System Indexes.
+ * UPGRADE: API calls safely hoisted outside the execution loop to prevent timeouts.
  */
 function generateProjectedCostTable(ss) {
   ss = (ss && typeof ss.getSheetByName === 'function') ? ss : SpreadsheetApp.getActiveSpreadsheet();
@@ -24,10 +104,9 @@ function generateProjectedCostTable(ss) {
   const { sdeMatMap, sdeProdMap } = _getSdeMaps(ss);
   const overviewData = getOverviewData(ss);
   if (!overviewData || overviewData.length < 2) return;
-  
-  // THE FIX: Switch entirely to the centralized Master Config Engine
+
   const configMap = _getMasterBlueprintConfig(ss);
-  
+
   const headers = overviewData[0];
   const col = {
     id: headers.map(h => String(h).toLowerCase().trim()).indexOf("type_id"),
@@ -51,7 +130,7 @@ function generateProjectedCostTable(ss) {
 
     if (actID === 1) {
       invertedProductMap.set(Number(prodObj.productTypeID), {
-        bpID: bpID, 
+        bpID: bpID,
         yield: Number(prodObj.quantity) || 1
       });
     }
@@ -84,20 +163,27 @@ function generateProjectedCostTable(ss) {
   }
 
   // =================================================================
-  // 3. Initialize Cost & Amortization Maps (WITH CACHE ARMOR)
+  // 3. Initialize Cost, Amortization, & True Tax Maps (API SAFE ZONE)
   // =================================================================
   const costMap = _getBlendedCostMap(ss, Array.from(allRequiredMatIds));
   const amortMap = _getBpoAmortizationMap(ss);
   const internalBpcMap = _buildInternalBpcMap_(ss);
-  const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty("BPC_WAC_KEY") || '{}');
+  const bpcWacData = JSON.parse(SCRIPT_PROP.getProperty(BPC_WAC_KEY) || '{}');
+
+  // --- THE TRUE TAX ENGINE MAPS ---
+  const sdeBasePriceMap = _getSdeBasePriceMap(ss);
+  const systemIndexMap = _getSystemCostIndexMap(ss);
+  const targetSystemId = _getNamedOr_(ss, 'setting_production_system', 30002187); // Default: Amarr
+  
+  const bpoAttributesMap = _getBpoAttributesMapFromEsi();
 
   const allTargetBpIds = Array.from(new Set(validTargets.map(t => t.bpID)));
-  
-  // Pass the new configMap to the Waterfall Engine
   const waterfallStatsMap = _buildWaterfallBlueprintStatsMap(allTargetBpIds, configMap);
-  let bpoAttributesMap = _getBpoAttributesMapFromEsi();
 
-  const EST_INSTALL_RATE = 0.05;
+  // Pull active location and its config row once globally
+  const activeLocation = _getNamedOr_(ss, 'setting_production_structure', 'Amarr VIII (NPC)');
+  const structureMap = _getStructureSettingsMap(ss);
+  const activeSetting = structureMap.get(activeLocation) || { taxRate: 0.0, rigBonus: 1.0, structureType: 'NPC Station' };
 
   // =================================================================
   // 4. Core Mathematical Assembly Evaluation Loop
@@ -108,33 +194,31 @@ function generateProjectedCostTable(ss) {
 
     const waterfallStats = waterfallStatsMap.get(target.bpID);
     const bpoItemAttributes = bpoAttributesMap.get(target.bpID);
-
-    // THE DRY CALL: Ask the Smart Config Engine for the baseline rules
     const baseConfig = _resolveSmartConfig(target.bpID, target.name, ss);
 
-    let ME_LEVEL = 0; 
-    let meSourceLog = ""; 
-    
-    // PRIORITY 1: Waterfall Ledger (Actual historical build data)
+    let ME_LEVEL = 0;
+    let meSourceLog = "";
+
+    // PRIORITY 1: Waterfall Ledger
     if (waterfallStats && waterfallStats.me > 0) {
-      ME_LEVEL = waterfallStats.me; 
+      ME_LEVEL = waterfallStats.me;
       meSourceLog = `Ledger (ME: ${ME_LEVEL})`;
-    } 
-    // PRIORITY 2: ESI Hangar Cache (Physical blueprint on hand)
+    }
+    // PRIORITY 2: ESI Hangar Cache
     else if (bpoItemAttributes && bpoItemAttributes.material_efficiency > 0) {
-      ME_LEVEL = Number(bpoItemAttributes.material_efficiency); 
+      ME_LEVEL = Number(bpoItemAttributes.material_efficiency);
       meSourceLog = `ESI Hangar (ME: ${ME_LEVEL})`;
-    } 
-    // PRIORITY 3: Config Engine (CSV Explicit Override OR Smart Default)
+    }
+    // PRIORITY 3: Config Engine
     else {
       ME_LEVEL = baseConfig.maxMe;
       meSourceLog = `${baseConfig.source || 'Config CSV'} (ME: ${ME_LEVEL})`;
     }
 
-    // THE DRY CALL: Let the centralized engine do all the math
+    // Pass everything dynamically into the math call
     const financials = _calculateJobFinancials({
       bpId: target.bpID,
-      activityId: 1, // Projected is always Manufacturing
+      activityId: 1,
       runs: baseConfig.presetRuns,
       meLevel: ME_LEVEL,
       materials: materials,
@@ -144,10 +228,20 @@ function generateProjectedCostTable(ss) {
       bpcWacData: bpcWacData,
       presetRuns: baseConfig.presetRuns,
       baseYield: target.yield,
-      actualInstallCost: undefined, // Triggers the EST_INSTALL_RATE fallback
-      estInstallRate: EST_INSTALL_RATE
+
+      waterfallAvgCost: waterfallStats ? waterfallStats.avgCost : 0,
+
+      actualInstallCost: undefined,
+      systemId: targetSystemId,
+      sdeBasePriceMap: sdeBasePriceMap,
+      systemIndexMap: systemIndexMap,
+
+      // FULLY DYNAMIC FROM STRUCTURE_SETTINGS:
+      facilityTaxRate: activeSetting.taxRate,
+      structureRigBonus: activeSetting.rigBonus
     });
 
+    // The unitCost returned by financials now perfectly includes the live Amarr installation tax
     return [target.typeID, target.name, financials.unitCost, meSourceLog, new Date()];
   });
 
@@ -190,4 +284,3 @@ function generateProjectedCostTable(ss) {
 
   LOG.info(`Done: ${outputRows.length} items updated seamlessly via Array.`);
 }
-

@@ -180,63 +180,53 @@ function getMarketSettingsMap(ss) {
 
 
 /**
- * [THE RACER] - Reuse/Reset Strategy.
- * Clears the sheet if it exists (Reuse). Creates if missing.
- * Returns status object for consistent error handling.
+ * [THE RACER] - Optimized Reset Strategy
+ * Bypasses heavy sheet.clear() operations to prevent V8 INTERNAL crashes.
+ * Uses clearContents() to dump the data array instantly while the sheet is awake.
+ * Dynamically strips dead columns to protect the 10M cell limit.
  */
 function prepareTempSheet(ss, sheetName, headers) {
-  var success = true; // Assume success initially unless catch block flips it
-  var errorMessage = null;
-
-  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(sheetName);
+  // Trigger-safe check
+  if (!ss || typeof ss.getSheetByName !== 'function') {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+  
+  var sheet = ss.getSheetByName(sheetName);
 
   if (sheet) {
     try {
-      // Try to clear contents (Fastest reuse)
-      sheet.clear();
+      sheet.clearContents();
     } catch (e) {
-      // If clear fails, fallback to nuclear option
-      errorMessage = `[prepareTempSheet] Clear failed: ${e.message}. Attempting nuclear delete/insert.`;
-      console.warn(errorMessage);
-      try {
-        ss.deleteSheet(sheet);
-      } catch (e2) {
-        success = false;
-        errorMessage += ` | Delete failed: ${e2.message}`;
-        return { success: false, state: null, error: errorMessage };
-      }
-
-      try {
-        sheet = ss.insertSheet(sheetName);
-      } catch (e3) {
-        success = false;
-        errorMessage += ` | Insert failed: ${e3.message}`;
-        return { success: false, state: null, error: errorMessage };
-      }
+      return { success: false, state: null, error: "ClearContents failed: " + e.message };
     }
   } else {
     try {
       sheet = ss.insertSheet(sheetName);
-    } catch (e4) {
-      return { success: false, state: null, error: "Failed to insert new sheet: " + e4.message };
+    } catch (e) {
+      return { success: false, state: null, error: "Insert failed: " + e.message };
     }
   }
 
-  // Set Headers
+  // Set Headers & Trim Bloat
   if (headers && headers.length > 0) {
     try {
-      const headerRow = (Array.isArray(headers[0])) ? headers[0] : headers;
-      sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
-    } catch (e5) {
-      console.warn("Header set failed: " + e5.message);
-      // Non-fatal, but worth noting
+      var headerRow = Array.isArray(headers[0]) ? headers[0] : headers;
+      var requiredCols = headerRow.length;
+      
+      sheet.getRange(1, 1, 1, requiredCols).setValues([headerRow]);
+      sheet.setFrozenRows(1);
+      
+      // THE GUILLOTINE: Destroy all unused columns
+      var maxCols = sheet.getMaxColumns();
+      if (maxCols > requiredCols) {
+        sheet.deleteColumns(requiredCols + 1, maxCols - requiredCols);
+      }
+    } catch (e) {
+      console.warn("[prepareTempSheet] Header setup/trim warning: " + e.message);
     }
   }
 
-  try { sheet.setFrozenRows(1); } catch (e) { }
-
-  return { success: success, state: sheet, error: errorMessage };
+  return { success: true, state: sheet, error: null };
 }
 
 
@@ -370,95 +360,7 @@ function wakeUpSheet(ss) {
 }
 
 
-/**
- * Performs a Safe "Hot Swap" (Overwrite + Reuse).
- * 1. Copies data from Temp -> Target (Preserves Target ID/Refs).
- * 2. Clears Temp (Does NOT Delete).
- * This prevents "Service timed out" because no sheets are destroyed.
- * * [UPDATED] Handles Named Range repair logic internally if map provided.
- */
-function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null) {
-  const docLock = LockService.getDocumentLock();
-  if (!docLock.tryLock(30000)) return { success: false, errorMessage: "Could not acquire Document Lock." };
 
-  try {
-    const targetSheet = ss.getSheetByName(targetName);
-    const tempSheet = ss.getSheetByName(tempName);
-
-    if (!tempSheet) return { success: false, errorMessage: `Temp sheet '${tempName}' not found.` };
-
-    // 1. GET DATA from Temp
-    const sourceRange = tempSheet.getDataRange();
-    const sourceValues = sourceRange.getValues();
-
-    // 2. PREPARE Target (Create if missing)
-    let finalSheet = targetSheet;
-    if (!finalSheet) {
-      finalSheet = ss.insertSheet(targetName);
-    } else {
-      try { finalSheet.clear(); } catch (e) { finalSheet.clearContents(); }
-    }
-
-    // 3. WRITE to Target
-    if (sourceValues.length > 0) {
-      finalSheet.getRange(1, 1, sourceValues.length, sourceValues[0].length).setValues(sourceValues);
-    }
-
-    // AUTO-TRIM EXCESS ROWS/COLS
-    const totalRows = finalSheet.getMaxRows();
-    const totalCols = finalSheet.getMaxColumns();
-    if (sourceValues.length > 0 && sourceValues[0].length > 0) {
-      const dataRows = sourceValues.length;
-      const dataCols = sourceValues[0].length;
-
-      // Delete excess rows if any
-      if (totalRows > dataRows) {
-        finalSheet.deleteRows(dataRows + 1, totalRows - dataRows);
-      }
-      // Delete excess columns if any
-      if (totalCols > dataCols) {
-        finalSheet.deleteColumns(dataCols + 1, totalCols - dataCols);
-      }
-    }
-
-    // 4. REWIRE NAMED RANGES (If map provided)
-    // Since we overwrote the target sheet (kept ID), most ranges persist.
-    // However, if the data size changed drastically, we might need to resize them.
-    if (repairMap && finalSheet) {
-      const lastRow = finalSheet.getLastRow();
-      const lastCol = finalSheet.getLastColumn();
-
-      for (const [rangeName, a1Ref] of Object.entries(repairMap)) {
-        try {
-          // Logic to set named range to the full data extent minus header (usually)
-          // Defaulting to "Full Sheet Data" logic if specific logic isn't passed
-          if (lastRow > 1) {
-            const range = finalSheet.getRange(1, 1, lastRow - 1, lastCol);
-            ss.setNamedRange(rangeName, range);
-            console.log(`[AtomicSwap] Updated Named Range '${rangeName}'`);
-          }
-        } catch (e) {
-          console.warn(`[AtomicSwap] Failed to update Named Range '${rangeName}': ${e.message}`);
-        }
-      }
-    }
-
-    // 5. CLEANUP Temp (Just Clear, Don't Delete)
-    try {
-      tempSheet.clear();
-    } catch (e) {
-      console.warn("Failed to clear temp sheet (non-fatal): " + e.message);
-    }
-
-    //SpreadsheetApp.flush(); // Thats Handled in pauseSheet
-    return { success: true, errorMessage: null };
-
-  } catch (e) {
-    return { success: false, errorMessage: e.message };
-  } finally {
-    docLock.releaseLock();
-  }
-}
 
 /**
  * Internal check to see if the refresh "Engine" is active.
@@ -727,6 +629,155 @@ function _chunkAndPut(key, content, ttlSeconds) {
   }
 }
 
+function atomicSwapAndFlush(ss, targetName, tempName, repairMap = null, holdAnesthesia = false, requireLock = true) {
+  let docLock = null;
+
+  if (requireLock) {
+    docLock = LockService.getDocumentLock();
+    if (!docLock.tryLock(30000)) return { success: false, errorMessage: "Could not acquire Document Lock." };
+  }
+
+  let needsWakeUp = false;
+
+  try {
+    // 1. ADMINISTER ANESTHESIA
+    if (!holdAnesthesia && typeof pauseSheet === 'function') {
+      needsWakeUp = pauseSheet(ss);
+    }
+
+    const tempSheet = ss.getSheetByName(tempName);
+    if (!tempSheet) throw new Error(`Temp sheet '${tempName}' not found.`);
+
+    // 2. READ DATA IN BULK
+    const sourceValues = tempSheet.getDataRange().getValues();
+    const numRows = sourceValues.length;
+    const numCols = numRows > 0 ? sourceValues[0].length : 0;
+
+    if (numRows === 0 || (numRows === 1 && numCols === 1 && sourceValues[0][0] === "")) {
+      throw new Error("Temp sheet contains no data.");
+    }
+
+    // 3. TARGET PREP
+    let finalSheet = ss.getSheetByName(targetName) || ss.insertSheet(targetName);
+
+    // 4. DETERMINE ANCHOR & CACHE DIMENSIONS
+    let pasteRow = 1;
+    let pasteCol = 1;
+    let anchorRange = null;
+    let firstRepairKey = null;
+
+    if (repairMap) {
+      const keys = Object.keys(repairMap);
+      if (keys.length > 0) {
+        firstRepairKey = keys[0];
+        anchorRange = finalSheet.getRange(repairMap[firstRepairKey]);
+        pasteRow = anchorRange.getRow();
+        pasteCol = anchorRange.getColumn();
+      }
+    }
+
+    const initialMaxRows = finalSheet.getMaxRows();
+    const initialMaxCols = finalSheet.getMaxColumns();
+    const dataRowsEnd = pasteRow + numRows - 1;
+    const dataColsEnd = pasteCol + numCols - 1;
+
+    // 5. TARGETED CLEAR
+    if (initialMaxRows >= pasteRow && initialMaxCols >= pasteCol) {
+      finalSheet.getRange(
+        pasteRow,
+        pasteCol,
+        initialMaxRows - pasteRow + 1,
+        initialMaxCols - pasteCol + 1
+      ).clearContent();
+    }
+
+    // 6. EXPAND BOUNDARIES (Prevents out-of-bounds crashes)
+    if (dataRowsEnd > initialMaxRows) finalSheet.insertRowsAfter(initialMaxRows, dataRowsEnd - initialMaxRows);
+    if (dataColsEnd > initialMaxCols) finalSheet.insertColumnsAfter(initialMaxCols, dataColsEnd - initialMaxCols);
+
+    // 7. WRITE DATA
+    finalSheet.getRange(pasteRow, pasteCol, numRows, numCols).setValues(sourceValues);
+
+    // 8. AUTO-TRIM EXCESS
+    const frozenRows = finalSheet.getFrozenRows();
+    const frozenCols = finalSheet.getFrozenColumns();
+
+    const currentMaxRows = finalSheet.getMaxRows();
+    const safeTargetRows = Math.max(dataRowsEnd, frozenRows + 1);
+    if (currentMaxRows > safeTargetRows) {
+      finalSheet.deleteRows(safeTargetRows + 1, currentMaxRows - safeTargetRows);
+    }
+
+    const currentMaxCols = finalSheet.getMaxColumns();
+    const safeTargetCols = Math.max(dataColsEnd, frozenCols + 1);
+    if (currentMaxCols > safeTargetCols) {
+      finalSheet.deleteColumns(safeTargetCols + 1, currentMaxCols - safeTargetCols);
+    }
+
+    // 9. REWIRE NAMED RANGES (Optimized Local Cache + In-Place Update)
+    if (repairMap) {
+      // 1. Fetch ALL named ranges in the document exactly once (1 API Call)
+      const allNamedRanges = ss.getNamedRanges();
+
+      // 2. Build a local Javascript dictionary for instant, zero-latency lookups
+      const nrCache = {};
+      for (let i = 0; i < allNamedRanges.length; i++) {
+        nrCache[allNamedRanges[i].getName()] = allNamedRanges[i];
+      }
+
+      for (const [rangeName, startPos] of Object.entries(repairMap)) {
+        if (!startPos) continue;
+
+        try {
+          // Fall back to cached anchor to skip another getRange API call when possible
+          const providedRange = (rangeName === firstRepairKey) ? anchorRange : finalSheet.getRange(startPos);
+          const startRow = providedRange.getRow();
+          const startCol = providedRange.getColumn();
+
+          if (dataRowsEnd >= startRow) {
+            const exactNumRows = dataRowsEnd - startRow + 1;
+            let exactNumCols = providedRange.getNumColumns();
+
+            if (exactNumCols === 1 && String(startPos).indexOf(':') === -1) {
+              exactNumCols = Math.max(1, dataColsEnd - startCol + 1);
+            }
+
+            const exactRange = finalSheet.getRange(startRow, startCol, exactNumRows, exactNumCols);
+
+            // 3. Instant local check bypasses the ss.getNamedRange() API call
+            if (nrCache[rangeName]) {
+              nrCache[rangeName].setRange(exactRange);
+            } else {
+              ss.setNamedRange(rangeName, exactRange); // Only hits the server if creation is required
+            }
+          }
+        } catch (e) {
+          console.warn(`[AtomicSwap] Failed to update Named Range '${rangeName}': ${e.message}`);
+        }
+      }
+    }
+
+
+    // 10. CLEANUP Temp
+    tempSheet.clearContents();
+
+    return { success: true, errorMessage: null };
+
+  } catch (e) {
+    return { success: false, errorMessage: e.message };
+  } finally {
+    // 11. WAKE UP & RELEASE LOCK
+    if (!holdAnesthesia && needsWakeUp && typeof wakeUpSheet === 'function') {
+      wakeUpSheet(ss);
+    }
+    if (requireLock && docLock) {
+      docLock.releaseLock();
+    }
+  }
+}
+
+
+
 /**
  * Retrieves and reassembles sharded data from ScriptCache.
  * @param {string} key The base cache key.
@@ -800,14 +851,30 @@ function manualEmergencyReset() {
 }
 
 function guardedSheetTransaction(fn, timeoutMs) {
-  var lock = LockService.getDocumentLock();
-  if (!lock.tryLock(timeoutMs || 5000)) return { success: false, error: "Lock Conflict/Busy" };
-  try { return { success: true, state: fn() }; }
-  catch (e) { return { success: false, error: e.message }; }
-  finally { lock.releaseLock(); }
+  const lock = LockService.getDocumentLock();
+
+  if (!lock.tryLock(timeoutMs || 5000)) {
+    return { success: false, error: "Lock Conflict: Script is currently busy." };
+  }
+
+  try {
+    return { success: true, state: fn() };
+  } catch (e) {
+    return { success: false, error: e.message };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
-function withSheetLock(fn, timeoutMs) { return guardedSheetTransaction(fn, timeoutMs).state; }
+function withSheetLock(fn, timeoutMs) {
+  const result = guardedSheetTransaction(fn, timeoutMs);
+
+  if (!result.success) {
+    throw new Error(`withSheetLock Failed: ${result.error}`);
+  }
+
+  return result.state;
+}
 
 var Utility = (function () {
   function median(values, opts) {
